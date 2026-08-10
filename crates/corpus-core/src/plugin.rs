@@ -1,0 +1,323 @@
+//! The corpus plugin protocol: newline-delimited JSON over stdio.
+//!
+//! A plugin is any executable that reads request lines on stdin and writes
+//! reply lines on stdout:
+//!
+//! ```text
+//! → {"id":1,"method":"probe","params":null}
+//! ← {"id":1,"ok":true,"result":{"ready":true,"notes":"regtest up"}}
+//! ```
+//!
+//! Plugins control host infrastructure (docker, nix, Lightning nodes) and
+//! are therefore trusted code; the protocol's job is not sandboxing but a
+//! stable, language-agnostic contract — a plugin can be a bash script.
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::error::Error;
+
+/// Plugin manifest (`plugin.toml` inside a plugin directory).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginManifest {
+    /// Plugin name (unique within the registry).
+    pub name: String,
+    /// Plugin version.
+    pub version: Option<String>,
+    /// Human-readable description.
+    pub description: Option<String>,
+    /// Executable entry point, relative to the manifest's directory.
+    pub exec: String,
+    /// Environment variables passed to the plugin process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+impl PluginManifest {
+    /// Load a manifest from a plugin directory.
+    pub fn load(dir: &Path) -> Result<Self, Error> {
+        let path = dir.join("plugin.toml");
+        let raw =
+            fs::read_to_string(&path).map_err(|e| Error::Manifest(path.clone(), e.to_string()))?;
+        let manifest: Self =
+            toml::from_str(&raw).map_err(|e| Error::Manifest(path.clone(), e.to_string()))?;
+        Ok(manifest)
+    }
+}
+
+/// Result of a `probe` call: is the environment usable right now?
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeResult {
+    /// True if the environment is ready for campaigns.
+    pub ready: bool,
+    /// Human-readable detail (what is missing, versions, etc.).
+    #[serde(default)]
+    pub notes: String,
+}
+
+/// One oracle as advertised by `oracles`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OracleInfo {
+    /// Oracle name (unique within the plugin).
+    pub name: String,
+    /// What invariant it checks.
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Result of a `call_oracle`: the verdict and the verbatim oracle log.
+/// Finding bodies need the log, so it is part of the protocol contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OracleResult {
+    /// `hold` | `violated` | `inconclusive`.
+    pub verdict: String,
+    /// Oracle stdout/stderr captured during the run.
+    #[serde(default)]
+    pub log: String,
+}
+
+/// Result of a `sandbox_exec`: combined output and the process exit code.
+/// The plugin owns the long-lived sandbox; corpus never learns its name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxExecResult {
+    /// Combined stdout+stderr from the sandboxed command.
+    pub output: String,
+    /// Process exit code.
+    pub exit_code: i32,
+}
+
+/// Result of a `faucet` op.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FaucetResult {
+    /// Human-readable result text (invoice, balance, or refusal reason).
+    pub text: String,
+    /// Sats paid by this op, if it was a successful payment.
+    #[serde(default)]
+    pub paid_sats: Option<u64>,
+}
+
+/// Parameters for `faucet`: op is required, the rest are op-dependent.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FaucetCall {
+    /// Paid BOLT11 invoice (`pay`).
+    pub invoice: Option<String>,
+    /// Amount in sats (`invoice`).
+    pub amount_sat: Option<u64>,
+    /// Optional memo (`invoice`).
+    pub memo: Option<String>,
+}
+
+/// A running plugin process speaking the protocol.
+#[derive(Debug)]
+pub struct Plugin {
+    manifest: PluginManifest,
+    dir: PathBuf,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: AtomicU64,
+}
+
+#[derive(Debug, Serialize)]
+struct Request<'a> {
+    id: u64,
+    method: &'a str,
+    params: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Reply {
+    id: u64,
+    ok: bool,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+impl Plugin {
+    /// Spawn the plugin process from its directory.
+    pub fn spawn(dir: &Path) -> Result<Self, Error> {
+        // Canonicalize: with `current_dir` set, a relative exec path would
+        // be resolved ambiguously (parent vs child working directory).
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let manifest = PluginManifest::load(&dir)?;
+        let exec = dir.join(&manifest.exec);
+        let mut command = Command::new(&exec);
+        command
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Plugins log to stderr; it never pollutes the protocol.
+            .stderr(Stdio::inherit());
+        for (key, value) in &manifest.env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().map_err(|e| Error::Plugin {
+            plugin: manifest.name.clone(),
+            message: format!("failed to spawn {}: {e}", exec.display()),
+        })?;
+        let stdin = child.stdin.take().ok_or_else(|| Error::Plugin {
+            plugin: manifest.name.clone(),
+            message: "no stdin".to_string(),
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .map(BufReader::new)
+            .ok_or_else(|| Error::Plugin {
+                plugin: manifest.name.clone(),
+                message: "no stdout".to_string(),
+            })?;
+        Ok(Self {
+            manifest,
+            dir: dir.to_path_buf(),
+            child,
+            stdin,
+            stdout,
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    /// The plugin's manifest.
+    pub fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    /// The plugin's directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Call a protocol method; returns the raw `result` value.
+    pub fn call(&mut self, method: &str, params: Option<Value>) -> Result<Value, Error> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let request = Request { id, method, params };
+        let mut line = serde_json::to_string(&request)?;
+        line.push('\n');
+        self.stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| self.stdin.flush())
+            .map_err(|e| Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: format!("write failed: {e}"),
+            })?;
+
+        let mut reply_line = String::new();
+        let read = self
+            .stdout
+            .read_line(&mut reply_line)
+            .map_err(|e| Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: format!("read failed: {e}"),
+            })?;
+        if read == 0 {
+            return Err(Error::PluginClosed(self.manifest.name.clone()));
+        }
+        let reply: Reply = serde_json::from_str(reply_line.trim()).map_err(|e| Error::Plugin {
+            plugin: self.manifest.name.clone(),
+            message: format!("malformed reply {:?}: {e}", reply_line.trim()),
+        })?;
+        if reply.id != id {
+            return Err(Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: format!("reply id {} does not match request id {id}", reply.id),
+            });
+        }
+        if !reply.ok {
+            return Err(Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: reply
+                    .error
+                    .unwrap_or_else(|| "unknown plugin error".to_string()),
+            });
+        }
+        Ok(reply.result.unwrap_or(Value::Null))
+    }
+
+    /// `probe`: is the environment usable right now?
+    pub fn probe(&mut self) -> Result<ProbeResult, Error> {
+        let value = self.call("probe", None)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// `up`: start the environment.
+    pub fn up(&mut self) -> Result<(), Error> {
+        self.call("up", None)?;
+        Ok(())
+    }
+
+    /// `down`: stop the environment.
+    pub fn down(&mut self) -> Result<(), Error> {
+        self.call("down", None)?;
+        Ok(())
+    }
+
+    /// `targets`: in-scope endpoints the agent may attack.
+    pub fn targets(&mut self) -> Result<Vec<String>, Error> {
+        let value = self.call("targets", None)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// `oracles`: available invariant checks.
+    pub fn oracles(&mut self) -> Result<Vec<OracleInfo>, Error> {
+        let value = self.call("oracles", None)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// `tools`: files mounted read-only into the sandbox (mount points).
+    pub fn tools(&mut self) -> Result<Vec<String>, Error> {
+        let value = self.call("tools", None)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// `sandbox_exec`: run a command inside the plugin-owned sandbox.
+    /// Lazy-starts the sandbox if it is not already running.
+    pub fn sandbox_exec(&mut self, command: &str) -> Result<SandboxExecResult, Error> {
+        let value = self.call(
+            "sandbox_exec",
+            Some(serde_json::json!({ "command": command })),
+        )?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// `call_oracle`: run one invariant check; returns verdict and log.
+    pub fn call_oracle(&mut self, name: &str) -> Result<OracleResult, Error> {
+        let value = self.call("call_oracle", Some(serde_json::json!({ "name": name })))?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// `faucet`: pay an invoice, create an invoice, or read the balance.
+    /// The plugin enforces the per-payment cap and the regtest-only check;
+    /// the caller (corpus) keeps the per-session budget.
+    pub fn faucet(&mut self, op: &str, args: &FaucetCall) -> Result<FaucetResult, Error> {
+        let mut params = serde_json::json!({ "op": op });
+        if let Some(invoice) = &args.invoice {
+            params["invoice"] = serde_json::Value::String(invoice.clone());
+        }
+        if let Some(amount_sat) = args.amount_sat {
+            params["amount_sat"] = serde_json::Value::from(amount_sat);
+        }
+        if let Some(memo) = &args.memo {
+            params["memo"] = serde_json::Value::String(memo.clone());
+        }
+        let value = self.call("faucet", Some(params))?;
+        Ok(serde_json::from_value(value)?)
+    }
+}
+
+impl Drop for Plugin {
+    fn drop(&mut self) {
+        // Plugins must handle SIGTERM/SIGKILL by releasing the environment
+        // only when they own it; see the plugin authoring guide.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}

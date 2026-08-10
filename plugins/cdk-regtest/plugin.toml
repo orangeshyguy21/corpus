@@ -1,0 +1,4 @@
+name = "cdk-regtest"
+version = "0.2.0"
+description = "CDK regtest arena (bitcoind + 4 LN nodes + 2 cdk-mintd) — first-party plugin: sandbox, oracles, faucet, targets"
+exec = "plugin"

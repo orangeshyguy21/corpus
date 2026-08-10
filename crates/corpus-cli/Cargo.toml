@@ -1,0 +1,19 @@
+[package]
+name = "corpus-cli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "corpus"
+path = "src/main.rs"
+
+[dependencies]
+corpus-core = { path = "../corpus-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }
