@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,23 @@ pub struct SandboxExecResult {
     pub exit_code: i32,
 }
 
+/// One pinned source tree mounted into the sandbox as research corpus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceInfo {
+    /// Repository name (`cdk`, `nuts`).
+    pub name: String,
+    /// Upstream repo (`owner/repo`).
+    #[serde(default)]
+    pub repo: String,
+    /// Human-readable tag/branch the pin was taken from.
+    #[serde(default)]
+    pub tag: String,
+    /// The pinned commit SHA (the actual pin).
+    pub sha: String,
+    /// Read-only mount point inside the sandbox.
+    pub mount: String,
+}
+
 /// Result of a `faucet` op.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FaucetResult {
@@ -121,8 +138,13 @@ pub struct Plugin {
     dir: PathBuf,
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Reply lines from the reader thread; a bounded `recv_timeout` in
+    /// `call` is what keeps a wedged plugin (unbounded nix eval, hung
+    /// docker exec) from freezing the whole MCP server.
+    replies: std::sync::mpsc::Receiver<String>,
     next_id: AtomicU64,
+    /// Maximum time to wait for one reply before killing the plugin tree.
+    call_timeout: std::time::Duration,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,6 +179,13 @@ impl Plugin {
             .stdout(Stdio::piped())
             // Plugins log to stderr; it never pollutes the protocol.
             .stderr(Stdio::inherit());
+        // Own process group so a timed-out call can kill the plugin AND
+        // anything it spawned (oracle scripts, nix re-execs, docker execs).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         for (key, value) in &manifest.env {
             command.env(key, value);
         }
@@ -168,21 +197,41 @@ impl Plugin {
             plugin: manifest.name.clone(),
             message: "no stdin".to_string(),
         })?;
-        let stdout = child
-            .stdout
-            .take()
-            .map(BufReader::new)
-            .ok_or_else(|| Error::Plugin {
-                plugin: manifest.name.clone(),
-                message: "no stdout".to_string(),
-            })?;
+        let stdout = child.stdout.take().ok_or_else(|| Error::Plugin {
+            plugin: manifest.name.clone(),
+            message: "no stdout".to_string(),
+        })?;
+        // Reader thread → channel: `call` can then wait with a deadline
+        // instead of blocking forever on a wedged plugin.
+        let (tx, replies) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,                    // EOF: plugin exited
+                    Ok(_) => {
+                        if tx.send(line).is_err() {
+                            break;                     // receiver gone
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let call_timeout = std::env::var("CORPUS_PLUGIN_CALL_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_secs(120));
         Ok(Self {
             manifest,
             dir: dir.to_path_buf(),
             child,
             stdin,
-            stdout,
+            replies,
             next_id: AtomicU64::new(1),
+            call_timeout,
         })
     }
 
@@ -210,15 +259,23 @@ impl Plugin {
                 message: format!("write failed: {e}"),
             })?;
 
-        let mut reply_line = String::new();
-        let read = self
-            .stdout
-            .read_line(&mut reply_line)
-            .map_err(|e| Error::Plugin {
-                plugin: self.manifest.name.clone(),
-                message: format!("read failed: {e}"),
-            })?;
-        if read == 0 {
+        let reply_line = match self.replies.recv_timeout(self.call_timeout) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.kill_tree();
+                return Err(Error::Plugin {
+                    plugin: self.manifest.name.clone(),
+                    message: format!(
+                        "call {method} timed out after {}s — plugin process tree killed",
+                        self.call_timeout.as_secs()
+                    ),
+                });
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::PluginClosed(self.manifest.name.clone()));
+            }
+        };
+        if reply_line.trim().is_empty() {
             return Err(Error::PluginClosed(self.manifest.name.clone()));
         }
         let reply: Reply = serde_json::from_str(reply_line.trim()).map_err(|e| Error::Plugin {
@@ -278,6 +335,13 @@ impl Plugin {
         Ok(serde_json::from_value(value)?)
     }
 
+    /// `sources`: the pinned source corpus mounted read-only into the
+    /// sandbox at /opt/src/<name>.
+    pub fn sources(&mut self) -> Result<Vec<SourceInfo>, Error> {
+        let value = self.call("sources", None)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
     /// `sandbox_exec`: run a command inside the plugin-owned sandbox.
     /// Lazy-starts the sandbox if it is not already running.
     pub fn sandbox_exec(&mut self, command: &str) -> Result<SandboxExecResult, Error> {
@@ -311,13 +375,35 @@ impl Plugin {
         let value = self.call("faucet", Some(params))?;
         Ok(serde_json::from_value(value)?)
     }
+
+    /// Kill the plugin and its whole process group (unix): scripts the
+    /// plugin spawned — oracle runs, nix re-execs, docker execs — must
+    /// not outlive a timed-out call.
+    fn kill_tree(&mut self) {
+        #[cfg(unix)]
+        {
+            let pgid = self.child.id().to_string();
+            let _ = Command::new("kill")
+                .args(["-TERM", &format!("-{pgid}")])
+                .status();
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Respawn the plugin in place after a fatal error (timeout, closed
+    /// stream). Callers must NOT blindly retry the failed call — the work
+    /// may have completed server-side (e.g. a faucet payment).
+    pub fn restart(&mut self) -> Result<(), Error> {
+        *self = Self::spawn(&self.dir)?;
+        Ok(())
+    }
 }
 
 impl Drop for Plugin {
     fn drop(&mut self) {
         // Plugins must handle SIGTERM/SIGKILL by releasing the environment
         // only when they own it; see the plugin authoring guide.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.kill_tree();
     }
 }

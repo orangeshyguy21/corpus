@@ -63,20 +63,29 @@ docs/research.md for the competitive context.
 
 Specialization beats one big agent — Buttercup's component split and our
 own PoC both point this way. Roles share the same runtime; they differ in
-system prompt, tool access, and budget:
+system prompt, tool access, and budget.
 
-- **scout** — maps attack surface at the pinned head: endpoints, state
-  machines, spec diffs, past-bug archeology (git log, advisories).
-  Output: hypothesis queue entries.
+The v1 built pair (in `.opencode/agent/`, enforced by opencode permissions):
+
+- **researcher** — research zone. Reads the open internet, the corpus
+  store, and the pinned source (`sources/`); executes nothing. Produces
+  hypothesis entries (`store/hypotheses/`) and curates technique cards
+  (`store/techniques/`). Folds in the earlier scout duties (surface
+  mapping, spec diffs, git archaeology) and librarian duties
+  (distillation, curation).
 - **operator** — takes one hypothesis, writes and iterates on a PoC in
   the sandbox with oracle feedback. Output: demonstrated result or
-  exhaustion of budget.
+  exhaustion of budget. Documents its own work at the point of evidence:
+  findings via the gated `finding_write`, attacks via `attack_save`,
+  technique cards via `technique_save` (always — negative results are
+  corpus value).
+
+Roadmap, not built yet:
+
 - **critic** — independent re-verification: replays the PoC from the
   transcript (fresh sandbox), checks novelty (does it reproduce on the
   previous release?), dedupes against existing findings. A finding
   graduates to `verified` only through the critic.
-- **librarian** — distills verified work into the corpus: finding files,
-  technique cards, threat-model updates, regression tests.
 
 v1: one researcher at a time, role switching by phase. Parallel
 researchers need one environment instance each (or strict serialization);
@@ -263,8 +272,9 @@ is the fallback; decide when we get there.
    protocol today.
 1. **Store**: corpus repo layout, finding schema, run logging with
    hash-chaining and signed commits.
-2. **Team**: roles (critic first — it is the verification multiplier),
-   watch mode skeleton, forensic benchmark suite v1 (3-5 historical bugs).
+2. **Team**: operator + researcher built (the v1 role pair); remaining
+   roles — critic first, it is the verification multiplier — plus watch
+   mode skeleton and forensic benchmark suite v1 (3-5 historical bugs).
 3. **TUI**: run dashboard + findings review.
 4. **Community**: plugin authoring guide + registry repo; desktop app.
 

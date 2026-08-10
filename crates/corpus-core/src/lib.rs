@@ -12,6 +12,6 @@ pub use error::Error;
 pub use models::{ModelEntry, ModelRegistry};
 pub use plugin::{
     FaucetCall, FaucetResult, OracleInfo, OracleResult, Plugin, PluginManifest, ProbeResult,
-    SandboxExecResult,
+    SandboxExecResult, SourceInfo,
 };
 pub use registry::{discover, plugins_dir, PluginDir};

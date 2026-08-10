@@ -18,9 +18,10 @@ ORACLES_DIR="$PLUGIN_DIR/oracles"
 FAUCET="$PLUGIN_DIR/faucet.sh"
 TOOLS_DIR="$PLUGIN_DIR/tools"
 EVIDENCE_DIR="$PLUGIN_DIR/evidence"
+MANIFEST="$PLUGIN_DIR/../../sources.toml"
 GW_NAME="corpus-target-gw"
 SANDBOX="corpus-sandbox-testing"
-EXEC_TIMEOUT_SECS="${CORPUS_EXEC_TIMEOUT_SECS:-120}"
+EXEC_TIMEOUT_SECS="${CORPUS_EXEC_TIMEOUT_SECS:-90}"
 
 reply_ok()   { printf '{"id":%s,"ok":true,"result":%s}\n' "$1" "$2"; }
 reply_err()  { printf '{"id":%s,"ok":false,"error":%s}\n' "$1" "$(jq -Rn --arg e "$2" '$e')"; }
@@ -53,6 +54,29 @@ config_url_port() { # config_url_port <mint_url> — port (default 80 if absent)
     local port="${url##*:}"
     [ "$port" = "$url" ] && port=80
     printf '%s' "$port"
+}
+
+manifest_get() { # manifest_get <name> <key> — sources.toml [sources.<name>]
+    awk -v name="$1" -v key="$2" '
+        function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+        /^\[sources\.[^]]+\]/ {
+            cur = $0
+            sub(/^\[sources\./, "", cur)
+            gsub(/\]|[ \t]/, "", cur)
+            next
+        }
+        cur == name {
+            line = $0
+            sub(/[ \t]*#.*$/, "", line)
+            if (index(line, "=") == 0) next
+            if (trim(substr(line, 1, index(line, "=") - 1)) == key) {
+                val = trim(substr(line, index(line, "=") + 1))
+                gsub(/^"|"$/, "", val)
+                print val
+                exit
+            }
+        }
+    ' "$MANIFEST"
 }
 
 sanitized_name() {
@@ -101,10 +125,33 @@ handle() {
                 notes="arena not up (run: arena.sh up, or call the up method)"
             else
                 m1="$(config_get target mint_url)"; m2="$(config_get target mint_url_2)"
-                if curl -sf --max-time 3 "$m1/v1/info" >/dev/null 2>&1 \
-                    && curl -sf --max-time 3 "$m2/v1/info" >/dev/null 2>&1; then
+                local info1 info2
+                info1="$(curl -sf --max-time 3 "$m1/v1/info" 2>/dev/null || true)"
+                info2="$(curl -sf --max-time 3 "$m2/v1/info" 2>/dev/null || true)"
+                if [ -n "$info1" ] && [ -n "$info2" ]; then
                     ready=true
                     notes="arena up, mints reachable"
+                    # Version-pin consistency: map the running mint's version
+                    # to a SHA via sources.toml and compare against what
+                    # config.toml [sources] pins/mounts. Wrong source mounted
+                    # for the running mint = every finding is invalid.
+                    local ver tag msha csha mtag
+                    ver="$(jq -r '.version // ""' <<<"$info1" | sed 's#^cdk-mintd/##')"
+                    if [ -n "$ver" ]; then
+                        tag="v${ver}"
+                        mtag="$(manifest_get cdk tag)"
+                        msha="$(manifest_get cdk sha)"
+                        csha="$(config_get sources cdk_sha)"
+                        if [ -n "$mtag" ] && [ "$tag" != "$mtag" ]; then
+                            # The dangerous case: agent reads source for a
+                            # version the mint is NOT running.
+                            ready=false
+                            notes="mint runs $ver but sources.toml pins $mtag — mounted source does not match the running mint"
+                        elif [ -n "$msha" ] && [ -n "$csha" ] && [ "$msha" != "$csha" ]; then
+                            ready=false
+                            notes="[sources].cdk_sha ($csha) disagrees with sources.toml ($mtag @ $msha) — mounted source is not the manifest pin"
+                        fi
+                    fi
                 else
                     notes="arena healthy; regtest mints not running (just regtest in the cdk repo)"
                 fi
@@ -144,6 +191,22 @@ handle() {
                 case "$(basename "$f")" in .gitkeep|build-tools.sh) continue ;; esac
                 items="$(jq -nc --argjson items "$items" \
                     --arg t "/opt/tools/$(basename "$f")" '$items + [$t]')"
+            done
+            reply_ok "$id" "$items"
+            ;;
+        sources)
+            # Mounted research corpus: pinned upstream trees at /opt/src/<name>.
+            # The sha comes from config.toml [sources] (what is mounted); the
+            # repo/tag come from the sources.toml manifest (the pin's identity).
+            local items="[]" entry sha repo tag
+            for entry in cdk nuts; do
+                sha="$(config_get sources "${entry}_sha")"
+                [ -n "$sha" ] || continue
+                repo="$(manifest_get "$entry" repo)"
+                tag="$(manifest_get "$entry" tag)"
+                items="$(jq -nc --argjson items "$items" \
+                    --arg name "$entry" --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" \
+                    '$items + [{name:$name, repo:$repo, tag:$tag, sha:$sha, mount:("/opt/src/"+$name)}]')"
             done
             reply_ok "$id" "$items"
             ;;

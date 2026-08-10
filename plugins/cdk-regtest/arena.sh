@@ -14,6 +14,8 @@ AGENT_IMAGE="corpus-agent:local"
 GW_NAME="corpus-target-gw"
 EVIDENCE_DIR="$PLUGIN_DIR/evidence"
 TOOLS_DIR="$PLUGIN_DIR/tools"
+SOURCES_DIR="$(cd "$PLUGIN_DIR/../.." && pwd)/sources"
+SOURCES_MANIFEST="${CORPUS_SOURCES_MANIFEST:-$(cd "$PLUGIN_DIR/../.." && pwd)/sources.toml}"
 
 usage() {
     cat <<'EOF'
@@ -236,6 +238,10 @@ cmd_agent() {
         -e "CDK_TARGET_MINT_URL_2=$mint_url_2"
         -e "EVIDENCE_DIR=/evidence"
     )
+    # Pinned source corpus: /opt/src/<name>, read-only.
+    while IFS= read -r mount; do
+        run_args+=("$mount")
+    done < <(source_mount_args)
     if [ "$detach" = true ]; then
         run_args+=(-d)
     elif [ -t 1 ]; then
@@ -249,6 +255,24 @@ cmd_agent() {
     if [ "$detach" = true ]; then
         echo "detached agent container: corpus-sandbox-$job" >&2
     fi
+}
+
+# source_mount_args — the pinned research corpus at /opt/src/<name>, read-only.
+# Each host tree is sources/<name>/<sha>; config.toml [sources] selects the
+# sha, sources.toml is the manifest. Die loudly on missing pins: an agent
+# must never silently run without the source the mission pins assume.
+source_mount_args() {
+    local args=() name sha
+    for name in cdk nuts; do
+        sha="$(cfg sources "${name}_sha" '')"
+        [ -n "$sha" ] || continue
+        local tree="$SOURCES_DIR/$name/$sha"
+        if [ ! -d "$tree/.git" ]; then
+            die "sources/$name/$sha not fetched — run: bash plugins/cdk-regtest/setup.sh"
+        fi
+        args+=(-v "$tree:/opt/src/$name:ro")
+    done
+    printf '%s\n' "${args[@]}"
 }
 
 # Probe: run curl from an ephemeral agent container on a given network.
@@ -303,6 +327,28 @@ cmd_doctor() {
         check warn "mint 2 unreachable: $mint_url_2"
     fi
 
+    echo "sources (pinned research corpus)"
+    local name sha tree
+    for name in cdk nuts; do
+        sha="$(cfg sources "${name}_sha" '')"
+        if [ -z "$sha" ]; then
+            check warn "sources/$name: not configured in config.toml [sources]"
+            continue
+        fi
+        tree="$SOURCES_DIR/$name/$sha"
+        if [ ! -d "$tree/.git" ]; then
+            check warn "sources/$name/$sha not fetched (run: plugins/cdk-regtest/setup.sh)"
+            continue
+        fi
+        local head
+        head="$(git -C "$tree" rev-parse HEAD 2>/dev/null || true)"
+        if [ "$head" = "$sha" ]; then
+            check ok "sources/$name: HEAD == pin ($sha)"
+        else
+            check fail "sources/$name: HEAD $head != pinned $sha — re-fetch"
+        fi
+    done
+
     echo "arena"
     local net egress_net
     net="$(cfg arena network corpus-arena)"
@@ -355,6 +401,17 @@ cmd_status() {
     echo "containers:"
     docker ps -a --filter "name=corpus-" --format '  {{.Names}} {{.Status}}'
     echo "evidence: $EVIDENCE_DIR ($(du -sh "$EVIDENCE_DIR" 2>/dev/null | cut -f1 || echo empty))"
+    echo "sources: $SOURCES_DIR"
+    local name sha head
+    for name in cdk nuts; do
+        sha="$(cfg sources "${name}_sha" '')"
+        if [ -n "$sha" ] && [ -d "$SOURCES_DIR/$name/$sha/.git" ]; then
+            head="$(git -C "$SOURCES_DIR/$name/$sha" rev-parse HEAD 2>/dev/null || echo ?)"
+            echo "  $name: mounted $sha (HEAD $head)"
+        else
+            echo "  $name: not fetched"
+        fi
+    done
 }
 
 main() {

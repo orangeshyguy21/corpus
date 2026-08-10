@@ -7,3 +7,6 @@
 # cdk-regtest plugin runtime state: sandbox evidence and compiled tools.
 /plugins/cdk-regtest/evidence
 /plugins/cdk-regtest/tools/cdk-cli
+# Pinned source cache (derived data, content-addressed). The SHAs live in
+# sources.toml (committed); the trees themselves are fetched host-side.
+/sources

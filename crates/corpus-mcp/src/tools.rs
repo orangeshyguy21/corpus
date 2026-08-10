@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use corpus_core::{FaucetCall, Plugin};
+use corpus_core::{FaucetCall, Plugin, ProbeResult};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -20,12 +20,17 @@ const OUTPUT_CAP_BYTES: usize = 8 * 1024;
 pub struct Ctx {
     /// The environment plugin driving the harness.
     pub plugin: Plugin,
-    /// Corpus store root (findings/, attacks/).
+    /// Corpus store root (findings/, attacks/, techniques/, runs/).
     pub store: PathBuf,
     /// Faucet spend within this server session (sats).
     pub faucet_spent_sats: u64,
     /// Per-session faucet budget.
     pub faucet_budget_sats: u64,
+    /// Probe result captured at startup. The server refuses tool calls
+    /// while `ready` is false — fail loud, never silently misleading.
+    pub probe_ready: bool,
+    /// Probe notes explaining exactly what is wrong.
+    pub probe_notes: String,
 }
 
 impl Ctx {
@@ -38,12 +43,20 @@ impl Ctx {
         let store = std::env::var("CORPUS_STORE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(format!("{home}/Sites/corpus/store")));
-        let plugin = Plugin::spawn(&plugin_dir)?;
+        let mut plugin = Plugin::spawn(&plugin_dir)?;
+        // Probe the environment once at startup; the result gates every
+        // tool call (version-pin mismatch included).
+        let probe = plugin.probe().unwrap_or_else(|e| ProbeResult {
+            ready: false,
+            notes: format!("probe failed: {e}"),
+        });
         Ok(Self {
             plugin,
             store,
             faucet_spent_sats: 0,
             faucet_budget_sats: 1_000_000,
+            probe_ready: probe.ready,
+            probe_notes: probe.notes,
         })
     }
 }
@@ -126,12 +139,35 @@ pub fn catalog() -> Value {
                 },
                 "required": ["name", "description", "script"]
             }
+        },
+        {
+            "name": "technique_save",
+            "description": "Save a technique card into the corpus (store/techniques/). Working notes — no oracle gate — but run_log MUST name an existing file in store/runs/ (this run's transcript). status: fired | analyzed-only | unresolved-lead. Write one after every mission, negative results included.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "status": {"type": "string", "enum": ["fired", "analyzed-only", "unresolved-lead"]},
+                    "body": {"type": "string"},
+                    "run_log": {"type": "string", "description": "basename of an existing file in store/runs/, e.g. 1786392937-attacker-call-target-info-once-then-reply.log"}
+                },
+                "required": ["name", "status", "body", "run_log"]
+            }
         }
     ])
 }
 
 /// Dispatch a tools/call.
 pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
+    // Fail loud: while the environment probe says not-ready (mints down,
+    // version-pin mismatch, arena torn down), no tool runs. The notes ARE
+    // the error so the agent sees exactly what to fix.
+    if !ctx.probe_ready {
+        return Err(Error::Args(format!(
+            "harness not ready — probe: {}",
+            ctx.probe_notes
+        )));
+    }
     match name {
         "target_info" => target_info(ctx),
         "sandbox_exec" => sandbox_exec(ctx, &require_str(args, "command")?),
@@ -140,6 +176,7 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         "wallet_fund" => wallet_fund(ctx, args),
         "finding_write" => finding_write(ctx, args),
         "attack_save" => attack_save(ctx, args),
+        "technique_save" => technique_save(ctx, args),
         other => Err(Error::Args(format!("unknown tool: {other}"))),
     }
 }
@@ -151,6 +188,28 @@ fn require_str(args: &Value, key: &str) -> Result<String> {
         .ok_or_else(|| Error::Args(format!("missing string argument: {key}")))
 }
 
+/// Run a plugin call; if the plugin died or wedged (timeout kills the
+/// process tree), respawn it so the NEXT call recovers, and surface the
+/// original error. The failed call itself is NEVER retried — the work may
+/// have completed server-side (e.g. a faucet payment).
+fn resilient<T>(
+    ctx: &mut Ctx,
+    f: impl FnOnce(&mut corpus_core::Plugin) -> std::result::Result<T, corpus_core::Error>,
+) -> Result<T> {
+    match f(&mut ctx.plugin) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if matches!(
+                error,
+                corpus_core::Error::PluginClosed(_) | corpus_core::Error::Plugin { .. }
+            ) {
+                let _ = ctx.plugin.restart();
+            }
+            Err(Error::Plugin(error))
+        }
+    }
+}
+
 fn require_u64(args: &Value, key: &str) -> Result<u64> {
     args.get(key)
         .and_then(Value::as_u64)
@@ -158,11 +217,16 @@ fn require_u64(args: &Value, key: &str) -> Result<u64> {
 }
 
 fn target_info(ctx: &mut Ctx) -> Result<String> {
-    let targets = ctx.plugin.targets()?;
-    let tools = ctx.plugin.tools()?;
+    let targets = resilient(ctx, |p| p.targets())?;
+    let tools = resilient(ctx, |p| p.tools())?;
+    let sources = resilient(ctx, |p| p.sources())?;
     Ok(serde_json::to_string_pretty(&json!({
         "targets": targets,
         "scope": "ONLY these URLs may be attacked; the sandbox cannot reach anything else",
+        "sources_in_sandbox": {
+            "note": "pinned upstream source, read-only at /opt/src/<name> — the research corpus (target implementation + NUT spec). This is the only sanctioned source; you have no host filesystem.",
+            "mounted": sources
+        },
         "tools_in_sandbox": tools,
         "faucet": {
             "max_payment_sats": 100000,
@@ -175,7 +239,7 @@ fn target_info(ctx: &mut Ctx) -> Result<String> {
 }
 
 fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
-    let result = ctx.plugin.sandbox_exec(command)?;
+    let result = resilient(ctx, |p| p.sandbox_exec(command))?;
     let mut combined = result.output;
     if combined.len() > OUTPUT_CAP_BYTES {
         combined.truncate(OUTPUT_CAP_BYTES);
@@ -192,7 +256,7 @@ fn oracle_run(ctx: &mut Ctx, name: &str) -> Result<String> {
     {
         return Err(Error::Args("bad oracle name".to_string()));
     }
-    let result = ctx.plugin.call_oracle(name)?;
+    let result = resilient(ctx, |p| p.call_oracle(name))?;
     Ok(format!("verdict: {}\n{}", result.verdict, result.log))
 }
 
@@ -215,7 +279,7 @@ fn faucet(ctx: &mut Ctx, args: &Value) -> Result<String> {
         "invoice" | "balance" => {}
         other => return Err(Error::Args(format!("unknown faucet op: {other}"))),
     }
-    let result = ctx.plugin.faucet(&op, &call)?;
+    let result = resilient(ctx, |p| p.faucet(&op, &call))?;
     if let Some(paid) = result.paid_sats {
         ctx.faucet_spent_sats += paid;
         return Ok(format!(
@@ -243,7 +307,7 @@ fn wallet_fund(ctx: &mut Ctx, args: &Value) -> Result<String> {
         return Err(Error::Args("work_dir must be a simple path under /tmp/".to_string()));
     }
     let amount = require_u64(args, "amount_sat")?;
-    let targets = ctx.plugin.targets()?;
+    let targets = resilient(ctx, |p| p.targets())?;
     let target = if targets.len() > 1 {
         match args.get("target").and_then(Value::as_u64).unwrap_or(0) {
             0 => targets[0].clone(),
@@ -305,10 +369,10 @@ fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
 
     let mut verified = false;
     let mut oracle_out = String::new();
-    match ctx.plugin.oracles() {
+    match resilient(ctx, |p| p.oracles()) {
         Ok(oracles) => {
             for oracle in &oracles {
-                let line = match ctx.plugin.call_oracle(&oracle.name) {
+                let line = match resilient(ctx, |p| p.call_oracle(&oracle.name)) {
                     Ok(result) => {
                         if result.verdict == "violated" {
                             verified = true;
@@ -369,6 +433,61 @@ fn attack_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
         std::fs::set_permissions(&run_path, std::fs::Permissions::from_mode(0o755))?;
     }
     Ok(format!("attack saved: {}", dir.display()))
+}
+
+/// Save a technique card into the corpus store. Working notes — no oracle
+/// gate (findings remain the gated artifact) — but the card MUST cite an
+/// existing run log in `store/runs/`, enforced here server-side.
+fn technique_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let name = require_str(args, "name")?;
+    let status = require_str(args, "status")?;
+    let body = require_str(args, "body")?;
+    let run_log = require_str(args, "run_log")?;
+
+    if !matches!(status.as_str(), "fired" | "analyzed-only" | "unresolved-lead") {
+        return Err(Error::Args(
+            "status must be fired | analyzed-only | unresolved-lead".to_string(),
+        ));
+    }
+    // run_log is a basename only — never a path — and must exist.
+    let run_log = run_log.trim();
+    if run_log.is_empty()
+        || run_log.contains('/')
+        || run_log.contains('\\')
+        || run_log == "."
+        || run_log == ".."
+    {
+        return Err(Error::Args(
+            "run_log must be a plain basename (no path)".to_string(),
+        ));
+    }
+    let log_path = ctx.store.join("runs").join(run_log);
+    if !log_path.is_file() {
+        return Err(Error::Args(format!(
+            "run_log must name an existing file in store/runs/ (not found: {run_log})"
+        )));
+    }
+
+    let slug = slugify(&name);
+    if slug.is_empty() {
+        return Err(Error::Args("name must contain alphanumerics".to_string()));
+    }
+    let dir = ctx.store.join("techniques");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{slug}.md"));
+    let overwrote = path.exists();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let card = format!(
+        "---\nname: {name}\nstatus: {status}\nrun_log: {run_log}\ntimestamp: {ts}\n---\n\n{body}\n"
+    );
+    std::fs::write(&path, &card)?;
+    Ok(format!(
+        "technique card saved: {} (status: {status}, overwrote existing: {overwrote})",
+        path.display()
+    ))
 }
 
 fn slugify(raw: &str) -> String {

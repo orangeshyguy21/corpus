@@ -5,6 +5,7 @@
       "type": "local",
       "command": ["/Users/admin/Sites/corpus/target/debug/corpus-mcp"],
       "enabled": true,
+      "timeout": 180000,
       "environment": {
         "CORPUS_PLUGIN_DIR": "/Users/admin/Sites/corpus/plugins/cdk-regtest",
         "CORPUS_STORE": "/Users/admin/Sites/corpus/store"
