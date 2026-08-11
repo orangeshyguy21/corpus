@@ -105,7 +105,7 @@ impl App {
             Err(error) => self.log(format!("plugin discovery failed: {error}")),
         }
         let models_path =
-            std::env::var("CORPUS_MODELS").unwrap_or_else(|_| "models.yaml".to_string());
+            std::env::var("CORPUS_MODELS").unwrap_or_else(|_| "benchmarks/models.yaml".to_string());
         match ModelRegistry::load(models_path.as_ref()) {
             Ok(registry) => {
                 self.models = registry

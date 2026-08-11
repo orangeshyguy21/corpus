@@ -19,7 +19,7 @@
 # (cln one backs the CLN mint, lnd two backs the LND mint), so funded flows
 # exercise real cross-node Lightning paths.
 #
-# Absorbed from cdk/vul-lab/bin/faucet.sh (2026-08-10); env vars renamed
+# Absorbed from cdk/bin/faucet.sh (2026-08-10); env vars renamed
 # VUL_LAB_* -> CORPUS_*. The /tmp/cdk_regtest_env contract is unchanged:
 # it belongs to the regtest environment this plugin targets.
 set -euo pipefail

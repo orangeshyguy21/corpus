@@ -1,8 +1,9 @@
-# corpus model registry — the model lab.
+# corpus model registry — the benchmark system's model lab.
 #
+# This file is the model registry for the benchmark system (benchmarks/).
 # Every model worth tracking for vulnerability research, with capability
-# tags and provenance. Benchmark scores live in benchmarks/results/; this
-# file is identity + metadata only. Capability tags are assessed from
+# tags and provenance. Scores live in benchmarks/results/<model>/*.yaml;
+# this file is identity + metadata only. Capability tags are assessed from
 # observed run behavior in THIS project (see benchmarks/), not vendor
 # claims — update them as evidence accumulates.
 

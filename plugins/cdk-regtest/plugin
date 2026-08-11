@@ -90,7 +90,7 @@ sandbox_ready() {
 }
 
 # Lazy-start the long-lived testing sandbox (plugin-owned; promise is the
-# same as vul-lab's — current behavior preserved, just moved plugin-side).
+# same as the PoC's — current behavior preserved, just moved plugin-side).
 ensure_sandbox() { # ensure_sandbox <id>
     local id="$1"
     sandbox_ready && return 0

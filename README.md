@@ -68,7 +68,7 @@ dependency.
 In this repo: Rust workspace (`crates/corpus-core`, `crates/corpus-mcp`
 MCP server, `crates/corpus-cli` with the ratatui TUI), the plugin
 protocol, two environment plugins (`plugins/cdk-regtest`,
-`plugins/nutshell-fake`), and the model registry (`models.yaml`).
+`plugins/nutshell-fake`), and the model registry (`benchmarks/models.yaml`).
 
 See:
 

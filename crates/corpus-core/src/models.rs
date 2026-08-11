@@ -32,7 +32,7 @@ pub struct ModelEntry {
     pub notes: String,
 }
 
-/// The model registry (parsed from `models.yaml`).
+/// The model registry (parsed from `benchmarks/models.yaml`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRegistry {
     /// All tracked models.

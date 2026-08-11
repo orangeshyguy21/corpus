@@ -1,6 +1,6 @@
 # cdk-regtest plugin configuration
 #
-# Absorbed from cdk/vul-lab/vul-lab.toml (2026-08-10). Two trust domains:
+# Absorbed from the cdk repo's PoC harness (2026-08-10). Two trust domains:
 #
 #   [job.testing]   Executes arbitrary attack code against the target.
 #                   Egress OFF by default: exploit code must never reach
@@ -14,7 +14,7 @@
 # Config parsing note: keep values flat (`key = "value"`, no `#` inside
 # values). The minimal bash reader in arena.sh handles only this subset.
 #
-# [model] and [corpus] sections from vul-lab.toml were NOT ported: they
+# [model] and [corpus] sections from the PoC config were NOT ported: they
 # belonged to the Rust orchestrator, which opencode has superseded.
 
 [arena]

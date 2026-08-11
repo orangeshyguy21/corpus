@@ -2,8 +2,8 @@
 # arena.sh — manages the corpus cdk-regtest "arena": the isolated container
 # networks where agents execute attacks against the CDK regtest environment.
 #
-# Absorbed from cdk/vul-lab/bin/vul-lab (2026-08-10). All vul-lab-* names
-# are renamed corpus-*; the orchestrator and run/mission machinery are not
+# Absorbed from the cdk PoC harness (2026-08-10). Names are renamed corpus-*;
+# the orchestrator and run/mission machinery are not
 # ported (opencode is the agent runner now). Configuration lives in
 # config.toml, plugin-local evidence/ is mounted into the sandbox.
 set -euo pipefail

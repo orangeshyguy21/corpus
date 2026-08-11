@@ -1,4 +1,4 @@
-# cdk-regtest attacker image (absorbed from vul-lab, 2026-08-10).
+# cdk-regtest attacker image (absorbed from the cdk PoC harness, 2026-08-10).
 #
 # Toolchain policy: bash + Rust-compiled binaries only. There is
 # intentionally NO Python (or any other interpreter) in this image.

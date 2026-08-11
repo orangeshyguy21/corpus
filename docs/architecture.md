@@ -229,7 +229,7 @@ oracle trip."
 corpus treats models as benchmarked, tagged equipment — not a config
 string. Three artifacts:
 
-- **Model registry** (`models.yaml`): every model worth tracking, with
+- **Model registry** (`benchmarks/models.yaml`): every model worth tracking, with
   capability tags (`coding`, `tool-use`, `long-context`, `reasoning`),
   parameter size, context window, provider, and install status.
 - **Forensic benchmark suite** (`benchmarks/forensic/`): historical bugs
@@ -277,6 +277,9 @@ is the fallback; decide when we get there.
    mode skeleton and forensic benchmark suite v1 (3-5 historical bugs).
 3. **TUI**: run dashboard + findings review.
 4. **Community**: plugin authoring guide + registry repo; desktop app.
+
+Steps 1–3 are expanded into workstreams with dependencies and a gantt in
+[../dev/roadmap-plan.md](../dev/roadmap-plan.md) (2026-08-10).
 
 ## Open questions
 

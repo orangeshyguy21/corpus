@@ -10,6 +10,10 @@ toml = "0.8"
 thiserror = "2"
 ratatui = "0.29"
 crossterm = "0.28"
+eframe = "0.31"
+egui = "0.31"
+egui_commonmark = "0.20"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 
 [profile.release]
 lto = true

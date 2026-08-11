@@ -15,8 +15,8 @@ as the first-party plugin (see "vul-lab absorbed" below).
 - `.opencode/agent/attacker.md`, `.opencode/agent/scribe.md` — the first
   two researchers. Attacker has sandbox network; scribe has store-write
   but no sandbox. Trust domains enforced via opencode permissions.
-  (Renamed 2026-08-10 → **operator** and **researcher**; see
-  `dev/research-team-plan.md`.)
+(Renamed 2026-08-10 → **operator** and **researcher**; see
+   `docs/decisions.md`.)
 - `store/` — findings/, attacks/, techniques/, runs/ (git-ignored unless
   committed deliberately).
 
@@ -74,7 +74,7 @@ oracle 020-conservation held. The mint serializes swaps correctly.
 
 The working vul-lab harness in the cdk repo was absorbed into corpus as
 the first-party `plugins/cdk-regtest` plugin — corpus no longer depends on
-`~/Sites/cdk/vul-lab`. Details in `dev/absorb-plan.md`; summary:
+`~/Sites/cdk/vul-lab`. Details in `docs/decisions.md`; summary:
 
 - Arena (networks, gateway, sandbox, agent image) ported to
   `plugins/cdk-regtest/arena.sh`, names renamed `vul-lab-*` →

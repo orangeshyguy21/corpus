@@ -6,7 +6,7 @@
 # read-only at /opt/tools in agent containers. Named docker volumes cache
 # the cargo registry and target dir so rebuilds are incremental.
 #
-# Absorbed from cdk/vul-lab/tools/build-tools.sh (2026-08-10). The source
+# Absorbed from cdk/tools/build-tools.sh (2026-08-10). The source
 # lives in the cdk repo (the target environment owner) via CORPUS_CDK_REPO.
 set -euo pipefail
 

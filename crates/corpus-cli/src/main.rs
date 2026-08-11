@@ -29,7 +29,7 @@ corpus — local-first vulnerability research platform
 
 Environment:
   CORPUS_PLUGINS_DIR           Plugins directory (default: ./plugins)
-  CORPUS_MODELS                models.yaml path (default: ./models.yaml)
+  CORPUS_MODELS                models.yaml path (default: ./benchmarks/models.yaml)
   CORPUS_STORE                 Store root (default: ~/Sites/corpus/store)";
 
 fn main() -> ExitCode {
@@ -278,7 +278,7 @@ fn models_cmd(args: &[String]) -> Result<(), String> {
         Some("list") => {
             let path = std::env::var("CORPUS_MODELS")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("models.yaml"));
+                .unwrap_or_else(|_| PathBuf::from("benchmarks/models.yaml"));
             let registry = ModelRegistry::load(&path).map_err(|e| e.to_string())?;
             for model in &registry.models {
                 println!(
