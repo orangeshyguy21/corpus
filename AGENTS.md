@@ -21,9 +21,10 @@ crates/
                      slated for removal once the deck covers M1+M2)
   corpus-deck/       egui desktop app (corpus-deck), the operator UI
 plugins/
-  cdk-regtest/       first-party environment plugin (sandbox + oracles +
-                     faucet + targets) for the CDK e-cash target
-  nutshell-fake/     minimal fake plugin example (plugin protocol reference)
+  cdk-regtest/       reference environment plugin (sandbox + oracles +
+                     faucet + targets) for the CDK e-cash target; the
+                     in-repo protocol fixture. Other plugins live in
+                     their own repos (see roadmap #18).
 benchmarks/
   models.yaml        model registry (identity + metadata; scores live in
                      benchmarks/results/<model>/*.yaml)
@@ -33,8 +34,11 @@ store/               the corpus knowledge base (hypotheses, techniques,
                      findings, attacks, runs)
 sources.toml         pinned target source manifest (repo → commit SHA)
 sources/             git-ignored fetch of pinned trees (sources/<name>/<sha>/)
-docs/                architecture.md, decisions.md, research.md, alpha-1.md
-dev/                 ACTIVE plans only (roadmap-plan, corpus-deck-egui-plan)
+docs/                (gone — folded into dev/; see below)
+dev/                 everything uncommitted & machine-local: architecture,
+                     decisions, research, alpha-1, plus ACTIVE plans
+                     (roadmap-plan, corpus-deck-egui-plan) and the demo
+                     poster. Git-ignored: may be absent on a fresh clone.
 .opencode/           opencode config + the role agents (operator, researcher)
 ```
 
@@ -94,7 +98,7 @@ Any executable speaking newline-delimited JSON on stdio is a plugin
 (bash qualifies). The client lives in `crates/corpus-core/src/plugin.rs`;
 the full method table (`probe`, `up/down`, `targets`, `tools`, `sources`,
 `sandbox_exec`, `oracles`, `call_oracle`, `faucet`) is documented in
-`crates/corpus-core/src/plugin.rs` and `docs/architecture.md`.
+`crates/corpus-core/src/plugin.rs` and `dev/architecture.md`.
 The reference plugin is `plugins/cdk-regtest`.
 
 ## Store conventions
@@ -119,12 +123,13 @@ list of M0 mistakes and the house style for egui panels, repaint
 cadence, and store semantics.
 
 For anything touching the research loop (roles, tool contracts, sandbox
-policy), `docs/architecture.md` "The research team" and "Trust domains"
+policy), `dev/architecture.md` "The research team" and "Trust domains"
 are authoritative; `dev/roadmap-plan.md` is the honest state-of-the-world.
 
 ## Plan hygiene (house rule)
 
-Any plan in `dev/` that becomes DONE gets collapsed into `docs/decisions.md`
+Any plan in `dev/` that becomes DONE gets collapsed into
+`dev/decisions.md`
 (one paragraph: what was decided, why, where the code lives) and deleted
 from `dev/`. `dev/` keeps ACTIVE plans only; this keeps pointers in this
 file and `dev/roadmap-plan.md` fresh.

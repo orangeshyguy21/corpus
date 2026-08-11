@@ -67,15 +67,12 @@ dependency.
 
 In this repo: Rust workspace (`crates/corpus-core`, `crates/corpus-mcp`
 MCP server, `crates/corpus-cli` with the ratatui TUI), the plugin
-protocol, two environment plugins (`plugins/cdk-regtest`,
-`plugins/nutshell-fake`), and the model registry (`benchmarks/models.yaml`).
+protocol, the reference environment plugin (`plugins/cdk-regtest`),
+and the model registry (`benchmarks/models.yaml`).
 
-See:
-
-- [docs/research.md](docs/research.md) — landscape: similar projects,
-  enabling tech, and what to learn from each
-- [docs/architecture.md](docs/architecture.md) — proposed system design:
-  core entities, plugin protocol, trust domains, data model, roadmap
+(Design context — architecture, research landscape, decisions, and the
+live roadmap — lives in `dev/`, which is machine-local scratch and not
+included in this repository.)
 
 ## Authorized use
 

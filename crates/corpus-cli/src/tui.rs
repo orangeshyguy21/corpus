@@ -511,9 +511,9 @@ mod tests {
     fn renders_panels() {
         let mut app = App::new();
         let manifest: corpus_core::PluginManifest =
-            toml::from_str("name = \"nutshell-fake\"\nexec = \"x.sh\"\n").expect("manifest");
+            toml::from_str("name = \"example-plugin\"\nexec = \"x.sh\"\n").expect("manifest");
         app.plugins.push(PluginDir {
-            dir: std::path::PathBuf::from("plugins/nutshell-fake"),
+            dir: std::path::PathBuf::from("plugins/example"),
             manifest,
         });
         app.probe_status = vec![Some("ready".to_string())];
@@ -531,7 +531,7 @@ mod tests {
         app.apply_result(ActionResult {
             plugin_index: 0,
             oracle_index: None,
-            line: "nutshell-fake: ready — mint up".to_string(),
+            line: "example-plugin: ready — mint up".to_string(),
             plugin_status: Some("ready".to_string()),
             oracles: None,
             verdict: None,
@@ -547,7 +547,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("nutshell-fake [ready]"), "plugin: {text}");
+        assert!(text.contains("example-plugin [ready]"), "plugin: {text}");
         assert!(
             text.contains("002-double-spend-rejected [hold]"),
             "oracle: {text}"
