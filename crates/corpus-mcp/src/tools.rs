@@ -31,7 +31,13 @@ pub struct Ctx {
     pub probe_ready: bool,
     /// Probe notes explaining exactly what is wrong.
     pub probe_notes: String,
+    /// When the probe last ran — re-probes while gated are rate-limited
+    /// so a polling model cannot hammer docker/curl in a tight loop.
+    pub last_probe: std::time::Instant,
 }
+
+/// Minimum interval between re-probes while the gate is closed.
+const REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Ctx {
     /// Resolve from the environment.
@@ -57,6 +63,7 @@ impl Ctx {
             faucet_budget_sats: 1_000_000,
             probe_ready: probe.ready,
             probe_notes: probe.notes,
+            last_probe: std::time::Instant::now(),
         })
     }
 }
@@ -161,7 +168,22 @@ pub fn catalog() -> Value {
 pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     // Fail loud: while the environment probe says not-ready (mints down,
     // version-pin mismatch, arena torn down), no tool runs. The notes ARE
-    // the error so the agent sees exactly what to fix.
+    // the error so the agent sees exactly what to fix. The probe is a
+    // startup snapshot — environments RECOVER (mints get restarted
+    // mid-session), so while gated, re-probe (rate-limited) before
+    // refusing: a closed gate must heal itself.
+    if !ctx.probe_ready && ctx.last_probe.elapsed() >= REPROBE_INTERVAL {
+        ctx.last_probe = std::time::Instant::now();
+        match resilient(ctx, |p| p.probe()) {
+            Ok(probe) => {
+                ctx.probe_ready = probe.ready;
+                ctx.probe_notes = probe.notes;
+            }
+            Err(error) => {
+                ctx.probe_notes = format!("probe failed: {error}");
+            }
+        }
+    }
     if !ctx.probe_ready {
         return Err(Error::Args(format!(
             "harness not ready — probe: {}",
