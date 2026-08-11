@@ -3,15 +3,11 @@
 //! agents. Hand-rolled minimal protocol: initialize, tools/list,
 //! tools/call. No async, no framework: the attack surface stays auditable.
 
-mod error;
-mod tools;
-
 use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::error::{Error, Result};
-use crate::tools::Ctx;
+use corpus_mcp::{error::{Error, Result}, tools, tools::Ctx};
 
 fn main() {
     if let Err(error) = serve() {

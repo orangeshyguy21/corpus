@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[lib]
+name = "corpus_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "corpus-mcp"
 path = "src/main.rs"

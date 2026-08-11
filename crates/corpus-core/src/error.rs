@@ -22,6 +22,11 @@ pub enum Error {
     #[error("toml error: {0}")]
     Toml(#[from] toml::de::Error),
 
+    /// A store layout violation (invalid slug, missing project/team, a
+    /// refused promotion, etc.).
+    #[error("store error: {0}")]
+    Store(String),
+
     /// A plugin manifest is missing or malformed.
     #[error("invalid plugin manifest at {0}: {1}")]
     Manifest(PathBuf, String),
@@ -39,3 +44,6 @@ pub enum Error {
     #[error("plugin {0} closed its protocol stream unexpectedly")]
     PluginClosed(String),
 }
+
+/// Result alias for corpus-core.
+pub type Result<T> = std::result::Result<T, Error>;
