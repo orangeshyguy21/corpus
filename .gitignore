@@ -1,7 +1,10 @@
 /target
 # The corpus store (findings, attacks, runs) is private and stays out of
 # the public app repo. It should eventually be its own private git repo.
-/store
+# Core templates under store/templates are the exception: they ship with the
+# app and are versioned (see AGENTS.md — templates are data, in the store).
+/store/*
+!/store/templates/
 # Working plans, notes, and scratch — local to each developer.
 /dev
 # cdk-regtest plugin runtime state: sandbox evidence and compiled tools.

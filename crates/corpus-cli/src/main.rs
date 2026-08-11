@@ -3,6 +3,7 @@
 //! Headless subcommands exist for scripting and debugging; with no
 //! subcommand the TUI dashboard launches.
 
+mod store_admin;
 mod tui;
 
 use std::io::{BufRead, BufReader, Write};
@@ -10,7 +11,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-use corpus_core::{discover, plugins_dir, ModelRegistry, Plugin};
+use corpus_core::{discover, plugins_dir, ModelRegistry, Plugin, Scope, Store};
 
 const USAGE: &str = "\
 corpus — local-first vulnerability research platform
@@ -18,19 +19,29 @@ corpus — local-first vulnerability research platform
   corpus [tui]                 Launch the TUI dashboard (default)
   corpus run <agent> [-m model] [--research] <mission...>
                                Run an opencode mission; transcript is logged
-                               to store/runs/ automatically. --research
-                               follows up with a researcher curation pass
-                               (technique cards + hypothesis entries).
+                               to the scoped store (default project/team
+                               corpus runs/) automatically. --research
+                               follows up with a researcher curation pass.
   corpus plugin list           List discovered environment plugins
   corpus plugin probe <name>   Probe one plugin (environment health)
   corpus plugin call <name> <method> [params-json]
                                Raw protocol call (debugging)
   corpus models list           List the model registry
+  corpus project list|new|clone|delete
+                               Project CRUD (store/projects/<slug>/)
+  corpus team list|new|edit|clone|delete|wipe <project> ...
+                               Team CRUD + corpus wipe (generation counter)
+  corpus template list|render  Core/project templates + render to .opencode/agent/
+  corpus promote <project> <team> <category> <entry> [--confirm]
+                               Lift a team entry into the project corpus
+  corpus store migrate         Relocate a legacy flat store into the default
+                               project (projects/<slug>/corpus/)
 
 Environment:
   CORPUS_PLUGINS_DIR           Plugins directory (default: ./plugins)
   CORPUS_MODELS                models.yaml path (default: ./benchmarks/models.yaml)
-  CORPUS_STORE                 Store root (default: ~/Sites/corpus/store)";
+  CORPUS_STORE                 Store root (default: ~/Sites/corpus/store)
+  CORPUS_PROJECT, CORPUS_TEAM  Default write/promote scope (default: default/default)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,6 +50,11 @@ fn main() -> ExitCode {
         Some("run") => run_cmd(&args[1..]),
         Some("plugin") => plugin_cmd(&args[1..]),
         Some("models") => models_cmd(&args[1..]),
+        Some("project") => store_admin::project_cmd(&args[1..]),
+        Some("team") => store_admin::team_cmd(&args[1..]),
+        Some("template") => store_admin::template_cmd(&args[1..]),
+        Some("promote") => store_admin::promote_cmd(&args[1..]),
+        Some("store") => store_admin::store_cmd(&args[1..]),
         Some("help") | Some("--help") | Some("-h") => {
             println!("{USAGE}");
             Ok(())
@@ -90,11 +106,9 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
         return Err("usage: corpus run <agent> [-m model] [--research] <mission...>".to_string());
     }
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let store = std::env::var("CORPUS_STORE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(format!("{home}/Sites/corpus/store")));
-    let runs = store.join("runs");
+    let store = Store::from_env();
+    let scope = Scope::from_env();
+    let runs = scope.corpus_dir(&store).join("runs");
     std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
 
     let ts = std::time::SystemTime::now()
