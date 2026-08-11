@@ -1,0 +1,4 @@
+name = "echo-plugin"
+version = "0.0.1"
+description = "Fake plugin for protocol tests"
+exec = "plugin.sh"

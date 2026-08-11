@@ -1,0 +1,13 @@
+# Benchmark results schema (v1)
+#
+# One file per (model, suite) pair: benchmarks/results/<model-tag>/<suite>.yaml
+# Every benchmark run is recorded — this is what makes model swaps
+# regression-testable. Scores are claims backed by run logs; the run id
+# references the full transcript in the corpus store.
+model: qwen3.6:35b
+suite: forensic-v1
+inference:
+  endpoint: http://127.0.0.1:11434
+  num_ctx: 32768
+  temperature: 0.6
+cases: []  # entries: {case_id, found, steps, seconds, run_id, notes}

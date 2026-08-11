@@ -1,0 +1,4 @@
+name = "nutshell-fake"
+version = "0.1.0"
+description = "Nutshell (Cashu Python mint) with FakeWallet backend — free minting, no faucet needed; built from pinned local checkout"
+exec = "nutshell-fake.sh"

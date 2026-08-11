@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# corpus plugin: cdk-regtest — the first-party CDK regtest arena harness.
+#
+# Protocol: newline-delimited JSON on stdin/stdout. Logs go to stderr.
+# This adapter is fully self-contained: the arena (arena.sh), oracles, and
+# faucet all live in this plugin directory. The regtest environment itself
+# (bitcoind + LN nodes + mints, via `just regtest` in the cdk repo) is
+# started by the operator; this plugin owns the arena around it.
+#
+# The plugin owns the long-lived sandbox container (corpus-sandbox-testing)
+# and the per-payment faucet cap; corpus-mcp keeps the per-session budget.
+set -uo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARENA="$PLUGIN_DIR/arena.sh"
+CONF="$PLUGIN_DIR/config.toml"
+ORACLES_DIR="$PLUGIN_DIR/oracles"
+FAUCET="$PLUGIN_DIR/faucet.sh"
+TOOLS_DIR="$PLUGIN_DIR/tools"
+EVIDENCE_DIR="$PLUGIN_DIR/evidence"
+MANIFEST="$PLUGIN_DIR/../../sources.toml"
+GW_NAME="corpus-target-gw"
+SANDBOX="corpus-sandbox-testing"
+EXEC_TIMEOUT_SECS="${CORPUS_EXEC_TIMEOUT_SECS:-90}"
+
+reply_ok()   { printf '{"id":%s,"ok":true,"result":%s}\n' "$1" "$2"; }
+reply_err()  { printf '{"id":%s,"ok":false,"error":%s}\n' "$1" "$(jq -Rn --arg e "$2" '$e')"; }
+
+config_get() { # config_get <section> <key>
+    awk -v section="$1" -v key="$2" '
+        function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+        /^\[[^]]+\]/ {
+            cur = $0
+            gsub(/\[|\]|[ \t]/, "", cur)
+            next
+        }
+        cur == section {
+            line = $0
+            sub(/[ \t]*#.*$/, "", line)
+            if (index(line, "=") == 0) next
+            if (trim(substr(line, 1, index(line, "=") - 1)) == key) {
+                val = trim(substr(line, index(line, "=") + 1))
+                gsub(/^"|"$/, "", val)
+                print val
+                exit
+            }
+        }
+    ' "$CONF"
+}
+
+config_url_port() { # config_url_port <mint_url> — port (default 80 if absent)
+    local url="${1#*://}"
+    url="${url%%/*}"
+    local port="${url##*:}"
+    [ "$port" = "$url" ] && port=80
+    printf '%s' "$port"
+}
+
+manifest_get() { # manifest_get <name> <key> — sources.toml [sources.<name>]
+    awk -v name="$1" -v key="$2" '
+        function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+        /^\[sources\.[^]]+\]/ {
+            cur = $0
+            sub(/^\[sources\./, "", cur)
+            gsub(/\]|[ \t]/, "", cur)
+            next
+        }
+        cur == name {
+            line = $0
+            sub(/[ \t]*#.*$/, "", line)
+            if (index(line, "=") == 0) next
+            if (trim(substr(line, 1, index(line, "=") - 1)) == key) {
+                val = trim(substr(line, index(line, "=") + 1))
+                gsub(/^"|"$/, "", val)
+                print val
+                exit
+            }
+        }
+    ' "$MANIFEST"
+}
+
+sanitized_name() {
+    case "$1" in *[!a-zA-Z0-9._-]* | "" | *..*) return 1 ;; esac
+    printf '%s' "$1"
+}
+
+# Is the arena sandbox up and ready to exec into?
+sandbox_ready() {
+    [ "$(docker inspect -f '{{.State.Running}}' "$SANDBOX" 2>/dev/null)" = "true" ]
+}
+
+# Lazy-start the long-lived testing sandbox (plugin-owned; promise is the
+# same as the PoC's — current behavior preserved, just moved plugin-side).
+ensure_sandbox() { # ensure_sandbox <id>
+    local id="$1"
+    sandbox_ready && return 0
+    local out
+    if ! out="$("$ARENA" agent testing --detach -- sleep infinity 2>&1)"; then
+        reply_err "$id" "sandbox start failed: $out"
+        return 1
+    fi
+    # Container starts asynchronously; wait for docker to report it running.
+    for _ in $(seq 1 20); do
+        sandbox_ready && return 0
+        sleep 1
+    done
+    reply_err "$id" "sandbox did not become ready"
+    return 1
+}
+
+handle() {
+    local id="$1" method="$2" params="$3"
+
+    case "$method" in
+        probe)
+            local ready=false notes net egress_net m1 m2
+            if ! command -v docker >/dev/null 2>&1; then
+                notes="docker not found (install OrbStack or Docker Desktop)"
+            elif ! docker info >/dev/null 2>&1; then
+                notes="docker daemon not running"
+            elif ! docker network inspect "$(config_get arena network)" >/dev/null 2>&1 \
+                || ! docker network inspect "$(config_get arena egress_network)" >/dev/null 2>&1 \
+                || ! docker image inspect corpus-agent:local >/dev/null 2>&1 \
+                || ! docker inspect "$GW_NAME" >/dev/null 2>&1; then
+                notes="arena not up (run: arena.sh up, or call the up method)"
+            else
+                m1="$(config_get target mint_url)"; m2="$(config_get target mint_url_2)"
+                local info1 info2
+                info1="$(curl -sf --max-time 3 "$m1/v1/info" 2>/dev/null || true)"
+                info2="$(curl -sf --max-time 3 "$m2/v1/info" 2>/dev/null || true)"
+                if [ -n "$info1" ] && [ -n "$info2" ]; then
+                    ready=true
+                    notes="arena up, mints reachable"
+                    # Version-pin consistency: map the running mint's version
+                    # to a SHA via sources.toml and compare against what
+                    # config.toml [sources] pins/mounts. Wrong source mounted
+                    # for the running mint = every finding is invalid.
+                    local ver tag msha csha mtag
+                    ver="$(jq -r '.version // ""' <<<"$info1" | sed 's#^cdk-mintd/##')"
+                    if [ -n "$ver" ]; then
+                        tag="v${ver}"
+                        mtag="$(manifest_get cdk tag)"
+                        msha="$(manifest_get cdk sha)"
+                        csha="$(config_get sources cdk_sha)"
+                        if [ -n "$mtag" ] && [ "$tag" != "$mtag" ]; then
+                            # The dangerous case: agent reads source for a
+                            # version the mint is NOT running.
+                            ready=false
+                            notes="mint runs $ver but sources.toml pins $mtag — mounted source does not match the running mint"
+                        elif [ -n "$msha" ] && [ -n "$csha" ] && [ "$msha" != "$csha" ]; then
+                            ready=false
+                            notes="[sources].cdk_sha ($csha) disagrees with sources.toml ($mtag @ $msha) — mounted source is not the manifest pin"
+                        fi
+                    fi
+                else
+                    notes="arena healthy; regtest mints not running (just regtest in the cdk repo)"
+                fi
+            fi
+            reply_ok "$id" "$(jq -nc --argjson ready "$ready" --arg notes "$notes" \
+                '{ready:$ready, notes:$notes}')"
+            ;;
+        up)
+            out="$("$ARENA" up 2>&1)" && reply_ok "$id" "$(jq -nc '{notes:"arena up"}')" \
+                || reply_err "$id" "$out"
+            ;;
+        down)
+            out="$("$ARENA" down 2>&1)" && reply_ok "$id" "$(jq -nc '{notes:"arena down"}')" \
+                || reply_err "$id" "$out"
+            ;;
+        targets)
+            # The agent attacks over the target gateway — the ONLY off-bridge
+            # path from the internal network. Host URLs live in config.toml;
+            # what the sandbox can actually reach is gateway-scoped.
+            local m1 m2
+            m1="$(config_get target mint_url)"
+            m2="$(config_get target mint_url_2)"
+            if [ -z "$m1" ] || [ -z "$m2" ]; then
+                reply_err "$id" "targets misconfigured in $CONF"
+                return
+            fi
+            reply_ok "$id" "$(jq -nc \
+                --arg a "http://$GW_NAME:$(config_url_port "$m1")" \
+                --arg b "http://$GW_NAME:$(config_url_port "$m2")" \
+                '[ $a, $b ]')"
+            ;;
+        tools)
+            # Files mounted read-only into the sandbox (v tools/:/opt/tools:ro).
+            local items="[]"
+            for f in "$TOOLS_DIR"/*; do
+                [ -f "$f" ] || continue
+                case "$(basename "$f")" in .gitkeep|build-tools.sh) continue ;; esac
+                items="$(jq -nc --argjson items "$items" \
+                    --arg t "/opt/tools/$(basename "$f")" '$items + [$t]')"
+            done
+            reply_ok "$id" "$items"
+            ;;
+        sources)
+            # Mounted research corpus: pinned upstream trees at /opt/src/<name>.
+            # The sha comes from config.toml [sources] (what is mounted); the
+            # repo/tag come from the sources.toml manifest (the pin's identity).
+            local items="[]" entry sha repo tag
+            for entry in cdk nuts; do
+                sha="$(config_get sources "${entry}_sha")"
+                [ -n "$sha" ] || continue
+                repo="$(manifest_get "$entry" repo)"
+                tag="$(manifest_get "$entry" tag)"
+                items="$(jq -nc --argjson items "$items" \
+                    --arg name "$entry" --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" \
+                    '$items + [{name:$name, repo:$repo, tag:$tag, sha:$sha, mount:("/opt/src/"+$name)}]')"
+            done
+            reply_ok "$id" "$items"
+            ;;
+        sandbox_exec)
+            local command
+            command="$(jq -r '.command // ""' <<<"$params")"
+            if [ -z "$command" ]; then
+                reply_err "$id" "missing command"; return
+            fi
+            if ! docker info >/dev/null 2>&1; then
+                reply_err "$id" "docker daemon not running"; return
+            fi
+            ensure_sandbox "$id" || return
+            local output rc
+            output="$(docker exec "$SANDBOX" timeout "$EXEC_TIMEOUT_SECS" \
+                bash -c "$command" 2>&1)"; rc=$?
+            # Combined stdout+stderr; corpus-mcp applies the output size cap.
+            reply_ok "$id" "$(jq -nc \
+                --arg output "$output" --argjson exit_code "$rc" \
+                '{output:$output, exit_code:$exit_code}')"
+            ;;
+        oracles)
+            local items="[]"
+            for f in "$ORACLES_DIR"/[0-9]*.sh; do
+                [ -f "$f" ] || continue
+                local name desc
+                name="$(basename "$f" .sh)"
+                desc="$(grep -m1 '^# Oracle' "$f" | sed 's/^# //')"
+                items="$(jq -nc --argjson items "$items" --arg name "$name" --arg desc "$desc" \
+                    '$items + [{name:$name, description:$desc}]')"
+            done
+            reply_ok "$id" "$items"
+            ;;
+        call_oracle)
+            local name
+            name="$(jq -r '.name // ""' <<<"$params")"
+            name="$(sanitized_name "$name")" || { reply_err "$id" "bad oracle name"; return; }
+            local script="$ORACLES_DIR/$name.sh"
+            [ -f "$script" ] || { reply_err "$id" "unknown oracle: $name"; return; }
+            local out rc verdict
+            out="$(MINT_URL="$(config_get target mint_url)" \
+                MINT_URL_2="$(config_get target mint_url_2)" \
+                EVIDENCE_DIR="$EVIDENCE_DIR" bash "$script" 2>&1)" && rc=0 || rc=$?
+            case "$rc" in
+                0) verdict="hold" ;;
+                1) verdict="violated" ;;
+                *) verdict="inconclusive" ;;
+            esac
+            reply_ok "$id" "$(jq -nc --arg verdict "$verdict" --arg log "$out" \
+                '{verdict:$verdict, log:$log}')"
+            ;;
+        faucet)
+            # {op, invoice?, amount_sat?, memo?} -> {text, paid_sats?}.
+            # The plugin enforces the per-payment cap (config) and the
+            # regtest-only check (faucet.sh); corpus-mcp owns the session
+            # budget. Refusals come back as text, not protocol errors, so
+            # the agent reads the actual reason.
+            [ -x "$FAUCET" ] || { reply_err "$id" "faucet not available"; return; }
+            local op invoice amount memo
+            op="$(jq -r '.op // ""' <<<"$params")"
+            invoice="$(jq -r '.invoice // ""' <<<"$params")"
+            amount="$(jq -r '.amount_sat // ""' <<<"$params")"
+            memo="$(jq -r '.memo // ""' <<<"$params")"
+            local max_sats
+            max_sats="$(config_get faucet max_payment_sats)"
+            [ -n "$max_sats" ] || max_sats=100000
+            local out err rc paid=""
+            tmp_stdout="$(mktemp)"; tmp_stderr="$(mktemp)"
+            case "$op" in
+                pay)
+                    [ -n "$invoice" ] || { rm -f "$tmp_stdout" "$tmp_stderr"; reply_err "$id" "missing invoice for op=pay"; return; }
+                    CORPUS_FAUCET_MAX_SATS="$max_sats" "$FAUCET" pay "$invoice" >"$tmp_stdout" 2>"$tmp_stderr" && rc=0 || rc=$?
+                    out="$(cat "$tmp_stdout")"; err="$(cat "$tmp_stderr")"
+                    paid="$(grep -o 'PAID_SATS=[0-9]*' <<<"$out" | cut -d= -f2 | head -1)"
+                    ;;
+                invoice)
+                    case "$amount" in *[!0-9]* | "") rm -f "$tmp_stdout" "$tmp_stderr"; reply_err "$id" "missing numeric amount_sat for op=invoice"; return ;; esac
+                    if [ -n "$memo" ]; then
+                        CORPUS_FAUCET_MAX_SATS="$max_sats" "$FAUCET" invoice "$amount" "$memo" >"$tmp_stdout" 2>"$tmp_stderr" && rc=0 || rc=$?
+                    else
+                        CORPUS_FAUCET_MAX_SATS="$max_sats" "$FAUCET" invoice "$amount" >"$tmp_stdout" 2>"$tmp_stderr" && rc=0 || rc=$?
+                    fi
+                    out="$(cat "$tmp_stdout")"; err="$(cat "$tmp_stderr")"
+                    ;;
+                balance)
+                    "$FAUCET" balance >"$tmp_stdout" 2>"$tmp_stderr" && rc=0 || rc=$?
+                    out="$(cat "$tmp_stdout")"; err="$(cat "$tmp_stderr")"
+                    ;;
+                *)
+                    rm -f "$tmp_stdout" "$tmp_stderr"
+                    reply_err "$id" "unknown faucet op: $op"; return
+                    ;;
+            esac
+            rm -f "$tmp_stdout" "$tmp_stderr"
+            if [ "$rc" -ne 0 ]; then
+                local reason
+                reason="$(grep '^faucet: error' <<<"$err" | head -1 | sed 's/^faucet: error: //')"
+                [ -n "$reason" ] || reason="faucet op '$op' failed"
+                reply_ok "$id" "$(jq -nc --arg text "[faucet error] $reason" '{text:$text, paid_sats:null}')"
+            elif [ -n "$paid" ]; then
+                reply_ok "$id" "$(jq -nc --arg text "paid $paid sat" --argjson paid_sats "$paid" \
+                    '{text:$text, paid_sats:$paid_sats}')"
+            else
+                reply_ok "$id" "$(jq -nc --arg text "$out" '{text:$text, paid_sats:null}')"
+            fi
+            ;;
+        *)
+            reply_err "$id" "unknown method: $method"
+            ;;
+    esac
+}
+
+while IFS= read -r line; do
+    id="$(jq -r '.id // 0' <<<"$line" 2>/dev/null)" || id=0
+    method="$(jq -r '.method // ""' <<<"$line" 2>/dev/null)" || method=""
+    params="$(jq -c '.params // {}' <<<"$line" 2>/dev/null)" || params="{}"
+    handle "$id" "$method" "$params"
+done

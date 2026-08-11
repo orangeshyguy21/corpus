@@ -1,0 +1,79 @@
+# corpus model registry — the benchmark system's model lab.
+#
+# This file is the model registry for the benchmark system (benchmarks/).
+# Every model worth tracking for vulnerability research, with capability
+# tags and provenance. Scores live in benchmarks/results/<model>/*.yaml;
+# this file is identity + metadata only. Capability tags are assessed from
+# observed run behavior in THIS project (see benchmarks/), not vendor
+# claims — update them as evidence accumulates.
+
+models:
+  - tag: qwen3.6:35b
+    name: Qwen 3.6 35B
+    provider: ollama
+    params_b: 35
+    context_k: 32
+    capabilities: [coding, tool-use, long-context]
+    notes: >
+      Current default. Ran coherent 12-25 step attack missions in vul-lab
+      PoC: correct tool protocol throughout, honest zero-finding reports.
+
+  - tag: gpt-oss:120b
+    name: gpt-oss 120B
+    provider: ollama
+    params_b: 120
+    context_k: 32
+    capabilities: [reasoning, coding, tool-use]
+    notes: >
+      Largest locally installed; candidate exploit-writer when mission
+      difficulty exceeds 35B-class models. Slower per token.
+
+  - tag: gpt-oss:20b
+    name: gpt-oss 20B
+    provider: ollama
+    params_b: 20
+    context_k: 32
+    capabilities: [coding, tool-use]
+    notes: Fast; candidate for triage/critic passes and high-iteration loops.
+
+  - tag: qwen3.5:35b
+    name: Qwen 3.5 35B
+    provider: ollama
+    params_b: 35
+    context_k: 32
+    capabilities: [coding, tool-use]
+    notes: Previous-generation fallback; keep for A/B regression checks.
+
+  - tag: qwen3.5:9b
+    name: Qwen 3.5 9B
+    provider: ollama
+    params_b: 9
+    context_k: 32
+    capabilities: [fast]
+    notes: Small; useful for dedupe, summarization, cheap critic passes.
+
+  - tag: deepseek-r1:70b
+    name: DeepSeek R1 70B
+    provider: ollama
+    params_b: 70
+    context_k: 32
+    capabilities: [reasoning]
+    notes: >
+      Reasoning-tuned; hypothesis generation candidate. Watch: long CoT
+      burns step budgets unless guided.
+
+  - tag: gemma4:31b
+    name: Gemma 4 31B
+    provider: ollama
+    params_b: 31
+    context_k: 32
+    capabilities: [coding]
+    notes: Diversity candidate for parallel attempt swarms.
+
+  - tag: gemma4:e4b
+    name: Gemma 4 E4B
+    provider: ollama
+    params_b: 4
+    context_k: 32
+    capabilities: [fast]
+    notes: Tiny; candidate for log classification and routing only.

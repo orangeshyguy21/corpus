@@ -1,0 +1,12 @@
+/target
+# The corpus store (findings, attacks, runs) is private and stays out of
+# the public app repo. It should eventually be its own private git repo.
+/store
+# Working plans, notes, and scratch — local to each developer.
+/dev
+# cdk-regtest plugin runtime state: sandbox evidence and compiled tools.
+/plugins/cdk-regtest/evidence
+/plugins/cdk-regtest/tools/cdk-cli
+# Pinned source cache (derived data, content-addressed). The SHAs live in
+# sources.toml (committed); the trees themselves are fetched host-side.
+/sources

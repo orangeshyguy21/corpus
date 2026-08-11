@@ -1,0 +1,19 @@
+# Forensic benchmark case (schema v1)
+#
+# One file per case. A case pins a target to the parent commit of a known
+# historical fix; researchers get the mission WITHOUT being told where the
+# bug is. A case scores: found (oracle tripped) / steps / wall time.
+id: CDK-BENCH-0001
+target:
+  plugin: cdk-regtest
+  repo: https://github.com/cashubtc/cdk
+  rev: "0000000000000000000000000000000000000000"  # TODO: pin a real historical fix
+technique: quote-race
+mission: |
+  Placeholder case. Populate with a real historical CDK bug: check out the
+  parent of the fix commit, run the standard mission, and score whether
+  the researcher rediscovers the vulnerability unaided.
+scoring:
+  max_steps: 40
+  time_budget_minutes: 60
+  pass: oracle-violation

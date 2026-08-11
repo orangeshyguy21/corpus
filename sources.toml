@@ -1,0 +1,24 @@
+# sources.toml — pinned upstream source manifest.
+#
+# The single source of truth for "which code do agents read". SHAs are the
+# pin (tags are mutable); the tag is recorded alongside for display and
+# fetch. Fetched trees live git-ignored under sources/<name>/<sha>/ and are
+# mounted read-only into agent sandboxes at /opt/src/<name>.
+#
+# The warnet phase will hold multiple revisions per repo here so a mission
+# can be replayed against mints at different versions; today each repo pins
+# exactly one revision, and config.toml [sources] selects which is mounted.
+
+# Target implementation: cdk-mintd. Pinned to the v0.17.0 release commit,
+# which is the version the regtest mints report on /v1/info (cdk-mintd/0.17.0).
+[sources.cdk]
+repo = "cashubtc/cdk"
+tag = "v0.17.0"
+sha = "86a7c6cacb362daa67a0d636e303b66faf3965d9"
+
+# Cashu protocol spec (the NUTs the mint implements). Pinned to origin/main;
+# the spec repo has no releases, so the branch tip is the reference.
+[sources.nuts]
+repo = "cashubtc/nuts"
+tag = "main"
+sha = "3bc8b6d5b160d4427cbde01b4cd1c782ce6a835a"
