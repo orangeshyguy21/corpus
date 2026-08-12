@@ -55,7 +55,7 @@ pub fn discover(dir: &Path) -> Result<Vec<PluginDir>, Error> {
 }
 
 /// A discovered plugin plus its live probe status — the aggregation the
-/// deck renders. spawned/probed on the host inside corpus-core, so the
+/// app renders. spawned/probed on the host inside corpus-core, so the
 /// UI never spawns plugins itself (trust domains).
 #[derive(Debug, Clone)]
 pub struct PluginStatus {

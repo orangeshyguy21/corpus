@@ -1,8 +1,8 @@
-//! Launch screen (deck-flow chunks 5 + 7): the run view — a run header,
+//! Launch screen (app-flow chunks 5 + 7): the run view — a run header,
 //! the embedded terminal pane (`tmux attach -t <session>` in-pane; the
 //! external-terminal popup is GONE), and abort/dismiss chrome. tmux
-//! stays the supervisor: the pane is just a client, so deck close/crash
-//! never kills a run, and a relaunched deck offers live corpus sessions
+//! stays the supervisor: the pane is just a client, so app close/crash
+//! never kills a run, and a relaunched app offers live corpus sessions
 //! for re-attach. A run on the piped fallback (no tmux) has no pane —
 //! it keeps the chunk-5 transcript tail. No replay, oracle panes, or
 //! docking: those are the M1 run-dashboard follow-up. Launches are
@@ -14,7 +14,7 @@ use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
 use std::time::Duration;
 
-use crate::state::{DeckState, RunStatus};
+use crate::state::{AppState, RunStatus};
 use crate::terminal::TerminalPane;
 
 /// Widget state for the run view.
@@ -24,14 +24,14 @@ pub struct LaunchView {
     /// session, or to an orphan session the operator re-attached.
     pane: TerminalPane,
     /// The orphan session chosen from the re-attach list (a run that
-    /// outlived a previous deck process).
+    /// outlived a previous app process).
     reattached: Option<String>,
     /// Auto-follow the tail (piped-fallback runs only).
     follow: bool,
 }
 
 impl LaunchView {
-    pub fn show(&mut self, ui: &mut Ui, state: &mut DeckState, toasts: &mut Toasts) {
+    pub fn show(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
         // Drain whatever the session produced since the last frame (the
         // pipe-pane capture keeps feeding the transcript machinery even
         // while the pane is the live view).
@@ -41,7 +41,7 @@ impl LaunchView {
             ui.heading("Launch");
             if let Some(meta) = &state.run_meta {
                 ui.separator();
-                ui.weak(format!("{} · {} · agent {}", meta.project, meta.team, meta.agent));
+                ui.weak(format!("{} · agent {}", meta.project, meta.agent));
                 ui.separator();
                 ui.weak(&meta.transcript);
             }
@@ -99,18 +99,18 @@ impl LaunchView {
             }
             ui.add_space(4.0);
         } else if running {
-            ui.weak("run in flight — the pane is a tmux client on the run; deck close never kills it");
+            ui.weak("run in flight — the pane is a tmux client on the run; app close never kills it");
             ui.add_space(4.0);
         }
 
         // Aim the pane: the live run's session wins; otherwise the
-        // operator's re-attach pick (a run that outlived the deck).
+        // operator's re-attach pick (a run that outlived the app).
         let target = if let Some(argv) = state.live_pty_attach() {
             self.reattached = None;
-            let session = DeckState::pty_attach_session(&argv).unwrap_or_default();
+            let session = AppState::pty_attach_session(&argv).unwrap_or_default();
             Some((session, argv))
         } else if let Some(session) = self.reattached.clone() {
-            DeckState::session_attach_command(&session).map(|argv| (session, argv))
+            AppState::session_attach_command(&session).map(|argv| (session, argv))
         } else {
             None
         };
@@ -161,18 +161,18 @@ impl LaunchView {
         }
     }
 
-    /// No deck-owned run: offer the live corpus tmux sessions for
-    /// in-pane re-attach (a run survives the deck by design).
-    fn orphans(&mut self, ui: &mut Ui, state: &mut DeckState, toasts: &mut Toasts) {
+    /// No app-owned run: offer the live corpus tmux sessions for
+    /// in-pane re-attach (a run survives the app by design).
+    fn orphans(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
         ui.add_space(24.0);
         ui.label(
-            RichText::new("No run active — open Teams and hit Launch… on a team.")
+            RichText::new("No run active — open Missions and hit Launch… on a mission.")
                 .weak()
                 .size(17.0),
         );
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Live runs from before this deck session:").weak());
+            ui.label(RichText::new("Live runs from before this app session:").weak());
             if ui.button("Refresh").clicked() {
                 state.refresh_live_sessions();
             }
@@ -187,7 +187,7 @@ impl LaunchView {
             ui.horizontal(|ui| {
                 ui.monospace(&session);
                 if ui.button("Attach in pane").clicked() {
-                    if DeckState::session_attach_command(&session).is_some() {
+                    if AppState::session_attach_command(&session).is_some() {
                         self.reattached = Some(session.clone());
                     } else {
                         toast(toasts, ToastKind::Error, "tmux is not available");
@@ -198,7 +198,7 @@ impl LaunchView {
         ui.add_space(4.0);
         ui.weak(
             "a re-attached run is steered and ended inside its TUI (quitting opencode \
-             ends the session); abort/dismiss chrome only covers runs this deck launched",
+             ends the session); abort/dismiss chrome only covers runs this app launched",
         );
     }
 }

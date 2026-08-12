@@ -19,7 +19,7 @@ crates/
   corpus-mcp/        MCP server exposing the corpus tools to agents
   corpus-cli/        headless CLI: run / plugin / models (+ ratatui TUI,
                      slated for removal once the deck covers M1+M2)
-  corpus-deck/       egui desktop app (corpus-deck), the operator UI
+  corpus-app/        egui desktop app (corpus-app), the operator UI
 plugins/
   cdk-regtest/       reference environment plugin (sandbox + oracles +
                      faucet + targets) for the CDK e-cash target; the
@@ -30,29 +30,30 @@ benchmarks/
                      benchmarks/results/<model>/*.yaml)
   forensic/          historical-bug forensic suite (CDK-BENCH-XXXX.yaml)
   results/           per-model benchmark score results
-store/               the corpus knowledge base. Core templates (versioned
+store/               the corpus knowledge base. Core seed agents (versioned
                      with the app — the one committed part of store/) live
-                     at store/templates/{permissions,prompts,agents}; the
-                     data itself is scoped:
-                     store/projects/<slug>/corpus/ (project-global, curated)
-                     store/projects/<slug>/teams/<team>/corpus/ (team-scoped)
+                     at store/templates/agents/<slug>/{opencode.json, prompts/};
+                     the data itself is scoped:
+                     store/projects/<slug>/corpus/             (the corpus)
+                     store/projects/<slug>/agents/<slug>/      (agent configs)
+                     store/projects/<slug>/missions/<slug>.md  (mission records)
 sources.toml         pinned target source manifest (repo → commit SHA)
 sources/             git-ignored fetch of pinned trees (sources/<name>/<sha>/)
 docs/                (gone — folded into dev/; see below)
 dev/                 everything uncommitted & machine-local: architecture,
                      decisions, research, alpha-1, plus ACTIVE plans
-                     (roadmap-plan, data-model-plan, deck-flow-plan)
+                     (roadmap-plan, data-model-plan, app-flow-plan)
                      and the demo poster. Git-ignored: may be absent on
                      a fresh clone.
 .opencode/           opencode config + the role agents (operator, researcher,
-                     generated from store/templates — do not hand-edit)
+                     generated from store/templates/agents — do not hand-edit)
 ```
 
 ## Build / test / run commands
 
 ```bash
 cargo build -p corpus-core -p corpus-mcp -p corpus-cli   # core + CLI
-cargo build -p corpus-deck                                # the egui app
+cargo build -p corpus-app                                # the egui app
 cargo test -p corpus-core -p corpus-mcp                   # unit + scoped-store tests
 cargo build --workspace                                   # everything
 ```
@@ -72,56 +73,54 @@ Environment is checked via `corpus plugin probe cdk-regtest`. The CLI:
 corpus plugin list
 corpus plugin probe <name>
 corpus plugin call <name> <method> [params-json]
-# Run a mission; the team's agents are materialized to
-# .opencode/agent/ first (naming: <team>-<agent>.md; the default team
-# keeps bare names), then opencode runs on the CORPUS_PROJECT/TEAM
-# scope. The deck launches the FULL opencode TUI in a DETACHED tmux
-# session (corpus-<team>-<agent>-<ts>) and shows it in the EMBEDDED
-# terminal pane (egui_term; the pane runs `tmux attach` in-process —
-# no external-terminal popup): click the pane to steer, and the run
-# survives attach/detach/deck-close; a relaunched deck lists live
-# corpus-* sessions for in-pane re-attach. $corpus run$ is the HEADLESS {% 
-# opencode run$ (automation): transcript .log in the team runs/.
-# Transcript of record for TUI runs: Dismiss/abort exports the session
-# to <epoch>-<agent>.json in the team runs/; the live tail is tmux
-# pipe-pane raw capture (ANSI-stripped). The model is ALWAYS explicit
-# (agent instance -> agent template -> launch arg; the launch pre-fills
-# the agent's instance/template default, then the registry's tool-use
-# default; never opencode's ambient default — a launch with none
-# refuses). Deck model fields are ONE shared picker (search +
-# provider-grouped, views/model_picker.rs over corpus-core's
-# model_list() = `opencode models --verbose`, TTL-cached, ↻ forces
-# --refresh; no free-text model fields survive — opencode missing
-# degrades the picker to free text + warning). Without tmux (>= 3.2a)
-# the deck degrades to the piped headless spawn (no attach);
+# Run a mission; the agent is materialized to
+# .opencode/agent/ first (bare names), then opencode runs on the
+# CORPUS_PROJECT scope. The app launches the FULL opencode TUI in a
+# DETACHED tmux session (corpus-<agent>-<ts>) and shows it in the
+# EMBEDDED terminal pane (egui_term; the pane runs `tmux attach`
+# in-process — no external-terminal popup): click the pane to steer,
+# and the run survives attach/detach/app-close; a relaunched app lists
+# live corpus-* sessions for in-pane re-attach. `corpus run` is the
+# HEADLESS `opencode run` (automation): transcript .log in the project
+# corpus runs/. Transcript of record for TUI runs: Dismiss/abort
+# exports the session to <epoch>-<agent>.json in the project corpus
+# runs/; the live tail is tmux pipe-pane raw capture
+# (ANSI-stripped). The model is ALWAYS explicit (primary agent entry
+# -> launch arg -> registry tool-use default; never opencode's ambient
+# default — a launch with none refuses). App model fields are ONE shared
+# picker (search + provider-grouped, views/model_picker.rs over
+# corpus-core's model_list() = `opencode models --verbose`, TTL-cached,
+# ↻ forces --refresh; no free-text model fields survive — opencode
+# missing degrades the picker to free text + warning). Without tmux
+# (>= 3.2a) the app degrades to the piped headless spawn (no attach);
 # CORPUS_NO_TMUX=1 forces it.
 # --research appends a researcher pass
 corpus run <agent> [-m model] [--research] <mission...>
 # Model registry
 corpus models list
-# Scoped store admin: projects, teams, templates, promotion
-corpus project list|new|clone|delete|rebind <slug> --plugin <name>
-corpus team list|new|edit|clone|delete|wipe <project> ...
-corpus template list|render|delete  # list/delete resolve by slug OR frontmatter name; render to .opencode/agent/<slug>.md
-corpus promote <project> <team> <category> <entry> [--confirm]
-corpus store migrate [--dry-run]   # relocate a legacy flat store into
-                                   # store/projects/<default>/corpus/ (dry-run
-                                   # reports only; moves are checksum-verified)
+# Scoped store admin: projects, agents, missions
+corpus project list|new|clone|delete|rebind|wipe <slug>
+corpus agent list|new|clone|delete <project> ...
+corpus mission list|new|delete <project> ...
+corpus store migrate [--dry-run] [--project <slug>] [--confirm]
+                                  # relocate a legacy flat store into
+                                  # store/projects/<default>/corpus/ (dry-run
+                                  # reports only; moves are checksum-verified)
+                                  # --confirm also removes legacy template dirs
 ```
 
-The default write/read scope is project `default` / team `default`
-(`CORPUS_PROJECT`/`CORPUS_TEAM` override it). Agents write into the team
-scope via the MCP tools; entries reach the project-global corpus only via
-`corpus_promote` (embargoed findings require `--confirm`). Launch knobs:
-`CORPUS_NO_TMUX=1` forces the piped (no-attach) run backend (the deck's
+The default write/read scope is project `default`
+(`CORPUS_PROJECT` overrides it). Agents write into the project corpus
+via the MCP tools. Launch knobs:
+`CORPUS_NO_TMUX=1` forces the piped (no-attach) run backend (the app's
 run view then shows the transcript tail instead of the embedded pane);
 `CORPUS_TERMINAL` only shapes corpus-core's `attach_command()` helper
-(external-terminal attach, retained for CLI use — the deck never pops a
+(external-terminal attach, retained for CLI use — the app never pops a
 terminal).
 
-Execution budget is a TEAM property (`--budget` on `corpus team
-new|edit`; cleared with `--budget -`), not an agent one — the team is
-the launch unit. Agent templates carry permission/prompt refs + model
+Execution budget is a MISSION property (per-mission, in the mission
+record frontmatter), not a per-agent or per-project one — the mission is
+the launch unit. Agent configs carry model/description/prompt/permission
 only.
 
 A fresh agent should answer "how do I run the oracle suite?" with: `corpus
@@ -155,39 +154,38 @@ The reference plugin is `plugins/cdk-regtest`.
 ## Store conventions
 
 - Categories: `store/projects/<project>/corpus/{hypotheses,techniques,findings,attacks,runs}/`
-  on the **project-global** corpus, and the same layout under each team's
-  `store/projects/<project>/teams/<team>/corpus/`.
-- Core templates live at `store/templates/{permissions,prompts,agents}/` and
-  are the one committed part of store/ (`.gitignore` carves them out of the
-  otherwise-private store). The role agents in `.opencode/agent/` are
-  **generated** from them (`corpus template render`) — hand-editing both is
-  drift.
+  on the **project-global** corpus (the ONLY corpus scope).
+- Core seed agents live at `store/templates/agents/<slug>/` (opencode.json +
+  prompts/) and are the one committed part of store/ (`.gitignore` carves them
+  out of the otherwise-private store). The role agents in `.opencode/agent/`
+  are **generated** from them — hand-editing both is drift.
 - Slugs are **kebab-case**, one card per technique (no `_` / title drift).
 - `findings/` and `runs/` filenames carry an **epoch-seconds prefix**
   (`<epoch>-<slug>`); they read newest-first. Other categories are A–Z.
 - Findings/techniques/hypotheses carry YAML frontmatter
   (`name`, `status`, `run_log`, `timestamp`); techniques cite the run log
-  that produced them (`run_log` must name an existing file in the team
-  corpus `runs/`, project corpus `runs/` as fallback for migrated logs).
+  that produced them (`run_log` must name an existing file in the project
+  corpus `runs/`).
 - Every entry carries `sensitivity: open | internal | embargoed`, defaulted
-  by the write tools (embargoed for findings, internal otherwise). Entries
-  leave a team scope only via `corpus_promote`; **embargoed entries require
-  an explicit confirm flag**. Promotion records `promoted_from:
-  <project>/<team>@<hash>/<generation>`.
+  by the write tools (embargoed for findings, internal otherwise).
+  `sensitivity:` stays in frontmatter as the classification future egress/
+  redaction gates act on (roadmap data-security).
 - **Contamination rule:** the store never references `benchmarks/**` or
   `plugins/**` internals; a run whose transcript reads them is
   contaminated and unscored.
 - Attacks are **directories** (`attacks/<slug>/attack.md + run.sh`).
-- Team corpus **wipe** (`corpus team wipe`) deletes the working subtree and
-  bumps `corpus_generation` in the team spec; provenance strings
-  (`project/team@hash/generation`) keep old run logs attributable.
+- Project corpus **wipe** (`corpus project wipe`) deletes the working
+  subtree and bumps `corpus_generation` in the project spec; provenance
+  strings (`agent@<config-hash>` + generation) keep old run logs
+  attributable.
 
 ## Agent-building guidance
 
-For corpus-deck work, `dev/deck-flow-plan.md` is authoritative: the deck
-is being rebuilt ground-up in gated chunks (shell → projects → plugin →
-teams → agents → launch → wizard), each chunk stopping for operator
-assessment. The old M0 code and the absent egui plan carry no authority.
+For corpus-app (egui) work, `dev/app-flow-plan.md` is authoritative: the
+app is being redesigned against the operator's mocks in gated chunks
+(theme/shell → sidebar → top bar → project → agent → mission views),
+each chunk stopping for operator assessment. It rides the teamless data
+model in `dev/data-model-plan.md`.
 
 For anything touching the research loop (roles, tool contracts, sandbox
 policy), `dev/architecture.md` "The research team" and "Trust domains"

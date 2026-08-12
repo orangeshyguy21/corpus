@@ -1,9 +1,9 @@
 //! The model registry: open-weight models as tagged, benchmarked
 //! equipment. See docs/architecture.md ("The model lab").
 //!
-//! Also home of `model_list()` (deck-flow chunk 8): the AVAILABLE
+//! Also home of `model_list()` (app-flow chunk 8): the AVAILABLE
 //! models from `opencode models --verbose`, parsed, provider-grouped,
-//! and TTL-cached — the deck's model pickers render this.
+//! and TTL-cached — the app's model pickers render this.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -58,7 +58,7 @@ impl ModelRegistry {
         Ok(registry)
     }
 
-    /// The model the deck pre-fills for a launch: the registry's first
+    /// The model the app pre-fills for a launch: the registry's first
     /// tool-use-capable entry (falling back to the first tracked model).
     /// This is an EXPLICIT launch arg — it pre-fills the operator's
     /// field, it is never an ambient fallback the engine picks.
@@ -75,7 +75,7 @@ impl ModelRegistry {
 // --- model_list(): opencode's available models, grouped (chunk 8) ---
 
 /// How long the process-global model-list cache is trusted. The
-/// shell-out costs ~0.6s and the deck renders pickers every frame;
+/// shell-out costs ~0.6s and the app renders pickers every frame;
 /// `refresh` bypasses the TTL AND re-pulls opencode's models.dev cache.
 const MODEL_LIST_TTL: Duration = Duration::from_secs(300);
 

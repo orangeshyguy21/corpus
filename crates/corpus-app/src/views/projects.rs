@@ -1,4 +1,4 @@
-//! Projects screen (deck-flow chunks 1+2): the project list as a striped
+//! Projects screen (app-flow chunks 1+2): the project list as a striped
 //! table, create (display name + plugin from a dropdown over the
 //! discovered environment plugins, each with a live probe badge; the
 //! machine id is auto-generated), edit (change the plugin binding the
@@ -8,9 +8,9 @@
 //! First-run detection: a store with zero projects lands on the create
 //! form — the seed of the chunk-6 onboarding wizard.
 //!
-//! No business logic here: corpus-core calls go through `DeckState`;
+//! No business logic here: corpus-core calls go through `AppState`;
 //! results surface as toasts. Probing is a corpus-core aggregation
-//! (`DeckState::refresh_plugins`), scheduled on demand, never per-frame.
+//! (`AppState::refresh_plugins`), scheduled on demand, never per-frame.
 
 use std::time::Duration;
 
@@ -20,14 +20,14 @@ use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
 use corpus_core::PluginStatus;
 
-use crate::state::DeckState;
+use crate::state::AppState;
 
 /// Probe-status badge colors (green = ready, amber = not ready).
 const READY: Color32 = Color32::from_rgb(120, 200, 120);
 const NOT_READY: Color32 = Color32::from_rgb(255, 180, 90);
 
 /// Widget state for the Projects screen: the row selection plus the
-/// create/clone/edit form fields. Corpus state lives in `DeckState`.
+/// create/clone/edit form fields. Corpus state lives in `AppState`.
 pub struct ProjectsView {
     selected: Option<String>,
     last_was_empty: bool,
@@ -63,7 +63,7 @@ impl Default for ProjectsView {
 }
 
 impl ProjectsView {
-    pub fn show(&mut self, ui: &mut Ui, state: &mut DeckState, toasts: &mut Toasts) {
+    pub fn show(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
         // First-run (and first-run-after-everything-deleted): land on the
         // create form. Only on the empty -> non-empty transition, so a
         // dismissed form stays dismissed while the store is empty.
@@ -149,7 +149,7 @@ impl ProjectsView {
     }
 
     /// The striped project table; clicking a row selects it.
-    fn project_table(&mut self, ui: &mut Ui, state: &mut DeckState) {
+    fn project_table(&mut self, ui: &mut Ui, state: &mut AppState) {
         TableBuilder::new(ui)
             .striped(true)
             .column(Column::auto().at_least(140.0))
@@ -209,7 +209,7 @@ impl ProjectsView {
     /// The create form: display name + the plugin picker (dropdown over
     /// the discovered plugins with live probe badges). The machine id is
     /// generated (state.rs) — the operator never types one.
-    fn create_window(&mut self, ui: &mut Ui, state: &mut DeckState, toasts: &mut Toasts) {
+    fn create_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
         let mut open = self.show_create;
         let mut created = false;
         egui::Window::new("New project")
@@ -249,7 +249,7 @@ impl ProjectsView {
 
     /// The clone form: display name (falls back to the source's) plus
     /// the copy-corpus toggle. The new id is generated, like create's.
-    fn clone_window(&mut self, ui: &mut Ui, state: &mut DeckState, toasts: &mut Toasts) {
+    fn clone_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
         let Some(from) = self.selected.clone() else {
             self.show_clone = false;
             return;
@@ -292,7 +292,7 @@ impl ProjectsView {
 
     /// Delete the selected project; the default-project refusal bubbles
     /// up as an error toast (the operator never loses `default`).
-    fn delete_selected(&mut self, state: &mut DeckState, toasts: &mut Toasts) {
+    fn delete_selected(&mut self, state: &mut AppState, toasts: &mut Toasts) {
         let Some(slug) = self.selected.clone() else {
             return;
         };
@@ -308,7 +308,7 @@ impl ProjectsView {
 
     /// The edit form: change the selected project's plugin binding with
     /// the same badge-carrying picker as create.
-    fn edit_window(&mut self, ui: &mut Ui, state: &mut DeckState, toasts: &mut Toasts) {
+    fn edit_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
         let Some(slug) = self.selected.clone() else {
             self.show_edit = false;
             return;

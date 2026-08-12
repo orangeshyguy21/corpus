@@ -10,41 +10,42 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use corpus_core::{discover, plugins_dir, ModelRegistry, Plugin, Scope, Store};
+use corpus_core::{ModelRegistry, Plugin, Scope, Store};
 
 const USAGE: &str = "\
 corpus — local-first vulnerability research platform
 
   corpus [tui]                 Launch the TUI dashboard (default)
   corpus run <agent> [-m model] [--research] <mission...>
-                               Run a mission on the CORPUS_PROJECT/TEAM
-                               scope: agents materialize to
+                               Run a mission on the CORPUS_PROJECT
+                               scope: the agent materializes to
                                .opencode/agent/ first, the run detaches
                                into a tmux session
-                               (corpus-<team>-<agent>-<ts>) — attach with
+                               (corpus-<agent>-<ts>) — attach with
                                `tmux attach -t <name>` any time. No tmux?
                                degrades to a piped spawn (no attach).
-                               Transcript: team corpus runs/.
+                               Transcript: project corpus runs/.
   corpus plugin list           List discovered environment plugins
   corpus plugin probe <name>   Probe one plugin (environment health)
   corpus plugin call <name> <method> [params-json]
                                Raw protocol call (debugging)
   corpus models list           List the model registry
-  corpus project list|new|clone|delete
+  corpus project list|new|clone|delete|wipe|rebind
                                Project CRUD (store/projects/<slug>/)
-  corpus team list|new|edit|clone|delete|wipe <project> ...
-                               Team CRUD + corpus wipe (generation counter)
-  corpus template list|render  Core/project templates + render to .opencode/agent/
-  corpus promote <project> <team> <category> <entry> [--confirm]
-                               Lift a team entry into the project corpus
-  corpus store migrate         Relocate a legacy flat store into the default
-                               project (projects/<slug>/corpus/)
+  corpus agent list|new|clone|delete <project> ...
+                               Agent CRUD (store/projects/<p>/agents/<slug>/)
+  corpus mission list|new|delete <project> ...
+                               Mission CRUD
+  corpus store migrate [--dry-run] [--project <slug>] [--confirm]
+                               Relocate a legacy flat store into the default
+                               project (projects/<slug>/corpus/).
+                               --confirm also removes legacy template dirs.
 
 Environment:
   CORPUS_PLUGINS_DIR           Plugins directory (default: ./plugins)
   CORPUS_MODELS                models.yaml path (default: ./benchmarks/models.yaml)
   CORPUS_STORE                 Store root (default: ~/Sites/corpus/store)
-  CORPUS_PROJECT, CORPUS_TEAM  Default write/promote scope (default: default/default)
+  CORPUS_PROJECT               Default write scope (default: default)
   CORPUS_TERMINAL              Terminal app for `attach` (default: from $TERM_PROGRAM)
   CORPUS_NO_TMUX=1             Force the piped run backend (no detached sessions)";
 
@@ -56,9 +57,8 @@ fn main() -> ExitCode {
         Some("plugin") => plugin_cmd(&args[1..]),
         Some("models") => models_cmd(&args[1..]),
         Some("project") => store_admin::project_cmd(&args[1..]),
-        Some("team") => store_admin::team_cmd(&args[1..]),
-        Some("template") => store_admin::template_cmd(&args[1..]),
-        Some("promote") => store_admin::promote_cmd(&args[1..]),
+        Some("agent") => store_admin::agent_cmd(&args[1..]),
+        Some("mission") => store_admin::mission_cmd(&args[1..]),
         Some("store") => store_admin::store_cmd(&args[1..]),
         Some("help") | Some("--help") | Some("-h") => {
             println!("{USAGE}");
@@ -76,12 +76,10 @@ fn main() -> ExitCode {
 }
 
 /// `corpus run <agent> [-m model] [--research] <mission...>` — run an
-/// opencode mission with the transcript logged to the scoped store
-/// `runs/` automatically. The team's agents are materialized to
-/// `.opencode/agent/` first (default team: bare names; other teams:
-/// `<team>-<agent>.md`), then the same session handle the deck uses
-/// spawns opencode with CORPUS_PROJECT/CORPUS_TEAM set, so the MCP
-/// server writes into the team scope.
+/// opencode mission with the transcript logged to the project corpus
+/// `runs/` automatically. The agent is materialized to `.opencode/agent/`
+/// first (bare names), then opencode spawns with CORPUS_PROJECT set,
+/// so the MCP server writes into the project scope.
 fn run_cmd(args: &[String]) -> Result<(), String> {
     let mut agent: Option<String> = None;
     let mut model: Option<String> = None;
@@ -116,20 +114,21 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
 
     let store = Store::from_env();
     let scope = Scope::from_env();
-    let spec = corpus_core::TeamSpec::load(&store, &scope.project, &scope.team)
-        .map_err(|e| e.to_string())?;
-    if !spec.agents.contains_key(&agent) {
-        let have: Vec<String> = spec.agents.keys().cloned().collect();
+
+    // Check the agent exists on the project.
+    if store.load_agent(&scope.project, &agent).is_err() {
+        let agents = store.list_agents(&scope.project).map_err(|e| e.to_string())?;
+        let have: Vec<String> = agents.iter().map(|(s, _)| s.clone()).collect();
         return Err(format!(
-            "team {}/{} has no agent named {:?} (agents: {})",
-            scope.project, scope.team, agent, have.join(", ")
+            "project {} has no agent named {:?} (agents: {})",
+            scope.project,
+            agent,
+            have.join(", ")
         ));
     }
-    // Materialize the team's agents first (the default team re-renders
-    // the checked-in pair byte-identically; other teams get
-    // `<team>-<agent>.md`).
-    let written = store
-        .materialize_team_agents(&scope.project, &scope.team)
+
+    // Materialize the agent (clear + render to .opencode/agent/).
+    let written = store.render_agent(&scope.project, &agent)
         .map_err(|e| e.to_string())?;
     for path in &written {
         println!("materialized {}", path.display());
@@ -137,7 +136,6 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
 
     let mut session = corpus_core::RunSession::spawn_headless(
         &scope.project,
-        &scope.team,
         &agent,
         model.as_deref(),
         &mission,
@@ -152,18 +150,17 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
     if research {
         let prompt = format!(
             "Read the operator run transcript at {}. Curate and distill it \
-             into the corpus: (1) technique card(s) under store/techniques/ \
-             for every attack surface analyzed or attempted — mechanics, \
-             preconditions, the oracle that would catch it, and status \
-             (fired / analyzed-only / unresolved-lead) — citing this run \
-             log. (2) A 'failure modes' section per card citing transcript \
+             into the corpus: (1) technique card(s) under the project corpus \
+             techniques/ for every attack surface analyzed or attempted — \
+             mechanics, preconditions, the oracle that would catch it, and \
+             status (fired / analyzed-only / unresolved-lead) — citing this \
+             run log. (2) A 'failure modes' section per card citing transcript \
              moments. (3) An honest run outcome at the end of each card: \
-             completed / truncated / blocked, and why. (4) If the \
-             transcript yields a fresh lead worth attacking, write one \
-             hypothesis entry under store/hypotheses/ (target surface, \
-             rationale, suggested mission text, source citations). \
-             Remember the contamination rule: never read benchmarks/** or \
-             plugins/**.",
+             completed / truncated / blocked, and why. (4) If the transcript \
+             yields a fresh lead worth attacking, write one hypothesis entry \
+             under the project corpus hypotheses/ (target surface, rationale, \
+             suggested mission text, source citations). Remember the \
+             contamination rule: never read benchmarks/** or plugins/**.",
             session.transcript.display()
         );
         println!("researching {} ...", session.transcript.display());
@@ -174,9 +171,11 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
         log.write_all(b"\n\n# --- researcher pass ---\n\n")
             .map_err(|e| e.to_string())?;
         drop(log);
+        // Materialize the researcher agent for the follow-up.
+        let _ = store.render_agent(&scope.project, "researcher")
+            .map_err(|e| e.to_string())?;
         let mut session = corpus_core::RunSession::spawn_headless_append(
             &scope.project,
-            &scope.team,
             "researcher",
             model.as_deref(),
             &prompt,
@@ -311,3 +310,5 @@ fn find<'a>(
         .find(|p| p.manifest.name == name)
         .ok_or_else(|| format!("plugin not found: {name}"))
 }
+
+use corpus_core::{discover, plugins_dir};

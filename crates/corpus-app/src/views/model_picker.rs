@@ -1,4 +1,4 @@
-//! The shared model picker (deck-flow chunk 8): search +
+//! The shared model picker (app-flow chunk 8): search +
 //! provider-grouped, the ONE widget behind every model-selection
 //! surface (launch dialog, agent template composer, team instance
 //! overrides, add-agent-to-team). The widget knows NOTHING about the

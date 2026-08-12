@@ -1,15 +1,16 @@
 [package]
-name = "corpus-deck"
+name = "corpus-app"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [[bin]]
-name = "corpus-deck"
+name = "corpus-app"
 path = "src/main.rs"
 
 [dependencies]
 corpus-core = { path = "../corpus-core" }
+serde_json = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 # Vendored per the deck-flow-plan table: egui_extras + egui-toast at

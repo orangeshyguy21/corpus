@@ -1,4 +1,4 @@
-//! The deck's nav: one entry per planned screen, greyed until its chunk
+//! The app's nav: one entry per planned screen, greyed until its chunk
 //! lands, plus the screen-change requests views issue (launch switches
 //! the operator to the run view).
 
@@ -6,19 +6,19 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Projects,
-    Teams,
     Agents,
+    Missions,
     Launch,
 }
 
 impl Screen {
-    pub const ALL: [Screen; 4] = [Screen::Projects, Screen::Teams, Screen::Agents, Screen::Launch];
+    pub const ALL: [Screen; 4] = [Screen::Projects, Screen::Agents, Screen::Missions, Screen::Launch];
 
     pub fn label(self) -> &'static str {
         match self {
             Screen::Projects => "Projects",
-            Screen::Teams => "Teams",
             Screen::Agents => "Agents",
+            Screen::Missions => "Missions",
             Screen::Launch => "Launch",
         }
     }
@@ -27,8 +27,8 @@ impl Screen {
     pub fn note(self) -> &'static str {
         match self {
             Screen::Projects => "project list, create, clone, delete",
-            Screen::Teams => "the selected project's teams: create, edit, clone, delete, wipe, launch",
-            Screen::Agents => "template editors (permission/prompt/agent) + add-agent-to-team",
+            Screen::Agents => "the selected project's agents: raw JSON editor with core-side validation",
+            Screen::Missions => "mission list + launch reusing the existing run view",
             Screen::Launch => "run view: embedded terminal pane on the run's tmux session + abort/dismiss",
         }
     }

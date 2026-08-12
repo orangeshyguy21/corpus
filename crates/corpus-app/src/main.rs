@@ -1,13 +1,9 @@
-//! corpus-deck: the operator's window into the research team (egui).
+//! corpus-app: the operator's window into the research team (egui).
 //!
-//! Rebuilt ground-up per dev/deck-flow-plan.md: chunk 0 struck the M0
+//! Rebuilt ground-up per dev/app-flow-plan.md: chunk 0 struck the M0
 //! views to a shell (window, left nav with one entry per planned screen
-//! — greyed until its chunk lands, central panel, toast overlay);
-//! chunks 1–4 landed Projects, Teams, and the Agent template editors;
-//! chunk 5 landed the launch seam (materialize a team's agents, spawn a
-//! run on the team scope); chunk 7 embedded the terminal (egui_term —
-//! the run pane is a tmux client, the external-terminal popup is gone).
-//! House rules: corpus-core calls live behind `DeckState` (state.rs);
+//! — greyed until its chunk lands, central panel, toast overlay).
+//! House rules: corpus-core calls live behind `AppState` (state.rs);
 //! one module per screen; no business logic in widgets.
 
 mod nav;
@@ -21,23 +17,23 @@ use eframe::egui;
 use egui_toast::Toasts;
 
 use crate::nav::Screen;
-use crate::state::DeckState;
-use crate::views::{agents, launch, projects, teams};
+use crate::state::AppState;
+use crate::views::{agents, launch, missions, projects};
 
-/// corpus-deck application state: the deck's state layer, the active
+/// corpus-app application state: the app's state layer, the active
 /// screen, per-screen widget state, and the toast overlay.
 struct App {
-    state: DeckState,
+    state: AppState,
     screen: Screen,
     /// The screen shown last frame — screen-change hooks (fresh project
-    /// list before Teams/Agents render) fire on transitions only.
+    /// list before Agents/Missions render) fire on transitions only.
     last_screen: Screen,
-    /// A screen change a view requested (Teams → Launch); applied after
-    /// the central panel.
+    /// A screen change a view requested (Missions → Launch); applied
+    /// after the central panel.
     pending_nav: Option<Screen>,
     projects: projects::ProjectsView,
-    teams: teams::TeamsView,
     agents: agents::AgentsView,
+    missions: missions::MissionsView,
     launch: launch::LaunchView,
     toasts: Toasts,
 }
@@ -47,13 +43,13 @@ impl App {
         configure_style(&cc.egui_ctx);
         let screen = Screen::Projects;
         Self {
-            state: DeckState::from_env(),
+            state: AppState::from_env(),
             screen,
             last_screen: screen,
             pending_nav: None,
             projects: projects::ProjectsView::default(),
-            teams: teams::TeamsView::default(),
             agents: agents::AgentsView::default(),
+            missions: missions::MissionsView::default(),
             launch: launch::LaunchView::default(),
             toasts: Toasts::new(),
         }
@@ -67,7 +63,7 @@ impl eframe::App for App {
         // Screen-change hooks.
         if self.screen != self.last_screen {
             self.last_screen = self.screen;
-            if self.screen == Screen::Teams || self.screen == Screen::Agents {
+            if self.screen == Screen::Agents || self.screen == Screen::Missions {
                 self.state.refresh();
             }
             if self.screen == Screen::Launch {
@@ -77,7 +73,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("title_bar").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("corpus-deck").strong());
+                ui.heading(egui::RichText::new("corpus-app").strong());
                 ui.separator();
                 ui.weak("the operator's window into the research team");
             });
@@ -107,26 +103,26 @@ impl eframe::App for App {
             Screen::Projects => {
                 self.projects.show(ui, &mut self.state, &mut self.toasts);
             }
-            Screen::Teams => {
-                self.teams.show(
+            Screen::Agents => {
+                self.agents.show(ui, &mut self.state, &mut self.toasts);
+            }
+            Screen::Missions => {
+                self.missions.show(
                     ui,
                     &mut self.state,
                     &mut self.toasts,
                     &mut self.pending_nav,
                 );
             }
-            Screen::Agents => {
-                self.agents.show(ui, &mut self.state, &mut self.toasts);
-            }
             Screen::Launch => {
                 self.launch.show(ui, &mut self.state, &mut self.toasts);
             }
         });
 
-        // Apply a screen change a view requested (Teams -> Launch).
+        // Apply a screen change a view requested (Missions -> Launch).
         if let Some(screen) = self.pending_nav.take() {
             self.screen = screen;
-            self.last_screen = screen; // the transition hook already ran
+            self.last_screen = screen;
         }
 
         // Toast overlay (top-right of the whole window).
@@ -161,11 +157,11 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_title("corpus-deck"),
+            .with_title("corpus-app"),
         ..Default::default()
     };
     eframe::run_native(
-        "corpus-deck",
+        "corpus-app",
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )

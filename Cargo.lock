@@ -764,6 +764,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "corpus-app"
+version = "0.1.0"
+dependencies = [
+ "corpus-core",
+ "eframe",
+ "egui",
+ "egui-toast",
+ "egui_commonmark",
+ "egui_extras",
+ "egui_term",
+ "serde_json",
+]
+
+[[package]]
 name = "corpus-cli"
 version = "0.1.0"
 dependencies = [
@@ -784,19 +798,6 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.20",
  "toml",
-]
-
-[[package]]
-name = "corpus-deck"
-version = "0.1.0"
-dependencies = [
- "corpus-core",
- "eframe",
- "egui",
- "egui-toast",
- "egui_commonmark",
- "egui_extras",
- "egui_term",
 ]
 
 [[package]]

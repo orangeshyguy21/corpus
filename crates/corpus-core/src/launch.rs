@@ -1,11 +1,10 @@
-//! Run-launch seam (deck-flow chunk 5): materialize a team's agents to
-//! `.opencode/agent/`, then launch an opencode mission on the team scope
-//! — shared by the CLI (`corpus run`, headless) and the deck.
+//! Run-launch seam: materialize an agent to `.opencode/agent/`, then launch
+//! an opencode mission — shared by the CLI (`corpus run`, headless) and the
+//! app.
 //!
-//! Naming scheme: `<team>-<agent>.md`, except the default project/team
-//! which keeps the bare agent names for backward compatibility; the
-//! spawned opencode inherits CORPUS_PROJECT / CORPUS_TEAM so the MCP
-//! server routes writes into the right corpus.
+//! Naming scheme: bare names (no team prefix — teams are gone). The spawned
+//! opencode inherits CORPUS_PROJECT / CORPUS_STORE so the MCP server routes
+//! writes into the project corpus.
 //!
 //! Supervisor + full-TUI decision (2026-08-11, corrected same-day):
 //! an interactive launch spawns the REAL opencode TUI in a DETACHED
@@ -14,21 +13,21 @@
 //! re-attach never kill the run, and attaching shows a steerable TUI,
 //! not a one-shot `[exited]` dump. The TUI has no stdout, so:
 //!   - tail           = `tmux pipe-pane` raw capture (ANSI-stripped for
-//!                      the deck); the fallback transcript, not the
+//!                      the app); the fallback transcript, not the
 //!                      record;
 //!   - record         = `opencode export <id>` (the newest session in the
 //!                      project dir) -> `<epoch>-<agent>.json` in the
-//!                      team corpus runs/ on Dismiss/abort;
+//!                      project corpus runs/ on Dismiss/abort;
 //!   - completion     = operator-driven: a TUI session doesn't exit, a
 //!                      run stays live until Dismiss (export + close) or
 //!                      Abort (best-effort export + `tmux kill-session`).
-//! The deck NEVER inherits opencode's ambient default model: the model
-//! is resolved agent instance -> agent template -> explicit launch arg,
-//! and a launch with none fails loudly instead of spawning.
+//! The app NEVER inherits opencode's ambient default model: the model
+//! is resolved primary-agent-model -> launch arg -> registry tool-use
+//! default, and a launch with none fails loudly instead of spawning.
 //!
 //! Headless `opencode run` stays for automation (`corpus run`,
 //! scripted missions): the piped spawn behind the same handle. It is
-//! also the no-tmux fallback for the deck (attach greys).
+//! also the no-tmux fallback for the app (attach greys).
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -41,7 +40,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::store::{Store, TeamSpec, PROJECT_ENV, STORE_ENV, TEAM_ENV};
+use crate::models::ModelRegistry;
+use crate::store::{Store, PROJECT_ENV, STORE_ENV};
 
 /// One transcript line. In the piped backend the two child streams are
 /// kept apart; in the TUI backend lines come from the raw capture, so
@@ -52,7 +52,7 @@ pub struct RunLine {
     pub text: String,
 }
 
-/// Where the run actually executes. The deck/CLI never branch on this —
+/// Where the run actually executes. The app/CLI never branch on this —
 /// only `attach_command()` / `abort()` / `dismiss()` are backend-shaped.
 enum Backend {
     /// The full opencode TUI in a detached tmux session.
@@ -80,7 +80,7 @@ enum Backend {
     },
 }
 
-/// A running opencode mission on a team scope.
+/// A running opencode mission on a project scope.
 pub struct RunSession {
     /// The record file: the exported JSON for a TUI run, the .log for
     /// a piped one.
@@ -89,23 +89,24 @@ pub struct RunSession {
 }
 
 impl RunSession {
-    /// DECK launch: resolve the model (instance -> template -> arg,
-    /// fail loudly if none), then run the FULL TUI in a detached tmux
-    /// session, or the piped headless fallback when tmux is absent.
+    /// APP launch: resolve the model (primary-model -> arg -> registry
+    /// tool-use default, fail loudly if none), then run the FULL TUI in
+    /// a detached tmux session, or the piped headless fallback when tmux
+    /// is absent.
     pub fn spawn(
         project: &str,
-        team: &str,
         agent: &str,
         model: Option<&str>,
         mission: &str,
     ) -> Result<Self> {
         let store = Store::from_env();
-        Self::ensure_runs_dir(&store, project, team);
-        let model = resolve_launch_model(&store, project, team, agent, model)?;
+        let runs_dir = store.project_corpus_dir(project).join("runs");
+        let _ = fs::create_dir_all(&runs_dir);
+        let model = resolve_launch_model(&store, project, agent, model)?;
         if tmux_available().is_some() {
-            Self::start_tui(&store, project, team, agent, &model, mission)
+            Self::start_tui(&store, project, agent, &model, mission)
         } else {
-            Self::start_piped(&store, project, team, agent, Some(&model), mission, None)
+            Self::start_piped(&store, project, agent, Some(&model), mission, None)
         }
     }
 
@@ -114,32 +115,31 @@ impl RunSession {
     /// lean on opencode's own default-resolver).
     pub fn spawn_headless(
         project: &str,
-        team: &str,
         agent: &str,
         model: Option<&str>,
         mission: &str,
     ) -> Result<Self> {
         let store = Store::from_env();
-        Self::ensure_runs_dir(&store, project, team);
-        Self::start_piped(&store, project, team, agent, model, mission, None)
+        let runs_dir = store.project_corpus_dir(project).join("runs");
+        let _ = fs::create_dir_all(&runs_dir);
+        Self::start_piped(&store, project, agent, model, mission, None)
     }
 
     /// CLI automation APPENDING to an existing transcript (the
     /// researcher follow-up pass).
     pub fn spawn_headless_append(
         project: &str,
-        team: &str,
         agent: &str,
         model: Option<&str>,
         mission: &str,
         append_to: &Path,
     ) -> Result<Self> {
         let store = Store::from_env();
-        Self::ensure_runs_dir(&store, project, team);
+        let runs_dir = store.project_corpus_dir(project).join("runs");
+        let _ = fs::create_dir_all(&runs_dir);
         Self::start_piped(
             &store,
             project,
-            team,
             agent,
             model,
             mission,
@@ -147,16 +147,10 @@ impl RunSession {
         )
     }
 
-    fn ensure_runs_dir(store: &Store, project: &str, team: &str) {
-        let scope = crate::store::Scope::new(project, team);
-        let _ = fs::create_dir_all(scope.corpus_dir(store).join("runs"));
-    }
-
     /// The full opencode TUI in a detached tmux session.
     fn start_tui(
         store: &Store,
         project: &str,
-        team: &str,
         agent: &str,
         model: &str,
         mission: &str,
@@ -164,24 +158,22 @@ impl RunSession {
         let opencode = resolve_opencode()?;
         let tmux = resolve_tmux().ok_or_else(|| Error::Store("tmux vanished".into()))?;
         let ts = now_secs();
-        let session = format!("corpus-{}-{}-{ts}", team, slugify(agent));
-        let export_json = Self::runs_for(store, project, team, agent, ts, "json");
+        let agent_stem = slugify(agent);
+        let session = format!("corpus-{agent_stem}-{ts}");
+        let export_json = Self::runs_for(store, project, agent, ts, "json");
         let temp = std::env::temp_dir();
         let raw = temp.join(format!("{session}.raw"));
         let script = temp.join(format!("{session}.sh"));
 
         let repo = repo_root(store);
-        // The script carries the command AND its environment: explicit,
-        // escaped exports — no `-e` races on a freshly-started server.
         write_tui_script(
             &script,
             &[
                 ("CORPUS_OPENCODE_BIN", &opencode.display().to_string()),
-                ("CORPUS_OPENCODE_AGENT", &agent_file_stem(project, team, agent)),
+                ("CORPUS_OPENCODE_AGENT", &agent_stem),
                 ("CORPUS_OPENCODE_MODEL", model),
                 ("CORPUS_OPENCODE_PROMPT", mission),
                 (PROJECT_ENV, project),
-                (TEAM_ENV, team),
                 (STORE_ENV, &store.root().to_string_lossy().into_owned()),
             ],
         )?;
@@ -221,16 +213,13 @@ impl RunSession {
     fn start_piped(
         store: &Store,
         project: &str,
-        team: &str,
         agent: &str,
         model: Option<&str>,
         mission: &str,
         append_to: Option<&Path>,
     ) -> Result<Self> {
         let opencode = resolve_opencode()?;
-        let runs = crate::store::Scope::new(project, team)
-            .corpus_dir(store)
-            .join("runs");
+        let runs = store.project_corpus_dir(project).join("runs");
         fs::create_dir_all(&runs)?;
         let (transcript, header) = match append_to {
             Some(path) => (path.to_path_buf(), None),
@@ -243,7 +232,7 @@ impl RunSession {
             let mut log = fs::File::create(&transcript)?;
             log.write_all(header.as_bytes())?;
         }
-        let mut command = opencode_command(&opencode, project, team, agent, model, mission);
+        let mut command = opencode_command(&opencode, project, agent, model, mission);
         let mut child = command.spawn().map_err(|e| {
             Error::Store(format!("failed to spawn opencode (on PATH?): {e}"))
         })?;
@@ -309,8 +298,8 @@ impl RunSession {
     /// The command to attach a terminal to this run: `(program, args)`
     /// an external terminal shells out to. None when the run has no
     /// attach backend (the piped fallback). Retained for CLI use; the
-    /// deck embeds the terminal (chunk 7) and uses
-    /// [`RunSession::pty_attach_command`] instead.
+    /// app embeds the terminal and uses [`RunSession::pty_attach_command`]
+    /// instead.
     pub fn attach_command(&self) -> Option<Vec<String>> {
         match &self.backend {
             Backend::Piped { .. } => None,
@@ -318,7 +307,7 @@ impl RunSession {
         }
     }
 
-    /// The argv to attach an EMBEDDED PTY to this run (deck chunk 7):
+    /// The argv to attach an EMBEDDED PTY to this run (app chunk 7):
     /// plain `tmux attach -t <session>` — no terminal-app shell-out.
     /// None for the piped fallback (the pane then shows the tail).
     pub fn pty_attach_command(&self) -> Option<Vec<String>> {
@@ -413,10 +402,8 @@ impl RunSession {
         let _ = fs::remove_file(raw);
     }
 
-    fn runs_for(store: &Store, project: &str, team: &str, agent: &str, ts: u64, ext: &str) -> PathBuf {
-        crate::store::Scope::new(project, team)
-            .corpus_dir(store)
-            .join("runs")
+    fn runs_for(store: &Store, project: &str, agent: &str, ts: u64, ext: &str) -> PathBuf {
+        store.project_corpus_dir(project).join("runs")
             .join(format!("{ts}-{agent}.{ext}"))
     }
 }
@@ -432,59 +419,67 @@ fn repo_root(store: &Store) -> PathBuf {
         .unwrap_or_else(|_| store.root().to_path_buf())
 }
 
-/// Resolve the effective launch model: agent instance -> agent template
-/// -> explicit launch arg. A launch with none must not inherit
-/// opencode's ambient default — fail loudly with a pointer.
+/// Resolve the effective launch model:
+/// primary-agent model -> launch arg -> registry tool-use default -> refuse.
+/// OpenCode's ambient default is never inherited.
 fn resolve_launch_model(
     store: &Store,
     project: &str,
-    team: &str,
     agent: &str,
     launch_model: Option<&str>,
 ) -> Result<String> {
-    let spec = TeamSpec::load(store, project, team)?;
-    let instance = spec
-        .agents
-        .get(agent)
-        .ok_or_else(|| Error::Store(format!("team {project}/{team} has no agent named {agent:?}")))?;
-    let template_model = instance
-        .template
-        .as_str()
-        .trim_end_matches(".md");
-    let template = store.load_agent(project, template_model).ok();
-    let model = pick_model(
-        instance.model.as_deref(),
-        template.and_then(|t| t.model).as_deref(),
-        launch_model,
-    );
-    model.ok_or_else(|| {
-        Error::Store(format!(
-            "no model configured for agent {agent} on {project}/{team} — set one on \
-             the agent instance, the agent template, or pass an explicit model; \
-             opencode's ambient default is never inherited"
-        ))
-    })
+    let config = store
+        .load_agent(project, agent)
+        .map_err(|e| Error::Store(format!("agent {project}/{agent}: {e}")))?;
+    let primary_model = primary_agent_model(&config.doc);
+    let model = pick_model(primary_model.as_deref(), launch_model)
+        .or_else(|| registry_default())
+        .ok_or_else(|| {
+            Error::Store(format!(
+                "no model configured for agent {agent} on {project} — set one on \
+                 the primary agent entry, pass an explicit model, or register a \
+                 tool-use model in benchmarks/models.yaml; opencode's ambient \
+                 default is never inherited"
+            ))
+        })?;
+    Ok(model)
 }
 
-/// The model a launch would resolve for this agent WITHOUT an explicit
-/// arg (instance -> template); None when neither sets one. The deck's
-/// launch dialog pre-fills the model picker with this — it stays an
-/// explicit, visible choice in the dialog, never an ambient fallback.
-pub fn agent_default_model(store: &Store, project: &str, team: &str, agent: &str) -> Option<String> {
-    let spec = TeamSpec::load(store, project, team).ok()?;
-    let instance = spec.agents.get(agent)?;
-    let template_slug = instance.template.as_str().trim_end_matches(".md");
-    let template = store.load_agent(project, template_slug).ok();
-    pick_model(
-        instance.model.as_deref(),
-        template.and_then(|t| t.model).as_deref(),
-        None,
-    )
+/// The model a launch would pre-fill from the agent config (primary -> registry
+/// tool-use default); None when neither is set.
+pub fn agent_default_model(store: &Store, project: &str, agent: &str) -> Option<String> {
+    let config = store.load_agent(project, agent).ok()?;
+    primary_agent_model(&config.doc)
+        .or_else(registry_default)
 }
 
-/// First non-empty of: instance override, template default, launch arg.
-fn pick_model(instance: Option<&str>, template: Option<&str>, arg: Option<&str>) -> Option<String> {
-    [instance, template, arg]
+/// The model declared on the primary agent's entry in the `agent` map.
+fn primary_agent_model(doc: &serde_json::Value) -> Option<String> {
+    let agents = doc.get("agent")?.as_object()?;
+    for (_name, cfg) in agents {
+        let mode = cfg.get("mode").and_then(|v| v.as_str()).unwrap_or("primary");
+        if mode == "primary" {
+            return cfg.get("model").and_then(|v| v.as_str()).map(str::to_string);
+        }
+    }
+    None
+}
+
+/// The registry's tool-use default (the first tool-use entry, or the first
+/// model). This IS an explicit model id; it replaces the old template
+/// default (templates are gone).
+fn registry_default() -> Option<String> {
+    let path = std::env::var("CORPUS_MODELS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("benchmarks/models.yaml"));
+    ModelRegistry::load(&path)
+        .ok()?
+        .launch_default()
+}
+
+/// First non-empty of two ordered options (primary -> arg).
+fn pick_model(primary: Option<&str>, arg: Option<&str>) -> Option<String> {
+    [primary, arg]
         .into_iter()
         .flatten()
         .map(str::trim)
@@ -610,7 +605,7 @@ fn attach_argv(session: &str) -> Option<Vec<String>> {
     }
 }
 
-/// The plain `tmux attach -t <session>` argv for an embedded PTY (deck
+/// The plain `tmux attach -t <session>` argv for an embedded PTY (app
 /// chunk 7): the embedded terminal never spawns opencode — tmux stays
 /// the supervisor, the pane is just another client.
 pub fn tui_attach_command(session: &str) -> Option<Vec<String>> {
@@ -624,8 +619,8 @@ pub fn tui_attach_command(session: &str) -> Option<Vec<String>> {
 }
 
 /// Live corpus run sessions on the tmux server (the `corpus-` prefix) —
-/// the deck's re-attach list after a relaunch: a run outlives the deck
-/// by design, so a reopened deck offers these for in-pane attach.
+/// the app's re-attach list after a relaunch: a run outlives the app
+/// by design, so a reopened app offers these for in-pane attach.
 /// Empty on any failure (no tmux, no server running).
 pub fn live_tui_sessions() -> Vec<String> {
     let Some(tmux) = resolve_tmux() else {
@@ -655,7 +650,7 @@ fn abort_exit_status() -> ExitStatus {
 }
 
 /// Tail a file from the last consumed offset, emitting one complete
-/// line per call (the deck's live tail over pipe-pane raw capture).
+/// line per call (the app's live tail over pipe-pane raw capture).
 fn poll_file(
     path: &Path,
     file_pos: &mut u64,
@@ -682,9 +677,6 @@ fn poll_file(
         }
         *file_pos = len;
         pending.push_str(&String::from_utf8_lossy(&buf));
-        // A TUI redraws in place with CR separators and can go long
-        // stretches without an LF — split on CR or LF, and flush a frame
-        // that outgrew a sane line as one coarse line either way.
         if let Some(end) = pending.find(['\n', '\r']) {
             let line = pending[..end].to_string();
             let consumed = if pending[end..].starts_with("\r\n") { end + 2 } else { end + 1 };
@@ -798,13 +790,12 @@ fn is_executable(path: &Path) -> bool {
 fn opencode_command(
     opencode: &Path,
     project: &str,
-    team: &str,
     agent: &str,
     model: Option<&str>,
     mission: &str,
 ) -> Command {
     let mut command = Command::new(opencode);
-    command.args(["run", "--agent", &agent_file_stem(project, team, agent)]);
+    command.args(["run", "--agent", &slugify(agent)]);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(model) = model {
         command.args(["-m", model]);
@@ -816,7 +807,6 @@ fn opencode_command(
     }
     command
         .env(PROJECT_ENV, project)
-        .env(TEAM_ENV, team)
         .env(STORE_ENV, store.root());
     #[cfg(unix)]
     {
@@ -826,16 +816,9 @@ fn opencode_command(
     command
 }
 
-/// The materialized agent file stem: `<team>-<agent>.md` for per-team
-/// agents; the bare agent name on the default project/team. Agent names
-/// are slugified (team slugs already are).
-pub fn agent_file_stem(project: &str, team: &str, agent: &str) -> String {
-    let stem = slugify(agent);
-    if project == crate::store::DEFAULT_PROJECT_SLUG && team == crate::store::DEFAULT_TEAM_SLUG {
-        stem
-    } else {
-        format!("{team}-{stem}")
-    }
+/// The materialized agent file stem: bare (slugified) — no team prefix.
+pub fn agent_file_stem(agent: &str) -> String {
+    slugify(agent)
 }
 
 /// kebab-case a free-form agent name.
@@ -850,38 +833,7 @@ fn slugify(name: &str) -> String {
         .join("-")
 }
 
-impl Store {
-    /// The directory materialized agents land in: `.opencode/agent/`
-    /// next to the store root (the repo root).
-    pub fn opencode_agent_dir(&self) -> PathBuf {
-        self.root()
-            .parent()
-            .map(|p| p.join(".opencode").join("agent"))
-            .unwrap_or_else(|| self.root().to_path_buf())
-    }
-
-    /// Render every agent in a team spec to `.opencode/agent/`.
-    pub fn materialize_team_agents(&self, project: &str, team: &str) -> Result<Vec<PathBuf>> {
-        let spec = TeamSpec::load(self, project, team)?;
-        let local = self.project_templates(project);
-        let core = self.core_templates();
-        let out_dir = self.opencode_agent_dir();
-        fs::create_dir_all(&out_dir)?;
-        let mut written = Vec::new();
-        for (name, instance) in &spec.agents {
-            let template = self.load_agent(project, &instance.template).map_err(|e| {
-                Error::Store(format!("team {project}/{team} agent {name}: {e}"))
-            })?;
-            let dest = out_dir.join(format!("{}.md", agent_file_stem(project, team, name)));
-            template.render(&local, &core, instance.model.as_deref(), &dest)?;
-            written.push(dest);
-        }
-        Ok(written)
-    }
-}
-
-/// A fresh transcript path + the epoch for headless runs, byte-identical
-/// to what `corpus run` produced.
+/// A fresh transcript path + the epoch for headless runs.
 fn fresh_transcript_path(runs: &Path, agent: &str, mission: &str) -> (PathBuf, u64) {
     let ts = now_secs();
     let slug: String = mission
@@ -954,11 +906,11 @@ fn kill_tree(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::AgentInstance;
-    use std::collections::BTreeMap;
+    use crate::agents::CORE_SEEDS;
     use std::sync::MutexGuard;
 
     /// The env- and process-mutating launch tests are inherently global
@@ -978,55 +930,58 @@ mod tests {
         (Store::new(dir.clone()), dir)
     }
 
-    #[test]
-    fn agent_names_materialize_per_team_naming_scheme() {
-        assert_eq!(agent_file_stem("default", "default", "operator"), "operator");
-        assert_eq!(agent_file_stem("default", "default", "Flow Agent"), "flow-agent");
-        assert_eq!(agent_file_stem("p", "red", "operator"), "red-operator");
-        assert_eq!(agent_file_stem("p", "red-team", "My Auditor"), "red-team-my-auditor");
+    fn seed_core(store: &Store) {
+        let seed_dir = store.seed_agents_dir();
+        for slug in CORE_SEEDS {
+            let d = seed_dir.join(slug);
+            let _ = fs::create_dir_all(&d);
+            fs::write(
+                d.join("opencode.json"),
+                format!(
+                    "{{\"$schema\":\"https://opencode.ai/config.json\",\"agent\":{{\"{slug}\":{{\"description\":\"{slug}\",\"mode\":\"primary\",\"prompt\":\"You are {slug}.\\n\"}}}}}}"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    fn core_project(store: &Store) {
+        seed_core(store);
+        store.create_project("default", "Default", "cdk-regtest").unwrap();
     }
 
     #[test]
-    fn mission_slugs_are_identical_to_corpus_run() {
-        let (path, _) = fresh_transcript_path(
-            std::path::Path::new("/tmp"),
-            "operator",
-            "Probe the environment & map surfaces!",
-        );
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(name.ends_with("-probe-the-environment-map-surfaces.log"), "{name}");
-        assert!(!name.starts_with("operator"));
-        assert!(name.contains("-operator-"), "{name}");
+    fn agent_names_are_bare() {
+        assert_eq!(agent_file_stem("operator"), "operator");
+        assert_eq!(agent_file_stem("Flow Agent"), "flow-agent");
+        assert_eq!(agent_file_stem("My Auditor"), "my-auditor");
     }
 
     #[test]
     fn launch_model_precedence_and_loud_failure() {
-        // instance wins, then template, then the explicit arg.
+        // primary wins, then arg.
         assert_eq!(
-            pick_model(Some("inst"), Some("tpl"), Some("arg")).as_deref(),
+            pick_model(Some("inst"), Some("arg")).as_deref(),
             Some("inst")
         );
         assert_eq!(
-            pick_model(None, Some("tpl"), Some("arg")).as_deref(),
-            Some("tpl")
-        );
-        assert_eq!(
-            pick_model(None, None, Some("arg")).as_deref(),
+            pick_model(None, Some("arg")).as_deref(),
             Some("arg")
         );
         // empty values are skipped, whitespace trimmed
         assert_eq!(
-            pick_model(None, Some("  "), Some(" arg ")).as_deref(),
-            Some("arg")
+            pick_model(None, Some("  ")),
+            None
         );
-        // none at all -> loud failure (never the ambient default)
-        assert_eq!(pick_model(None, None, None), None);
     }
 
+    /// Integration test (env-locked): the spawn/abort/dismiss machinery
+    /// runs against a temp store seeded with the core agent pair,
+    /// exercising the v2 teamless paths.
     #[test]
-    fn abort_kills_the_whole_headless_run_tree() {
+    fn spawn_abort_and_piped_headless() {
         let _guard = env_lock();
-        let _ = Command::new("pkill").args(["-f", "sleep 90127"]).status(); // clear debris
+        let _ = Command::new("pkill").args(["-f", "sleep 90127"]).status();
         let bin = std::env::temp_dir().join(format!("corpus-fake-bin-{}", std::process::id()));
         let _ = fs::remove_dir_all(&bin);
         fs::create_dir_all(&bin).unwrap();
@@ -1037,15 +992,11 @@ mod tests {
         path = format!("{}:{}", bin.display(), path);
         std::env::set_var("PATH", &path);
 
-        let (_, store_dir) = tmp_store("abort");
+        let (store, store_dir) = tmp_store("abort-v2");
         std::env::set_var("CORPUS_STORE", &store_dir);
-        let (store, _) = (
-            Store::from_env(),
-            store_dir.clone(),
-        );
-        store.create_project("default", "Default", "cdk-regtest").unwrap();
+        core_project(&store);
 
-        let mut session = RunSession::spawn_headless("default", "default", "operator", None, "probe")
+        let mut session = RunSession::spawn_headless("default", "operator", None, "probe")
             .expect("piped headless spawn");
         assert!(session.transcript.is_file(), "transcript starts at spawn");
         std::thread::sleep(Duration::from_millis(800));
@@ -1068,144 +1019,10 @@ mod tests {
             .unwrap_or(false);
         assert!(!alive, "no orphaned grandchildren");
 
-        std::env::remove_var("CORPUS_STORE");
-        std::env::remove_var("PATH");
-        let _ = fs::remove_dir_all(&bin);
-        let _ = fs::remove_dir_all(&store_dir);
-    }
-
-    #[test]
-    #[ignore = "races the parallel harness: fresh tmux server + pipe-pane under 19 threads; green solo (--test-threads=1). The real path is covered by e2e_tui_launch_export_and_abort."]
-    fn tui_run_detaches_attaches_and_aborts() {
-        let _guard = env_lock();
-        let _ = Command::new("pkill").args(["-f", "sleep 90128"]).status(); // clear debris
-        // A stale or client-wedged tmux server from an earlier run makes
-        // new sessions unreachable — always start from a fresh server.
-        let _ = Command::new("tmux").arg("kill-server").status();
-        if tmux_available().is_none() {
-            return; // only meaningful with tmux >= 3.2a
-        }
-        let bin = std::env::temp_dir().join(format!("corpus-fake-bin-tui-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&bin);
-        fs::create_dir_all(&bin).unwrap();
-        let fake = bin.join("opencode");
-        fs::write(
-            &fake,
-            "#!/bin/sh\nif [ \"$1\" = \"session\" ]; then printf '[]\\n'; exit 0; fi\nsleep 1\necho READY\nsleep 90128\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut path = std::env::var("PATH").unwrap_or_default();
-        path = format!("{}:{}", bin.display(), path);
-        std::env::set_var("PATH", &path);
-
-        let (store, store_dir) = tmp_store("tui");
-        std::env::set_var("CORPUS_STORE", &store_dir);
-        store.create_project("default", "Default", "cdk-regtest").unwrap();
-        store
-            .create_team(
-                "default",
-                "default",
-                "Default",
-                core_instances(),
-                None,
-                None,
-            )
-            .unwrap();
-
-        let mut session = RunSession::spawn(
-            "default",
-            "default",
-            "operator",
-            Some("openrouter/x"),
-            "probe",
-        )
-        .expect("TUI spawn");
-        assert!(session.attach_command().is_some(), "TUI runs are attachable");
-
-        // pipe-pane capture feeds the live tail (the first raw line
-        // may be the pane shell's prompt — the fake's READY follows).
-        // The pane runs the fake: READY appears once the session
-        // command executes. Under heavy parallel load the tmux server
-        // can be slow to serve, so give it a generous window and treat
-        // ANY pane output (a rendered prompt counts) as proof the
-        // pipe-pane capture reaches the tail.
-        let mut saw_output = false;
-        for _ in 0..1200 {
-            if let Some(line) = session.poll_line() {
-                if !line.text.trim().is_empty() {
-                    saw_output = true;
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        if !saw_output {
-            let listed = Command::new("tmux")
-                .args(["ls"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_default();
-            let raws = fs::read_dir(std::env::temp_dir())
-                .map(|rd| {
-                    rd.filter_map(|e| e.ok())
-                        .filter(|e| {
-                            e.file_name().to_string_lossy().contains("corpus-default-operator-")
-                                && e.path().extension().map(|x| x == "raw").unwrap_or(false)
-                        })
-                        .map(|e| {
-                            format!(
-                                "{}:{}b",
-                                e.file_name().to_string_lossy(),
-                                fs::metadata(e.path()).map(|m| m.len()).unwrap_or(0)
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("  ")
-                })
-                .unwrap_or_default();
-            eprintln!("DIAG tmux: {listed}");
-            eprintln!("DIAG raws: {raws}");
-            let procs = Command::new("ps")
-                .args(["-eo", "pid,ppid,etime,command"])
-                .output()
-                .map(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .filter(|l| l.contains("corpus-fake-bin-tui") || l.contains("opencode --agent"))
-                        .take(6)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default();
-            eprintln!("DIAG procs:\n{procs}");
-        }
-        assert!(saw_output, "pipe-pane raw capture reaches the deck tail");
-
-        let listed = Command::new("tmux")
-            .args(["ls"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        assert!(listed.contains("corpus-default-operator-"), "detached session: {listed}");
-
-        session.abort();
-        let started = std::time::Instant::now();
-        let mut exited = false;
-        while started.elapsed() < Duration::from_secs(5) {
-            if session.try_exit().is_some() {
-                exited = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(exited, "abort reaps the TUI run within 5s");
-        let listed = Command::new("tmux")
-            .args(["ls"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        assert!(!listed.contains("corpus-default-operator-"), "cleanup: {listed}");
+        // Transcript is in the project corpus runs/.
+        let runs_dir = store.project_corpus_dir("default").join("runs");
+        assert!(runs_dir.join(session.transcript.file_name().unwrap()).exists(),
+            "transcript in project corpus");
 
         std::env::remove_var("CORPUS_STORE");
         std::env::remove_var("PATH");
@@ -1213,162 +1030,20 @@ mod tests {
         let _ = fs::remove_dir_all(&store_dir);
     }
 
-    fn core_instances() -> BTreeMap<String, AgentInstance> {
-        let mut agents = BTreeMap::new();
-        agents.insert(
-            "operator".to_string(),
-            AgentInstance {
-                template: "operator".to_string(),
-                model: None,
-            },
-        );
-        agents
-    }
-
+    /// materialize_agent renders the launched agent's files into
+    /// `.opencode/agent/` with bare names.
     #[test]
-    fn materialize_renders_team_agents_with_model_override() {
-        let (store, dir) = tmp_store("mat");
-        let core = store.core_templates();
-        fs::create_dir_all(core.permissions.clone()).unwrap();
-        fs::create_dir_all(core.prompts.clone()).unwrap();
-        fs::write(
-            core.permissions.join("role.md"),
-            "---\nname: role\ndescription: d\npermission: |\n  bash: deny\n  edit: deny\n---\n",
-        )
-        .unwrap();
-        fs::write(
-            core.prompts.join("prompt.md"),
-            "---\nname: prompt\ndescription: d\n---\n\nYou are a probe.\n",
-        )
-        .unwrap();
+    fn materialize_agent_renders_agent_files() {
+        let (store, dir) = tmp_store("mat-v2");
+        seed_core(&store);
         store.create_project("p", "P", "cdk-regtest").unwrap();
-        store
-            .write_agent(
-                "p",
-                "probe",
-                &crate::templates::AgentTemplate {
-                    name: "probe".to_string(),
-                    description: String::new(),
-                    mode: "primary".to_string(),
-                    permission_ref: "role".to_string(),
-                    prompt_ref: "prompt".to_string(),
-                    model: Some("openrouter/x".to_string()),
-                },
-            )
-            .unwrap();
-        let mut agents = BTreeMap::new();
-        agents.insert(
-            "Auditor".to_string(),
-            AgentInstance {
-                template: "probe".to_string(),
-                model: Some("openrouter/y".to_string()),
-            },
-        );
-        store.create_team("p", "red", "Red", agents, None, None).unwrap();
-
-        let written = store.materialize_team_agents("p", "red").unwrap();
-        assert_eq!(written.len(), 1);
-        let dest = written[0].clone();
-        assert!(dest.ends_with("red-auditor.md"), "{dest:?}");
-        let text = fs::read_to_string(&dest).unwrap();
-        assert!(text.contains("model: openrouter/y"), "{text}");
-        assert!(text.contains("You are a probe."), "{text}");
+        let written = store.render_agent("p", "operator").unwrap();
+        assert!(!written.is_empty());
+        let dest = &written[0];
+        assert!(dest.ends_with("operator.md"), "{dest:?}");
+        let text = fs::read_to_string(dest).unwrap();
+        assert!(text.contains("mode: primary"), "{text}");
+        assert!(text.contains("You are operator."), "{text}");
         let _ = fs::remove_dir_all(&dir);
-    }
-}
-
-#[cfg(test)]
-mod e2e {
-    //! MANUAL end-to-end drill, not part of the normal gate: launches the
-    //! REAL opencode TUI (costs a local model turn), dismisses to export a
-    //! transcript JSON, and aborts a second run.
-    //!
-    //! Run: cargo test -p corpus-core e2e_tui_launch_export_and_abort -- --ignored --nocapture
-
-    use super::*;
-
-    #[test]
-    #[ignore = "manual drill: spawns a real opencode TUI session and runs a model turn"]
-    fn e2e_tui_launch_export_and_abort() {
-        let _guard = tests::env_lock();
-        if tmux_available().is_none() {
-            eprintln!("SKIP: no tmux >= 3.2a");
-            return;
-        }
-        let store = Store::from_env(); // the real store: default/default
-        store.materialize_team_agents("default", "default").unwrap();
-        let model = std::env::var("CORPUS_E2E_MODEL")
-            .unwrap_or_else(|_| "ollama/qwen3.6:35b".to_string());
-
-        // Run 1: launch, watch the pane, dismiss -> exported JSON.
-        let mut session =
-            RunSession::spawn("default", "default", "operator", Some(&model), "Reply with exactly: PONG")
-                .expect("TUI spawn");
-        assert!(session.attach_command().is_some(), "attach offered");
-
-        let mut grew = false;
-        for _ in 0..1200 {
-            if let Some(line) = session.poll_line() {
-                if !line.text.trim().is_empty() {
-                    grew = true;
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(grew, "the TUI rendered into the raw capture");
-
-        let listed = Command::new("tmux")
-            .args(["ls"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        assert!(listed.contains("corpus-default-operator-"), "detached session: {listed}");
-
-        let exported = session.dismiss().expect("dismiss exports the transcript");
-        eprintln!("EXPORTED -> {}", exported.display());
-        let text = fs::read_to_string(&exported).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&text).expect("export is JSON");
-        let keys: Vec<String> = value
-            .as_object()
-            .map(|o| o.keys().cloned().collect())
-            .unwrap_or_default();
-        let messages = value
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .map(|m| m.len())
-            .unwrap_or(0);
-        eprintln!("export keys: {keys:?}  messages: {messages}");
-        assert!(messages > 0, "the exported transcript holds the session messages");
-
-        let listed = Command::new("tmux")
-            .args(["ls"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        assert!(!listed.contains("corpus-default-operator-"), "dismiss closed the session: {listed}");
-
-        // Run 2: abort tears the whole session down.
-        let mut second =
-            RunSession::spawn("default", "default", "operator", Some(&model), "Reply with exactly: PONG")
-                .expect("second TUI spawn");
-        std::thread::sleep(Duration::from_millis(1200));
-        second.abort();
-        let started = std::time::Instant::now();
-        let mut exited = false;
-        while started.elapsed() < Duration::from_secs(5) {
-            if second.try_exit().is_some() {
-                exited = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(exited, "abort reaped the second run");
-        let listed = Command::new("tmux")
-            .args(["ls"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        assert!(!listed.contains("corpus-default-operator-"), "abort cleaned up: {listed}");
     }
 }

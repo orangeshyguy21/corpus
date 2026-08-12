@@ -1,8 +1,8 @@
-//! TerminalPane (deck-flow chunk 7): the embedded terminal wrapping
+//! TerminalPane (app-flow chunk 7): the embedded terminal wrapping
 //! `egui_term` (alacritty_terminal PTY backend). The pane NEVER spawns
 //! opencode — it runs `tmux attach -t <run session>` inside the
 //! embedded PTY, so tmux stays the supervisor: closing or crashing the
-//! deck closes the PTY, the tmux CLIENT detaches, and the run lives on.
+//! app closes the PTY, the tmux CLIENT detaches, and the run lives on.
 //!
 //! Focus discipline: click the pane to focus it (keys — including the
 //! ctrl chords the opencode TUI uses, and tab — route to the PTY); the
@@ -31,9 +31,9 @@ pub struct TerminalPane {
     attached: Option<String>,
     /// Click-to-focus state; released by a click outside the pane.
     focused: bool,
-    /// Font matched to the deck theme, resolved on first show.
+    /// Font matched to the app theme, resolved on first show.
     font: Option<TerminalFont>,
-    /// Colors matched to the deck theme (panel fill + readable fg).
+    /// Colors matched to the app theme (panel fill + readable fg).
     theme: TerminalTheme,
     /// Backend ids must be unique per attach (widget state is keyed).
     next_id: u64,
@@ -88,7 +88,7 @@ impl TerminalPane {
     }
 
     /// Spawn the embedded PTY running the attach argv. The child is
-    /// wrapped in `env TERM=… COLORTERM=…` because a GUI-launched deck
+    /// wrapped in `env TERM=… COLORTERM=…` because a GUI-launched app
     /// carries no TERM (tmux refuses to attach without one) and tmux
     /// 3.2+ passes RGB through for clients advertising truecolor.
     fn attach(&mut self, ctx: &egui::Context, session: &str, argv: &[String]) -> Result<(), String> {
@@ -170,11 +170,11 @@ impl TerminalPane {
     }
 }
 
-/// Colors matched to the deck theme: the run pane sits on the deck's
+/// Colors matched to the app theme: the run pane sits on the app's
 /// panel fill with the stock readable palette otherwise.
 fn pane_theme() -> TerminalTheme {
     let palette = ColorPalette {
-        background: "#18191e".to_string(), // the deck's panel_fill (24,25,30)
+        background: "#18191e".to_string(), // the app's panel_fill (24,25,30)
         black: "#18191e".to_string(),
         foreground: "#d8d8d8".to_string(),
         ..Default::default()
@@ -182,7 +182,7 @@ fn pane_theme() -> TerminalTheme {
     TerminalTheme::new(Box::new(palette))
 }
 
-/// The deck's own monospace text style as the terminal font.
+/// The app's own monospace text style as the terminal font.
 fn pane_font(ctx: &egui::Context) -> TerminalFont {
     let font_type = ctx
         .style()
