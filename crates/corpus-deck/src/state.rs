@@ -7,13 +7,14 @@
 //! never in a view.
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 
 use corpus_core::{
-    AgentInstance, AgentTemplate, Error, PermissionTemplate, PluginStatus, Project, PromptTemplate,
-    RunLine, RunSession, Store, TeamSpec, TemplateKind,
+    AgentInstance, AgentTemplate, Error, ModelList, PermissionTemplate, PluginStatus, Project,
+    PromptTemplate, RunLine, RunSession, Store, TeamSpec, TemplateKind,
 };
 
 /// Deck-wide state: the corpus-core store handle plus the data the
@@ -44,6 +45,19 @@ pub struct DeckState {
     /// Live corpus tmux sessions seen at the last `refresh_live_sessions`
     /// — the re-attach list a relaunched deck offers (chunk 7).
     pub live_sessions: Vec<String>,
+    /// The opencode model list (chunk 8), lazily loaded by
+    /// `ensure_models`; corpus-core TTL-caches the shell-out underneath.
+    models: Option<ModelList>,
+    /// Why the model list is unavailable (pickers degrade to free text
+    /// with this as the warning).
+    models_error: Option<String>,
+    /// In-flight background fetch. The shell-out (0.6s cached, multiple
+    /// seconds with --refresh over the network) must NEVER run on the
+    /// UI thread — immediate-mode means the whole app freezes.
+    models_rx: Option<std::sync::mpsc::Receiver<Result<ModelList, String>>>,
+    /// Registry-known model ids (`provider/tag`), the picker's
+    /// "benchmarked" badge. Loaded once with the model list.
+    benchmarked: Option<HashSet<String>>,
 }
 
 /// Who/what the active or last run was.
@@ -87,6 +101,10 @@ impl DeckState {
             run_status: None,
             export_path: None,
             live_sessions: Vec::new(),
+            models: None,
+            models_error: None,
+            models_rx: None,
+            benchmarked: None,
         };
         deck.refresh();
         deck
@@ -287,12 +305,90 @@ impl DeckState {
     /// tool-use default (an explicit arg — the engine never falls back
     /// to opencode's ambient model). None when the registry is empty.
     pub fn suggested_model(&self) -> Option<String> {
-        let path = std::env::var("CORPUS_MODELS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("benchmarks/models.yaml"));
-        corpus_core::ModelRegistry::load(&path)
+        corpus_core::ModelRegistry::load(&models_yaml_path())
             .ok()?
             .launch_default()
+    }
+
+    // --- model list (chunk 8) ---
+
+    /// Load the model list + badge set on first use; a no-op once
+    /// either succeeded or failed (the caller's ↻ button retries).
+    pub fn ensure_models(&mut self) {
+        if self.benchmarked.is_none() {
+            self.benchmarked = Some(load_benchmarked_ids());
+        }
+        if self.models.is_none() && self.models_error.is_none() {
+            self.refresh_models(false);
+        }
+    }
+
+    /// (Re)pull the model list ON A BACKGROUND THREAD; the result lands
+    /// via `poll_models` (called every frame from App::update). `force`
+    /// bypasses corpus-core's TTL and re-pulls opencode's models.dev
+    /// cache — the pickers' ↻ button. A click while a fetch is in
+    /// flight is ignored (the UI shows a spinner instead).
+    pub fn refresh_models(&mut self, force: bool) {
+        if self.models_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(corpus_core::model_list(force).map_err(|e| e.to_string()));
+        });
+        self.models_rx = Some(rx);
+    }
+
+    /// Apply a finished background model fetch. Called every frame.
+    pub fn poll_models(&mut self) {
+        let Some(rx) = &self.models_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(list)) => {
+                self.models = Some(list);
+                self.models_error = None;
+                self.models_rx = None;
+            }
+            Ok(Err(error)) => {
+                self.models = None;
+                self.models_error = Some(error);
+                self.models_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.models_rx = None;
+            }
+        }
+    }
+
+    /// True while a background model fetch is in flight (the ↻ buttons
+    /// show a spinner instead of offering another click).
+    pub fn models_loading(&self) -> bool {
+        self.models_rx.is_some()
+    }
+
+    /// The grouped model list, when available (None = pickers degrade).
+    pub fn models(&self) -> Option<&ModelList> {
+        self.models.as_ref()
+    }
+
+    /// Why the model list is unavailable, for the degrade warning.
+    pub fn models_error(&self) -> Option<&str> {
+        self.models_error.as_deref()
+    }
+
+    /// Registry-known model ids (`provider/tag`) — the picker's
+    /// "benchmarked" badge. The deck already reads the registry for the
+    /// launch pre-fill, so this adds no new dependency edge.
+    pub fn benchmarked_ids(&self) -> Option<&HashSet<String>> {
+        self.benchmarked.as_ref()
+    }
+
+    /// The launch-dialog pre-fill for an agent: the instance -> template
+    /// resolution, falling back to the registry's tool-use default (all
+    /// layers stay EXPLICIT choices visible in the dialog).
+    pub fn agent_default_model(&self, project: &str, team: &str, agent: &str) -> Option<String> {
+        corpus_core::agent_default_model(&self.store, project, team, agent)
+            .or_else(|| self.suggested_model())
     }
 
     /// Create a team with a fresh auto-generated id and the core agent
@@ -538,6 +634,27 @@ pub fn parse_agent_rows(rows: &[AgentRow]) -> Result<BTreeMap<String, AgentInsta
         }
     }
     Ok(agents)
+}
+
+/// The registry path (`CORPUS_MODELS` override, else the repo file).
+fn models_yaml_path() -> PathBuf {
+    std::env::var("CORPUS_MODELS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("benchmarks/models.yaml"))
+}
+
+/// The registry's model ids as opencode refs (`provider/tag`) — the
+/// picker's "benchmarked" badge set.
+fn load_benchmarked_ids() -> HashSet<String> {
+    corpus_core::ModelRegistry::load(&models_yaml_path())
+        .map(|registry| {
+            registry
+                .models
+                .iter()
+                .map(|m| format!("{}/{}", m.provider, m.tag))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A fresh RFC-4122-v4-formatted id, generated without new dependencies:

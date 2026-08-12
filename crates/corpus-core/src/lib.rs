@@ -16,8 +16,11 @@ mod store;
 mod templates;
 
 pub use error::{Error, Result};
-pub use launch::{agent_file_stem, live_tui_sessions, tui_attach_command, RunLine, RunSession};
-pub use models::{ModelEntry, ModelRegistry};
+pub use launch::{
+    agent_default_model, agent_file_stem, live_tui_sessions, tui_attach_command, RunLine,
+    RunSession,
+};
+pub use models::{model_list, ModelEntry, ModelList, ModelOption, ModelProviderGroup, ModelRegistry};
 pub use plugin::{
     FaucetCall, FaucetResult, OracleInfo, OracleResult, Plugin, PluginManifest, ProbeResult,
     SandboxExecResult, SourceInfo,

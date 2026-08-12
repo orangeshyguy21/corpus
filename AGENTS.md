@@ -86,9 +86,15 @@ corpus plugin call <name> <method> [params-json]
 # to <epoch>-<agent>.json in the team runs/; the live tail is tmux
 # pipe-pane raw capture (ANSI-stripped). The model is ALWAYS explicit
 # (agent instance -> agent template -> launch arg; the launch pre-fills
-# the registry's tool-use default; never opencode's ambient default —
-# a launch with none refuses). Without tmux (>= 3.2a) the deck degrades
-# to the piped headless spawn (no attach); CORPUS_NO_TMUX=1 forces it.
+# the agent's instance/template default, then the registry's tool-use
+# default; never opencode's ambient default — a launch with none
+# refuses). Deck model fields are ONE shared picker (search +
+# provider-grouped, views/model_picker.rs over corpus-core's
+# model_list() = `opencode models --verbose`, TTL-cached, ↻ forces
+# --refresh; no free-text model fields survive — opencode missing
+# degrades the picker to free text + warning). Without tmux (>= 3.2a)
+# the deck degrades to the piped headless spawn (no attach);
+# CORPUS_NO_TMUX=1 forces it.
 # --research appends a researcher pass
 corpus run <agent> [-m model] [--research] <mission...>
 # Model registry

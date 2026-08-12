@@ -466,6 +466,22 @@ fn resolve_launch_model(
     })
 }
 
+/// The model a launch would resolve for this agent WITHOUT an explicit
+/// arg (instance -> template); None when neither sets one. The deck's
+/// launch dialog pre-fills the model picker with this — it stays an
+/// explicit, visible choice in the dialog, never an ambient fallback.
+pub fn agent_default_model(store: &Store, project: &str, team: &str, agent: &str) -> Option<String> {
+    let spec = TeamSpec::load(store, project, team).ok()?;
+    let instance = spec.agents.get(agent)?;
+    let template_slug = instance.template.as_str().trim_end_matches(".md");
+    let template = store.load_agent(project, template_slug).ok();
+    pick_model(
+        instance.model.as_deref(),
+        template.and_then(|t| t.model).as_deref(),
+        None,
+    )
+}
+
 /// First non-empty of: instance override, template default, launch arg.
 fn pick_model(instance: Option<&str>, template: Option<&str>, arg: Option<&str>) -> Option<String> {
     [instance, template, arg]
@@ -688,7 +704,7 @@ fn poll_file(
 /// Resolve the opencode binary WITHOUT assuming PATH (GUI-launched
 /// apps get a minimal PATH on macOS). Tried: PATH, `~/.opencode/bin`,
 /// the repo-local `node_modules/.bin`.
-fn resolve_opencode() -> Result<PathBuf> {
+pub(crate) fn resolve_opencode() -> Result<PathBuf> {
     if let Some(found) = on_path("opencode") {
         return Ok(found);
     }

@@ -16,6 +16,7 @@ use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
 use crate::nav::Screen;
 use crate::state::{AgentRow, DeckState};
+use crate::views::model_picker::{ModelField, ModelPicker};
 
 /// The probe-level mission a fresh Launch dialog suggests (the chunk-5
 /// acceptance runs one like this).
@@ -47,6 +48,11 @@ pub struct TeamsView {
     launch_agent: Option<String>,
     launch_model: String,
     launch_mission: String,
+    /// The launch dialog's model picker (chunk 8).
+    launch_picker: ModelPicker,
+    /// One model picker per agent row in the edit form (chunk 8) —
+    /// kept the same length as `edit_agents`.
+    edit_pickers: Vec<ModelPicker>,
 }
 
 impl Default for TeamsView {
@@ -70,6 +76,8 @@ impl Default for TeamsView {
             launch_agent: None,
             launch_model: String::new(),
             launch_mission: PROBE_MISSION.to_string(),
+            launch_picker: ModelPicker::default(),
+            edit_pickers: Vec::new(),
         }
     }
 }
@@ -349,9 +357,28 @@ impl TeamsView {
                 ui.label("Budget (empty = no cap on the team's execution)");
                 ui.text_edit_singleline(&mut self.edit_budget);
                 ui.add_space(4.0);
-                ui.label("Agents (name · template · model — rows replace the set exactly)");
+                ui.horizontal(|ui| {
+                    ui.label("Agents (name · template · model — rows replace the set exactly)");
+                    if state.models_loading() {
+                        ui.spinner();
+                    } else if ui
+                        .button("↻")
+                        .on_hover_text("refresh the model list from opencode")
+                        .clicked()
+                    {
+                        state.refresh_models(true);
+                    }
+                });
+                state.ensure_models();
+                self.edit_pickers
+                    .resize_with(self.edit_agents.len(), ModelPicker::default);
+                let agents_rows = &mut self.edit_agents;
+                let pickers = &mut self.edit_pickers;
+                let models = state.models();
+                let badges = state.benchmarked_ids();
+                let models_error = state.models_error();
                 let mut remove: Option<usize> = None;
-                for (index, row) in self.edit_agents.iter_mut().enumerate() {
+                for (index, row) in agents_rows.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut row.name).desired_width(110.0),
@@ -359,12 +386,18 @@ impl TeamsView {
                         ui.add(
                             egui::TextEdit::singleline(&mut row.template).desired_width(110.0),
                         );
-                        ui.add(
-                            egui::TextEdit::singleline(&mut row.model)
-                                .desired_width(110.0)
-                                .hint_text("model (optional)"),
+                        pickers[index].field(
+                            ui,
+                            &format!("edit_row_model_{index}"),
+                            &mut row.model,
+                            ModelField {
+                                models,
+                                badges,
+                                degrade_note: models_error,
+                                allow_none: true,
+                            },
                         );
-                        if ui.button("✕").clicked() {
+                        if ui.button("×").clicked() {
                             remove = Some(index);
                         }
                     });
@@ -525,7 +558,8 @@ impl TeamsView {
 
     /// Populate the launch dialog from the selected team (agent pick
     /// defaults to the first agent on the spec; mission suggests a
-    /// probe-level run).
+    /// probe-level run; the model pre-fills with the agent's resolved
+    /// default — instance → template → registry, all explicit).
     fn arm_launch(&mut self, state: &mut DeckState) {
         let Some(slug) = self.selected.clone() else {
             return;
@@ -537,8 +571,14 @@ impl TeamsView {
             .map(|(_, spec)| spec.agents.keys().cloned().collect())
             .unwrap_or_default();
         self.launch_agent = agents.first().cloned();
-        self.launch_model = state.suggested_model().unwrap_or_default();
+        let project = self.project.clone().unwrap_or_default();
+        self.launch_model = self
+            .launch_agent
+            .as_deref()
+            .and_then(|agent| state.agent_default_model(&project, &slug, agent))
+            .unwrap_or_default();
         self.launch_mission = PROBE_MISSION.to_string();
+        state.ensure_models();
         self.show_launch = !agents.is_empty();
     }
 
@@ -582,13 +622,43 @@ impl TeamsView {
                     .show_ui(ui, |ui| {
                         for (name, template) in &agents {
                             let label = format!("{name} ({template})");
-                            ui.selectable_value(&mut self.launch_agent, Some(name.clone()), label);
+                            if ui
+                                .selectable_value(&mut self.launch_agent, Some(name.clone()), label)
+                                .clicked()
+                            {
+                                // Re-pre-fill the model with the newly
+                                // picked agent's resolved default.
+                                self.launch_model = state
+                                    .agent_default_model(project, &team, name)
+                                    .unwrap_or_default();
+                            }
                         }
                     });
                 ui.label("Model (explicit — opencode's ambient default is never used)");
-                ui.text_edit_singleline(&mut self.launch_model);
+                ui.horizontal(|ui| {
+                    self.launch_picker.field(
+                        ui,
+                        "launch_model",
+                        &mut self.launch_model,
+                        ModelField {
+                            models: state.models(),
+                            badges: state.benchmarked_ids(),
+                            degrade_note: state.models_error(),
+                            allow_none: false,
+                        },
+                    );
+                    if state.models_loading() {
+                        ui.spinner();
+                    } else if ui
+                        .button("↻")
+                        .on_hover_text("refresh the model list from opencode")
+                        .clicked()
+                    {
+                        state.refresh_models(true);
+                    }
+                });
                 if self.launch_model.trim().is_empty() {
-                    ui.weak("no model set — the launch will refuse until you fill this in");
+                    ui.weak("no model picked — the launch will refuse until you pick one");
                 }
                 ui.label("Mission");
                 ui.add(
@@ -617,9 +687,9 @@ impl TeamsView {
                                     toast(
                                         toasts,
                                         ToastKind::Warning,
-                                        "set a model first — an explicit model is required \
-                                         (opencode's ambient default is never used). It \
-                                         pre-fills from the model registry.",
+                                        "pick a model first — an explicit model is required \
+                                         (opencode's ambient default is never used). The picker \
+                                         pre-fills from the agent's instance/template default.",
                                     );
                                 } else {
                                     match state.launch(project, &team, &agent, model, &mission) {

@@ -18,6 +18,7 @@ use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 use corpus_core::TemplateKind;
 
 use crate::state::{DeckState, TemplateEntry};
+use crate::views::model_picker::{ModelField, ModelPicker};
 
 const GOOD: Color32 = Color32::from_rgb(120, 200, 120);
 const BAD: Color32 = Color32::from_rgb(255, 90, 90);
@@ -61,6 +62,10 @@ pub struct AgentsView {
     add_team: Option<String>,
     add_name: String,
     add_model: String,
+    /// The agent composer's model picker (chunk 8).
+    composer_picker: ModelPicker,
+    /// The add-agent-to-team window's model picker (chunk 8).
+    add_picker: ModelPicker,
 }
 
 impl Default for AgentsView {
@@ -83,6 +88,8 @@ impl Default for AgentsView {
             add_team: None,
             add_name: String::new(),
             add_model: String::new(),
+            composer_picker: ModelPicker::default(),
+            add_picker: ModelPicker::default(),
         }
     }
 }
@@ -521,10 +528,11 @@ impl AgentsView {
         }
     }
 
-    /// Agent composer fields: mode + resolved ref picks + model.
-    fn agent_fields(&mut self, ui: &mut Ui, state: &DeckState, project: &str) {
+    /// Agent composer fields: mode + resolved ref picks + model picker.
+    fn agent_fields(&mut self, ui: &mut Ui, state: &mut DeckState, project: &str) {
         let permissions = state.template_entries(project, TemplateKind::Permission);
         let prompts = state.template_entries(project, TemplateKind::Prompt);
+        state.ensure_models();
         ui.horizontal(|ui| {
             ui.label("Mode");
             egui::ComboBox::from_id_salt("agent_mode")
@@ -548,8 +556,29 @@ impl AgentsView {
         );
         ui.label("Prompt template (project-then-core)");
         ref_picker(ui, "agent_prompt_ref", &mut self.buf.prompt_ref, &prompts);
-        ui.label("Model (opt: provider/model — empty = the operator's choice at run)");
-        ui.text_edit_singleline(&mut self.buf.model);
+        ui.label("Model (optional — empty = decide at launch)");
+        ui.horizontal(|ui| {
+            self.composer_picker.field(
+                ui,
+                "agent_template_model",
+                &mut self.buf.model,
+                ModelField {
+                    models: state.models(),
+                    badges: state.benchmarked_ids(),
+                    degrade_note: state.models_error(),
+                    allow_none: true,
+                },
+            );
+            if state.models_loading() {
+                ui.spinner();
+            } else if ui
+                .button("↻")
+                .on_hover_text("refresh the model list from opencode")
+                .clicked()
+            {
+                state.refresh_models(true);
+            }
+        });
     }
 
     /// Save the editor buffer for its kind. Returns a user-facing error
@@ -637,6 +666,7 @@ impl AgentsView {
             .map(|e| e.name.clone())
             .unwrap_or_else(|| slug.clone());
         state.refresh_teams(project);
+        state.ensure_models();
         self.add_template = Some(slug);
         self.add_team = state.teams.first().map(|(slug, _)| slug.clone());
         self.add_name = name;
@@ -670,7 +700,28 @@ impl AgentsView {
                 ui.label("Agent name (the key on the team spec)");
                 ui.text_edit_singleline(&mut self.add_name);
                 ui.label("Model (optional — empty = the template default)");
-                ui.text_edit_singleline(&mut self.add_model);
+                ui.horizontal(|ui| {
+                    self.add_picker.field(
+                        ui,
+                        "add_agent_model",
+                        &mut self.add_model,
+                        ModelField {
+                            models: state.models(),
+                            badges: state.benchmarked_ids(),
+                            degrade_note: state.models_error(),
+                            allow_none: true,
+                        },
+                    );
+                    if state.models_loading() {
+                        ui.spinner();
+                    } else if ui
+                        .button("↻")
+                        .on_hover_text("refresh the model list from opencode")
+                        .clicked()
+                    {
+                        state.refresh_models(true);
+                    }
+                });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Add").clicked() {

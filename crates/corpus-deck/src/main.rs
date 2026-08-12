@@ -62,6 +62,8 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Background fetch results land here (never block the UI thread).
+        self.state.poll_models();
         // Screen-change hooks.
         if self.screen != self.last_screen {
             self.last_screen = self.screen;

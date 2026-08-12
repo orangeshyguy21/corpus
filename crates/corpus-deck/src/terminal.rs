@@ -173,10 +173,12 @@ impl TerminalPane {
 /// Colors matched to the deck theme: the run pane sits on the deck's
 /// panel fill with the stock readable palette otherwise.
 fn pane_theme() -> TerminalTheme {
-    let mut palette = ColorPalette::default();
-    palette.background = "#18191e".to_string(); // the deck's panel_fill (24,25,30)
-    palette.black = "#18191e".to_string();
-    palette.foreground = "#d8d8d8".to_string();
+    let palette = ColorPalette {
+        background: "#18191e".to_string(), // the deck's panel_fill (24,25,30)
+        black: "#18191e".to_string(),
+        foreground: "#d8d8d8".to_string(),
+        ..Default::default()
+    };
     TerminalTheme::new(Box::new(palette))
 }
 

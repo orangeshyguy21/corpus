@@ -4,5 +4,6 @@
 
 pub mod agents;
 pub mod launch;
+pub mod model_picker;
 pub mod projects;
 pub mod teams;
