@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use corpus_core::{
-    core_agent_instances, AgentInstance, AgentTemplate, Store, TeamSpec, Templates,
+    core_agent_instances, AgentInstance, Store, TeamSpec, Templates,
 };
 
 /// Parse `name=template[?model=model]` agent instantiations. Starts EMPTY —
@@ -36,7 +36,6 @@ fn parse_agent_instances(raw: &[&str]) -> Result<BTreeMap<String, AgentInstance>
             AgentInstance {
                 template,
                 model,
-                budget: None,
             },
         );
     }
@@ -67,6 +66,13 @@ fn apply_team_edits(spec: &mut TeamSpec, opts: &TeamOptions) -> Result<(), Strin
             spec.rev_override = Some(rev.clone());
         }
     }
+    if let Some(budget) = &opts.budget {
+        if budget == "-" {
+            spec.budget = None;
+        } else {
+            spec.budget = Some(budget.clone());
+        }
+    }
     let parsed = parse_agent_instances(&opts.agents.iter().map(String::as_str).collect::<Vec<_>>());
     for (name, instance) in parsed? {
         spec.agents.insert(name, instance);
@@ -81,6 +87,7 @@ fn apply_team_edits(spec: &mut TeamSpec, opts: &TeamOptions) -> Result<(), Strin
 struct TeamOptions {
     name: Option<String>,
     rev: Option<String>,
+    budget: Option<String>,
     agents: Vec<String>,
     drop_agents: Vec<String>,
 }
@@ -96,6 +103,10 @@ fn parse_team_options(args: &[String]) -> Result<TeamOptions, String> {
             }
             "--rev" => {
                 opts.rev = Some(args.get(i + 1).ok_or("missing value after --rev")?.clone());
+                i += 2;
+            }
+            "--budget" => {
+                opts.budget = Some(args.get(i + 1).ok_or("missing value after --budget")?.clone());
                 i += 2;
             }
             "--agent" => {
@@ -195,8 +206,28 @@ pub fn project_cmd(args: &[String]) -> Result<(), String> {
             println!("deleted project {slug}");
             Ok(())
         }
+        Some("rebind") => {
+            let slug = args
+                .get(1)
+                .ok_or("usage: corpus project rebind <slug> --plugin <name>")?;
+            let mut plugin: Option<String> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--plugin" => {
+                        plugin = Some(args.get(i + 1).ok_or("missing value after --plugin")?.clone());
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown option: {other}")),
+                }
+            }
+            let plugin = plugin.ok_or("missing required --plugin <name>")?;
+            store.rebind_project(slug, &plugin).map_err(|e| e.to_string())?;
+            println!("rebound project {slug} -> plugin {plugin}");
+            Ok(())
+        }
         _ => Err(
-            "usage: corpus project list|new <slug>|clone <slug> --to <new>|delete <slug>"
+            "usage: corpus project list|new <slug>|clone <slug> --to <new>|delete <slug>|rebind <slug> --plugin <name>"
                 .to_string(),
         ),
     }
@@ -215,7 +246,7 @@ pub fn team_cmd(args: &[String]) -> Result<(), String> {
         "list" => {
             for (slug, spec) in store.list_teams(project).map_err(|e| e.to_string())? {
                 println!(
-                    "{:<16} gen={} agents=[{}]{}",
+                    "{:<16} gen={} agents=[{}]{}{}",
                     slug,
                     spec.corpus_generation,
                     spec.agents
@@ -225,13 +256,16 @@ pub fn team_cmd(args: &[String]) -> Result<(), String> {
                         .join(", "),
                     spec.rev_override
                         .map(|r| format!(" rev={r}"))
+                        .unwrap_or_default(),
+                    spec.budget
+                        .map(|b| format!(" budget={b}"))
                         .unwrap_or_default()
                 );
             }
             Ok(())
         }
         "new" => {
-            let team = team.ok_or("usage: corpus team new <project> <slug> [--name <label>] [--rev <sha>] [--agent name=template?model=...]")?;
+            let team = team.ok_or("usage: corpus team new <project> <slug> [--name <label>] [--rev <sha>] [--budget <value>] [--agent name=template?model=...]")?;
             let rest: Vec<String> = args[3..].to_vec();
             let opts = parse_team_options(&rest)?;
             let agents = agents_for_new(&opts)?;
@@ -242,6 +276,7 @@ pub fn team_cmd(args: &[String]) -> Result<(), String> {
                     opts.name.as_deref().unwrap_or(team),
                     agents,
                     opts.rev.as_deref(),
+                    opts.budget.as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
             println!(
@@ -252,7 +287,7 @@ pub fn team_cmd(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "edit" => {
-            let team = team.ok_or("usage: corpus team edit <project> <team> [--name <label>] [--rev <sha|->] [--agent ...] [--drop-agent <name>]")?;
+            let team = team.ok_or("usage: corpus team edit <project> <team> [--name <label>] [--rev <sha|->] [--budget <value|->] [--agent ...] [--drop-agent <name>]")?;
             let rest: Vec<String> = args[3..].to_vec();
             let opts = parse_team_options(&rest)?;
             store
@@ -299,47 +334,102 @@ pub fn team_cmd(args: &[String]) -> Result<(), String> {
 /// `corpus template ...`
 pub fn template_cmd(args: &[String]) -> Result<(), String> {
     let store = Store::from_env();
-    let core: Templates = store.core_templates();
     match args.first().map(String::as_str) {
         Some("list") => {
-            let mut agents = Vec::new();
-            if core.agents.is_dir() {
-                for entry in std::fs::read_dir(&core.agents).map_err(|e| e.to_string())? {
-                    let path = entry.map_err(|e| e.to_string())?.path();
-                    if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
-                        agents.push(name.to_string());
-                    }
-                }
-            }
-            agents.sort();
-            for slug in agents {
-                match AgentTemplate::load(&core.agents, &slug) {
-                    Ok(agent) => println!(
-                        "{:<20} {:<16} permission={} prompt={}{}{}",
-                        agent.name,
-                        agent.mode,
-                        agent.permission_ref,
-                        agent.prompt_ref,
-                        agent
-                            .model
-                            .as_deref()
-                            .filter(|m| !m.is_empty())
-                            .map(|m| format!(" model={m}"))
-                            .unwrap_or_default(),
-                        agent
-                            .budget
-                            .as_deref()
-                            .filter(|b| !b.is_empty())
-                            .map(|b| format!(" budget={b}"))
-                            .unwrap_or_default()
-                    ),
-                    Err(error) => println!("{slug}: <error: {error}>"),
+            // The current project's templates merged with core, shadowing
+            // by slug — the same union the deck's editors render.
+            let project = corpus_core::project_slug_env();
+            for kind in [
+                corpus_core::TemplateKind::Permission,
+                corpus_core::TemplateKind::Prompt,
+                corpus_core::TemplateKind::Agent,
+            ] {
+                for slug in store.template_slugs(&project, kind) {
+                    let origin = if store
+                        .project_templates(&project)
+                        .has(kind, &slug)
+                    {
+                        "project"
+                    } else {
+                        "core"
+                    };
+                    let extra = match kind {
+                        corpus_core::TemplateKind::Permission | corpus_core::TemplateKind::Prompt => {
+                            let description = match kind {
+                                corpus_core::TemplateKind::Permission => store
+                                    .load_permission(&project, &slug)
+                                    .map(|t| t.description),
+                                _ => store.load_prompt(&project, &slug).map(|t| t.description),
+                            }
+                            .unwrap_or_default();
+                            if description.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" description={description}")
+                            }
+                        }
+                        corpus_core::TemplateKind::Agent => {
+                            match store.load_agent(&project, &slug) {
+                                Ok(agent) => format!(
+                                    " permission={} prompt={}{}",
+                                    agent.permission_ref,
+                                    agent.prompt_ref,
+                                    agent
+                                        .model
+                                        .as_deref()
+                                        .filter(|m| !m.is_empty())
+                                        .map(|m| format!(" model={m}"))
+                                        .unwrap_or_default()
+                                ),
+                                Err(error) => format!(" <error: {error}>"),
+                            }
+                        }
+                    };
+                    let (name, mode) = match kind {
+                        corpus_core::TemplateKind::Agent => match store.load_agent(&project, &slug)
+                        {
+                            Ok(agent) => (agent.name, format!(" mode={}", agent.mode)),
+                            Err(_) => (slug.clone(), String::new()),
+                        },
+                        corpus_core::TemplateKind::Permission => (
+                            store
+                                .load_permission(&project, &slug)
+                                .map(|t| t.name)
+                                .unwrap_or_else(|_| slug.clone()),
+                            String::new(),
+                        ),
+                        corpus_core::TemplateKind::Prompt => (
+                            store
+                                .load_prompt(&project, &slug)
+                                .map(|t| t.name)
+                                .unwrap_or_else(|_| slug.clone()),
+                            String::new(),
+                        ),
+                    };
+                    println!(
+                        "{:<10} {:<8} {:<24} {:<12} {}{}{}",
+                        kind.label(),
+                        origin,
+                        name,
+                        slug,
+                        mode,
+                        extra,
+                        if origin == "project" {
+                            if store.core_templates().has(kind, &slug) {
+                                " (shadows core)"
+                            } else {
+                                ""
+                            }
+                        } else {
+                            ""
+                        }
+                    );
                 }
             }
             Ok(())
         }
         Some("render") => {
-            let slug = args.get(1).ok_or("usage: corpus template render <name> [--to <dir>]")?;
+            let name = args.get(1).ok_or("usage: corpus template render <name> [--to <dir>]")?;
             let mut dest: Option<String> = None;
             let mut i = 2;
             while i < args.len() {
@@ -351,15 +441,13 @@ pub fn template_cmd(args: &[String]) -> Result<(), String> {
                     other => return Err(format!("unknown option: {other}")),
                 }
             }
-            // Local (project) templates first, core as fallback — same rule
-            // as the renderer's own ref resolution.
-            let local = store.project_templates(&corpus_core::project_slug_env());
+            let project = corpus_core::project_slug_env();
+            // Accept a slug OR the template's frontmatter name (the deck
+            // authors by label; the store keys by slug).
+            let slug = resolve_agent_slug(&store, &project, name)?;
+            let agent = store.load_agent(&project, &slug).map_err(|e| e.to_string())?;
+            let local = store.project_templates(&project);
             let core_templates: Templates = store.core_templates();
-            let agent = if local.agents.join(format!("{slug}.md")).is_file() {
-                AgentTemplate::load(&local.agents, slug).map_err(|e| e.to_string())?
-            } else {
-                AgentTemplate::load(&core_templates.agents, slug).map_err(|e| e.to_string())?
-            };
             let default_dest = format!(".opencode/agent/{slug}.md");
             let out_dir = dest.as_deref().unwrap_or(".opencode/agent");
             let out_path = std::path::Path::new(out_dir).join(format!("{slug}.md"));
@@ -373,11 +461,54 @@ pub fn template_cmd(args: &[String]) -> Result<(), String> {
             } else {
                 " (not the checked-in location)"
             };
-            println!("rendered {} -> {}{}", slug, out_path.display(), note);
+            println!("rendered {} -> {}{}", name, out_path.display(), note);
             Ok(())
         }
-        _ => Err("usage: corpus template list|render <name> [--to <dir>]".to_string()),
+        Some("delete") => {
+            let name = args.get(1).ok_or("usage: corpus template delete <name> [--project <slug>]")?;
+            let mut project = corpus_core::project_slug_env();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--project" => {
+                        project = args.get(i + 1).ok_or("missing value after --project")?.clone();
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown option: {other}")),
+                }
+            }
+            let slug = resolve_agent_slug(&store, &project, name)?;
+            store
+                .delete_template(&project, corpus_core::TemplateKind::Agent, &slug)
+                .map_err(|e| e.to_string())?;
+            println!("deleted {project} agent template {slug}");
+            Ok(())
+        }
+        _ => Err(
+            "usage: corpus template list|render <name> [--to <dir>]|delete <name> [--project <slug>]"
+                .to_string(),
+        ),
     }
+}
+
+/// Resolve a template name (slug or frontmatter label) to its slug,
+/// project-then-core.
+fn resolve_agent_slug(store: &Store, project: &str, name: &str) -> Result<String, String> {
+    let local = store.project_templates(project);
+    let core = store.core_templates();
+    if local.agents.join(format!("{name}.md")).is_file()
+        || core.agents.join(format!("{name}.md")).is_file()
+    {
+        return Ok(name.to_string());
+    }
+    for slug in store.template_slugs(project, corpus_core::TemplateKind::Agent) {
+        if let Ok(template) = store.load_agent(project, &slug) {
+            if template.name == name {
+                return Ok(slug);
+            }
+        }
+    }
+    Err(format!("no agent template {name:?} (by slug or frontmatter name)"))
 }
 
 /// `corpus promote <project> <team> <category> <entry> [--confirm]`

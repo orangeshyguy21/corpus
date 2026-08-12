@@ -29,7 +29,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::frontmatter;
 use crate::sensitivity::Sensitivity;
-use crate::templates::Templates;
+use crate::templates::{
+    compose_agent_template, compose_permission_template, compose_prompt_template,
+    permission_resolves, prompt_resolves, AgentTemplate, PermissionTemplate, PromptTemplate,
+    TemplateKind, Templates,
+};
 
 /// Project the flat store migrates into, and the unscoped default.
 pub const DEFAULT_PROJECT_SLUG: &str = "default";
@@ -201,13 +205,14 @@ pub struct AgentInstance {
     pub template: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget: Option<String>,
+    // Budget deliberately does NOT live here: it is a TEAM property
+    // (the launch unit), not a per-agent one. See `TeamSpec::budget`.
 }
 
 /// A team spec (`store/projects/<p>/teams/<t>/team.yaml`). Teams are
 /// configs (roadmap §2): agents plus a pinned-rev override plus a corpus
-/// generation counter.
+/// generation counter. The step/time budget lives HERE — the team is the
+/// launch unit (chunk 5); an agent is a role on that team.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TeamSpec {
     /// Human label.
@@ -218,6 +223,10 @@ pub struct TeamSpec {
     /// Optional pinned-rev override; defaults to the plugin's pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev_override: Option<String>,
+    /// Team execution budget (e.g. `40m / 10k$`). Data only — the launch
+    /// seam reads it; opencode agents carry no budget field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<String>,
     /// Bumped on every corpus wipe so old run logs stay attributable.
     #[serde(default)]
     pub corpus_generation: u64,
@@ -392,6 +401,178 @@ impl Store {
         }
         Ok(project)
     }
+
+    /// Rebind a project's environment plugin (the one mutable binding a
+    /// project carries).
+    pub fn rebind_project(&self, slug: &str, plugin: &str) -> Result<Project> {
+        let mut project = Project::load(self, slug)?;
+        project.plugin = plugin.to_string();
+        project.save(self, slug)?;
+        Ok(project)
+    }
+}
+
+// -------------------------------------------------------------------------
+// Template CRUD (project scope; core stays read-only)
+// -------------------------------------------------------------------------
+
+impl Store {
+    /// Save a project-scope permission template (create or overwrite).
+    /// The composed file is parsed back before anything touches disk: a
+    /// permission block that does not parse as YAML is refused, never
+    /// written.
+    pub fn write_permission(
+        &self,
+        project: &str,
+        slug: &str,
+        template: &PermissionTemplate,
+    ) -> Result<()> {
+        validate_slug(slug)?;
+        check_label(&template.name)?;
+        let composed = compose_permission_template(template)?;
+        PermissionTemplate::parse(&composed)
+            .map_err(|e| Error::Store(format!("permission template {slug}: {e}")))?;
+        write_template_file(self, project, TemplateKind::Permission, slug, &composed)
+    }
+
+    /// Save a project-scope prompt template (create or overwrite). The
+    /// body must be non-empty and the composed file must parse.
+    pub fn write_prompt(&self, project: &str, slug: &str, template: &PromptTemplate) -> Result<()> {
+        validate_slug(slug)?;
+        check_label(&template.name)?;
+        let composed = compose_prompt_template(template)?;
+        PromptTemplate::parse(&composed)
+            .map_err(|e| Error::Store(format!("prompt template {slug}: {e}")))?;
+        write_template_file(self, project, TemplateKind::Prompt, slug, &composed)
+    }
+
+    /// Save a project-scope agent template (create or overwrite). The
+    /// permission/prompt refs are validated to resolve project-then-core
+    /// and the mode must be a real opencode mode — a composer that picks
+    /// a dangling ref is refused at save.
+    pub fn write_agent(&self, project: &str, slug: &str, template: &AgentTemplate) -> Result<()> {
+        validate_slug(slug)?;
+        check_label(&template.name)?;
+        if !["primary", "subagent", "all"].contains(&template.mode.as_str()) {
+            return Err(Error::Store(format!(
+                "agent template {slug}: mode must be primary|subagent|all, got {:?}",
+                template.mode
+            )));
+        }
+        let composed = compose_agent_template(template)?;
+        AgentTemplate::parse(&composed)
+            .map_err(|e| Error::Store(format!("agent template {slug}: {e}")))?;
+        let local = self.project_templates(project);
+        let core = self.core_templates();
+        if !permission_resolves(&local, &core, &template.permission_ref) {
+            return Err(Error::Store(format!(
+                "agent template {slug}: permission_ref {:?} does not resolve (project-then-core)",
+                template.permission_ref
+            )));
+        }
+        if !prompt_resolves(&local, &core, &template.prompt_ref) {
+            return Err(Error::Store(format!(
+                "agent template {slug}: prompt_ref {:?} does not resolve (project-then-core)",
+                template.prompt_ref
+            )));
+        }
+        write_template_file(self, project, TemplateKind::Agent, slug, &composed)
+    }
+
+    /// Delete a project-scope template. Core templates are read-only:
+    /// deleting a slug that only exists in the core set is refused.
+    pub fn delete_template(&self, project: &str, kind: TemplateKind, slug: &str) -> Result<()> {
+        validate_slug(slug)?;
+        let path = self
+            .project_templates_dir(project)
+            .join(kind.dir_name())
+            .join(format!("{slug}.md"));
+        if !path.is_file() {
+            let core = self.core_templates().has(kind, slug);
+            return Err(Error::Store(if core {
+                format!("core {kind:?} template {slug} is read-only")
+            } else {
+                format!("no such {kind:?} template: {slug}")
+            }));
+        }
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    /// Load a template project-then-core (shadowing): the project's file
+    /// wins when both exist.
+    pub fn load_permission(&self, project: &str, slug: &str) -> Result<PermissionTemplate> {
+        let local = self.project_templates(project);
+        let core = self.core_templates();
+        let dir = if local.permissions.join(format!("{slug}.md")).is_file() {
+            local.permissions.as_path()
+        } else {
+            core.permissions.as_path()
+        };
+        PermissionTemplate::load(dir, slug)
+    }
+
+    /// See [`Store::load_permission`].
+    pub fn load_prompt(&self, project: &str, slug: &str) -> Result<PromptTemplate> {
+        let local = self.project_templates(project);
+        let core = self.core_templates();
+        let dir = if local.prompts.join(format!("{slug}.md")).is_file() {
+            local.prompts.as_path()
+        } else {
+            core.prompts.as_path()
+        };
+        PromptTemplate::load(dir, slug)
+    }
+
+    /// See [`Store::load_permission`].
+    pub fn load_agent(&self, project: &str, slug: &str) -> Result<AgentTemplate> {
+        let local = self.project_templates(project);
+        let core = self.core_templates();
+        let dir = if local.agents.join(format!("{slug}.md")).is_file() {
+            local.agents.as_path()
+        } else {
+            core.agents.as_path()
+        };
+        AgentTemplate::load(dir, slug)
+    }
+
+    /// All slugs that RESOLVE for a kind under a project: project
+    /// templates plus core templates (project shadows core by slug —
+    /// the union is deduped and sorted).
+    pub fn template_slugs(&self, project: &str, kind: TemplateKind) -> Vec<String> {
+        let local = self.project_templates(project);
+        let core = self.core_templates();
+        let mut slugs: Vec<String> = local.list(kind);
+        for slug in core.list(kind) {
+            if !slugs.contains(&slug) {
+                slugs.push(slug);
+            }
+        }
+        slugs.sort();
+        slugs
+    }
+}
+
+/// The project templates must actually host the project before a write.
+fn write_template_file(
+    store: &Store,
+    project: &str,
+    kind: TemplateKind,
+    slug: &str,
+    composed: &str,
+) -> Result<()> {
+    let dir = store.project_templates_dir(project).join(kind.dir_name());
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join(format!("{slug}.md")), composed)?;
+    Ok(())
+}
+
+/// The human-readable name field must not be empty.
+fn check_label(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(Error::Store("template name must not be empty".into()));
+    }
+    Ok(())
 }
 
 // -------------------------------------------------------------------------
@@ -407,7 +588,6 @@ pub fn core_agent_instances() -> BTreeMap<String, AgentInstance> {
         AgentInstance {
             template: "operator".to_string(),
             model: None,
-            budget: None,
         },
     );
     agents.insert(
@@ -415,7 +595,6 @@ pub fn core_agent_instances() -> BTreeMap<String, AgentInstance> {
         AgentInstance {
             template: "researcher".to_string(),
             model: None,
-            budget: None,
         },
     );
     agents
@@ -430,6 +609,7 @@ impl Store {
         name: &str,
         agents: BTreeMap<String, AgentInstance>,
         rev_override: Option<&str>,
+        budget: Option<&str>,
     ) -> Result<TeamSpec> {
         validate_slug(slug)?;
         // The project must exist to host the team.
@@ -444,6 +624,7 @@ impl Store {
             name: name.to_string(),
             agents,
             rev_override: rev_override.map(str::to_string),
+            budget: budget.map(str::to_string),
             corpus_generation: 0,
             created: now_epoch(),
             cloned_from: None,
@@ -707,6 +888,7 @@ impl Store {
                 DEFAULT_TEAM_SLUG,
                 DEFAULT_TEAM_SLUG,
                 core_agent_instances(),
+                None,
                 None,
             )?;
         }
@@ -1053,6 +1235,193 @@ mod tests {
     }
 
     #[test]
+    fn template_crud_validates_and_shadows() {
+        let store = tmp_store("tpl-crud");
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        let core = store.core_templates();
+        let local = store.project_templates("p");
+        // Temp stores start template-less: arrange a core pair so the
+        // project-then-core fallback is real in this test.
+        fs::create_dir_all(core.permissions.clone()).unwrap();
+        fs::create_dir_all(core.prompts.clone()).unwrap();
+        fs::write(
+            core.permissions.join("operator.md"),
+            "---\nname: operator\ndescription: core operator perm\npermission: |\n  bash: deny\n  edit: deny\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            core.permissions.join("researcher.md"),
+            "---\nname: researcher\ndescription: core researcher perm\npermission: |\n  bash: deny\n  task: deny\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            core.prompts.join("operator.md"),
+            "---\nname: operator\ndescription: core operator prompt\n---\n\nYou are the operator.\n",
+        )
+        .unwrap();
+
+        // --- permission: round-trip through compose/parse, bytes intact
+        // (YAML block-scalar chomping normalizes a trailing newline on
+        // save — semantics unaffected, so the canonical block has none)
+        let block = "bash: deny\nedit: deny\nread:\n  \"*\": deny\n  \"store/projects/*/teams/*/corpus/**\": allow";
+        let perm = PermissionTemplate {
+            name: "My perm — with punctuation".to_string(),
+            description: "desc: with colons".to_string(),
+            permission: block.to_string(),
+        };
+        store.write_permission("p", "my-perm", &perm).unwrap();
+        let loaded = store.load_permission("p", "my-perm").unwrap();
+        assert_eq!(loaded.permission, block, "block round-trips byte-identically");
+        assert_eq!(loaded.name, perm.name);
+        // the project file exists, the core set is untouched
+        assert!(local.permissions.join("my-perm.md").is_file());
+        assert!(!core.permissions.join("my-perm.md").exists());
+
+        // --- invalid permission block refused, nothing written
+        let bad = PermissionTemplate {
+            name: "Bad".to_string(),
+            description: String::new(),
+            permission: "}]] not yaml".to_string(),
+        };
+        let err = store.write_permission("p", "bad", &bad).unwrap_err();
+        assert!(err.to_string().contains("not valid YAML"), "{err}");
+        assert!(store.load_permission("p", "bad").is_err());
+        assert!(!local.permissions.join("bad.md").exists());
+
+        // --- prompt: body required (the leading separator newline is
+        // part of the body per the render convention)
+        store
+            .write_prompt(
+                "p",
+                "my-prompt",
+                &PromptTemplate {
+                    name: "My prompt".to_string(),
+                    description: String::new(),
+                    body: "You are a probe.\n".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.load_prompt("p", "my-prompt").unwrap().body,
+            "\nYou are a probe.\n"
+        );
+        let err = store
+            .write_prompt(
+                "p",
+                "empty-prompt",
+                &PromptTemplate {
+                    name: "E".to_string(),
+                    description: String::new(),
+                    body: " ".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("empty body"), "{err}");
+
+        // --- agent: refs resolve project-then-core, mode validated
+        store
+            .write_agent(
+                "p",
+                "my-agent",
+                &AgentTemplate {
+                    name: "My agent".to_string(),
+                    description: String::new(),
+                    mode: "primary".to_string(),
+                    permission_ref: "my-perm".to_string(),
+                    prompt_ref: "my-prompt".to_string(),
+                    model: Some("openrouter/x".to_string()),
+                },
+            )
+            .unwrap();
+        let agent = store.load_agent("p", "my-agent").unwrap();
+        assert_eq!(agent.permission_ref, "my-perm");
+        assert_eq!(agent.model.as_deref(), Some("openrouter/x"));
+
+        let dangling = AgentTemplate {
+            name: "D".to_string(),
+            description: String::new(),
+            mode: "primary".to_string(),
+            permission_ref: "my-perm".to_string(),
+            prompt_ref: "ghost".to_string(),
+            model: None,
+        };
+        let err = store.write_agent("p", "dangling", &dangling).unwrap_err();
+        assert!(err.to_string().contains("prompt_ref"), "{err}");
+        // a core ref resolves too (project-then-core)
+        let via_core = AgentTemplate {
+            name: "V".to_string(),
+            description: String::new(),
+            mode: "subagent".to_string(),
+            permission_ref: "operator".to_string(),
+            prompt_ref: "operator".to_string(),
+            model: None,
+        };
+        assert!(store.write_agent("p", "via-core", &via_core).is_ok());
+        let bad_mode = AgentTemplate {
+            name: "M".to_string(),
+            description: String::new(),
+            mode: "radical".to_string(),
+            permission_ref: "operator".to_string(),
+            prompt_ref: "operator".to_string(),
+            model: None,
+        };
+        let err = store.write_agent("p", "bad-mode", &bad_mode).unwrap_err();
+        assert!(err.to_string().contains("mode must be"), "{err}");
+
+        // --- shadowing by slug: project 'operator' overrides core load
+        let shadow = PermissionTemplate {
+            name: "Shadow operator".to_string(),
+            description: String::new(),
+            permission: "bash: deny\ntask: deny".to_string(),
+        };
+        store.write_permission("p", "operator", &shadow).unwrap();
+        let loaded = store.load_permission("p", "operator").unwrap();
+        assert_eq!(loaded.name, "Shadow operator", "project shadows core by slug");
+        let core_operator = PermissionTemplate::load(&core.permissions, "operator").unwrap();
+        assert_ne!(core_operator.name, "Shadow operator", "core file untouched");
+
+        // --- delete: project files removable, core-only slugs read-only
+        store.delete_template("p", TemplateKind::Permission, "my-perm").unwrap();
+        assert!(!local.permissions.join("my-perm.md").exists());
+        let err = store
+            .delete_template("p", TemplateKind::Permission, "researcher")
+            .unwrap_err();
+        assert!(err.to_string().contains("read-only"), "{err}");
+        let err = store
+            .delete_template("p", TemplateKind::Permission, "ghost")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such"), "{err}");
+
+        // --- the resolving slug list is the deduped union
+        let slugs = store.template_slugs("p", TemplateKind::Permission);
+        assert!(slugs.contains(&"my-prompt".to_string()) == false); // other kind
+        let perms = store.template_slugs("p", TemplateKind::Permission);
+        assert!(perms.contains(&"operator".to_string()), "shadowed slug once");
+        assert_eq!(
+            perms.iter().filter(|s| *s == "operator").count(),
+            1,
+            "no duplicate slugs in the union"
+        );
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn rebind_project_changes_binding() {
+        let store = tmp_store("rebind");
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        assert_eq!(Project::load(&store, "p").unwrap().plugin, "cdk-regtest");
+
+        store.rebind_project("p", "nuts-regtest").unwrap();
+        let project = Project::load(&store, "p").unwrap();
+        assert_eq!(project.plugin, "nuts-regtest");
+        let yaml = fs::read_to_string(store.project_dir("p").join("project.yaml")).unwrap();
+        assert!(yaml.contains("plugin: nuts-regtest"), "binding persisted: {yaml}");
+        // Unknown project refuses.
+        assert!(store.rebind_project("ghost", "x").is_err());
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
     fn team_roundtrip_clone_and_wipe() {
         let store = tmp_store("team");
         store.create_project("p", "P", "cdk-regtest").unwrap();
@@ -1063,9 +1432,13 @@ mod tests {
                 "Red team",
                 core_agent_instances(),
                 None,
+                Some("40m / 10k$"),
             )
             .unwrap();
         assert_eq!(team.corpus_generation, 0);
+        assert_eq!(team.budget.as_deref(), Some("40m / 10k$"), "budget is a team property");
+        let red_yaml = fs::read_to_string(store.team_dir("p", "red").join("team.yaml")).unwrap();
+        assert!(red_yaml.contains("budget: 40m / 10k$"), "budget persisted: {red_yaml}");
         write(
             &store.team_corpus_dir("p", "red").join("techniques/race.md"),
             "---\nname: race\n---\n\nbody\n",
@@ -1090,6 +1463,22 @@ mod tests {
         assert!(!store.team_corpus_dir("p", "red").join("techniques/race.md").exists());
         assert!(store.team_corpus_dir("p", "blue").join("findings/1-theft.md").is_file());
         assert_eq!(TeamSpec::load(&store, "p", "blue").unwrap().corpus_generation, 0);
+        // budget is editable via update_team and clearable
+        assert_eq!(
+            blue.budget.as_deref(),
+            Some("40m / 10k$"),
+            "clone carries the source's budget snapshot"
+        );
+        store
+            .update_team("p", "red", |spec| {
+                spec.budget = Some("30m".to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            TeamSpec::load(&store, "p", "red").unwrap().budget.as_deref(),
+            Some("30m")
+        );
         let _ = fs::remove_dir_all(store.root());
     }
 
@@ -1098,7 +1487,7 @@ mod tests {
         let store = tmp_store("promote");
         store.create_project("p", "P", "cdk-regtest").unwrap();
         store
-            .create_team("p", "t", "T", core_agent_instances(), None)
+            .create_team("p", "t", "T", core_agent_instances(), None, None)
             .unwrap();
         // internal technique promotes freely
         write(

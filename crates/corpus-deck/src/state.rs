@@ -1,0 +1,739 @@
+//! The deck's thin state layer.
+//!
+//! House rule (deck-flow-plan chunk 0): widgets never touch the filesystem
+//! or the corpus-core store API directly — every corpus-core call goes
+//! through `DeckState`, and widgets only render state and request actions.
+//! Business logic (validation, store plumbing) lives here or in corpus-core,
+//! never in a view.
+
+use std::collections::BTreeMap;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::path::PathBuf;
+
+use corpus_core::{
+    AgentInstance, AgentTemplate, Error, PermissionTemplate, PluginStatus, Project, PromptTemplate,
+    RunLine, RunSession, Store, TeamSpec, TemplateKind,
+};
+
+/// Deck-wide state: the corpus-core store handle plus the data the
+/// screens render. Owned by `App`, passed by reference to the views.
+pub struct DeckState {
+    store: Store,
+    /// All projects as `(slug, spec)`, sorted by slug (corpus-core order).
+    pub projects: Vec<(String, Project)>,
+    /// Discovered plugins with live probe results, refreshed on demand
+    /// (`refresh_plugins`) — never per-frame: probing spawns processes
+    /// on the host.
+    plugins: Vec<PluginStatus>,
+    /// Teams of `teams_project`, sorted by slug (corpus-core order).
+    pub teams: Vec<(String, TeamSpec)>,
+    /// Which project `teams` belongs to; a stale pair is never trusted.
+    pub teams_project: Option<String>,
+    /// The one active run (launch seam, chunk 5): a single session at a
+    /// time by design — the run view is a tail, not a multiplexer.
+    run: Option<RunSession>,
+    /// Identity of the active (or last-finished) run.
+    pub run_meta: Option<RunMeta>,
+    /// Transcript lines drained so far (the run view renders these).
+    pub run_lines: Vec<RunLine>,
+    /// None = still running; Some = final state (set once, at exit).
+    pub run_status: Option<RunStatus>,
+    /// The exported transcript path for a dismissed run.
+    pub export_path: Option<String>,
+    /// Live corpus tmux sessions seen at the last `refresh_live_sessions`
+    /// — the re-attach list a relaunched deck offers (chunk 7).
+    pub live_sessions: Vec<String>,
+}
+
+/// Who/what the active or last run was.
+#[derive(Debug, Clone)]
+pub struct RunMeta {
+    pub project: String,
+    pub team: String,
+    pub agent: String,
+    pub transcript: String,
+    /// The embedded-PTY attach argv captured at launch (None = piped
+    /// fallback): the pane must outlive the dropped session handle, so
+    /// attach state lives on the META, not the backend.
+    pub pty_attach: Option<Vec<String>>,
+}
+
+/// The final state of a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    /// Exited on its own with this code (piped headless only — a TUI
+    /// run never exits by itself).
+    Exited(i32),
+    /// Torn down by the operator (best-effort transcript export first).
+    Aborted,
+    /// Gracefully closed by the operator: transcript exported first.
+    Dismissed,
+}
+
+impl DeckState {
+    /// Resolve the store from the environment once; list projects.
+    pub fn from_env() -> Self {
+        let store = Store::from_env();
+        let mut deck = Self {
+            store,
+            projects: Vec::new(),
+            plugins: Vec::new(),
+            teams: Vec::new(),
+            teams_project: None,
+            run: None,
+            run_meta: None,
+            run_lines: Vec::new(),
+            run_status: None,
+            export_path: None,
+            live_sessions: Vec::new(),
+        };
+        deck.refresh();
+        deck
+    }
+
+    /// The store root this deck operates on (displayed as reassurance).
+    pub fn store_root(&self) -> String {
+        self.store.root().display().to_string()
+    }
+
+    /// Re-list the projects from the store.
+    pub fn refresh(&mut self) {
+        self.projects = self.store.list_projects().unwrap_or_default();
+    }
+
+    /// Re-probe the discovered plugins (host-side aggregation; the deck
+    /// never spawns plugins itself).
+    pub fn refresh_plugins(&mut self) {
+        self.plugins = corpus_core::plugin_status();
+    }
+
+    /// A fresh generated id, for anything the deck auto-ids (projects,
+    /// teams, template slugs).
+    pub fn fresh_id() -> String {
+        new_uuid_id()
+    }
+
+    /// The last plugin probe results (empty until `refresh_plugins`).
+    pub fn plugins(&self) -> &[PluginStatus] {
+        &self.plugins
+    }
+
+    /// Re-list a project's teams.
+    pub fn refresh_teams(&mut self, project: &str) {
+        self.teams = self.store.list_teams(project).unwrap_or_default();
+        self.teams_project = Some(project.to_string());
+    }
+
+    /// Create a project. The human gives the display name; the machine
+    /// gives the id — an auto-generated UUIDv4, which is a valid
+    /// kebab-case slug, so it slots straight into the store layout
+    /// (`store/projects/<id>/`), CLI scopes, and `CORPUS_PROJECT`.
+    pub fn create_project(&self, name: &str, plugin: &str) -> Result<(String, Project), Error> {
+        let id = new_uuid_id();
+        self.store.create_project(&id, name, plugin).map(|p| (id, p))
+    }
+
+    /// Clone a project with a fresh auto-generated id; the copied name
+    /// falls back to the source's when none is given.
+    pub fn clone_project(
+        &self,
+        from: &str,
+        name: Option<&str>,
+        with_corpus: bool,
+    ) -> Result<(String, Project), Error> {
+        let id = new_uuid_id();
+        self.store
+            .clone_project(from, &id, name, with_corpus)
+            .map(|p| (id, p))
+    }
+
+    pub fn delete_project(&self, slug: &str) -> Result<(), Error> {
+        self.store.delete_project(slug)
+    }
+
+    /// Change a project's environment plugin binding.
+    pub fn rebind_project(&self, slug: &str, plugin: &str) -> Result<Project, Error> {
+        self.store.rebind_project(slug, plugin)
+    }
+
+    // --- run launch (chunk 5) ---
+
+    /// Whether a run is currently live.
+    pub fn run_active(&self) -> bool {
+        self.run.is_some()
+    }
+
+    /// Materialize the team's agents and spawn the mission on the team
+    /// scope. One active run at a time.
+    pub fn launch(
+        &mut self,
+        project: &str,
+        team: &str,
+        agent: &str,
+        model: Option<&str>,
+        mission: &str,
+    ) -> Result<(), Error> {
+        if self.run.is_some() {
+            return Err(Error::Store(
+                "a run is already active — abort or wait for it first".into(),
+            ));
+        }
+        self.store.materialize_team_agents(project, team)?;
+        let session = RunSession::spawn(project, team, agent, model, mission)?;
+        let transcript = session.transcript.display().to_string();
+        let pty_attach = session.pty_attach_command();
+        self.run = Some(session);
+        self.run_meta = Some(RunMeta {
+            project: project.to_string(),
+            team: team.to_string(),
+            agent: agent.to_string(),
+            transcript,
+            pty_attach,
+        });
+        self.run_lines.clear();
+        self.run_status = None;
+        Ok(())
+    }
+
+    /// Drain any new transcript lines; mark the run finished the moment
+    /// it exits. Called every frame by the Launch screen.
+    pub fn poll_run(&mut self) {
+        let Some(mut session) = self.run.take() else {
+            return;
+        };
+        while let Some(line) = session.poll_line() {
+            self.run_lines.push(line);
+        }
+        if let Some(status) = session.try_exit() {
+            // An operator abort already recorded its terminal state;
+            // everything else surfaces as its exit code.
+            if self.run_status != Some(RunStatus::Aborted) {
+                self.run_status = Some(RunStatus::Exited(status.code().unwrap_or(1)));
+            }
+            return;
+        }
+        self.run = Some(session);
+    }
+
+    /// Operator-initiated tear-down: best-effort transcript export,
+    /// then kill the whole session tree. The run is immediately over.
+    pub fn abort_run(&mut self) {
+        if let Some(mut session) = self.run.take() {
+            session.abort();
+        }
+        self.run_status = Some(RunStatus::Aborted);
+    }
+
+    /// Graceful close: export the transcript of record (a TUI run's
+    /// `<epoch>-<agent>.json`), then close the run. On export failure
+    /// the run stays live so the operator can abort instead.
+    pub fn dismiss_run(&mut self) -> Result<(), Error> {
+        let Some(mut session) = self.run.take() else {
+            return Err(Error::Store("no run to dismiss".into()));
+        };
+        match session.dismiss() {
+            Ok(export) => {
+                self.export_path = Some(export.display().to_string());
+                self.run_status = Some(RunStatus::Dismissed);
+                Ok(())
+            }
+            Err(error) => {
+                self.run = Some(session);
+                Err(error)
+            }
+        }
+    }
+
+    /// The embedded-PTY attach argv of the LIVE run (chunk 7): Some for
+    /// a tmux TUI run, None for the piped fallback (or no run) — the
+    /// Launch screen then shows the transcript tail instead of the pane.
+    pub fn live_pty_attach(&self) -> Option<Vec<String>> {
+        if !self.run_active() {
+            return None;
+        }
+        self.run_meta.as_ref()?.pty_attach.clone()
+    }
+
+    /// The tmux session name embedded in a pty attach argv, if any.
+    pub fn pty_attach_session(argv: &[String]) -> Option<String> {
+        argv.windows(2)
+            .find(|w| w[0] == "-t")
+            .map(|w| w[1].clone())
+    }
+
+    /// Re-list the live corpus tmux sessions (the re-attach list shown
+    /// when the deck was relaunched over a surviving run).
+    pub fn refresh_live_sessions(&mut self) {
+        self.live_sessions = corpus_core::live_tui_sessions();
+    }
+
+    /// The attach argv for a discovered live session (re-attach after a
+    /// deck relaunch; None when tmux is gone).
+    pub fn session_attach_command(session: &str) -> Option<Vec<String>> {
+        corpus_core::tui_attach_command(session)
+    }
+
+    /// Reset the run view for a fresh launch.
+    pub fn clear_run(&mut self) {
+        self.run = None;
+        self.run_meta = None;
+        self.run_lines.clear();
+        self.run_status = None;
+        self.export_path = None;
+    }
+
+    /// The model the launch dialog pre-fills: the registry's curated
+    /// tool-use default (an explicit arg — the engine never falls back
+    /// to opencode's ambient model). None when the registry is empty.
+    pub fn suggested_model(&self) -> Option<String> {
+        let path = std::env::var("CORPUS_MODELS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("benchmarks/models.yaml"));
+        corpus_core::ModelRegistry::load(&path)
+            .ok()?
+            .launch_default()
+    }
+
+    /// Create a team with a fresh auto-generated id and the core agent
+    /// pair (operator + researcher) unless rows are given; see
+    /// [`parse_agent_rows`] — rows REPLACE the pair exactly, they never
+    /// mix with it (the phase-0 seeding rule). The execution budget is
+    /// a TEAM property here, not a per-agent one.
+    pub fn create_team(
+        &self,
+        project: &str,
+        name: &str,
+        rev: Option<&str>,
+        budget: Option<&str>,
+        rows: &[AgentRow],
+    ) -> Result<(String, TeamSpec), Error> {
+        let agents = if rows.is_empty() {
+            corpus_core::core_agent_instances()
+        } else {
+            parse_agent_rows(rows)?
+        };
+        let id = new_uuid_id();
+        self.store
+            .create_team(project, &id, name, agents, rev, budget)
+            .map(|spec| (id, spec))
+    }
+
+    /// Clone a team with a fresh auto-generated id (spec + full corpus,
+    /// generation snapshot).
+    pub fn clone_team(&self, project: &str, from: &str) -> Result<(String, TeamSpec), Error> {
+        let id = new_uuid_id();
+        self.store
+            .clone_team(project, from, &id)
+            .map(|(_slug, spec)| (id, spec))
+    }
+
+    pub fn delete_team(&self, project: &str, slug: &str) -> Result<(), Error> {
+        self.store.delete_team(project, slug)
+    }
+
+    /// Wipe a team's corpus (keeps the spec, bumps corpus_generation).
+    pub fn wipe_team_corpus(&self, project: &str, slug: &str) -> Result<TeamSpec, Error> {
+        self.store.wipe_team_corpus(project, slug)
+    }
+
+    /// Mutate a team's spec (label, rev override, agents) in one shot.
+    pub fn update_team(
+        &self,
+        project: &str,
+        slug: &str,
+        f: impl FnOnce(&mut TeamSpec) -> corpus_core::Result<()>,
+    ) -> Result<TeamSpec, Error> {
+        self.store.update_team(project, slug, f)
+    }
+
+    // --- templates (chunk 4) ---
+    /// The self-authored templates of a kind under a project, merged
+    /// with core (shadowing by slug), as the table/authors render them.
+    pub fn template_entries(&self, project: &str, kind: TemplateKind) -> Vec<TemplateEntry> {
+        self.store
+            .template_slugs(project, kind)
+            .into_iter()
+            .map(|slug| TemplateEntry::from_kind(&self.store, project, kind, &slug))
+            .collect()
+    }
+
+    pub fn load_permission(&self, project: &str, slug: &str) -> Result<PermissionTemplate, Error> {
+        self.store.load_permission(project, slug)
+    }
+
+    pub fn load_prompt(&self, project: &str, slug: &str) -> Result<PromptTemplate, Error> {
+        self.store.load_prompt(project, slug)
+    }
+
+    pub fn load_agent(&self, project: &str, slug: &str) -> Result<AgentTemplate, Error> {
+        self.store.load_agent(project, slug)
+    }
+
+    pub fn write_permission(
+        &self,
+        project: &str,
+        slug: &str,
+        template: &PermissionTemplate,
+    ) -> Result<(), Error> {
+        self.store.write_permission(project, slug, template)
+    }
+
+    pub fn write_prompt(
+        &self,
+        project: &str,
+        slug: &str,
+        template: &PromptTemplate,
+    ) -> Result<(), Error> {
+        self.store.write_prompt(project, slug, template)
+    }
+
+    pub fn write_agent(&self, project: &str, slug: &str, template: &AgentTemplate) -> Result<(), Error> {
+        self.store.write_agent(project, slug, template)
+    }
+
+    pub fn delete_template(&self, project: &str, kind: TemplateKind, slug: &str) -> Result<(), Error> {
+        self.store.delete_template(project, kind, slug)
+    }
+
+    /// Add ONE agent instance to a team from a template. The map insert
+    /// is the whole edit — nothing is re-seeded (phase-0 rule), and an
+    /// agent that is already on the team is refused, not overwritten.
+    pub fn add_agent_to_team(
+        &self,
+        project: &str,
+        team: &str,
+        name: &str,
+        template_slug: &str,
+        model: Option<&str>,
+    ) -> Result<(), Error> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::Store("agent name is required".into()));
+        }
+        if self.store.load_agent(project, template_slug).is_err() {
+            return Err(Error::Store(format!(
+                "agent template {template_slug:?} does not resolve on this project"
+            )));
+        }
+        let name_owned = name.to_string();
+        let template_owned = template_slug.to_string();
+        let model_owned = model.map(str::to_string);
+        self.store.update_team(project, team, |spec| {
+            if spec.agents.contains_key(&name_owned) {
+                return Err(Error::Store(format!("agent {name_owned} is already on this team")));
+            }
+            spec.agents.insert(
+                name_owned.clone(),
+                AgentInstance {
+                    template: template_owned.clone(),
+                    model: model_owned.clone(),
+                },
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+/// One template as the Agents screen renders it (all three kinds
+/// flattened; agent-only fields are `None` for permission/prompt rows).
+#[derive(Debug, Clone, Default)]
+pub struct TemplateEntry {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    /// True when the project tree provides this file (vs the core set).
+    pub is_project: bool,
+    /// True when a core template of the same slug is shadowed.
+    pub shadows_core: bool,
+    pub mode: Option<String>,
+    pub permission_ref: Option<String>,
+    pub prompt_ref: Option<String>,
+    pub model: Option<String>,
+}
+
+impl TemplateEntry {
+    fn from_kind(store: &corpus_core::Store, project: &str, kind: TemplateKind, slug: &str) -> Self {
+        let project_file = store.project_templates(project).has(kind, slug);
+        let shadows_core = project_file && store.core_templates().has(kind, slug);
+        let mut entry = TemplateEntry {
+            slug: slug.to_string(),
+            is_project: project_file,
+            shadows_core,
+            ..Default::default()
+        };
+        match kind {
+            TemplateKind::Permission => match store.load_permission(project, slug) {
+                Ok(template) => {
+                    entry.name = template.name;
+                    entry.description = template.description;
+                }
+                Err(error) => {
+                    entry.name = slug.to_string();
+                    entry.description = format!("<load error: {error}>");
+                }
+            },
+            TemplateKind::Prompt => match store.load_prompt(project, slug) {
+                Ok(template) => {
+                    entry.name = template.name;
+                    entry.description = template.description;
+                }
+                Err(error) => {
+                    entry.name = slug.to_string();
+                    entry.description = format!("<load error: {error}>");
+                }
+            },
+            TemplateKind::Agent => match store.load_agent(project, slug) {
+                Ok(template) => {
+                    entry.name = template.name;
+                    entry.description = template.description;
+                    entry.mode = Some(template.mode);
+                    entry.permission_ref = Some(template.permission_ref);
+                    entry.prompt_ref = Some(template.prompt_ref);
+                    entry.model = template.model;
+                }
+                Err(error) => {
+                    entry.name = slug.to_string();
+                    entry.description = format!("<load error: {error}>");
+                }
+            },
+        }
+        entry
+    }
+}
+
+/// One editable agent row in the team forms (name + template + optional
+/// model, empty model = the template default).
+#[derive(Debug, Clone, Default)]
+pub struct AgentRow {
+    pub name: String,
+    pub template: String,
+    pub model: String,
+}
+
+/// Turn form rows into the team spec's agent map. Rows are EXACT: what
+/// the user listed is what the team gets — the core pair is never
+/// silently re-seeded, and a dropped row stays dropped (phase-0 rule).
+pub fn parse_agent_rows(rows: &[AgentRow]) -> Result<BTreeMap<String, AgentInstance>, Error> {
+    let mut agents = BTreeMap::new();
+    for row in rows {
+        let name = row.name.trim();
+        let template = row.template.trim();
+        if name.is_empty() || template.is_empty() {
+            return Err(Error::Store("each agent needs a name and a template".into()));
+        }
+        let model = row.model.trim();
+        let model = if model.is_empty() { None } else { Some(model.to_string()) };
+        if agents.insert(
+            name.to_string(),
+            AgentInstance {
+                template: template.to_string(),
+                model,
+            },
+        )
+        .is_some()
+        {
+            return Err(Error::Store(format!("duplicate agent name: {name}")));
+        }
+    }
+    Ok(agents)
+}
+
+/// A fresh RFC-4122-v4-formatted id, generated without new dependencies:
+/// `RandomState` seeds each process with 128 bits of system entropy, and
+/// SipHash-128 over two fixed salts extracts two independent 64-bit
+/// values. Collision odds are the UUIDv4's own.
+fn new_uuid_id() -> String {
+    let mut bytes = uuid_bytes();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10xx
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+fn uuid_bytes() -> [u8; 16] {
+    let seeds = RandomState::new();
+    let mut low = seeds.build_hasher();
+    low.write(&[0]);
+    let mut high = seeds.build_hasher();
+    high.write(&[1]);
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&low.finish().to_le_bytes());
+    out[8..].copy_from_slice(&high.finish().to_le_bytes());
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_ids_are_formatted_uuids_and_valid_slugs() {
+        for _ in 0..100 {
+            let id = new_uuid_id();
+            assert_eq!(id.len(), 36, "{id}");
+            assert_eq!(id.bytes().filter(|b| *b == b'-').count(), 4, "{id}");
+            // A generated id must drop straight into the store layout.
+            assert!(corpus_core::validate_slug(&id).is_ok(), "{id}");
+        }
+    }
+
+    #[test]
+    fn generated_ids_differ_across_calls() {
+        let a = new_uuid_id();
+        let b = new_uuid_id();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn deck_authoring_flow_end_to_end() {
+        // The deck's own store, from the environment: author templates
+        // and attach an agent exactly like the Agents screen does.
+        let tmp = std::env::temp_dir().join(format!("corpus-deck-flow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("CORPUS_STORE", &tmp);
+        let mut deck = DeckState::from_env();
+
+        let (project, _) = deck.create_project("Flow demo", "cdk-regtest").unwrap();
+
+        // Permission editor save.
+        let perm = DeckState::fresh_id();
+        deck.write_permission(
+            &project,
+            &perm,
+            &corpus_core::PermissionTemplate {
+                name: "Flow perm".to_string(),
+                description: String::new(),
+                permission: "bash: deny\nedit: deny\n".to_string(),
+            },
+        )
+        .unwrap();
+        // Invalid permission YAML is refused at save, never written.
+        let bad = DeckState::fresh_id();
+        let err = deck
+            .write_permission(
+                &project,
+                &bad,
+                &corpus_core::PermissionTemplate {
+                    name: "Bad".to_string(),
+                    description: String::new(),
+                    permission: "}]] not yaml".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("not valid YAML"), "{err}");
+        assert!(deck.load_permission(&project, &bad).is_err(), "nothing written");
+
+        // Prompt editor save.
+        let prompt = DeckState::fresh_id();
+        deck.write_prompt(
+            &project,
+            &prompt,
+            &corpus_core::PromptTemplate {
+                name: "Flow prompt".to_string(),
+                description: String::new(),
+                body: "You audit the flow.\n".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Agent composer save (generated slug, refs resolve locally).
+        let agent = DeckState::fresh_id();
+        deck.write_agent(
+            &project,
+            &agent,
+            &corpus_core::AgentTemplate {
+                name: "Flow agent".to_string(),
+                description: String::new(),
+                mode: "primary".to_string(),
+                permission_ref: perm.clone(),
+                prompt_ref: prompt.clone(),
+                model: None,
+            },
+        )
+        .unwrap();
+
+        // The table the Agents screen renders shows it as a project row.
+        let entries = deck.template_entries(&project, TemplateKind::Agent);
+        let row = entries.iter().find(|e| e.slug == agent).expect("row present");
+        assert!(row.is_project);
+        assert_eq!(row.name, "Flow agent");
+        assert!(!row.shadows_core, "no core template named like the generated slug");
+
+        // Add the agent to a team (a team created via the Teams screen).
+        let (team, _) = deck
+            .create_team(&project, "Flow team", None, Some("40m / 10k$"), &[])
+            .unwrap();
+        // The budget is a team property, readable back from the spec.
+        let team_spec = corpus_core::TeamSpec::load(&deck.store, &project, &team).unwrap();
+        assert_eq!(team_spec.budget.as_deref(), Some("40m / 10k$"));
+        deck.add_agent_to_team(&project, &team, "auditor", &agent, None).unwrap();
+        let duplicate = deck
+            .add_agent_to_team(&project, &team, "auditor", &agent, None)
+            .unwrap_err();
+        assert!(duplicate.to_string().contains("already on this team"), "{duplicate}");
+        let spec = corpus_core::TeamSpec::load(&deck.store, &project, &team)
+            .expect("team spec loads");
+        assert_eq!(spec.agents["auditor"].template, agent);
+        assert_eq!(
+            spec.agents.len(),
+            3,
+            "core pair + the added agent — adding never reseeds or drops"
+        );
+
+        // Delete via the editors' Delete path.
+        deck.delete_template(&project, TemplateKind::Agent, &agent).unwrap();
+        assert!(
+            deck.template_entries(&project, TemplateKind::Agent)
+                .iter()
+                .all(|e| e.slug != agent)
+        );
+        drop(deck);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn agent_rows_map_exactly_what_was_listed() {
+        let agents = parse_agent_rows(&[
+            AgentRow {
+                name: "critic".into(),
+                template: "researcher".into(),
+                model: "remote".into(),
+            },
+            AgentRow {
+                name: "scout".into(),
+                template: "researcher".into(),
+                model: String::new(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents["critic"].template, "researcher");
+        assert_eq!(agents["critic"].model.as_deref(), Some("remote"));
+        assert_eq!(agents["scout"].model, None);
+        assert!(!agents.contains_key("operator"), "no silent core seeding");
+    }
+
+    #[test]
+    fn agent_rows_reject_empty_and_duplicate_names() {
+        assert!(parse_agent_rows(&[AgentRow::default()]).is_err(), "empty row refused");
+        assert!(
+            parse_agent_rows(&[AgentRow { name: "x".into(), template: String::new(), model: String::new() }])
+                .is_err(),
+            "missing template refused"
+        );
+        let dup = parse_agent_rows(&[
+            AgentRow { name: "a".into(), template: "t".into(), model: String::new() },
+            AgentRow { name: "a".into(), template: "u".into(), model: String::new() },
+        ]);
+        assert!(dup.is_err(), "duplicate name refused");
+    }
+}

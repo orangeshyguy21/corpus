@@ -1,132 +1,77 @@
 //! corpus-deck: the operator's window into the research team (egui).
 //!
-//! One window, four views: Arena, Missions, Corpus, Prompts. Milestone M0
-//! ships the scaffold + the Corpus view (store browser + markdown viewer)
-//! plus a status bar reporting environment health via `corpus-core`.
+//! Rebuilt ground-up per dev/deck-flow-plan.md: chunk 0 struck the M0
+//! views to a shell (window, left nav with one entry per planned screen
+//! — greyed until its chunk lands, central panel, toast overlay);
+//! chunks 1–4 landed Projects, Teams, and the Agent template editors;
+//! chunk 5 landed the launch seam (materialize a team's agents, spawn a
+//! run on the team scope); chunk 7 embedded the terminal (egui_term —
+//! the run pane is a tmux client, the external-terminal popup is gone).
+//! House rules: corpus-core calls live behind `DeckState` (state.rs);
+//! one module per screen; no business logic in widgets.
 
-mod mission;
-mod remote;
-mod store;
+mod nav;
+mod state;
+mod terminal;
 mod views;
 
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eframe::egui;
+use egui_toast::Toasts;
 
-use crate::store::Store;
-use crate::views::corpus;
-use crate::views::missions;
+use crate::nav::Screen;
+use crate::state::DeckState;
+use crate::views::{agents, launch, projects, teams};
 
-/// Which top-level view is showing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum View {
-    Arena,
-    Missions,
-    Corpus,
-    Prompts,
-}
-
-impl View {
-    const ALL: [View; 4] = [View::Arena, View::Missions, View::Corpus, View::Prompts];
-
-    fn label(self) -> &'static str {
-        match self {
-            View::Arena => "Arena",
-            View::Missions => "Missions",
-            View::Corpus => "Corpus",
-            View::Prompts => "Prompts",
-        }
-    }
-}
-
-/// A background environment-status report (probe + targets).
-#[derive(Debug)]
-struct EnvStatus {
-    ready: bool,
-    notes: String,
-    targets: Vec<String>,
-    plugins: usize,
-}
-
-/// corpus-deck application state.
+/// corpus-deck application state: the deck's state layer, the active
+/// screen, per-screen widget state, and the toast overlay.
 struct App {
-    store: Store,
-    view: View,
-    corpus: corpus::View,
-    missions: missions::View,
-    /// Last time `store/` was polled (1 Hz refresh).
-    last_scan: Instant,
-    /// Worker channel carrying environment status.
-    status_rx: Receiver<EnvStatus>,
-    status_tx: Sender<EnvStatus>,
-    status: Option<EnvStatus>,
-    /// Last time a probe worker was launched (re-probe cadence).
-    last_probe: Instant,
+    state: DeckState,
+    screen: Screen,
+    /// The screen shown last frame — screen-change hooks (fresh project
+    /// list before Teams/Agents render) fire on transitions only.
+    last_screen: Screen,
+    /// A screen change a view requested (Teams → Launch); applied after
+    /// the central panel.
+    pending_nav: Option<Screen>,
+    projects: projects::ProjectsView,
+    teams: teams::TeamsView,
+    agents: agents::AgentsView,
+    launch: launch::LaunchView,
+    toasts: Toasts,
 }
-
-/// Store poll cadence.
-const SCAN_INTERVAL: Duration = Duration::from_secs(1);
-/// Environment re-probe cadence: the environment changes under us (mints
-/// get restarted mid-demo); the status bar must heal like the gate does.
-const PROBE_INTERVAL: Duration = Duration::from_secs(15);
-/// UI refresh cadence: without this the store poll would be invisible —
-/// egui only repaints on input unless asked.
-const REPAINT_INTERVAL: Duration = Duration::from_millis(500);
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_style(&cc.egui_ctx);
-        let (status_tx, status_rx) = mpsc::channel();
-        let mut app = Self {
-            store: Store::scan(),
-            view: View::Corpus,
-            corpus: corpus::View::default(),
-            missions: missions::View::default(),
-            last_scan: Instant::now(),
-            status_rx,
-            status_tx,
-            status: None,
-            last_probe: Instant::now() - PROBE_INTERVAL,
-        };
-        app.start_probe();
-        app
-    }
-
-    /// Kick off a worker thread that discovers plugins and probes the
-    /// first one, reporting readiness + targets (never blocks the UI).
-    fn start_probe(&mut self) {
-        self.last_probe = Instant::now();
-        let tx = self.status_tx.clone();
-        std::thread::spawn(move || {
-            let report = probe_environment();
-            let _ = tx.send(report);
-        });
-    }
-
-    /// Poll the store and re-probe the environment on their cadences.
-    fn poll(&mut self) {
-        if self.last_scan.elapsed() >= SCAN_INTERVAL {
-            self.last_scan = Instant::now();
-            self.store = Store::scan();
-        }
-        if self.last_probe.elapsed() >= PROBE_INTERVAL {
-            self.start_probe();
-        }
-    }
-
-    fn drain_status(&mut self) {
-        while let Ok(status) = self.status_rx.try_recv() {
-            self.status = Some(status);
+        let screen = Screen::Projects;
+        Self {
+            state: DeckState::from_env(),
+            screen,
+            last_screen: screen,
+            pending_nav: None,
+            projects: projects::ProjectsView::default(),
+            teams: teams::TeamsView::default(),
+            agents: agents::AgentsView::default(),
+            launch: launch::LaunchView::default(),
+            toasts: Toasts::new(),
         }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll();
-        self.drain_status();
-
+        // Screen-change hooks.
+        if self.screen != self.last_screen {
+            self.last_screen = self.screen;
+            if self.screen == Screen::Teams || self.screen == Screen::Agents {
+                self.state.refresh();
+            }
+            if self.screen == Screen::Launch {
+                self.state.refresh_live_sessions();
+            }
+        }
         egui::TopBottomPanel::top("title_bar").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
@@ -137,92 +82,56 @@ impl eframe::App for App {
             ui.add_space(2.0);
         });
 
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                match &self.status {
-                    Some(status) => {
-                        let (color, text) = if status.ready {
-                            (egui::Color32::from_rgb(120, 200, 120), "● ready")
-                        } else {
-                            (egui::Color32::from_rgb(255, 140, 100), "● not ready")
-                        };
-                        ui.colored_label(color, text);
-                        if !status.notes.is_empty() {
-                            ui.weak(&status.notes);
-                        }
-                        ui.separator();
-                        if status.targets.is_empty() {
-                            ui.weak("no targets");
-                        } else {
-                            ui.monospace(status.targets.join("  "));
-                        }
-                        ui.separator();
-                        ui.weak(format!("{} plugins", status.plugins));
-                    }
-                    None => {
-                        ui.spinner();
-                        ui.weak("probing environment…");
-                    }
-                }
-            });
-            ui.add_space(2.0);
-        });
-
         egui::SidePanel::left("nav")
             .resizable(false)
-            .default_width(140.0)
+            .default_width(150.0)
             .show(ctx, |ui| {
                 ui.add_space(12.0);
-                for view in View::ALL {
-                    let selected = self.view == view;
-                    let button = egui::Button::new(egui::RichText::new(view.label()).size(17.0))
+                for screen in Screen::ALL {
+                    let selected = self.screen == screen;
+                    let button = egui::Button::new(egui::RichText::new(screen.label()).size(16.0))
                         .selected(selected)
-                        .min_size(egui::vec2(ui.available_width() - 8.0, 34.0));
-                    if ui.add(button).clicked() {
-                        self.view = view;
+                        .min_size(egui::vec2(ui.available_width() - 8.0, 30.0));
+                    let response = ui.add(button);
+                    if response.clicked() {
+                        self.screen = screen;
                     }
+                    response.on_hover_text(screen.note());
                     ui.add_space(4.0);
                 }
             });
 
-        // The Corpus view's tree is a real panel, not a hand-rolled
-        // split: it fills the window height by construction.
-        if self.view == View::Corpus {
-            egui::SidePanel::left("corpus_tree")
-                .resizable(true)
-                .default_width(320.0)
-                .width_range(220.0..=520.0)
-                .show(ctx, |ui| {
-                    self.corpus.show_tree(ui, &self.store);
-                });
-        }
-
-        // Missions: controls left, transcript in the central panel.
-        if self.view == View::Missions {
-            egui::SidePanel::left("missions_controls")
-                .resizable(true)
-                .default_width(300.0)
-                .width_range(240.0..=460.0)
-                .show(ctx, |ui| {
-                    self.missions.controls(ui, &self.store);
-                });
-        }
-
-        egui::CentralPanel::default().show(ctx, |ui| match self.view {
-            View::Corpus => {
-                self.corpus.show_preview(ui, &self.store);
+        egui::CentralPanel::default().show(ctx, |ui| match self.screen {
+            Screen::Projects => {
+                self.projects.show(ui, &mut self.state, &mut self.toasts);
             }
-            View::Arena => stub(ui, "Arena", "sandbox topology + agent chips (M3)"),
-            View::Missions => {
-                self.missions.transcript(ui);
+            Screen::Teams => {
+                self.teams.show(
+                    ui,
+                    &mut self.state,
+                    &mut self.toasts,
+                    &mut self.pending_nav,
+                );
             }
-            View::Prompts => stub(ui, "Prompts", "mission prompt library (M4)"),
+            Screen::Agents => {
+                self.agents.show(ui, &mut self.state, &mut self.toasts);
+            }
+            Screen::Launch => {
+                self.launch.show(ui, &mut self.state, &mut self.toasts);
+            }
         });
 
-        // Dashboard cadence: the store poll and probe re-arm need frames
-        // even when nobody is clicking.
-        ctx.request_repaint_after(REPAINT_INTERVAL);
+        // Apply a screen change a view requested (Teams -> Launch).
+        if let Some(screen) = self.pending_nav.take() {
+            self.screen = screen;
+            self.last_screen = screen; // the transition hook already ran
+        }
+
+        // Toast overlay (top-right of the whole window).
+        self.toasts.show(ctx);
+
+        // Keep the toast overlay and its timers animating between clicks.
+        ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
 
@@ -244,49 +153,6 @@ fn configure_style(ctx: &egui::Context) {
         egui::FontId::proportional(24.0),
     );
     ctx.set_style(style);
-}
-
-/// Placeholder for not-yet-implemented views.
-fn stub(ui: &mut egui::Ui, title: &str, hint: &str) {
-    ui.add_space(24.0);
-    ui.heading(title);
-    ui.add_space(8.0);
-    ui.weak(hint);
-}
-
-/// Discover plugins and probe the first one (background thread).
-fn probe_environment() -> EnvStatus {
-    use corpus_core::{discover, plugins_dir, Plugin};
-    let dir = plugins_dir();
-    let plugins = discover(&dir).unwrap_or_default();
-    let mut report = EnvStatus {
-        ready: false,
-        notes: String::new(),
-        targets: Vec::new(),
-        plugins: plugins.len(),
-    };
-    let Some(first) = plugins.first() else {
-        report.notes = format!("no plugins in {}", dir.display());
-        return report;
-    };
-    match Plugin::spawn(&first.dir) {
-        Ok(mut plugin) => {
-            match plugin.probe() {
-                Ok(result) => {
-                    report.ready = result.ready;
-                    report.notes = result.notes;
-                }
-                Err(error) => report.notes = format!("probe failed: {error}"),
-            }
-            if let Ok(targets) = plugin.targets() {
-                report.targets = targets;
-            }
-        }
-        Err(error) => {
-            report.notes = format!("spawn failed: {error}");
-        }
-    }
-    report
 }
 
 fn main() -> eframe::Result {

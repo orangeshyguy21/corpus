@@ -49,4 +49,17 @@ impl ModelRegistry {
         let registry: Self = serde_yaml::from_str(&raw)?;
         Ok(registry)
     }
+
+    /// The model the deck pre-fills for a launch: the registry's first
+    /// tool-use-capable entry (falling back to the first tracked model).
+    /// This is an EXPLICIT launch arg — it pre-fills the operator's
+    /// field, it is never an ambient fallback the engine picks.
+    pub fn launch_default(&self) -> Option<String> {
+        let entry = self
+            .models
+            .iter()
+            .find(|m| m.capabilities.iter().any(|c| c == "tool-use"))
+            .or_else(|| self.models.first())?;
+        Some(format!("{}/{}", entry.provider, entry.tag))
+    }
 }

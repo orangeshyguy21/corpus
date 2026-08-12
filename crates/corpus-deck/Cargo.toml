@@ -12,9 +12,11 @@ path = "src/main.rs"
 corpus-core = { path = "../corpus-core" }
 eframe = { workspace = true }
 egui = { workspace = true }
+# Vendored per the deck-flow-plan table: egui_extras + egui-toast at
+# chunk 1, egui_commonmark at chunk 4 (markdown preview), egui_term at
+# chunk 7 (embedded terminal — published 0.1.0 matches workspace egui
+# 0.31 exactly; no vendoring/patching needed).
 egui_commonmark = { workspace = true }
-reqwest = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_yaml = { workspace = true }
-toml = { workspace = true }
+egui_extras = "0.31"
+egui-toast = "0.17"
+egui_term = "0.1"

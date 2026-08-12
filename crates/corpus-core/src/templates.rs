@@ -1,9 +1,10 @@
 //! Core templates and the agent-file renderer.
 //!
 //! The data model splits a role into three templates — permission, prompt,
-//! and agent (`permission_ref` + `prompt_ref` + model/budget) — because
-//! roles differ only in prompt, tools, model, and budget (roadmap §2): they
-//! must be composable, not monolithic markdown.
+//! and agent (`permission_ref` + `prompt_ref` + model) — because roles
+//! differ only in prompt, tools, and model (roadmap §2): they must be
+//! composable, not monolithic markdown. Execution budget is NOT part of
+//! an agent: it lives on the TEAM (`TeamSpec::budget`), the launch unit.
 //!
 //! On second look, the model ships three template *directories* (the core
 //! set under `store/templates/`, plus per-project user/plugin sets later),
@@ -19,6 +20,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_yaml::{Mapping, Value};
 
 use crate::error::{Error, Result};
 use crate::frontmatter;
@@ -29,6 +31,34 @@ pub struct Templates {
     pub permissions: PathBuf,
     pub prompts: PathBuf,
     pub agents: PathBuf,
+}
+
+/// A template kind, coerced to its directory name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateKind {
+    Permission,
+    Prompt,
+    Agent,
+}
+
+impl TemplateKind {
+    /// The directory name for this kind.
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            TemplateKind::Permission => "permissions",
+            TemplateKind::Prompt => "prompts",
+            TemplateKind::Agent => "agents",
+        }
+    }
+
+    /// Human label for this kind.
+    pub fn label(self) -> &'static str {
+        match self {
+            TemplateKind::Permission => "permission",
+            TemplateKind::Prompt => "prompt",
+            TemplateKind::Agent => "agent",
+        }
+    }
 }
 
 impl Templates {
@@ -47,6 +77,39 @@ impl Templates {
         fs::create_dir_all(&self.prompts)?;
         fs::create_dir_all(&self.agents)?;
         Ok(())
+    }
+
+    /// The directory holding one kind's templates.
+    pub fn kind_dir(&self, kind: TemplateKind) -> PathBuf {
+        match kind {
+            TemplateKind::Permission => self.permissions.clone(),
+            TemplateKind::Prompt => self.prompts.clone(),
+            TemplateKind::Agent => self.agents.clone(),
+        }
+    }
+
+    /// Template slugs (<stem>.md files) present in this tree for a kind.
+    pub fn list(&self, kind: TemplateKind) -> Vec<String> {
+        let mut slugs = Vec::new();
+        let dir = self.kind_dir(kind);
+        let Ok(read) = fs::read_dir(&dir) else {
+            return slugs;
+        };
+        for entry in read.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    slugs.push(stem.to_string());
+                }
+            }
+        }
+        slugs.sort();
+        slugs
+    }
+
+    /// True when a slug exists in this tree for a kind.
+    pub fn has(&self, kind: TemplateKind, slug: &str) -> bool {
+        self.kind_dir(kind).join(format!("{slug}.md")).is_file()
     }
 }
 
@@ -128,7 +191,7 @@ impl PromptTemplate {
     }
 }
 
-/// An agent template: `permission_ref + prompt_ref + model + budget`.
+/// An agent template: `permission_ref + prompt_ref + model`.
 ///
 /// Rendering resolves the two refs (local templates first, core templates as
 /// fallback) and emits an opencode agent file whose frontmatter carries the
@@ -149,10 +212,10 @@ pub struct AgentTemplate {
     /// run time, so the renderer omits it.
     #[serde(default)]
     pub model: Option<String>,
-    /// Default step/time budget. Data only — opencode agents have no budget
-    /// field, so this stays out of the rendered file.
-    #[serde(default)]
-    pub budget: Option<String>,
+    // Budget deliberately does NOT live on the agent template: it is a
+    // TEAM property (`TeamSpec::budget`), because the team is the launch
+    // unit. Older template files may carry an inert `budget:` key; serde
+    // skips unknown fields, so they still parse.
 }
 
 fn default_mode() -> String {
@@ -219,6 +282,76 @@ fn resolve_prompt(local: &Templates, core: &Templates, slug: &str) -> Result<Pro
         return PromptTemplate::load(&local.prompts, slug);
     }
     PromptTemplate::load(&core.prompts, slug)
+}
+
+// -------------------------------------------------------------------------
+// Template authoring (chunk 4a): compose files, validate, resolve refs.
+// -------------------------------------------------------------------------
+
+/// Validate a permission block alone (validate-on-save and the deck
+/// editor's inline check). A permission isn't enforced until it parses.
+pub fn validate_permission_block(block: &str) -> Result<()> {
+    let _: Mapping = serde_yaml::from_str(block)
+        .map_err(|e| Error::Store(format!("permission block is not valid YAML: {e}")))?;
+    Ok(())
+}
+
+/// True when a permission ref resolves project-then-core.
+pub fn permission_resolves(local: &Templates, core: &Templates, slug: &str) -> bool {
+    local.permissions.join(format!("{slug}.md")).is_file()
+        || core.permissions.join(format!("{slug}.md")).is_file()
+}
+
+/// True when a prompt ref resolves project-then-core.
+pub fn prompt_resolves(local: &Templates, core: &Templates, slug: &str) -> bool {
+    local.prompts.join(format!("{slug}.md")).is_file()
+        || core.prompts.join(format!("{slug}.md")).is_file()
+}
+
+fn y(s: &str) -> Value {
+    Value::String(s.to_string())
+}
+
+/// Compose a permission template file: frontmatter (the `permission`
+/// block serialized as a YAML block scalar) plus a human-notes body.
+pub fn compose_permission_template(t: &PermissionTemplate) -> Result<String> {
+    let mut map = Mapping::new();
+    map.insert(y("name"), y(&t.name));
+    map.insert(y("description"), y(&t.description));
+    map.insert(y("permission"), y(&t.permission));
+    compose_frontmatter(map)
+}
+
+/// Compose a prompt template file: frontmatter + the prompt body.
+pub fn compose_prompt_template(t: &PromptTemplate) -> Result<String> {
+    let mut map = Mapping::new();
+    map.insert(y("name"), y(&t.name));
+    map.insert(y("description"), y(&t.description));
+    let fm = compose_frontmatter(map)?;
+    Ok(format!("{fm}\n{}", t.body))
+}
+
+/// Compose an agent template file: frontmatter only (a composer has no
+/// body). Empty model serializes as null and parses back to None.
+pub fn compose_agent_template(t: &AgentTemplate) -> Result<String> {
+    let mut map = Mapping::new();
+    map.insert(y("name"), y(&t.name));
+    map.insert(y("description"), y(&t.description));
+    map.insert(y("mode"), y(&t.mode));
+    map.insert(y("permission_ref"), y(&t.permission_ref));
+    map.insert(y("prompt_ref"), y(&t.prompt_ref));
+    map.insert(
+        y("model"),
+        t.model.as_deref().map(y).unwrap_or(Value::Null),
+    );
+    compose_frontmatter(map)
+}
+
+/// Serialize a frontmatter mapping into a `---`-fenced file.
+fn compose_frontmatter(map: Mapping) -> Result<String> {
+    let fm = serde_yaml::to_string(&map)
+        .map_err(|e| Error::Store(format!("cannot serialize template: {e}")))?;
+    Ok(format!("---\n{fm}---\n"))
 }
 
 /// Compose a rendered opencode agent file.

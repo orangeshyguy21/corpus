@@ -72,15 +72,31 @@ Environment is checked via `corpus plugin probe cdk-regtest`. The CLI:
 corpus plugin list
 corpus plugin probe <name>
 corpus plugin call <name> <method> [params-json]
-# Run a mission; transcript lands in the scoped corpus runs/ (default
-# project/team); --research appends a researcher curation pass
+# Run a mission; the team's agents are materialized to
+# .opencode/agent/ first (naming: <team>-<agent>.md; the default team
+# keeps bare names), then opencode runs on the CORPUS_PROJECT/TEAM
+# scope. The deck launches the FULL opencode TUI in a DETACHED tmux
+# session (corpus-<team>-<agent>-<ts>) and shows it in the EMBEDDED
+# terminal pane (egui_term; the pane runs `tmux attach` in-process —
+# no external-terminal popup): click the pane to steer, and the run
+# survives attach/detach/deck-close; a relaunched deck lists live
+# corpus-* sessions for in-pane re-attach. $corpus run$ is the HEADLESS {% 
+# opencode run$ (automation): transcript .log in the team runs/.
+# Transcript of record for TUI runs: Dismiss/abort exports the session
+# to <epoch>-<agent>.json in the team runs/; the live tail is tmux
+# pipe-pane raw capture (ANSI-stripped). The model is ALWAYS explicit
+# (agent instance -> agent template -> launch arg; the launch pre-fills
+# the registry's tool-use default; never opencode's ambient default —
+# a launch with none refuses). Without tmux (>= 3.2a) the deck degrades
+# to the piped headless spawn (no attach); CORPUS_NO_TMUX=1 forces it.
+# --research appends a researcher pass
 corpus run <agent> [-m model] [--research] <mission...>
 # Model registry
 corpus models list
 # Scoped store admin: projects, teams, templates, promotion
-corpus project list|new|clone|delete
+corpus project list|new|clone|delete|rebind <slug> --plugin <name>
 corpus team list|new|edit|clone|delete|wipe <project> ...
-corpus template list|render     # render a template to .opencode/agent/<name>.md
+corpus template list|render|delete  # list/delete resolve by slug OR frontmatter name; render to .opencode/agent/<slug>.md
 corpus promote <project> <team> <category> <entry> [--confirm]
 corpus store migrate [--dry-run]   # relocate a legacy flat store into
                                    # store/projects/<default>/corpus/ (dry-run
@@ -90,7 +106,17 @@ corpus store migrate [--dry-run]   # relocate a legacy flat store into
 The default write/read scope is project `default` / team `default`
 (`CORPUS_PROJECT`/`CORPUS_TEAM` override it). Agents write into the team
 scope via the MCP tools; entries reach the project-global corpus only via
-`corpus_promote` (embargoed findings require `--confirm`).
+`corpus_promote` (embargoed findings require `--confirm`). Launch knobs:
+`CORPUS_NO_TMUX=1` forces the piped (no-attach) run backend (the deck's
+run view then shows the transcript tail instead of the embedded pane);
+`CORPUS_TERMINAL` only shapes corpus-core's `attach_command()` helper
+(external-terminal attach, retained for CLI use — the deck never pops a
+terminal).
+
+Execution budget is a TEAM property (`--budget` on `corpus team
+new|edit`; cleared with `--budget -`), not an agent one — the team is
+the launch unit. Agent templates carry permission/prompt refs + model
+only.
 
 A fresh agent should answer "how do I run the oracle suite?" with: `corpus
 plugin probe cdk-regtest` (is the environment healthy) then via the MCP

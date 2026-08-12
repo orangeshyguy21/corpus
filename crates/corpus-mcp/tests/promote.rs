@@ -20,7 +20,7 @@ fn rig(tag: &str) -> (Ctx, Store, PathBuf) {
     let store = Store::new(root.clone());
     store.create_project("proj", "Proj", "echo-plugin").unwrap();
     store
-        .create_team("proj", "red", "Red team", core_agent_instances(), None)
+        .create_team("proj", "red", "Red team", core_agent_instances(), None, None)
         .unwrap();
     let ctx = Ctx {
         plugin: corpus_core::Plugin::spawn(&echo_plugin()).unwrap(),

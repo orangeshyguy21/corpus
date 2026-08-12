@@ -36,6 +36,7 @@ fn rig(tag: &str) -> TestRig {
             "Red team",
             core_agent_instances(),
             None,
+            None,
         )
         .expect("create team from core templates");
     let ctx = Ctx {

@@ -7,6 +7,7 @@
 
 mod error;
 pub mod frontmatter;
+pub mod launch;
 mod models;
 mod plugin;
 mod registry;
@@ -15,16 +16,20 @@ mod store;
 mod templates;
 
 pub use error::{Error, Result};
+pub use launch::{agent_file_stem, live_tui_sessions, tui_attach_command, RunLine, RunSession};
 pub use models::{ModelEntry, ModelRegistry};
 pub use plugin::{
     FaucetCall, FaucetResult, OracleInfo, OracleResult, Plugin, PluginManifest, ProbeResult,
     SandboxExecResult, SourceInfo,
 };
-pub use registry::{discover, plugins_dir, PluginDir};
+pub use registry::{discover, plugin_status, plugins_dir, PluginDir, PluginStatus};
 pub use sensitivity::Sensitivity;
 pub use store::{
     checksum, core_agent_instances, project_slug_env, store_root_env, team_slug_env, validate_slug,
     AgentInstance, MigrationReport, MigrateOptions, Project, Promoted, Scope, Store, TeamSpec,
     CATEGORIES, DEFAULT_PROJECT_SLUG, DEFAULT_TEAM_SLUG, PROJECT_ENV, STORE_ENV, TEAM_ENV,
 };
-pub use templates::{AgentTemplate, PermissionTemplate, PromptTemplate, Templates};
+pub use templates::{
+    permission_resolves, prompt_resolves, validate_permission_block, AgentTemplate,
+    PermissionTemplate, PromptTemplate, TemplateKind, Templates,
+};
