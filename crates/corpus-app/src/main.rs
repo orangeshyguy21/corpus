@@ -13,6 +13,7 @@
 //! House rules: corpus-core calls live behind `AppState` (state.rs); one
 //! module per screen; no business logic in widgets.
 
+mod chat;
 mod fmt;
 mod nav;
 mod sidebar;
@@ -26,6 +27,7 @@ use std::time::Duration;
 use eframe::egui;
 use egui_phosphor::regular as ph;
 
+use crate::chat::Chat as _;
 use crate::nav::Screen;
 use crate::sidebar::Sidebar;
 use crate::state::AppState;
@@ -44,6 +46,21 @@ struct App {
     agents: agents::AgentsView,
     missions: missions::MissionsView,
     toasts: egui_toast::Toasts,
+    /// The management chat (dev/decisions.md + dev/decisions.md): a native egui
+    /// panel backed by the EMBEDDED goose runtime (`chat/embedded.rs`). All
+    /// GDK lives in `chat`.
+    chat: chat::ChatHandle,
+    chat_panel: chat::panel::ChatPanelView,
+    /// The team role the current chat backend was launched as
+    /// (dev/decisions.md chunk 3); a change restarts the scoped session.
+    chat_role: chat::team::TeamRole,
+    /// Last operator-position context pushed to the chat backend (re-pushed
+    /// only on change).
+    last_chat_context: String,
+    /// The chat panel's current width (drag-settable, clamped 280..=half). A
+    /// panel width in app state, so the divider is sticky and never persisted
+    /// as pathologically wide by egui's own memory.
+    chat_width: f32,
 }
 
 impl App {
@@ -58,12 +75,26 @@ impl App {
             agents: agents::AgentsView::default(),
             missions: missions::MissionsView::default(),
             toasts: egui_toast::Toasts::new(),
+            chat: chat::ChatHandle::idle(""),
+            chat_panel: chat::panel::ChatPanelView::default(),
+            chat_role: chat::team::TeamRole::Orchestrator,
+            last_chat_context: String::new(),
+            chat_width: 360.0,
             state,
         }
     }
 }
 
 impl eframe::App for App {
+    /// Don't persist egui's GUI memory (window positions AND **panel widths**)
+    /// to disk. Persisted `PanelState` was restoring the chat panel's once-dragged
+    /// full width on every launch, so it "slid across the whole window" and
+    /// resisted being dragged back. We reset to a sane default each start; any
+    /// signed layout resets first frame.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Keep the selected project's scoped caches loaded (only hits disk
         // when the selection changed).
@@ -287,36 +318,114 @@ impl App {
             });
     }
 
-    /// The reserved (chunk 0, empty) chat panel: a header + stretchable
-    /// filler + a disabled, rounded input box. Content is UNDEFINED until
-    /// the chunk-6 definition conversation.
+    /// The management chat panel (dev/decisions.md chunk 3, native egui):
+    /// a model picker (reused from the app's model layer; Ollama group
+    /// default), a streaming markdown message view, tool-call cards, and the
+    /// confirm-token ritual as inline Approve/Reject.
     fn chat_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("chat_panel")
+        // Width policy: default ~360px, min 280px. The max clamp keeps the panel
+        // from ever being forced wider than half the window. `show` returns the
+        // panel's actual width, which we clamp and feed back as the default so
+        // dragging STICKS (and stays clamped) across frames. Disk-persistence of
+        // panel width is off (persist_egui_memory=false) so a once-dragged-wide
+        // panel cannot be restored on the next launch.
+        let half = ctx.screen_rect().width() * 0.5;
+        let max = half.max(360.0);
+        let inner = egui::SidePanel::right("chat_panel_v2")
             .resizable(true)
-            .default_width(260.0)
-            .min_width(200.0)
+            .default_width(self.chat_width)
+            .min_width(280.0)
+            .max_width(max)
             .frame(
                 egui::Frame::default()
                     .fill(theme::BG)
                     .inner_margin(egui::Margin::symmetric(12, 12)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Chat");
-                    ui.add_space(4.0);
-                    ui.colored_label(theme::TEXT_FAINT, "content pending definition");
-                });
-                ui.separator();
-                ui.add_space(10.0);
-                // Stretch filler; the input box sits at the bottom.
-                ui.add_space((ui.available_height() - 44.0).max(0.0));
-                ui.add_enabled(
-                    false,
-                    egui::TextEdit::singleline(&mut self.state.chat_draft)
-                        .hint_text("message…")
-                        .desired_width(f32::INFINITY),
-                );
+                self.chat_model_picker(ui);
+                // Drain backend events into the view, then render.
+                self.chat_panel.absorb(&self.chat);
+                self.ensure_chat_started();
+                // Juice the session with the operator's current position
+                // (re-pushed only when it changes).
+                let ctx = self.chat_context();
+                if ctx != self.last_chat_context {
+                    self.chat.set_context(&ctx);
+                    self.last_chat_context = ctx;
+                }
+                self.chat_panel.show(ui, &mut self.chat);
             });
+        // Persist the (clamped) dragged width so the divider sticks.
+        self.chat_width = inner.response.rect.width().clamp(280.0, max);
+    }
+
+    /// The chat model picker: driven by corpus-core's `ollama_models()` — the
+    /// GDK chat talks to the Ollama server DIRECTLY, so it lists what Ollama
+    /// has pulled, never opencode's catalog (missions/agents keep `model_list`).
+    /// The selected value is the bare model name (the provider is pinned to
+    /// ollama in the chat backend's GOOSE_MODEL). Never an ambient default;
+    /// with no model selected the panel refuses to start.
+    fn chat_model_picker(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("model");
+            let current = self.chat_panel.model().to_string();
+            egui::ComboBox::from_id_salt("chat_model")
+                .selected_text(if current.is_empty() { "choose…".to_string() } else { current.clone() })
+                .show_ui(ui, |ui| {
+                    if let Ok(list) = corpus_core::ollama_models() {
+                        for g in &list.groups {
+                            if !g.label.is_empty() {
+                                ui.label(egui::RichText::new(&g.label).weak().small());
+                            }
+                            for m in &g.models {
+                                let label = if m.name.is_empty() { m.model.clone() } else { m.name.clone() };
+                                if ui.selectable_label(current == m.model, &label).clicked() {
+                                    self.chat_panel.set_model(&m.model);
+                                }
+                            }
+                        }
+                    } else {
+                        ui.label("ollama not available — a model is required");
+                    }
+                });
+        });
+    }
+
+    /// The chat is ALWAYS the Orchestrator — the operator never picks a
+    /// role; delegation to scoped specialists is the orchestrator's job.
+    fn ensure_chat_started(&mut self) {
+        if self.chat_panel.model().is_empty() {
+            return; // no model -> panel stays idle (refuses to start)
+        }
+        let Some(project) = self.state.effective_project() else {
+            return;
+        };
+        let model = self.chat_panel.model().to_string();
+        let role = chat::team::TeamRole::Orchestrator;
+        let live = self.chat.project() == project
+            && self.chat_role == role
+            && self.chat.phase() != chat::ChatPhase::Idle;
+        if live {
+            return;
+        }
+        self.chat_role = role;
+        self.chat = chat::ChatHandle::start_scoped(&project, &model, role);
+    }
+
+    /// The operator-position context juiced into chat turns: where the
+    /// operator is in the app (project, screen, selected entities) so
+    /// "this agent" / "this project" resolve without a clarifying round-trip.
+    fn chat_context(&self) -> String {
+        let project = self
+            .state
+            .effective_project()
+            .unwrap_or_else(|| "none".into());
+        let agent = self.state.selected_agent.as_deref().unwrap_or("none");
+        let mission = self.state.selected_mission.as_deref().unwrap_or("none");
+        format!(
+            "project={project}; screen={:?}; selected_agent={agent}; selected_mission={mission}",
+            self.state.current_screen
+        )
     }
 }
 

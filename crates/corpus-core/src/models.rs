@@ -271,6 +271,65 @@ fn provider_label(id: &str) -> &str {
     }
 }
 
+// --- ollama_models(): the local Ollama server's installed models (GDK chat) ---
+//
+// The GDK management chat drives `goose acp` -> Ollama DIRECTLY, so its model
+// picker must enumerate `ollama list` (the actual serving set), NOT opencode's
+// models.dev catalog. Missions/agents keep opencode's catalog (`model_list`);
+// this is the chat arm's own source.
+
+/// `ollama list`, parsed into a single Ollama group. Only models the local
+/// server has pulled are selectable for the chat. Errors when `ollama` is
+/// missing or returns nothing — callers degrade to free text.
+pub fn ollama_models() -> Result<ModelList, Error> {
+    let ollama = std::env::var("OLLAMA").unwrap_or_else(|_| "ollama".to_string());
+    let output = Command::new(&ollama)
+        .arg("list")
+        .output()
+        .map_err(|e| Error::Store(format!("ollama list failed to run: {e}")))?;
+    if !output.status.success() {
+        return Err(Error::Store("ollama list reported an error".into()));
+    }
+    let names = parse_ollama_list(&String::from_utf8_lossy(&output.stdout));
+    if names.is_empty() {
+        return Err(Error::Store("ollama returned no models".into()));
+    }
+    let mut models: Vec<ModelOption> = names
+        .into_iter()
+        .map(|n| ModelOption {
+            id: format!("ollama/{n}"),
+            model: n.clone(),
+            name: n.clone(),
+        })
+        .collect();
+    models.sort_by(|a, b| a.model.cmp(&b.model));
+    Ok(ModelList {
+        groups: vec![ModelProviderGroup {
+            id: "ollama".into(),
+            label: "Ollama (local)".to_string(),
+            models,
+        }],
+    })
+}
+
+/// Parse `ollama list`'s tabular output: the first whitespace token of each
+/// non-header row is the model name (`NAME ID SIZE MODIFIED` header skipped).
+fn parse_ollama_list(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.trim_start().starts_with("NAME") {
+            continue;
+        }
+        if let Some(name) = line.split_whitespace().next() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +413,31 @@ openrouter/~anthropic/claude-fable-latest
             Some("a \"quoted\" b")
         );
         assert_eq!(parse_json_string_value(" no string here"), None);
+    }
+
+    #[test]
+    fn ollama_list_parse_takes_name_column_only() {
+        let sample = concat!(
+            "NAME                                    ID              SIZE      MODIFIED      \n",
+            "qwen3.8:27b                             0b1bb9add2f8    29 GB      2 minutes ago\n",
+            "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0    0b1bb9add2f8    29 GB      6 minutes ago \n",
+            "qwen3.6:35b                             07d35212591f    23 GB      3 months ago  \n",
+        );
+        let names = parse_ollama_list(sample);
+        assert_eq!(
+            names,
+            vec![
+                "qwen3.8:27b".to_string(),
+                "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0".to_string(),
+                "qwen3.6:35b".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ollama_group_labels_known_provider_and_keeps_ids() {
+        let list = group_models(vec![("ollama/qwen3.6:35b".to_string(), "qwen3.6:35b".to_string())]);
+        assert_eq!(list.groups[0].label, "Ollama (local)");
     }
 
     #[test]

@@ -8,9 +8,40 @@ publish = false
 name = "corpus-app"
 path = "src/main.rs"
 
+[features]
+# The embedded goose runtime backend for the management chat (dev/decisions.md).
+# Default ON for operator builds (the app's native chat); headless builds opt out
+# with `--no-default-features`, which ALSO drops the heavyweight goose dep tree
+# (goose is an `optional = true` dependency below, gated behind this feature).
+# With the feature OFF the chat backend is a no-op stub that reports a clear error.
+default = ["chat-embed"]
+chat-embed = ["dep:goose"]
+
 [dependencies]
 corpus-core = { path = "../corpus-core" }
 serde_json = { workspace = true }
+# The embedded goose runtime (dev/decisions.md). Optional + gated on
+# `chat-embed` so a headless `--no-default-features` build never compiles the
+# goose tree. All goose types are quarantined inside `src/chat/embedded.rs`;
+# the rest of the app sees only our own ChatEvent/ChatCommand/Chat types.
+goose = { workspace = true, optional = true }
+# Resolver pins for the goose git-dep's transitive ICU stack. goose's own lock
+# resolves `idna_adapter = 1.2.1` (ICU 2.1.x) because goose pins `icu_locale =
+# "=2.1.1"`; a FRESH resolve drags in `idna_adapter 1.2.2` → `icu_normalizer
+# 2.2` → `icu_collections 2.2`, which conflicts with `icu_locale =2.1.1`.
+# These exact pins force Cargo to the same ICU generation goose's lock uses.
+# Revisit on a deliberate goose bump (dev/decisions.md "bumps are events").
+idna_adapter = "=1.2.1"
+icu_normalizer = "=2.1.1"
+icu_collections = "=2.1.1"
+icu_locale = "=2.1.1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util"] }
+tokio-util = "0.7"
+anyhow = "1"
+# The chat backend runs its tokio runtime on a dedicated background thread
+# (egui is sync); futures drives the reply stream (CancellationToken from
+# tokio-util::sync is always available in 0.7, no feature gate).
+futures = "0.3"
 eframe = { workspace = true }
 egui = { workspace = true }
 # Vendored per the deck-flow-plan table: egui_extras + egui-toast at

@@ -4,6 +4,7 @@
 //! gates) that no prompt can talk its way around. Write tools land in the
 //! project corpus (the ONLY corpus scope).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use corpus_core::{FaucetCall, Plugin, ProbeResult, Scope, Store};
@@ -37,6 +38,23 @@ pub struct Ctx {
     /// When the probe last ran — re-probes while gated are rate-limited
     /// so a polling model cannot hammer docker/curl in a tight loop.
     pub last_probe: std::time::Instant,
+    /// Admin profile on: the corpus-admin tool group is exposed and the
+    /// probe-required gate is bypassed (admin is store-only, host-side).
+    pub admin: bool,
+    /// Pending destructive-op confirmations keyed by their one-shot token.
+    /// Minted by a dry-run call; consumed by the token-bearing re-call.
+    pub pending_confirms: HashMap<String, PendingConfirm>,
+}
+
+/// A pending destructive-op confirmation: a single-use, short-TTL token
+/// minted by a dry-run call and consumed by the token-bearing re-call that
+/// actually mutates the store. `key` is the token (hash of op+target+nonce).
+#[derive(Debug)]
+pub struct PendingConfirm {
+    pub op: String,
+    pub target: String,
+    /// Epoch seconds at which the token expires.
+    pub expires_at: u64,
 }
 
 /// Minimum interval between re-probes while the gate is closed.
@@ -65,6 +83,8 @@ impl Ctx {
             probe_ready: probe.ready,
             probe_notes: probe.notes,
             last_probe: std::time::Instant::now(),
+            admin: false,
+            pending_confirms: HashMap::new(),
         })
     }
 

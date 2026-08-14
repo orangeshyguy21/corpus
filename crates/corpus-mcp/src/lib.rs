@@ -5,5 +5,6 @@
 //! `Ctx` against a fixture store and echo plugin without speaking the MCP
 //! wire protocol.
 
+pub mod admin;
 pub mod error;
 pub mod tools;

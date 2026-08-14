@@ -7,17 +7,25 @@ use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
-use corpus_mcp::{error::{Error, Result}, tools, tools::Ctx};
+use corpus_mcp::{
+    admin,
+    error::{Error, Result},
+    tools, tools::Ctx,
+};
 
 fn main() {
-    if let Err(error) = serve() {
+    // `--admin` selects the corpus-admin profile: the same binary, a second
+    // trust profile. The sandbox-facing profile never enables it.
+    let admin = std::env::args().any(|a| a == "--admin");
+    if let Err(error) = serve(admin) {
         eprintln!("corpus-mcp: fatal: {error}");
         std::process::exit(1);
     }
 }
 
-fn serve() -> Result<()> {
+fn serve(admin: bool) -> Result<()> {
     let mut ctx = Ctx::from_env()?;
+    ctx.admin = admin;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 
@@ -55,12 +63,11 @@ fn serve() -> Result<()> {
                 })
             }
             "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-            "tools/list" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "tools": tools::catalog() }
-            }),
-            "tools/call" => handle_call(&mut ctx, id, &request),
+            "tools/list" => {
+                let tools = if admin { admin::catalog() } else { tools::catalog() };
+                json!({"jsonrpc": "2.0", "id": id, "result": { "tools": tools }})
+            }
+            "tools/call" => handle_call(&mut ctx, id, &request, admin),
             other => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -77,7 +84,7 @@ fn serve() -> Result<()> {
 }
 
 /// tools/call dispatch.
-fn handle_call(ctx: &mut Ctx, id: Value, request: &Value) -> Value {
+fn handle_call(ctx: &mut Ctx, id: Value, request: &Value, admin: bool) -> Value {
     let name = request
         .pointer("/params/name")
         .and_then(Value::as_str)
@@ -86,7 +93,12 @@ fn handle_call(ctx: &mut Ctx, id: Value, request: &Value) -> Value {
     let empty = json!({});
     let args = request.pointer("/params/arguments").unwrap_or(&empty);
 
-    match tools::dispatch(ctx, &name, args) {
+    let result = if admin {
+        admin::dispatch(ctx, &name, args)
+    } else {
+        tools::dispatch(ctx, &name, args)
+    };
+    match result {
         Ok(text) => json!({
             "jsonrpc": "2.0",
             "id": id,
