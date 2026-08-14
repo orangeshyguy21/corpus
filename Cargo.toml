@@ -13,6 +13,11 @@ crossterm = "0.28"
 eframe = "0.31"
 egui = "0.31"
 egui_commonmark = "0.20"
+egui_extras = "0.31"
+egui-toast = "0.17"
+egui_term = "0.1"
+egui-phosphor = "0.9"
+image = "0.25"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 
 [profile.release]

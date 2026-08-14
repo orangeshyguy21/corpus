@@ -1,117 +1,7 @@
-//! `corpus project/team/template/promote/store` admin commands: the scoped
-//! store (core templates, projects, teams, corpora) exposed headlessly.
-//! Builds directly on corpus-core's store module — the deck will ride the
-//! same API later.
+//! `corpus project/agent/mission/store` admin commands: the scoped
+//! store (projects, agents, missions, corpus) exposed headlessly.
 
-use std::collections::BTreeMap;
-
-use corpus_core::{
-    core_agent_instances, AgentInstance, AgentTemplate, Store, TeamSpec, Templates,
-};
-
-/// Parse `name=template[?model=model]` agent instantiations. Starts EMPTY —
-/// the caller decides whether the core defaults come in. This is deliberate:
-/// `team edit` must never re-seed agents the operator dropped, so the seed
-/// must not live inside the parser.
-fn parse_agent_instances(raw: &[&str]) -> Result<BTreeMap<String, AgentInstance>, String> {
-    let mut agents = BTreeMap::new();
-    for spec in raw {
-        let (name, rest) = spec.split_once('=').ok_or_else(|| {
-            format!("bad --agent {spec:?}: expected name=template[?model=model]")
-        })?;
-        if name.is_empty() {
-            return Err(format!("--agent has an empty name: {spec:?}"));
-        }
-        let (template, model) = match rest.split_once('?') {
-            Some((template, opts)) => {
-                let model = opts.strip_prefix("model=").map(str::to_string).ok_or_else(|| {
-                    format!("bad --agent {spec:?}: only ?model= is supported")
-                })?;
-                (template.to_string(), Some(model))
-            }
-            None => (rest.to_string(), None),
-        };
-        agents.insert(
-            name.to_string(),
-            AgentInstance {
-                template,
-                model,
-                budget: None,
-            },
-        );
-    }
-    Ok(agents)
-}
-
-/// The agent set for `team new`: the core pair by default, EXACTLY the
-/// explicitly-passed set when `--agent` flags are given (no silent seeding).
-fn agents_for_new(opts: &TeamOptions) -> Result<BTreeMap<String, AgentInstance>, String> {
-    if opts.agents.is_empty() {
-        Ok(core_agent_instances())
-    } else {
-        parse_agent_instances(&opts.agents.iter().map(String::as_str).collect::<Vec<_>>())
-    }
-}
-
-/// Apply `team edit` mutations to a loaded spec. Only ever touches what the
-/// flags name: `--agent` inserts/replaces exactly those agent names,
-/// `--drop-agent` removes exactly those; nothing else is re-seeded.
-fn apply_team_edits(spec: &mut TeamSpec, opts: &TeamOptions) -> Result<(), String> {
-    if let Some(name) = &opts.name {
-        spec.name = name.clone();
-    }
-    if let Some(rev) = &opts.rev {
-        if rev == "-" {
-            spec.rev_override = None;
-        } else {
-            spec.rev_override = Some(rev.clone());
-        }
-    }
-    let parsed = parse_agent_instances(&opts.agents.iter().map(String::as_str).collect::<Vec<_>>());
-    for (name, instance) in parsed? {
-        spec.agents.insert(name, instance);
-    }
-    for name in &opts.drop_agents {
-        spec.agents.remove(name);
-    }
-    Ok(())
-}
-
-#[derive(Debug, Default)]
-struct TeamOptions {
-    name: Option<String>,
-    rev: Option<String>,
-    agents: Vec<String>,
-    drop_agents: Vec<String>,
-}
-
-fn parse_team_options(args: &[String]) -> Result<TeamOptions, String> {
-    let mut opts = TeamOptions::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--name" => {
-                opts.name = Some(args.get(i + 1).ok_or("missing value after --name")?.clone());
-                i += 2;
-            }
-            "--rev" => {
-                opts.rev = Some(args.get(i + 1).ok_or("missing value after --rev")?.clone());
-                i += 2;
-            }
-            "--agent" => {
-                opts.agents.push(args.get(i + 1).ok_or("missing value after --agent")?.clone());
-                i += 2;
-            }
-            "--drop-agent" => {
-                opts.drop_agents
-                    .push(args.get(i + 1).ok_or("missing value after --drop-agent")?.clone());
-                i += 2;
-            }
-            other => return Err(format!("unknown team option: {other}")),
-        }
-    }
-    Ok(opts)
-}
+use corpus_core::{Mission, Store};
 
 /// `corpus project ...`
 pub fn project_cmd(args: &[String]) -> Result<(), String> {
@@ -120,11 +10,12 @@ pub fn project_cmd(args: &[String]) -> Result<(), String> {
         Some("list") => {
             for (slug, project) in store.list_projects().map_err(|e| e.to_string())? {
                 println!(
-                    "{:<20} {:<24} plugin={} created={}{}",
+                    "{:<20} {:<24} plugin={} created={} gen={}{}",
                     slug,
                     project.name,
                     project.plugin,
                     project.created,
+                    project.corpus_generation,
                     project
                         .cloned_from
                         .map(|f| format!(" cloned-from={f}"))
@@ -195,215 +86,206 @@ pub fn project_cmd(args: &[String]) -> Result<(), String> {
             println!("deleted project {slug}");
             Ok(())
         }
+        Some("wipe") => {
+            let slug = args.get(1).ok_or("usage: corpus project wipe <slug>")?;
+            let project = store.wipe_project_corpus(slug).map_err(|e| e.to_string())?;
+            println!(
+                "wiped project corpus {slug} (generation {})",
+                project.corpus_generation
+            );
+            Ok(())
+        }
+        Some("rebind") => {
+            let slug = args
+                .get(1)
+                .ok_or("usage: corpus project rebind <slug> --plugin <name>")?;
+            let mut plugin: Option<String> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--plugin" => {
+                        plugin = Some(args.get(i + 1).ok_or("missing value after --plugin")?.clone());
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown option: {other}")),
+                }
+            }
+            let plugin = plugin.ok_or("missing required --plugin <name>")?;
+            store.rebind_project(slug, &plugin).map_err(|e| e.to_string())?;
+            println!("rebound project {slug} -> plugin {plugin}");
+            Ok(())
+        }
         _ => Err(
-            "usage: corpus project list|new <slug>|clone <slug> --to <new>|delete <slug>"
+            "usage: corpus project list|new <slug>|clone <slug> --to <new>|delete <slug>|wipe <slug>|rebind <slug> --plugin <name>"
                 .to_string(),
         ),
     }
 }
 
-/// `corpus team ...`
-pub fn team_cmd(args: &[String]) -> Result<(), String> {
+/// `corpus agent ...`
+pub fn agent_cmd(args: &[String]) -> Result<(), String> {
     let store = Store::from_env();
     let sub = args.first().map(String::as_str).ok_or_else(|| {
-        "usage: corpus team list|new|edit|clone|delete|wipe <project> ...".to_string()
+        "usage: corpus agent list|new|clone|delete <project> ...".to_string()
     })?;
     let project = args.get(1).ok_or("missing project slug")?;
-    let team = args.get(2);
 
     match sub {
         "list" => {
-            for (slug, spec) in store.list_teams(project).map_err(|e| e.to_string())? {
+            for (slug, agent) in store.list_agents(project).map_err(|e| e.to_string())? {
                 println!(
-                    "{:<16} gen={} agents=[{}]{}",
+                    "{:<20} {:<24} created={} hash={}{}",
                     slug,
-                    spec.corpus_generation,
-                    spec.agents
-                        .iter()
-                        .map(|(name, inst)| format!("{name}:{}", inst.template))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    spec.rev_override
-                        .map(|r| format!(" rev={r}"))
+                    agent.meta.name,
+                    agent.meta.created,
+                    store.agent_config_hash(project, &slug).unwrap_or_default(),
+                    agent
+                        .meta
+                        .cloned_from
+                        .as_deref()
+                        .map(|f| format!(" cloned-from={f}"))
                         .unwrap_or_default()
                 );
             }
             Ok(())
         }
         "new" => {
-            let team = team.ok_or("usage: corpus team new <project> <slug> [--name <label>] [--rev <sha>] [--agent name=template?model=...]")?;
-            let rest: Vec<String> = args[3..].to_vec();
-            let opts = parse_team_options(&rest)?;
-            let agents = agents_for_new(&opts)?;
-            let spec = store
-                .create_team(
-                    project,
-                    team,
-                    opts.name.as_deref().unwrap_or(team),
-                    agents,
-                    opts.rev.as_deref(),
-                )
-                .map_err(|e| e.to_string())?;
-            println!(
-                "created team {project}/{team} ({} agents, generation {})",
-                spec.agents.len(),
-                spec.corpus_generation
-            );
-            Ok(())
-        }
-        "edit" => {
-            let team = team.ok_or("usage: corpus team edit <project> <team> [--name <label>] [--rev <sha|->] [--agent ...] [--drop-agent <name>]")?;
-            let rest: Vec<String> = args[3..].to_vec();
-            let opts = parse_team_options(&rest)?;
-            store
-                .update_team(project, team, |spec| {
-                    apply_team_edits(spec, &opts).map_err(|e| corpus_core::Error::Store(e))
-                })
-                .map_err(|e| e.to_string())?;
-            println!("updated team {project}/{team}");
-            Ok(())
-        }
-        "clone" => {
-            let team = team.ok_or("usage: corpus team clone <project> <team> --to <new-team>")?;
-            let to = args
-                .iter()
-                .position(|a| a == "--to")
-                .and_then(|i| args.get(i + 1))
-                .ok_or("missing --to <new-team>")?
-                .clone();
-            let (slug, spec) = store.clone_team(project, team, &to).map_err(|e| e.to_string())?;
-            println!("cloned team {project}/{team} -> {slug} (generation {})", spec.corpus_generation);
-            Ok(())
-        }
-        "delete" => {
-            let team = team.ok_or("usage: corpus team delete <project> <team>")?;
-            store.delete_team(project, team).map_err(|e| e.to_string())?;
-            println!("deleted team {project}/{team}");
-            Ok(())
-        }
-        "wipe" => {
-            let team = team.ok_or("usage: corpus team wipe <project> <team>")?;
-            let spec = store.wipe_team_corpus(project, team).map_err(|e| e.to_string())?;
-            println!(
-                "wiped team corpus {project}/{team} (generation {})",
-                spec.corpus_generation
-            );
-            Ok(())
-        }
-        _ => Err(
-            "usage: corpus team list|new|edit|clone|delete|wipe <project> [<team>] ...".to_string(),
-        ),
-    }
-}
-
-/// `corpus template ...`
-pub fn template_cmd(args: &[String]) -> Result<(), String> {
-    let store = Store::from_env();
-    let core: Templates = store.core_templates();
-    match args.first().map(String::as_str) {
-        Some("list") => {
-            let mut agents = Vec::new();
-            if core.agents.is_dir() {
-                for entry in std::fs::read_dir(&core.agents).map_err(|e| e.to_string())? {
-                    let path = entry.map_err(|e| e.to_string())?.path();
-                    if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
-                        agents.push(name.to_string());
-                    }
-                }
-            }
-            agents.sort();
-            for slug in agents {
-                match AgentTemplate::load(&core.agents, &slug) {
-                    Ok(agent) => println!(
-                        "{:<20} {:<16} permission={} prompt={}{}{}",
-                        agent.name,
-                        agent.mode,
-                        agent.permission_ref,
-                        agent.prompt_ref,
-                        agent
-                            .model
-                            .as_deref()
-                            .filter(|m| !m.is_empty())
-                            .map(|m| format!(" model={m}"))
-                            .unwrap_or_default(),
-                        agent
-                            .budget
-                            .as_deref()
-                            .filter(|b| !b.is_empty())
-                            .map(|b| format!(" budget={b}"))
-                            .unwrap_or_default()
-                    ),
-                    Err(error) => println!("{slug}: <error: {error}>"),
-                }
-            }
-            Ok(())
-        }
-        Some("render") => {
-            let slug = args.get(1).ok_or("usage: corpus template render <name> [--to <dir>]")?;
-            let mut dest: Option<String> = None;
-            let mut i = 2;
+            let slug = args.get(2).ok_or("usage: corpus agent new <project> <slug> [--seed <seed-agent>]")?;
+            let mut seed: Option<String> = None;
+            let mut i = 3;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--to" => {
-                        dest = Some(args.get(i + 1).ok_or("missing value after --to")?.clone());
+                    "--seed" => {
+                        seed = Some(args.get(i + 1).ok_or("missing value after --seed")?.clone());
                         i += 2;
                     }
                     other => return Err(format!("unknown option: {other}")),
                 }
             }
-            // Local (project) templates first, core as fallback — same rule
-            // as the renderer's own ref resolution.
-            let local = store.project_templates(&corpus_core::project_slug_env());
-            let core_templates: Templates = store.core_templates();
-            let agent = if local.agents.join(format!("{slug}.md")).is_file() {
-                AgentTemplate::load(&local.agents, slug).map_err(|e| e.to_string())?
+            if let Some(ref s) = seed {
+                store.create_agent_from_seed(project, slug, s).map_err(|e| e.to_string())?;
             } else {
-                AgentTemplate::load(&core_templates.agents, slug).map_err(|e| e.to_string())?
-            };
-            let default_dest = format!(".opencode/agent/{slug}.md");
-            let out_dir = dest.as_deref().unwrap_or(".opencode/agent");
-            let out_path = std::path::Path::new(out_dir).join(format!("{slug}.md"));
-            std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
-            let model = agent.model.as_deref();
-            agent
-                .render(&local, &core_templates, model, &out_path)
-                .map_err(|e| e.to_string())?;
-            let note = if out_path.to_string_lossy() == default_dest {
-                ""
-            } else {
-                " (not the checked-in location)"
-            };
-            println!("rendered {} -> {}{}", slug, out_path.display(), note);
+                store.create_blank_agent(project, slug).map_err(|e| e.to_string())?;
+            }
+            println!("created agent {project}/{slug}");
             Ok(())
         }
-        _ => Err("usage: corpus template list|render <name> [--to <dir>]".to_string()),
+        "clone" => {
+            let from = args.get(2).ok_or("usage: corpus agent clone <project> <from> --to <new-slug>")?;
+            let to = args
+                .iter()
+                .position(|a| a == "--to")
+                .and_then(|i| args.get(i + 1))
+                .ok_or("missing --to <new-slug>")?
+                .clone();
+            store.clone_agent(project, from, &to).map_err(|e| e.to_string())?;
+            println!("cloned agent {project}/{from} -> {to}");
+            Ok(())
+        }
+        "delete" => {
+            let slug = args.get(2).ok_or("usage: corpus agent delete <project> <slug>")?;
+            store.delete_agent(project, slug).map_err(|e| e.to_string())?;
+            println!("deleted agent {project}/{slug}");
+            Ok(())
+        }
+        _ => Err(
+            "usage: corpus agent list|new|clone|delete <project> [<slug>] ...".to_string(),
+        ),
     }
 }
 
-/// `corpus promote <project> <team> <category> <entry> [--confirm]`
-pub fn promote_cmd(args: &[String]) -> Result<(), String> {
-    let project = args.get(0).ok_or("usage: corpus promote <project> <team> <category> <entry> [--confirm]")?;
-    let team = args.get(1).ok_or("usage: corpus promote <project> <team> <category> <entry> [--confirm]")?;
-    let category = args.get(2).ok_or("missing category")?;
-    let entry = args.get(3).ok_or("missing entry")?;
-    let confirm = args.iter().any(|a| a == "--confirm");
+/// `corpus mission ...`
+pub fn mission_cmd(args: &[String]) -> Result<(), String> {
     let store = Store::from_env();
-    let promoted = store
-        .promote_entry(project, team, category, entry, confirm)
-        .map_err(|e| e.to_string())?;
-    println!(
-        "promoted {category}/{entry} -> {} (sensitivity: {}, from: {})",
-        promoted.entry.display(),
-        promoted.sensitivity.as_str(),
-        promoted.provenance
-    );
-    Ok(())
+    let sub = args.first().map(String::as_str).ok_or_else(|| {
+        "usage: corpus mission list|new|delete <project> ...".to_string()
+    })?;
+    let project = args.get(1).ok_or("missing project slug")?;
+
+    match sub {
+        "list" => {
+            for (slug, mission) in store.list_missions(project).map_err(|e| e.to_string())? {
+                println!(
+                    "{:<20} agent={} status={} budget={} created={} pins={:?}",
+                    slug,
+                    mission.agent,
+                    mission.status,
+                    mission.budget.as_deref().unwrap_or("-"),
+                    mission.created,
+                    mission.pins
+                );
+            }
+            Ok(())
+        }
+        "new" => {
+            let slug = args.get(2).ok_or("usage: corpus mission new <project> <slug> --agent <agent> [--budget <val>] [--pin <repo=rev>] <brief>")?;
+            let mut agent: Option<String> = None;
+            let mut budget: Option<String> = None;
+            let mut pins = std::collections::BTreeMap::new();
+            let mut brief_words: Vec<String> = Vec::new();
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--agent" => {
+                        agent = Some(args.get(i + 1).ok_or("missing value after --agent")?.clone());
+                        i += 2;
+                    }
+                    "--budget" => {
+                        budget = Some(args.get(i + 1).ok_or("missing value after --budget")?.clone());
+                        i += 2;
+                    }
+                    "--pin" => {
+                        let spec = args.get(i + 1).ok_or("missing value after --pin")?.clone();
+                        if let Some((repo, rev)) = spec.split_once('=') {
+                            pins.insert(repo.to_string(), rev.to_string());
+                        } else {
+                            return Err("--pin expects repo=rev".to_string());
+                        }
+                        i += 2;
+                    }
+                    word => {
+                        brief_words.push(word.to_string());
+                        i += 1;
+                    }
+                }
+            }
+            let agent = agent.ok_or("missing required --agent <agent>")?;
+            let mission = Mission {
+                agent,
+                pins,
+                budget,
+                status: "queued".to_string(),
+                created: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                name: None,
+                session: None,
+                opencode_session: None,
+            };
+            store
+                .write_mission(project, slug, &mission, &brief_words.join(" "))
+                .map_err(|e| e.to_string())?;
+            println!("created mission {project}/{slug}");
+            Ok(())
+        }
+        "delete" => {
+            let slug = args.get(2).ok_or("usage: corpus mission delete <project> <slug>")?;
+            store.delete_mission(project, slug).map_err(|e| e.to_string())?;
+            println!("deleted mission {project}/{slug}");
+            Ok(())
+        }
+        _ => Err(
+            "usage: corpus mission list|new|delete <project> [<slug>] ...".to_string(),
+        ),
+    }
 }
 
-/// `corpus store migrate [--dry-run] [--project <slug>]`
+/// `corpus store migrate [--dry-run] [--project <slug>] [--confirm]`
 pub fn store_cmd(args: &[String]) -> Result<(), String> {
     let mut project = corpus_core::DEFAULT_PROJECT_SLUG.to_string();
     let mut dry_run = false;
+    let confirm = args.iter().any(|a| a == "--confirm");
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -416,10 +298,35 @@ pub fn store_cmd(args: &[String]) -> Result<(), String> {
                 project = args.get(i + 1).ok_or("missing value after --project")?.clone();
                 i += 2;
             }
+            "--confirm" => {
+                i += 1;
+            }
             other => return Err(format!("unknown store option: {other}")),
         }
     }
     let store = Store::from_env();
+    // v2 migration: if confirm is passed, also remove legacy template
+    // directories (the old permissions/prompts tiers).
+    if confirm {
+        let tpl = store.root().join("templates");
+        for kind in ["permissions", "prompts"] {
+            let dir = tpl.join(kind);
+            if dir.is_dir() {
+                println!("removing legacy template dir {}...", dir.display());
+                std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+            }
+        }
+        // Also remove per-project template dirs if they exist.
+        if let Ok(projects) = store.list_projects() {
+            for (slug, _) in projects {
+                let pt = store.project_dir(&slug).join("templates");
+                if pt.is_dir() {
+                    let _ = std::fs::remove_dir_all(&pt);
+                    println!("removed project {slug} legacy templates");
+                }
+            }
+        }
+    }
     let report = store
         .migrate_legacy_flat_opt(&project, corpus_core::MigrateOptions { dry_run })
         .map_err(|e| e.to_string())?;
@@ -450,7 +357,6 @@ pub fn store_cmd(args: &[String]) -> Result<(), String> {
     for category in &report.removed_categories {
         println!("  removed legacy {category}/ (all entries verified)");
     }
-    println!("default team: {project}/default (backward-compat unscoped scope)");
     if report.unverified.is_empty() {
         Ok(())
     } else {
@@ -459,53 +365,5 @@ pub fn store_cmd(args: &[String]) -> Result<(), String> {
              kept in place for them",
             report.unverified.len()
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn opts_from(args: &[&str]) -> TeamOptions {
-        let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        parse_team_options(&v).expect("parse team options")
-    }
-
-    #[test]
-    fn team_new_with_explicit_agents_is_exactly_that_set() {
-        let opts = opts_from(&["--agent", "critic=researcher?model=remote", "--agent", "scout=researcher"]);
-        let agents = agents_for_new(&opts).unwrap();
-        assert_eq!(agents.len(), 2, "no silent core seeding with --agent");
-        assert_eq!(agents["critic"].template, "researcher");
-        assert_eq!(agents["critic"].model.as_deref(), Some("remote"));
-        assert!(!agents.contains_key("operator"));
-        assert!(!agents.contains_key("researcher"));
-    }
-
-    #[test]
-    fn team_new_without_flags_defaults_to_core_pair() {
-        let agents = agents_for_new(&opts_from(&[])).unwrap();
-        assert_eq!(agents.len(), 2);
-        assert!(agents.contains_key("operator"));
-        assert!(agents.contains_key("researcher"));
-    }
-
-    #[test]
-    fn edit_drop_then_add_does_not_resurrect_dropped_agents() {
-        let drop_operator = opts_from(&["--drop-agent", "operator"]);
-        let add_critic = opts_from(&["--agent", "critic=researcher"]);
-        let mut spec = TeamSpec {
-            agents: core_agent_instances(),
-            ..Default::default()
-        };
-        apply_team_edits(&mut spec, &drop_operator).unwrap();
-        assert!(!spec.agents.contains_key("operator"));
-        apply_team_edits(&mut spec, &add_critic).unwrap();
-        assert!(
-            !spec.agents.contains_key("operator"),
-            "a later --agent must not re-seed the core pair"
-        );
-        assert!(spec.agents.contains_key("critic"));
-        assert!(spec.agents.contains_key("researcher"));
     }
 }

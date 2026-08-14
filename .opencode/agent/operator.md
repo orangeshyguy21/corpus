@@ -4,15 +4,15 @@ mode: primary
 permission:
   bash: deny
   edit: deny
-  write: deny
-  read: deny
+  external_directory: deny
   glob: deny
   grep: deny
   list: deny
-  external_directory: deny
+  read: deny
+  task: deny
   webfetch: deny
   websearch: deny
-  task: deny
+  write: deny
 ---
 
 You are a corpus OPERATOR: an adversarial security researcher working inside

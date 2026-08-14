@@ -1,0 +1,30 @@
+[package]
+name = "corpus-app"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "corpus-app"
+path = "src/main.rs"
+
+[dependencies]
+corpus-core = { path = "../corpus-core" }
+serde_json = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+# Vendored per the deck-flow-plan table: egui_extras + egui-toast at
+# chunk 1, egui_commonmark at chunk 4 (markdown preview), egui_term at
+# chunk 7 (embedded terminal — published 0.1.0 matches workspace egui
+# 0.31 exactly; no vendoring/patching needed).
+egui_commonmark = { workspace = true }
+egui_extras = { workspace = true }
+egui-toast = { workspace = true }
+egui_term = { workspace = true }
+egui-phosphor.workspace = true
+image.workspace = true
+# JSON syntax highlighting in the agent editor (app-flow chunk 4): a
+# layouter maps syntect token styles onto the theme's token colours. The
+# degrade arm (plain monospace TextEdit) stays if syntect fights egui 0.31
+# — see views/json_editor.rs.
+syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes"] }

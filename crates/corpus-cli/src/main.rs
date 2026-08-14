@@ -6,42 +6,48 @@
 mod store_admin;
 mod tui;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
 
-use corpus_core::{discover, plugins_dir, ModelRegistry, Plugin, Scope, Store};
+use corpus_core::{ModelRegistry, Plugin, Scope, Store};
 
 const USAGE: &str = "\
 corpus — local-first vulnerability research platform
 
   corpus [tui]                 Launch the TUI dashboard (default)
   corpus run <agent> [-m model] [--research] <mission...>
-                               Run an opencode mission; transcript is logged
-                               to the scoped store (default project/team
-                               corpus runs/) automatically. --research
-                               follows up with a researcher curation pass.
+                               Run a mission on the CORPUS_PROJECT
+                               scope: the agent materializes to
+                               .opencode/agent/ first, the run detaches
+                               into a tmux session
+                               (corpus-<agent>-<ts>) — attach with
+                               `tmux attach -t <name>` any time. No tmux?
+                               degrades to a piped spawn (no attach).
+                               Transcript: project corpus runs/.
   corpus plugin list           List discovered environment plugins
   corpus plugin probe <name>   Probe one plugin (environment health)
   corpus plugin call <name> <method> [params-json]
                                Raw protocol call (debugging)
   corpus models list           List the model registry
-  corpus project list|new|clone|delete
+  corpus project list|new|clone|delete|wipe|rebind
                                Project CRUD (store/projects/<slug>/)
-  corpus team list|new|edit|clone|delete|wipe <project> ...
-                               Team CRUD + corpus wipe (generation counter)
-  corpus template list|render  Core/project templates + render to .opencode/agent/
-  corpus promote <project> <team> <category> <entry> [--confirm]
-                               Lift a team entry into the project corpus
-  corpus store migrate         Relocate a legacy flat store into the default
-                               project (projects/<slug>/corpus/)
+  corpus agent list|new|clone|delete <project> ...
+                               Agent CRUD (store/projects/<p>/agents/<slug>/)
+  corpus mission list|new|delete <project> ...
+                               Mission CRUD
+  corpus store migrate [--dry-run] [--project <slug>] [--confirm]
+                               Relocate a legacy flat store into the default
+                               project (projects/<slug>/corpus/).
+                               --confirm also removes legacy template dirs.
 
 Environment:
   CORPUS_PLUGINS_DIR           Plugins directory (default: ./plugins)
   CORPUS_MODELS                models.yaml path (default: ./benchmarks/models.yaml)
   CORPUS_STORE                 Store root (default: ~/Sites/corpus/store)
-  CORPUS_PROJECT, CORPUS_TEAM  Default write/promote scope (default: default/default)";
+  CORPUS_PROJECT               Default write scope (default: default)
+  CORPUS_TERMINAL              Terminal app for `attach` (default: from $TERM_PROGRAM)
+  CORPUS_NO_TMUX=1             Force the piped run backend (no detached sessions)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,9 +57,8 @@ fn main() -> ExitCode {
         Some("plugin") => plugin_cmd(&args[1..]),
         Some("models") => models_cmd(&args[1..]),
         Some("project") => store_admin::project_cmd(&args[1..]),
-        Some("team") => store_admin::team_cmd(&args[1..]),
-        Some("template") => store_admin::template_cmd(&args[1..]),
-        Some("promote") => store_admin::promote_cmd(&args[1..]),
+        Some("agent") => store_admin::agent_cmd(&args[1..]),
+        Some("mission") => store_admin::mission_cmd(&args[1..]),
         Some("store") => store_admin::store_cmd(&args[1..]),
         Some("help") | Some("--help") | Some("-h") => {
             println!("{USAGE}");
@@ -71,9 +76,10 @@ fn main() -> ExitCode {
 }
 
 /// `corpus run <agent> [-m model] [--research] <mission...>` — run an
-/// opencode mission with the transcript logged to `store/runs/`
-/// automatically. Nobody should ever `> /tmp/foo.log` a mission again:
-/// runs are corpus data, they belong in the store.
+/// opencode mission with the transcript logged to the project corpus
+/// `runs/` automatically. The agent is materialized to `.opencode/agent/`
+/// first (bare names), then opencode spawns with CORPUS_PROJECT set,
+/// so the MCP server writes into the project scope.
 fn run_cmd(args: &[String]) -> Result<(), String> {
     let mut agent: Option<String> = None;
     let mut model: Option<String> = None;
@@ -108,34 +114,35 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
 
     let store = Store::from_env();
     let scope = Scope::from_env();
-    let runs = scope.corpus_dir(&store).join("runs");
-    std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let slug: String = mission
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .take(6)
-        .collect::<Vec<_>>()
-        .join("-");
-    let log_path = runs.join(format!("{ts}-{agent}-{slug}.log"));
+    // Check the agent exists on the project.
+    if store.load_agent(&scope.project, &agent).is_err() {
+        let agents = store.list_agents(&scope.project).map_err(|e| e.to_string())?;
+        let have: Vec<String> = agents.iter().map(|(s, _)| s.clone()).collect();
+        return Err(format!(
+            "project {} has no agent named {:?} (agents: {})",
+            scope.project,
+            agent,
+            have.join(", ")
+        ));
+    }
 
-    let header = format!(
-        "# corpus run\n# agent: {agent}\n# model: {}\n# started: {ts}\n# mission: {mission}\n\n",
-        model.as_deref().unwrap_or("(default)")
-    );
-    let mut log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
-    log.write_all(header.as_bytes()).map_err(|e| e.to_string())?;
-    println!("logging to {}", log_path.display());
+    // Materialize the agent (clear + render to .opencode/agent/).
+    let written = store.render_agent(&scope.project, &agent)
+        .map_err(|e| e.to_string())?;
+    for path in &written {
+        println!("materialized {}", path.display());
+    }
 
-    let status = tee_opencode(&agent, model.as_deref(), &mission, log)?;
+    let mut session = corpus_core::RunSession::spawn_headless(
+        &scope.project,
+        &agent,
+        model.as_deref(),
+        &mission,
+    )
+    .map_err(|e| e.to_string())?;
+    println!("logging to {}", session.transcript.display());
+    let status = drain_session(&mut session)?;
     if !status.success() {
         return Err(format!("opencode exited with {status}"));
     }
@@ -143,30 +150,39 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
     if research {
         let prompt = format!(
             "Read the operator run transcript at {}. Curate and distill it \
-             into the corpus: (1) technique card(s) under store/techniques/ \
-             for every attack surface analyzed or attempted — mechanics, \
-             preconditions, the oracle that would catch it, and status \
-             (fired / analyzed-only / unresolved-lead) — citing this run \
-             log. (2) A 'failure modes' section per card citing transcript \
+             into the corpus: (1) technique card(s) under the project corpus \
+             techniques/ for every attack surface analyzed or attempted — \
+             mechanics, preconditions, the oracle that would catch it, and \
+             status (fired / analyzed-only / unresolved-lead) — citing this \
+             run log. (2) A 'failure modes' section per card citing transcript \
              moments. (3) An honest run outcome at the end of each card: \
-             completed / truncated / blocked, and why. (4) If the \
-             transcript yields a fresh lead worth attacking, write one \
-             hypothesis entry under store/hypotheses/ (target surface, \
-             rationale, suggested mission text, source citations). \
-             Remember the contamination rule: never read benchmarks/** or \
-             plugins/**.",
-            log_path.display()
+             completed / truncated / blocked, and why. (4) If the transcript \
+             yields a fresh lead worth attacking, write one hypothesis entry \
+             under the project corpus hypotheses/ (target surface, rationale, \
+             suggested mission text, source citations). Remember the \
+             contamination rule: never read benchmarks/** or plugins/**.",
+            session.transcript.display()
         );
-        println!("researching {} ...", log_path.display());
-        let status = tee_opencode("researcher", model.as_deref(), &prompt, {
-            let mut log = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&log_path)
-                .map_err(|e| e.to_string())?;
-            log.write_all(b"\n\n# --- researcher pass ---\n\n")
-                .map_err(|e| e.to_string())?;
-            log
-        })?;
+        println!("researching {} ...", session.transcript.display());
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&session.transcript)
+            .map_err(|e| e.to_string())?;
+        log.write_all(b"\n\n# --- researcher pass ---\n\n")
+            .map_err(|e| e.to_string())?;
+        drop(log);
+        // Materialize the researcher agent for the follow-up.
+        let _ = store.render_agent(&scope.project, "researcher")
+            .map_err(|e| e.to_string())?;
+        let mut session = corpus_core::RunSession::spawn_headless_append(
+            &scope.project,
+            "researcher",
+            model.as_deref(),
+            &prompt,
+            &session.transcript,
+        )
+        .map_err(|e| e.to_string())?;
+        let status = drain_session(&mut session)?;
         if !status.success() {
             return Err(format!("researcher exited with {status}"));
         }
@@ -174,63 +190,32 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Spawn `opencode run`, streaming output to both the terminal and the
-/// run log.
-fn tee_opencode(
-    agent: &str,
-    model: Option<&str>,
-    prompt: &str,
-    log: std::fs::File,
+/// Pump a session's lines to the terminal until it exits, then flush
+/// whatever the pumps still held.
+fn drain_session(
+    session: &mut corpus_core::RunSession,
 ) -> Result<std::process::ExitStatus, String> {
-    let mut command = std::process::Command::new("opencode");
-    command
-        .args(["run", "--agent", agent])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    if let Some(model) = model {
-        command.args(["-m", model]);
-    }
-    command.arg(prompt);
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("failed to spawn opencode (on PATH?): {e}"))?;
-
-    let log = Arc::new(Mutex::new(log));
-    let out = pump_lines(
-        child.stdout.take().ok_or("no stdout")?,
-        Box::new(std::io::stdout()),
-        Arc::clone(&log),
-    );
-    let err = pump_lines(
-        child.stderr.take().ok_or("no stderr")?,
-        Box::new(std::io::stderr()),
-        Arc::clone(&log),
-    );
-    let status = child.wait().map_err(|e| e.to_string())?;
-    let _ = out.join();
-    let _ = err.join();
-    Ok(status)
-}
-
-/// Pump a child output stream to both a terminal writer and the run log.
-fn pump_lines<S>(
-    stream: S,
-    mut term: Box<dyn Write + Send>,
-    log: Arc<Mutex<std::fs::File>>,
-) -> std::thread::JoinHandle<()>
-where
-    S: std::io::Read + Send + 'static,
-{
-    std::thread::spawn(move || {
-        for line in BufReader::new(stream).lines() {
-            let Ok(line) = line else { break };
-            let _ = writeln!(term, "{line}");
-            let _ = term.flush();
-            if let Ok(mut log) = log.lock() {
-                let _ = writeln!(log, "{line}");
+    loop {
+        while let Some(line) = session.poll_line() {
+            if line.stderr {
+                eprintln!("{}", line.text);
+            } else {
+                println!("{}", line.text);
             }
         }
-    })
+        if let Some(status) = session.try_exit() {
+            while let Some(line) = session.poll_line_timeout(std::time::Duration::from_millis(400))
+            {
+                if line.stderr {
+                    eprintln!("{}", line.text);
+                } else {
+                    println!("{}", line.text);
+                }
+            }
+            return Ok(status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
 }
 
 /// `corpus plugin ...` subcommands.
@@ -325,3 +310,5 @@ fn find<'a>(
         .find(|p| p.manifest.name == name)
         .ok_or_else(|| format!("plugin not found: {name}"))
 }
+
+use corpus_core::{discover, plugins_dir};
