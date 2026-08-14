@@ -1,211 +1,163 @@
-//! Missions screen: mission list + launch button reusing the existing
-//! run view. The launch dialog picks an agent + model + mission text.
+//! Mission view (mission-view-plan, "the defluff"): the embedded opencode
+//! TUI — and NOTHING else. No header, no hairline, no buttons, no status
+//! banner, no explainer text, no bottom pane row. The pane is rendered
+//! raw against the available rect (the central panel carries zero margin;
+//! frame the pane here for nothing, terminal only). Mission actions live
+//! in the sidebar mission-row menu; a mission is created AND launched by
+//! the Missions `+` in one click, landing at an empty opencode prompt.
+//!
+//! Show() = resolve selection -> consume `pending_launch` once -> poll the
+//! run -> aim the pane (see the attach precedence) -> show the pane
+//! filling the rect, or the fallback transcript tail (piped no-tmux), or a
+//! single faint centered line when idle.
 
 use std::time::Duration;
 
 use egui::{Align2, Ui};
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
-use crate::nav::Screen;
 use crate::state::AppState;
-use crate::views::model_picker::{ModelField, ModelPicker};
+use crate::terminal::TerminalPane;
+use crate::theme;
 
-const PROBE_MISSION: &str = "Probe the environment: report the plugin probe status, the sandbox targets, and the available tools. Do not attack anything; map the surfaces and cite what you observe.";
-
+/// Widget state for the Mission view: the embedded terminal and the
+/// tail-follow flag for the piped fallback. Run bookkeeping lives on
+/// `AppState` and the mission records — the view holds no launch state.
 pub struct MissionsView {
-    project: Option<String>,
-    viewed_project: Option<String>,
-    dirty: bool,
-    show_launch: bool,
-    launch_agent: Option<String>,
-    launch_model: String,
-    launch_mission: String,
-    launch_picker: ModelPicker,
+    pane: TerminalPane,
+    /// Auto-follow the tail (piped-fallback runs only).
+    follow: bool,
 }
 
 impl Default for MissionsView {
     fn default() -> Self {
         Self {
-            project: None,
-            viewed_project: None,
-            dirty: true,
-            show_launch: false,
-            launch_agent: None,
-            launch_model: String::new(),
-            launch_mission: PROBE_MISSION.to_string(),
-            launch_picker: ModelPicker::default(),
+            pane: TerminalPane::default(),
+            follow: true,
         }
     }
 }
 
 impl MissionsView {
-    pub fn show(
-        &mut self,
-        ui: &mut Ui,
-        state: &mut AppState,
-        toasts: &mut Toasts,
-        nav: &mut Option<Screen>,
-    ) {
-        let chosen = match &self.project {
-            Some(project) if state.projects.iter().any(|(slug, _)| slug == project) => {
-                project.clone()
-            }
-            _ => match state.projects.first() {
-                Some((slug, _)) => slug.clone(),
-                None => {
-                    ui.add_space(24.0);
-                    ui.weak("no projects yet — create one on the Projects screen");
-                    return;
-                }
-            },
+    pub fn show(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
+        let Some(project) = state.effective_project() else {
+            return;
         };
-        if self.project != Some(chosen.clone()) {
-            self.project = Some(chosen.clone());
-            self.dirty = true;
+        // Ensure a concrete mission selection (sidebar picks; else first).
+        let selection_stale = state
+            .selected_mission
+            .as_ref()
+            .map(|m| !state.missions.iter().any(|(s, _)| s == m))
+            .unwrap_or(true);
+        if selection_stale {
+            state.selected_mission = state.missions.first().map(|(s, _)| s.clone());
         }
-        if self.dirty {
-            self.dirty = false;
-        }
+        let Some(slug) = state.selected_mission.clone() else {
+            return;
+        };
+        let Some((_, mission)) = state.missions.iter().find(|(s, _)| s == &slug).cloned() else {
+            return;
+        };
 
-        ui.horizontal(|ui| {
-            ui.heading("Missions");
-            ui.add_space(8.0);
-            ui.label("project");
-            egui::ComboBox::from_id_salt("mission_project")
-                .selected_text(match state.projects.iter().find(|(s, _)| *s == chosen) {
-                    Some((slug, project)) => format!("{slug} — {}", project.name),
-                    None => chosen.clone(),
-                })
-                .show_ui(ui, |ui| {
-                    for (slug, project) in &state.projects {
-                        ui.selectable_value(&mut self.project, Some(slug.clone()), format!("{slug} — {p}", p = project.name));
-                    }
-                });
-        });
-        ui.add_space(4.0);
-
-        // Launch button — pick an agent and mission text.
-        ui.horizontal(|ui| {
-            if ui.button("+ New launch…").clicked() {
-                self.arm_launch(state);
-            }
-            if ui.button("Refresh").clicked() {
-                self.dirty = true;
-            }
-        });
-
-        ui.add_space(8.0);
-        ui.weak("Ad-hoc launch — pick an agent, model, and mission. Persistent mission records (corpus mission list) land with the Mission entity CRUD.");
-        ui.add_space(8.0);
-
-        self.launch_window(ui, state, toasts, &chosen, nav);
-    }
-
-    fn arm_launch(&mut self, state: &mut AppState) {
-        let project = self.project.clone().unwrap_or_default();
-        state.refresh_agents(&project);
-        self.launch_agent = state.agents.first().map(|(s, _)| s.clone());
-        self.launch_model = self
-            .launch_agent
-            .as_deref()
-            .and_then(|agent| state.agent_default_model(&project, agent))
-            .unwrap_or_default();
-        self.launch_mission = PROBE_MISSION.to_string();
-        state.ensure_models();
-        self.show_launch = !state.agents.is_empty();
-    }
-
-    fn launch_window(
-        &mut self,
-        ui: &mut Ui,
-        state: &mut AppState,
-        toasts: &mut Toasts,
-        project: &str,
-        nav: &mut Option<Screen>,
-    ) {
-        if !self.show_launch { return; }
-        let agents: Vec<String> = state.agents.iter().map(|(s, _)| s.clone()).collect();
-        let mut open = self.show_launch;
-        let mut launched = false;
-        let mut cancel = false;
-        egui::Window::new("Launch mission")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
-            .show(ui.ctx(), |ui| {
-                ui.label("Agent");
-                egui::ComboBox::from_id_salt("launch_agent")
-                    .selected_text(self.launch_agent.clone().unwrap_or_else(|| "—".to_string()))
-                    .show_ui(ui, |ui| {
-                        for name in &agents {
-                            if ui.selectable_value(&mut self.launch_agent, Some(name.clone()), name).clicked() {
-                                self.launch_model = state
-                                    .agent_default_model(project, name)
-                                    .unwrap_or_default();
-                            }
-                        }
-                    });
-                ui.label("Model (explicit — opencode's ambient default is never used)");
-                ui.horizontal(|ui| {
-                    self.launch_picker.field(
-                        ui,
-                        "launch_model",
-                        &mut self.launch_model,
-                        ModelField {
-                            models: state.models(),
-                            badges: state.benchmarked_ids(),
-                            degrade_note: state.models_error(),
-                            allow_none: false,
-                        },
-                    );
-                    if state.models_loading() { ui.spinner(); }
-                    else if ui.button("↻").on_hover_text("refresh the model list from opencode").clicked() {
-                        state.refresh_models(true);
-                    }
-                });
-                if self.launch_model.trim().is_empty() {
-                    ui.weak("no model picked — the launch will refuse until you pick one");
+        // A just-created mission launches automatically (once): a BARE TUI
+        // at an empty prompt. pending_launch is consumed even on failure.
+        if state.pending_launch.as_deref() == Some(slug.as_str()) {
+            state.pending_launch = None;
+            if !state.run_active() {
+                if let Err(error) = state.launch_mission(&project, &mission.agent, &slug) {
+                    toast(toasts, ToastKind::Error, error.to_string());
                 }
-                ui.label("Mission");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.launch_mission)
-                        .desired_rows(6)
-                        .desired_width(460.0),
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Launch").clicked() {
-                        match self.launch_agent.clone() {
-                            None => toast(toasts, ToastKind::Warning, "project has no agents to launch"),
-                            Some(agent) => {
-                                let model = if self.launch_model.trim().is_empty() { None } else { Some(self.launch_model.trim()) };
-                                let mission = self.launch_mission.clone();
-                                if model.is_none() {
-                                    toast(toasts, ToastKind::Warning,
-                                        "pick a model first — an explicit model is required \
-                                         (opencode's ambient default is never used).");
-                                } else {
-                                    match state.launch(project, &agent, model, &mission) {
-                                        Ok(()) => {
-                                            toast(toasts, ToastKind::Success, format!("launched {agent} on {project}"));
-                                            launched = true;
-                                            *nav = Some(Screen::Launch);
-                                        }
-                                        Err(error) => { toast(toasts, ToastKind::Error, error.to_string()) }
-                                    }
-                                }
-                            }
-                        }
+            }
+        }
+
+        // Drain whatever the session produced since the last frame.
+        state.poll_run();
+
+        // Attach precedence (state.rs): (1) the mission's recorded session
+        // when it's live on the tmux server, (2) the app-owned live run,
+        // (3) idle.
+        let target = if mission
+            .session
+            .as_ref()
+            .is_some_and(|s| state.live_sessions.contains(s))
+        {
+            let name = mission.session.clone().expect("checked above");
+            AppState::session_attach_command(&name).map(|argv| (name, argv))
+        } else if let Some(argv) = state.live_pty_attach() {
+            let name = AppState::pty_attach_session(&argv).unwrap_or_default();
+            Some((name, argv))
+        } else {
+            None
+        };
+        if let Err(error) = self.pane.sync_target(ui.ctx(), target) {
+            toast(toasts, ToastKind::Error, error);
+        }
+
+        if self.pane.attached().is_some() {
+            // The embedded opencode TUI, edge-to-edge.
+            self.pane.show(ui);
+        } else if state.run_active() {
+            // Piped fallback (no tmux): the bare transcript tail.
+            self.tail(ui, state);
+        } else if let Some(path) = &state.export_path {
+            // Idle with a known transcript: one faint centered line.
+            let rect = ui.max_rect();
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                format!("no live session — transcript: {path}"),
+                egui::FontId::monospace(12.0),
+                theme::TEXT_FAINT,
+            );
+        }
+        // else: nothing — an empty central column.
+
+        ui.ctx().request_repaint_after(Duration::from_millis(2500));
+    }
+
+    /// The piped no-tmux fallback transcript tail: full width, follow-tail
+    /// default on, ANSI stripped.
+    fn tail(&mut self, ui: &mut Ui, state: &mut AppState) {
+        ui.checkbox(&mut self.follow, "follow tail");
+        egui::ScrollArea::vertical()
+            .id_salt("mission_transcript")
+            .auto_shrink([false, false])
+            .stick_to_bottom(self.follow)
+            .show(ui, |ui| {
+                for line in &state.run_lines {
+                    let text = strip_ansi(&line.text);
+                    if line.stderr {
+                        ui.colored_label(theme::DANGER, text);
+                    } else {
+                        ui.monospace(text);
                     }
-                    if ui.button("Cancel").clicked() { cancel = true; }
-                });
+                }
             });
-        if cancel || !open { self.show_launch = false; }
-        if launched { self.show_launch = false; }
     }
 }
 
+/// Strip ANSI escape sequences (opencode streams colorized output).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    let b = c as u8;
+                    if (0x40..=0x7E).contains(&b) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Add a timed toast to the overlay.
 fn toast(toasts: &mut Toasts, kind: ToastKind, text: impl Into<String>) {
     toasts.add(
         Toast::new()

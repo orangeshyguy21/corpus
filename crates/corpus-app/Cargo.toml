@@ -18,6 +18,13 @@ egui = { workspace = true }
 # chunk 7 (embedded terminal — published 0.1.0 matches workspace egui
 # 0.31 exactly; no vendoring/patching needed).
 egui_commonmark = { workspace = true }
-egui_extras = "0.31"
-egui-toast = "0.17"
-egui_term = "0.1"
+egui_extras = { workspace = true }
+egui-toast = { workspace = true }
+egui_term = { workspace = true }
+egui-phosphor.workspace = true
+image.workspace = true
+# JSON syntax highlighting in the agent editor (app-flow chunk 4): a
+# layouter maps syntect token styles onto the theme's token colours. The
+# degrade arm (plain monospace TextEdit) stays if syntect fights egui 0.31
+# — see views/json_editor.rs.
+syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes"] }

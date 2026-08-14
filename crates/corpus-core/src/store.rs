@@ -169,6 +169,42 @@ impl Project {
     }
 }
 
+/// The result of a corpus walk: file count + total bytes under
+/// `store/projects/<p>/corpus/` (every file in every category, attack
+/// directories included).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CorpusStats {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// Walk a project's corpus counting files and summing their sizes. Cheap
+/// (one `read_dir` pass) — the UI calls it on selection change and manual
+/// refresh, never per-frame. Mirrors `find store/projects/<p>/corpus -type f`
+/// plus the byte total: only regular files count, directories (including
+/// attack dirs) are descended into.
+pub fn corpus_stats(store: &Store, project: &str) -> Result<CorpusStats> {
+    let root = store.project_corpus_dir(project);
+    let mut stats = CorpusStats::default();
+    if !root.is_dir() {
+        return Ok(stats);
+    }
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(meta) = fs::metadata(&path) {
+                stats.files += 1;
+                stats.bytes += meta.len();
+            }
+        }
+    }
+    Ok(stats)
+}
+
 /// A mission record (`store/projects/<p>/missions/<slug>.md`): the
 /// launch unit. Frontmatter carries the agent ref + source pins + budget +
 /// status + created; the markdown body is the mission brief.
@@ -188,6 +224,17 @@ pub struct Mission {
     /// Epoch seconds of creation.
     #[serde(default)]
     pub created: u64,
+    /// The operator-facing display name (sidebar label). Falls back to the
+    /// slug in the corpus store; the app renders `new` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The tmux session the mission's run is attached to (`corpus-<agent>-<ts>`),
+    /// when live — re-attach after an app relaunch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// The opencode session id (transcript of record) — export-on-dismiss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_session: Option<String>,
 }
 
 impl Mission {
@@ -456,6 +503,14 @@ impl Store {
         }
         fs::remove_file(path)?;
         Ok(())
+    }
+
+    /// Rewrite a mission record's frontmatter from an updated `Mission`,
+    /// preserving its brief body byte-for-byte. Used by the app to persist
+    /// run bookkeeping (session / opencode_session) and the display name.
+    pub fn update_mission(&self, project: &str, slug: &str, mission: &Mission) -> Result<()> {
+        let brief = self.mission_brief(project, slug)?;
+        self.write_mission(project, slug, mission, &brief)
     }
 }
 
@@ -737,6 +792,9 @@ mod tests {
                     budget: None,
                     status: "queued".to_string(),
                     created: 1,
+                    name: None,
+                    session: None,
+                    opencode_session: None,
                 },
                 "probe",
             )
@@ -769,6 +827,9 @@ mod tests {
                     budget: Some("40m / 10k$".to_string()),
                     status: "running".to_string(),
                     created: 42,
+                    name: None,
+                    session: None,
+                    opencode_session: None,
                 },
                 "# Probe the environment\nPlan: map surfaces.\n",
             )
@@ -791,6 +852,9 @@ mod tests {
                     budget: None,
                     status: "queued".to_string(),
                     created: 0,
+                    name: None,
+                    session: None,
+                    opencode_session: None,
                 },
                 "x",
             )
@@ -843,6 +907,29 @@ mod tests {
         // idempotent second run
         let second = store.migrate_legacy_flat(DEFAULT_PROJECT_SLUG).unwrap();
         assert_eq!(second.moved.len(), 0);
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn corpus_stats_counts_files_and_bytes() {
+        let store = tmp_store("stats");
+        seed_sample(&store);
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        assert_eq!(corpus_stats(&store, "p").unwrap(), CorpusStats::default());
+        write(&store.project_corpus_dir("p").join("findings/1.md"), "hello world\n");
+        write(&store.project_corpus_dir("p").join("techniques/quote.md"), "abcd");
+        // attack dirs are directories; their FILE contents count.
+        write(&store.project_corpus_dir("p").join("attacks/attack-a/attack.md"), "body bytes\n");
+        write(&store.project_corpus_dir("p").join("attacks/attack-a/run.sh"), "#!/bin/sh\n");
+        let stats = corpus_stats(&store, "p").unwrap();
+        assert_eq!(stats.files, 4);
+        assert_eq!(
+            stats.bytes,
+            (12 + 4 + 11 + 10) as u64,
+            "sum of exact byte lengths",
+        );
+        // a missing project corpus is empty, not an error
+        assert_eq!(corpus_stats(&store, "ghost").unwrap(), CorpusStats::default());
         let _ = fs::remove_dir_all(store.root());
     }
 

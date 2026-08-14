@@ -259,6 +259,9 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
+                name: None,
+                session: None,
+                opencode_session: None,
             };
             store
                 .write_mission(project, slug, &mission, &brief_words.join(" "))

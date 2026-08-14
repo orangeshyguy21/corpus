@@ -42,7 +42,8 @@ sources/             git-ignored fetch of pinned trees (sources/<name>/<sha>/)
 docs/                (gone — folded into dev/; see below)
 dev/                 everything uncommitted & machine-local: architecture,
                      decisions, research, alpha-1, plus ACTIVE plans
-                     (roadmap-plan, data-model-plan, app-flow-plan)
+                     (roadmap-plan, data-model-plan, app-flow-plan,
+                     app-parity-spec, mission-view-plan, gdk-chat-plan)
                      and the demo poster. Git-ignored: may be absent on
                      a fresh clone.
 .opencode/           opencode config + the role agents (operator, researcher,

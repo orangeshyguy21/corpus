@@ -1,12 +1,11 @@
-//! Projects screen (app-flow chunks 1+2): the project list as a striped
-//! table, create (display name + plugin from a dropdown over the
-//! discovered environment plugins, each with a live probe badge; the
-//! machine id is auto-generated), edit (change the plugin binding the
-//! same way), clone (with or without the shared corpus), delete (the
-//! default-project refusal surfaces as a toast).
-//!
-//! First-run detection: a store with zero projects lands on the create
-//! form — the seed of the chunk-6 onboarding wizard.
+//! Project view (app-flow chunk 3, app-parity-spec §5): the mock-faithful
+//! detail screen for the SELECTED project — header `Project: <name>` +
+//! Clone / Delete top-right + the dim `created:` stamp; a Plugin section
+//! (flat dropdown with a live probe badge, Saved via a rebind); a Corpus
+//! section (file/byte summary + an inline red Delete that wipes the corpus
+//! behind a confirm, and the painted stack-of-plates graphic); Save
+//! bottom-right. The project LIST lives in the sidebar (chunk 1), so this
+//! screen is a detail view, not a table.
 //!
 //! No business logic here: corpus-core calls go through `AppState`;
 //! results surface as toasts. Probing is a corpus-core aggregation
@@ -14,31 +13,28 @@
 
 use std::time::Duration;
 
-use egui::{Align2, Color32, RichText, Ui};
-use egui_extras::{Column, TableBuilder};
+use egui::{Align2, RichText, Ui};
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
-use corpus_core::PluginStatus;
-
+use crate::fmt::fmt_bytes;
 use crate::state::AppState;
+use crate::theme;
+use crate::views::plugin_picker::plugin_picker;
 
-/// Probe-status badge colors (green = ready, amber = not ready).
-const READY: Color32 = Color32::from_rgb(120, 200, 120);
-const NOT_READY: Color32 = Color32::from_rgb(255, 180, 90);
-
-/// Widget state for the Projects screen: the row selection plus the
-/// create/clone/edit form fields. Corpus state lives in `AppState`.
+/// Widget state for the Project view: the plugin picker in progress, the
+/// wipe confirm, and the clone dialog. The selected project itself lives on
+/// `AppState`.
 pub struct ProjectsView {
-    selected: Option<String>,
-    last_was_empty: bool,
-    show_create: bool,
-    create_name: String,
-    create_plugin: String,
+    /// The slug this view is bound to (drives `edit_plugin` re-sync on
+    /// project switch).
+    project: Option<String>,
+    /// Plugin binding being edited (Saved to rebind the project).
+    edit_plugin: String,
+    /// Open the confirm dialog before a corpus wipe.
+    confirm_wipe: bool,
     show_clone: bool,
     clone_name: String,
     clone_corpus: bool,
-    show_edit: bool,
-    edit_plugin: String,
     /// Schedule a fresh plugin probe aggregation next frame (probe state
     /// is fetched on demand, not continuously).
     needs_probe: bool,
@@ -47,16 +43,12 @@ pub struct ProjectsView {
 impl Default for ProjectsView {
     fn default() -> Self {
         Self {
-            selected: None,
-            last_was_empty: false,
-            show_create: false,
-            create_name: String::new(),
-            create_plugin: "cdk-regtest".to_string(),
+            project: None,
+            edit_plugin: String::new(),
+            confirm_wipe: false,
             show_clone: false,
             clone_name: String::new(),
             clone_corpus: false,
-            show_edit: false,
-            edit_plugin: String::new(),
             needs_probe: false,
         }
     }
@@ -64,196 +56,209 @@ impl Default for ProjectsView {
 
 impl ProjectsView {
     pub fn show(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
-        // First-run (and first-run-after-everything-deleted): land on the
-        // create form. Only on the empty -> non-empty transition, so a
-        // dismissed form stays dismissed while the store is empty.
-        let empty = state.projects.is_empty();
-        if empty && !self.last_was_empty {
-            self.show_create = true;
-            self.needs_probe = true;
+        let Some(slug) = state.effective_project() else {
+            ui.add_space(24.0);
+            ui.add(
+                egui::Label::new(RichText::new("no project selected").color(theme::TEXT_FAINT)),
+            );
+            return;
+        };
+        // Owned spec copy: no reference into `state` is held, so the view
+        // can call `&mut state` methods below (save, wipe, delete).
+        let Some(project) = state
+            .projects
+            .iter()
+            .find(|(s, _)| s == &slug)
+            .map(|(_, p)| p.clone())
+        else {
+            return;
+        };
+
+        // Sync the in-progress plugin binding when the viewed project
+        // changes (so opening a different project shows its current plugin).
+        if self.project.as_deref() != Some(slug.as_str()) {
+            self.project = Some(slug.clone());
+            self.edit_plugin = project.plugin.clone();
+            self.confirm_wipe = false;
         }
-        self.last_was_empty = empty;
-
-        ui.horizontal(|ui| {
-            ui.heading("Projects");
-            ui.add_space(8.0);
-            ui.weak(state.store_root());
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button("+ New project").clicked() {
-                self.show_create = true;
-                self.needs_probe = true;
-            }
-            let has_selection = self.selected.is_some();
-            let edit = ui
-                .add_enabled(has_selection, egui::Button::new("Edit…"))
-                .on_disabled_hover_text("select a project row first");
-            if edit.clicked() {
-                if let Some((_, project)) = state
-                    .projects
-                    .iter()
-                    .find(|(slug, _)| self.selected.as_deref() == Some(slug.as_str()))
-                {
-                    self.edit_plugin = project.plugin.clone();
-                }
-                self.show_edit = true;
-                self.needs_probe = true;
-            }
-            let clone = ui
-                .add_enabled(has_selection, egui::Button::new("Clone…"))
-                .on_disabled_hover_text("select a project row first");
-            if clone.clicked() {
-                self.clone_name.clear();
-                self.show_clone = true;
-            }
-            let delete = ui
-                .add_enabled(has_selection, egui::Button::new("Delete"))
-                .on_disabled_hover_text("select a project row first");
-            if delete.clicked() {
-                self.delete_selected(state, toasts);
-            }
-            if ui.button("Refresh").clicked() {
-                state.refresh();
-                self.needs_probe = true;
-            }
-            if let Some(slug) = &self.selected {
-                ui.separator();
-                ui.weak(format!("selected: {slug}"));
-            }
-        });
-        ui.add_space(8.0);
-
-        // Drain a requested plugin re-probe before the forms render, so a
-        // freshly opened picker shows current badges.
+        // Drain a requested plugin re-probe before the picker renders.
         if self.needs_probe {
             state.refresh_plugins();
             self.needs_probe = false;
         }
 
-        if empty {
-            ui.add_space(40.0);
-            ui.label(
-                RichText::new("No projects yet — create your first project.")
-                    .weak()
-                    .size(18.0),
-            );
-            ui.add_space(8.0);
-        }
+        // --- header (spec §5): `Project: <name>` + Delete / Clone /
+        // created stamp, then a hairline.
+        let name = if project.name.is_empty() {
+            slug.clone()
+        } else {
+            project.name.clone()
+        };
+        ui.horizontal(|ui| {
+            ui.label(theme::screen_header(format!("Project: {name}")));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::destructive_button(ui, "Delete").clicked() {
+                    self.delete_project(state, toasts, &slug);
+                }
+                if theme::house_button(ui, "Clone").clicked() {
+                    self.clone_name.clear();
+                    self.clone_corpus = false;
+                    self.show_clone = true;
+                }
+                ui.label(
+                    RichText::new(format!("created: {}", fmt_epoch(project.created)))
+                        .size(12.0)
+                        .color(theme::TEXT_FAINT),
+                );
+            });
+        });
+        theme::hairline(ui);
+        ui.add_space(24.0);
 
-        self.project_table(ui, state);
+        // --- Plugin section (spec §5): heading, then the flat field. NO
+        // helper text under it.
+        ui.label(theme::section_heading("Plugin"));
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            plugin_picker(ui, &mut self.edit_plugin, state.plugins(), &mut self.needs_probe);
+        });
+        ui.add_space(28.0);
 
-        self.create_window(ui, state, toasts);
-        self.clone_window(ui, state, toasts);
-        self.edit_window(ui, state, toasts);
-    }
-
-    /// The striped project table; clicking a row selects it.
-    fn project_table(&mut self, ui: &mut Ui, state: &mut AppState) {
-        TableBuilder::new(ui)
-            .striped(true)
-            .column(Column::auto().at_least(140.0))
-            .column(Column::remainder().at_least(120.0))
-            .column(Column::auto().at_least(110.0))
-            .column(Column::auto().at_least(150.0))
-            .column(Column::auto().at_least(90.0))
-            .header(24.0, |mut header| {
-                header.col(|ui| {
-                    ui.strong("id");
-                });
-                header.col(|ui| {
-                    ui.strong("name");
-                });
-                header.col(|ui| {
-                    ui.strong("plugin");
-                });
-                header.col(|ui| {
-                    ui.strong("created");
-                });
-                header.col(|ui| {
-                    ui.strong("cloned from");
-                });
-            })
-            .body(|mut body| {
-                let local_projects = &state.projects;
-                for (slug, project) in local_projects {
-                    let selected = self.selected.as_deref() == Some(slug.as_str());
-                    body.row(26.0, |mut row| {
-                        row.col(|ui| {
-                            if ui
-                                .selectable_label(selected, RichText::new(slug).monospace())
-                                .clicked()
-                            {
-                                self.selected = Some(slug.clone());
-                            }
-                        });
-                        row.col(|ui| {
-                            ui.label(&project.name);
-                        });
-                        row.col(|ui| {
-                            ui.monospace(&project.plugin);
-                        });
-                        row.col(|ui| {
-                            ui.weak(fmt_epoch(project.created));
-                        });
-                        row.col(|ui| {
-                            if let Some(from) = &project.cloned_from {
-                                ui.weak(from);
-                            }
-                        });
-                    });
+        // --- Corpus section (spec §5): heading, then the stats row + the
+        // inline red Delete (wipe confirm), then the stack graphic.
+        ui.label(theme::section_heading("Corpus"));
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            match state.corpus_stats() {
+                Some(stats) => {
+                    ui.label(
+                        RichText::new(format!("{} files", stats.files))
+                            .size(14.0)
+                            .strong()
+                            .color(theme::TEXT),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(fmt_bytes(stats.bytes))
+                            .size(14.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                }
+                None => {
+                    ui.label(RichText::new("corpus not computed").color(theme::TEXT_FAINT));
+                }
+            };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::destructive_button(ui, "Delete").clicked() {
+                    self.confirm_wipe = true;
                 }
             });
+        });
+        ui.add_space(8.0);
+
+        // The painted stack-of-plates graphic (decorative v1; the TODO
+        // marks the data-driven revision).
+        self.stack_graphic(ui);
+        ui.add_space(8.0);
+
+        // --- Save (rebind) bottom-right (spec §5).
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
+            if theme::house_button(ui, "Save").clicked() {
+                self.save_binding(state, toasts, &slug);
+            }
+        });
+
+        self.clone_window(ui, state, toasts, &slug);
+        self.wipe_confirm_window(ui, state, toasts, &slug);
     }
 
-    /// The create form: display name + the plugin picker (dropdown over
-    /// the discovered plugins with live probe badges). The machine id is
-    /// generated (state.rs) — the operator never types one.
-    fn create_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
-        let mut open = self.show_create;
-        let mut created = false;
-        egui::Window::new("New project")
+    /// Rebind the project's plugin and refresh (projects + the source/env
+    /// the top bar and sidebar derive from the new binding).
+    fn save_binding(&mut self, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
+        if self.edit_plugin.trim().is_empty() {
+            toast(toasts, ToastKind::Warning, "pick a plugin first");
+            return;
+        }
+        match state.rebind_project(slug, self.edit_plugin.trim()) {
+            Ok(project) => {
+                toast(
+                    toasts,
+                    ToastKind::Success,
+                    format!("rebound {slug} -> plugin {}", project.plugin),
+                );
+                state.refresh();
+                // Refresh the per-source pins + env for the new binding.
+                state.select_project(slug);
+            }
+            Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
+        }
+    }
+
+    /// Delete the project (header Delete); the default-project refusal
+    /// bubbles up as a toast.
+    fn delete_project(&mut self, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
+        match state.delete_project(slug) {
+            Ok(()) => {
+                toast(toasts, ToastKind::Success, format!("deleted project {slug}"));
+                state.refresh();
+                // ensure_selection re-picks a project next frame.
+                state.selected_project = None;
+            }
+            Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
+        }
+    }
+
+    /// The Corpus Delete confirm: wiping empties the categories and bumps
+    /// `corpus_generation` (verified via CLI); the project + agents survive.
+    fn wipe_confirm_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
+        if !self.confirm_wipe {
+            return;
+        }
+        let mut open = self.confirm_wipe;
+        let mut wiped = false;
+        let mut cancel = false;
+        egui::Window::new("Delete corpus")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -60.0))
             .show(ui.ctx(), |ui| {
-                ui.label("Display name (this shows in lists — the id is generated)");
-                ui.text_edit_singleline(&mut self.create_name);
-                ui.label("Environment plugin");
-                plugin_picker(ui, &mut self.create_plugin, state.plugins(), &mut self.needs_probe);
-                ui.add_space(8.0);
-                if ui.button("Create").clicked() {
-                    let name = self.create_name.trim();
-                    if name.is_empty() {
-                        toast(toasts, ToastKind::Warning, "display name is required");
-                    } else {
-                        match state.create_project(name, self.create_plugin.trim()) {
-                            Ok((id, project)) => {
+                ui.label("This wipes the project corpus and bumps the generation.");
+                ui.weak("Findings, techniques, hypotheses, attacks and run logs are removed; the project and its agents survive. There is no undo.");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if theme::destructive_button(ui, "Wipe corpus").clicked() {
+                        match state.wipe_project_corpus(slug) {
+                            Ok(project) => {
                                 toast(
                                     toasts,
                                     ToastKind::Success,
-                                    format!("created project {} ({id})", project.name),
+                                    format!(
+                                        "corpus wiped (generation {})",
+                                        project.corpus_generation
+                                    ),
                                 );
                                 state.refresh();
-                                self.create_name.clear();
-                                created = true;
+                                state.refresh_corpus_stats(slug);
+                                wiped = true;
                             }
                             Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
                         }
                     }
-                }
+                    if theme::house_button(ui, "Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
             });
-        self.show_create = open && !created;
+        self.confirm_wipe = open && !wiped && !cancel;
     }
 
-    /// The clone form: display name (falls back to the source's) plus
-    /// the copy-corpus toggle. The new id is generated, like create's.
-    fn clone_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
-        let Some(from) = self.selected.clone() else {
-            self.show_clone = false;
+    /// The Clone dialog: display name (defaults to the source's) + the
+    /// copy-corpus toggle.
+    fn clone_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts, from: &str) {
+        if !self.show_clone {
             return;
-        };
+        }
         let mut open = self.show_clone;
         let mut cloned = false;
         egui::Window::new(format!("Clone project: {from}"))
@@ -264,23 +269,19 @@ impl ProjectsView {
             .show(ui.ctx(), |ui| {
                 ui.label("Display name (optional — defaults to the source's)");
                 ui.text_edit_singleline(&mut self.clone_name);
-                ui.checkbox(&mut self.clone_corpus, "copy the shared corpus");
+                ui.checkbox(&mut self.clone_corpus, "copy the corpus");
                 ui.add_space(8.0);
-                if ui.button("Clone").clicked() {
+                if theme::house_button(ui, "Clone").clicked() {
                     let name = if self.clone_name.trim().is_empty() {
                         None
                     } else {
                         Some(self.clone_name.trim())
                     };
-                    match state.clone_project(&from, name, self.clone_corpus) {
+                    match state.clone_project(from, name, self.clone_corpus) {
                         Ok((to, _)) => {
-                            toast(
-                                toasts,
-                                ToastKind::Success,
-                                format!("cloned project {from} -> {to}"),
-                            );
+                            toast(toasts, ToastKind::Success, format!("cloned project {from} -> {to}"));
                             state.refresh();
-                            self.clone_name.clear();
+                            state.select_project(&to);
                             cloned = true;
                         }
                         Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
@@ -290,122 +291,44 @@ impl ProjectsView {
         self.show_clone = open && !cloned;
     }
 
-    /// Delete the selected project; the default-project refusal bubbles
-    /// up as an error toast (the operator never loses `default`).
-    fn delete_selected(&mut self, state: &mut AppState, toasts: &mut Toasts) {
-        let Some(slug) = self.selected.clone() else {
-            return;
-        };
-        match state.delete_project(&slug) {
-            Ok(()) => {
-                toast(toasts, ToastKind::Success, format!("deleted project {slug}"));
-                self.selected = None;
-                state.refresh();
-            }
-            Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
+    /// The decorative stack-of-plates graphic (spec §5, `paint_corpus_stack`):
+    /// N = 12 parallelograms receding up-right, drawn back-to-front; only
+    /// the front plate fills. Purely painted — no data binding.
+    /// TODO: data-driven plate count.
+    fn stack_graphic(&mut self, ui: &mut Ui) {
+        let avail = ui.available_width();
+        let size = egui::vec2(avail.min(760.0), 240.0);
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        paint_corpus_stack(&painter, rect);
+    }
+}
+
+/// The stack-of-plates painter (spec §5): plates recede up-right, stroke
+/// PLATE_LINE, the front (i = 0) plate also fills PLATE_FRONT.
+fn paint_corpus_stack(painter: &egui::Painter, rect: egui::Rect) {
+    let n = 12usize;
+    let x0 = 60.0;
+    let y0 = rect.bottom() - 60.0;
+    let stroke = egui::Stroke::new(1.0_f32, theme::PLATE_LINE);
+    for i in (0..n).rev() {
+        let ox = x0 + (i as f32) * 34.0;
+        let oy = y0 - (i as f32) * 15.0;
+        let corners = [
+            egui::pos2(ox, oy),
+            egui::pos2(ox + 300.0, oy),
+            egui::pos2(ox + 330.0, oy - 20.0),
+            egui::pos2(ox + 30.0, oy - 20.0),
+        ];
+        if i == 0 {
+            painter.add(egui::Shape::convex_polygon(
+                corners.to_vec(),
+                theme::PLATE_FRONT,
+                stroke,
+            ));
+        } else {
+            painter.add(egui::Shape::closed_line(corners.to_vec(), stroke));
         }
-    }
-
-    /// The edit form: change the selected project's plugin binding with
-    /// the same badge-carrying picker as create.
-    fn edit_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
-        let Some(slug) = self.selected.clone() else {
-            self.show_edit = false;
-            return;
-        };
-        let name = state
-            .projects
-            .iter()
-            .find(|(s, _)| *s == slug)
-            .map(|(_, p)| p.name.clone())
-            .unwrap_or_default();
-        let mut open = self.show_edit;
-        let mut rebound = false;
-        egui::Window::new(format!("Edit project: {slug}"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
-            .show(ui.ctx(), |ui| {
-                ui.label("Display name");
-                ui.weak(&name);
-                ui.label("Environment plugin");
-                plugin_picker(ui, &mut self.edit_plugin, state.plugins(), &mut self.needs_probe);
-                ui.add_space(8.0);
-                if ui.button("Save binding").clicked() {
-                    if self.edit_plugin.trim().is_empty() {
-                        toast(toasts, ToastKind::Warning, "pick a plugin first");
-                    } else {
-                        match state.rebind_project(&slug, self.edit_plugin.trim()) {
-                            Ok(project) => {
-                                toast(
-                                    toasts,
-                                    ToastKind::Success,
-                                    format!("rebound project {slug} -> plugin {}", project.plugin),
-                                );
-                                state.refresh();
-                                rebound = true;
-                            }
-                            Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
-                        }
-                    }
-                }
-            });
-        self.show_edit = open && !rebound;
-    }
-}
-
-/// The plugin dropdown with a live probe badge per entry: colored dot +
-/// name, plus the failing plugin's notes inline (real probe detail on
-/// hover). An inline Re-probe button schedules a fresh aggregation.
-fn plugin_picker(ui: &mut Ui, current: &mut String, plugins: &[PluginStatus], needs_probe: &mut bool) {
-    if plugins.is_empty() {
-        ui.horizontal(|ui| {
-            ui.weak("no plugins discovered — check CORPUS_PLUGINS_DIR");
-            if ui.small_button("Re-probe").clicked() {
-                *needs_probe = true;
-            }
-        });
-        return;
-    }
-    egui::ComboBox::from_id_salt("plugin_picker")
-        .selected_text(
-            RichText::new(format!("{}  {current}", dot_marker(current, plugins)))
-                .color(badge_color(current, plugins)),
-        )
-        .show_ui(ui, |ui| {
-            for status in plugins {
-                let color = badge_color(&status.name, plugins);
-                ui.horizontal(|ui| {
-                    ui.colored_label(color, "●");
-                    let response =
-                        ui.selectable_value(current, status.name.clone(), RichText::new(&status.name).color(color));
-                    if !status.ready && !status.notes.is_empty() {
-                        response.on_hover_text(&status.notes);
-                        let short: String = status.notes.chars().take(48).collect();
-                        ui.weak(format!("{short}"));
-                    }
-                });
-            }
-        });
-}
-
-/// The probe badge for a plugin label: ● when ready, ○ when not.
-fn dot_marker(name: &str, plugins: &[PluginStatus]) -> &'static str {
-    if plugins.iter().any(|p| p.name == name && p.ready) {
-        "●"
-    } else {
-        "○"
-    }
-}
-
-/// The badge color for a plugin: green when the live probe is ready,
-/// amber otherwise (an unknown binding counts as not ready).
-fn badge_color(name: &str, plugins: &[PluginStatus]) -> Color32 {
-    if plugins.iter().any(|p| p.name == name && p.ready) {
-        READY
-    } else {
-        NOT_READY
     }
 }
 
@@ -420,7 +343,7 @@ fn toast(toasts: &mut Toasts, kind: ToastKind, text: impl Into<String>) {
 }
 
 /// Format epoch seconds as `YYYY-MM-DD HH:MMZ` (UTC). Display-only
-/// formatting for the created column — no date dependency needed.
+/// formatting for the created stamp — no date dependency needed.
 fn fmt_epoch(epoch: u64) -> String {
     let days = (epoch / 86_400) as i64;
     let secs = epoch % 86_400;

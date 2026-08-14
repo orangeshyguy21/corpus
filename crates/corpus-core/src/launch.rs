@@ -166,16 +166,21 @@ impl RunSession {
         let script = temp.join(format!("{session}.sh"));
 
         let repo = repo_root(store);
+        let prompt = if mission.trim().is_empty() {
+            None
+        } else {
+            Some(mission)
+        };
         write_tui_script(
             &script,
             &[
                 ("CORPUS_OPENCODE_BIN", &opencode.display().to_string()),
                 ("CORPUS_OPENCODE_AGENT", &agent_stem),
                 ("CORPUS_OPENCODE_MODEL", model),
-                ("CORPUS_OPENCODE_PROMPT", mission),
                 (PROJECT_ENV, project),
                 (STORE_ENV, &store.root().to_string_lossy().into_owned()),
             ],
+            prompt,
         )?;
         let mut command = Command::new(&tmux);
         command.args(["new-session", "-d", "-s", &session]);
@@ -492,19 +497,29 @@ fn pick_model(primary: Option<&str>, arg: Option<&str>) -> Option<String> {
 /// as a shell-escaped export (single-quoted, with `'` escaping), so no
 /// mission text can break out, and there is no dependency on tmux `-e`
 /// per-session env (which a freshly-started server may drop).
-fn write_tui_script(script: &Path, params: &[(&str, &str)]) -> Result<()> {
+/// An EMPTY `prompt` spawns a bare opencode TUI (no `--prompt`), so the
+/// operator types the mission into opencode's own input.
+fn write_tui_script(script: &Path, params: &[(&str, &str)], prompt: Option<&str>) -> Result<()> {
     let mut out = String::from("#!/bin/sh\n");
     for (key, value) in params {
         out.push_str(&format!("export {key}={}\n", shell_quote(value)));
     }
-    out.push_str(
-        "exec \"$CORPUS_OPENCODE_BIN\" --agent \"$CORPUS_OPENCODE_AGENT\" --model \"$CORPUS_OPENCODE_MODEL\" --prompt \"$CORPUS_OPENCODE_PROMPT\"\n",
-    );
+    let exec = match prompt {
+        Some(prompt) => format!("{} --prompt {}", make_exec_vars(), shell_quote(prompt)),
+        None => make_exec_vars(),
+    };
+    out.push_str(&format!("exec {exec}\n"));
     fs::write(script, out)?;
     let mut perms = fs::metadata(script)?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(script, perms)?;
     Ok(())
+}
+
+/// The `--agent/--model` prefix shared by every spawn: the agent and model
+/// are always explicit (opencode's ambient default is never inherited).
+fn make_exec_vars() -> String {
+    "\"$CORPUS_OPENCODE_BIN\" --agent \"$CORPUS_OPENCODE_AGENT\" --model \"$CORPUS_OPENCODE_MODEL\"".to_string()
 }
 
 /// Single-quote a dynamic value so it is inert inside the run script.
@@ -641,6 +656,36 @@ pub fn live_tui_sessions() -> Vec<String> {
         .filter(|name| name.starts_with("corpus-"))
         .map(str::to_string)
         .collect()
+}
+
+/// Kill a corpus tmux session (Abort for a re-attached run). No-op when
+/// tmux is unavailable; the session may already be dead.
+pub fn kill_tmux_session(session: &str) {
+    if let Some(tmux) = resolve_tmux() {
+        let _ = Command::new(tmux)
+            .args(["kill-session", "-t", session])
+            .status();
+    }
+}
+
+/// Export an opencode session's transcript of record to the project
+/// corpus `runs/<epoch>-<agent>.json` (Dismiss for a re-attached run
+/// that no longer has an app-owned handle). Reuses the pretty-export
+/// internals of the TUI backend.
+pub fn export_session(project: &str, agent: &str, opencode_session_id: &str) -> Result<PathBuf> {
+    let store = Store::from_env();
+    let repo = repo_root(&store);
+    let json = export_opencode_json(&repo, opencode_session_id)?;
+    let ts = now_secs();
+    let path = store
+        .project_corpus_dir(project)
+        .join("runs")
+        .join(format!("{ts}-{agent}.json"));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, json)?;
+    Ok(path)
 }
 
 /// Signal-shaped exit for an aborted TUI run (the transcript documents
@@ -800,7 +845,10 @@ fn opencode_command(
     if let Some(model) = model {
         command.args(["-m", model]);
     }
-    command.arg(mission);
+    // An EMPTY mission launches a bare `opencode run` TUI (no prompt).
+    if !mission.trim().is_empty() {
+        command.arg(mission);
+    }
     let store = Store::from_env();
     if let Some(repo_root) = store.root().parent() {
         command.current_dir(repo_root);

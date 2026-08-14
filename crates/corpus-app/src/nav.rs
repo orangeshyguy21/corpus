@@ -1,35 +1,13 @@
-//! The app's nav: one entry per planned screen, greyed until its chunk
-//! lands, plus the screen-change requests views issue (launch switches
-//! the operator to the run view).
+//! The app's nav: the three screens reachable from the sidebar. The old
+//! standalone `Screen::Launch` is gone — `LaunchView` merges into the
+//! mission view at chunk 5 (its machinery stays intact; the run view
+//! takes over the main column while a run is live). The active screen and
+//! the chat-panel toggle live on `AppState`, not here.
 
-/// One nav entry per planned screen.
+/// One nav entry per sidebar screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Projects,
     Agents,
     Missions,
-    Launch,
-}
-
-impl Screen {
-    pub const ALL: [Screen; 4] = [Screen::Projects, Screen::Agents, Screen::Missions, Screen::Launch];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Screen::Projects => "Projects",
-            Screen::Agents => "Agents",
-            Screen::Missions => "Missions",
-            Screen::Launch => "Launch",
-        }
-    }
-
-    /// Where the screen comes from in the plan (nav tooltips).
-    pub fn note(self) -> &'static str {
-        match self {
-            Screen::Projects => "project list, create, clone, delete",
-            Screen::Agents => "the selected project's agents: raw JSON editor with core-side validation",
-            Screen::Missions => "mission list + launch reusing the existing run view",
-            Screen::Launch => "run view: embedded terminal pane on the run's tmux session + abort/dismiss",
-        }
-    }
 }

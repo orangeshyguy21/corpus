@@ -3,7 +3,7 @@
 //! state and request actions.
 
 pub mod agents;
-pub mod launch;
+pub mod json_editor;
 pub mod missions;
-pub mod model_picker;
+pub mod plugin_picker;
 pub mod projects;

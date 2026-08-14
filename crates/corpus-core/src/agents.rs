@@ -434,3 +434,80 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_store(tag: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!("corpus-agents-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        Store::new(dir)
+    }
+
+    fn doc(agent: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "$schema": OPENCODE_SCHEMA, "agent": agent })
+    }
+
+    #[test]
+    fn save_agent_refuses_invalid_and_persists_valid() {
+        let store = tmp_store("save");
+        // A seed-less store still seeds the core pair; create a blank agent
+        // to save against (no seed needed for the blank path).
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store.create_blank_agent("p", "a").unwrap();
+
+        // No agent map.
+        assert!(store
+            .save_agent("p", "a", &serde_json::json!({ "$schema": "x" }))
+            .is_err());
+        // Empty agent map.
+        assert!(store.save_agent("p", "a", &doc(serde_json::json!({}))).is_err());
+        // Exactly one primary.
+        assert!(store
+            .save_agent(
+                "p",
+                "a",
+                &doc(serde_json::json!({
+                    "one": {"mode": "primary", "prompt": "x"},
+                    "two": {"mode": "primary", "prompt": "y"},
+                })),
+            )
+            .is_err());
+        // Bad permission action.
+        assert!(store
+            .save_agent(
+                "p",
+                "a",
+                &doc(serde_json::json!({
+                    "one": {"mode": "primary", "prompt": "x", "permission": "hax"},
+                })),
+            )
+            .is_err());
+        // Unresolved {file:} prompt ref.
+        assert!(store
+            .save_agent(
+                "p",
+                "a",
+                &doc(serde_json::json!({
+                    "one": {"mode": "primary", "prompt": "see {file:nope.md}"},
+                })),
+            )
+            .is_err());
+        // A valid document persists and reloads.
+        store
+            .save_agent(
+                "p",
+                "a",
+                &doc(serde_json::json!({
+                    "one": {"mode": "primary", "prompt": "hello"},
+                    "two": {"mode": "subagent", "prompt": "hi", "permission": {"task": "allow"}},
+                })),
+            )
+            .unwrap();
+        let agent = store.load_agent("p", "a").unwrap();
+        let map = agent.doc.get("agent").unwrap().as_object().unwrap();
+        assert!(map.contains_key("one") && map.contains_key("two"));
+        let _ = fs::remove_dir_all(store.root());
+    }
+}

@@ -175,7 +175,7 @@ fn core_seed_trust_domain_semantics_v2() {
         .expect("researcher write is a rule map");
     let project_corpus = "store/projects/p/corpus/findings/x.md";
     let legacy_flat = "store/hypotheses/older-embedded-path.md";
-    let team_corpus = "store/projects/p/teams/t/corpus/findings/x.md";
+    let _team_corpus = "store/projects/p/teams/t/corpus/findings/x.md";
 
     // The project corpus matches the allow pattern.
     let project_pattern = "store/projects/*/corpus/**";
