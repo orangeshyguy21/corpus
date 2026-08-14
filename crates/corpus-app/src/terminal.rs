@@ -15,9 +15,10 @@
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 
+use alacritty_terminal::term::TermMode;
 use egui_term::{
-    BackendSettings, ColorPalette, FontSettings, PtyEvent, TerminalBackend, TerminalFont,
-    TerminalTheme, TerminalView,
+    BackendCommand, BackendSettings, ColorPalette, FontSettings, PtyEvent, TerminalBackend,
+    TerminalFont, TerminalTheme, TerminalView,
 };
 
 /// An embedded terminal pane attached to one tmux session at a time.
@@ -137,6 +138,54 @@ impl TerminalPane {
             .set_font(font)
             .set_focus(self.focused);
         let response = ui.add(view);
+        // Scrollback: forward the wheel as SGR mouse reports when the
+        // attached program requested mouse mode (corpus tmux sessions get
+        // `set-option mouse on` at launch). egui_term's own wheel handler
+        // only scrolls its LOCAL grid — which is empty under the alternate
+        // screen tmux paints into — so without this there is no way to
+        // scroll a run's history (the "can't scroll the log" bug).
+        if backend
+            .last_content()
+            .terminal_mode
+            .intersects(TermMode::MOUSE_MODE)
+        {
+            if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                if response.rect.contains(pos) {
+                    let lines = ui.ctx().input(|i| {
+                        i.events
+                            .iter()
+                            .filter_map(|e| match e {
+                                egui::Event::MouseWheel {
+                                    unit: egui::MouseWheelUnit::Line,
+                                    delta,
+                                    ..
+                                } => Some(delta.y),
+                                _ => None,
+                            })
+                            .sum::<f32>()
+                    });
+                    let mut n = lines.signum() * lines.abs().ceil().min(12.0);
+                    while n != 0.0 {
+                        // SGR wheel report (button 64/65, press-only), the
+                        // exact bytes tmux answers with copy-mode scroll.
+                        // egui_term's MouseButton type is not exported, so
+                        // we write the sequence ourselves.
+                        let button: u8 = if n > 0.0 { 64 } else { 65 };
+                        let size = &backend.last_content().terminal_size;
+                        let col =
+                            ((pos.x - response.rect.left()) / size.cell_width.max(1) as f32) as usize
+                                + 1;
+                        let line =
+                            ((pos.y - response.rect.top()) / size.cell_height.max(1) as f32) as usize
+                                + 1;
+                        backend.process_command(BackendCommand::Write(
+                            format!("\x1b[<{button};{col};{line}M").into_bytes(),
+                        ));
+                        n -= n.signum();
+                    }
+                }
+            }
+        }
         // Focus discipline: click-to-focus; the release gesture is a
         // click anywhere outside the pane (documented in the header).
         if response.clicked() {

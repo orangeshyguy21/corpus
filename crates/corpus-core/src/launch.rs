@@ -191,6 +191,14 @@ impl RunSession {
             let _ = fs::remove_file(&script);
             return Err(Error::Store(format!("tmux refused the session: {status}")));
         }
+        // Session-scoped mouse mode: the embedded pane forwards wheel as
+        // SGR mouse reports, and tmux answers them with copy-mode scrollback
+        // (without this there is NO way to scroll a run's history in-app).
+        // Scoped to the session — the operator's global tmux config is
+        // untouched.
+        let _ = Command::new(&tmux)
+            .args(["set-option", "-t", &session, "mouse", "on"])
+            .status();
         // Raw pane capture FIRST (so early output is never missed).
         let _ = Command::new(&tmux)
             .args(["pipe-pane", "-t", &session])

@@ -1433,6 +1433,7 @@ dependencies = [
 name = "corpus-app"
 version = "0.1.0"
 dependencies = [
+ "alacritty_terminal",
  "anyhow",
  "corpus-core",
  "eframe",

@@ -52,6 +52,9 @@ egui_commonmark = { workspace = true }
 egui_extras = { workspace = true }
 egui-toast = { workspace = true }
 egui_term = { workspace = true }
+# Direct dep so the terminal pane can address the grid (scrollback mouse
+# reports): must stay version-locked with egui_term's alacritty_terminal.
+alacritty_terminal = "0.25"
 egui-phosphor.workspace = true
 image.workspace = true
 # JSON syntax highlighting in the agent editor (app-flow chunk 4): a
