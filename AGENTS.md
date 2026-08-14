@@ -33,6 +33,8 @@ benchmarks/
 store/               the corpus knowledge base. Core seed agents (versioned
                      with the app — the one committed part of store/) live
                      at store/templates/agents/<slug>/{opencode.json, prompts/};
+                     the management-chat recipe (goose, GDK) lives at
+                     store/templates/chat/ (recipe.yaml + subrecipes/);
                      the data itself is scoped:
                      store/projects/<slug>/corpus/             (the corpus)
                      store/projects/<slug>/agents/<slug>/      (agent configs)
@@ -43,7 +45,7 @@ docs/                (gone — folded into dev/; see below)
 dev/                 everything uncommitted & machine-local: architecture,
                      decisions, research, alpha-1, plus ACTIVE plans
                      (roadmap-plan, data-model-plan, app-flow-plan,
-                     app-parity-spec, mission-view-plan, gdk-chat-plan)
+                     app-parity-spec, mission-view-plan)
                      and the demo poster. Git-ignored: may be absent on
                      a fresh clone.
 .opencode/           opencode config + the role agents (operator, researcher,
@@ -56,8 +58,22 @@ dev/                 everything uncommitted & machine-local: architecture,
 cargo build -p corpus-core -p corpus-mcp -p corpus-cli   # core + CLI
 cargo build -p corpus-app                                # the egui app
 cargo test -p corpus-core -p corpus-mcp                   # unit + scoped-store tests
+cargo test -p corpus-app --bin corpus-app                 # app + chat/team injection probes
 cargo build --workspace                                   # everything
 ```
+
+Chat/embedding build ergonomics (the `goose` git-dep):
+- goose pins `rust-toolchain.toml = 1.96.1` — build/run with `+1.96.1`
+  (`rustup install 1.96.1`) if rustc-version errors appear.
+- This machine's global `~/.gitconfig` rewrites `https://github.com/` → SSH;
+  the goose repo has NO SSH access here, so any fetch/build of `goose` needs
+  `GIT_CONFIG_GLOBAL=/tmp/empty-gitconfig` (or
+  `-c url.https://github.com/.insteadof=`) prepended.
+- `goose` is optional behind `corpus-app`'s `chat-embed` feature (default ON).
+  Headless/CI builds skip the whole goose tree with
+  `cargo build -p corpus-app --no-default-features`.
+- True cold compile of the goose tree is ~107s (1438 crates); incremental is
+  sub-second. Consider `sccache` for repeated cold builds of the dep tree.
 
 The `cdk-regtest` plugin is a bash script plus a Docker-based arena; it is
 not built by cargo. One-shot setup (fetch pinned sources, build agent
@@ -108,7 +124,127 @@ corpus store migrate [--dry-run] [--project <slug>] [--confirm]
                                   # store/projects/<default>/corpus/ (dry-run
                                   # reports only; moves are checksum-verified)
                                   # --confirm also removes legacy template dirs
+# corpus-admin MCP profile: the SAME corpus-mcp binary behind `--admin`
+corpus-mcp --admin                 # stdio MCP server; 20 admin tools only
 ```
+
+## corpus-admin MCP profile (dev/decisions.md — chat runtime closeout)
+
+`corpus-mcp --admin` is a second trust profile of the same binary —
+host-side operator tooling, thin over corpus-core, for natural-language
+store administration via the GDK/goose chat. It sits OUTSIDE the research
+trust domains (no sandbox, no oracles, no targets) and never runs missions
+— it prepares them. The sandbox-facing profile (operator/researcher
+agents) never enables it; the chat session config always does
+(`corpus-mcp --admin`). The tool group lives in
+`crates/corpus-mcp/src/admin.rs`; `main.rs` gates `tools/list` + `tools/call`
+on the flag and the admin profile advertises NO sandbox/finding tools.
+
+Admin tools (all thin over corpus-core): `project_list/new/clone/delete/
+rebind`, `agent_list/get/save/clone/delete` (`agent_save` runs the core
+validator; invalid is refused with the validator's message), `mission_list/
+get/new/delete/set_budget/set_pins`, `corpus_wipe`, `corpus_stats/list/read`.
+
+- **Confirm-token gate (server-side, all four destructive ops):**
+  `project_delete`, `agent_delete`, `mission_delete`, `corpus_wipe` first
+  return a DRY-RUN summary + a one-shot confirm token (hash of
+  op+target+nonce, 60s TTL); the mutation only lands when the tool is
+  re-called with that token, which is consumed (single-use). `corpus_wipe`
+  without a token is a dry-run by construction.
+- **`project_rebind` validates the plugin against the registry** before
+  writing — a hallucinated/dangling plugin name is refused (chunk-0
+  finding). "Budget" edits are per-MISSION (`mission_set_budget`), never
+  per-agent.
+- Tests: `crates/corpus-mcp/tests/admin_profile.rs` covers no-token
+  dry-run, wrong/expired/single-use token, validator round-trip, rebind
+  registry validation, and admin tools absent without `--admin`.
+
+### GDK/goose chat wiring (chunk 1, local Ollama)
+
+Goose config (`~/.config/goose/config.yaml`) declares the admin extension
+and disables the shell:
+
+```yaml
+extensions:
+  corpus-admin:
+    type: stdio
+    name: corpus-admin
+    enabled: true
+    cmd: /Users/admin/Sites/corpus/target/debug/corpus-mcp
+    args: ["--admin"]
+    envs: {}
+    timeout: 300
+  developer:
+    enabled: false   # "bash denied" — the shell is off by design
+```
+
+- Context size is explicit: `GOOSE_INPUT_LIMIT: 32768` at the **root** of
+  config.yaml (goose's Ollama `num_ctx` override — provider-scoped is not
+  the recognized knob) — without it Ollama silently truncates at 4096 and
+  the session loops. Model stays explicit (`GOOSE_MODEL=qwen3.6:35b`).
+- **Session storage is redirected into the project scope**, NOT goose's
+  default `~/.local/share` session dir (chat transcripts carry finding
+  material). goose has no session-db-only override; the supported
+  mechanism is `GOOSE_PATH_ROOT` (reroutes the whole config/data/state
+  tree), so the sessions DB lands at
+  `store/projects/<p>/var/chat/data/sessions/`. ALWAYS launch the chat
+  through the wrapper `scripts/goose-chat [goose args...]` (scope =
+  `CORPUS_PROJECT`, default `default`) — it provisions the scope's own
+  config.yaml (provider + corpus-admin + developer-off, `GOOSE_INPUT_LIMIT`
+  at root) and execs goose with `GOOSE_PATH_ROOT` set. Example:
+  `scripts/goose-chat run -n ops -t "<prompt>"`. A raw `goose run` outside
+  the wrapper leaks sessions to the default dir.
+- **The management chat runs the committed recipe**
+  `store/templates/chat/recipe.yaml` — a FLAT single agent with the full
+  corpus-admin catalog and the confirm-token gate as the sole hard control
+  (D1 verdict: goose subrecipe delegation does not load a subrecipe's
+  extensions into subagents, so per-subagent grants are not enforceable via
+  subrecipes; `available_tools` DOES filter when a recipe runs as its own
+  main recipe — see dev/decisions.md, the chat-runtime closeout). Headless drive:
+  `scripts/goose-chat run --recipe store/templates/chat/recipe.yaml --params "request=<utterance>"`;
+  interactive: `scripts/goose-chat --recipe store/templates/chat/recipe.yaml`.
+- **The app's native management chat** (dev/decisions.md, the chat-runtime
+  closeout): goose's `Agent` runtime is EMBEDDED in-process as a source-level
+  git dependency (pinned rev, Apache-2.0 — see dev/decisions.md for the
+  deliberate-bump discipline and the ICS resolver pins). All GDK lives in `crates/corpus-app/src/chat/`
+  (boundary: our own `ChatEvent`/`ChatCommand`/`Chat` trait; `embedded.rs`
+  quarantines every goose type and drives the agent on a background thread,
+  spawning `corpus-mcp --admin` as its tool extension — our own protocol, not
+  a goose subprocess; never via `scripts/goose-chat`). The backend is gated
+  behind the cargo feature `chat-embed` (default ON). The confirm ritual is
+  IN-PROCESS and stronger than the old ACP arm: a mutating tool call is
+  surfaced to the operator as an inline Approve/Reject and released via
+  goose's `tool_confirmation_router` BEFORE dispatch — the model never sees a
+  token (the corpus-mcp server-side token gate stays as backstop). Headless
+  builds opt out with `--no-default-features`, which ALSO drops the goose dep
+  tree (`goose` is an optional dep); with it OFF the backend is a no-op stub
+  that reports the feature is required. The panel (`chat/panel.rs`, native
+  egui) renders streaming markdown, collapsible tool-call cards, and the
+  confirm ritual as inline Approve/Reject (the operator releases every
+  mutating tool call). The chat model picker is its OWN source — corpus-core
+  `ollama_models()` (`ollama list`), because the chat talks to Ollama
+  directly; the mission/agent picker keeps opencode's `model_list()`
+  unchanged. New deps on corpus-app: `goose` (+ `tokio`/`tokio-util`/
+  `futures`/`anyhow`, and ICU resolver pins). The MANAGED `goose acp`
+  subprocess arm it replaced is deleted (git history keeps it; the fallback
+  story lives in dev/decisions.md).
+  **TEAM SHAPE** (dev/decisions.md): the panel runs a
+  role-scoped session (`chat/team.rs` — a ROLE selector, default
+  **Orchestrator**). `TeamRole` = `Operator` / `Orchestrator` /
+  `AgentBuilder` / `ProjectManager` / `MissionManager` / `CorpusInspector`.
+  Each non-`Operator` role registers `corpus-mcp --admin` with
+  `available_tools` = its scoped domain, so a specialist is scoped BY
+  CONSTRUCTION (goose's `is_tool_available` refuses out-of-domain tools). The
+  destructive set (`corpus_wipe`/`project_delete`/`agent_delete`/
+  `mission_delete`) is withheld from EVERY specialist and the orchestrator
+  holds none (registers no admin extension); the Orchestrator delegates to
+  specialists via goose's **summon** platform extension (the only public
+  subagent hook — `run_subagent_task` is `pub(crate)`). **Destructive ops are
+  Operator-mode only** (switch the ROLE selector to Operator): there the full
+  catalog is present and every destructive call is gated by the inline
+  Approve/Reject before dispatch — `delete this corpus` works by switching to
+  Operator and Approving. Session transcripts flush to
+  `<project scope>/var/chat/<session>.md` on each completed turn.
 
 The default write/read scope is project `default`
 (`CORPUS_PROJECT` overrides it). Agents write into the project corpus

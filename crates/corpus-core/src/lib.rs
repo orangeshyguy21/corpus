@@ -21,7 +21,7 @@ pub use launch::{
     agent_default_model, agent_file_stem, export_session, kill_tmux_session, live_tui_sessions,
     tui_attach_command, RunLine, RunSession,
 };
-pub use models::{model_list, ModelEntry, ModelList, ModelOption, ModelProviderGroup, ModelRegistry};
+pub use models::{model_list, ollama_models, ModelEntry, ModelList, ModelOption, ModelProviderGroup, ModelRegistry};
 pub use plugin::{
     FaucetCall, FaucetResult, OracleInfo, OracleResult, Plugin, PluginManifest, ProbeResult,
     SandboxExecResult, SourceInfo,
@@ -29,7 +29,7 @@ pub use plugin::{
 pub use registry::{discover, plugin_sources, plugin_status, plugins_dir, PluginDir, PluginStatus, SourceRevs};
 pub use sensitivity::Sensitivity;
 pub use store::{
-    checksum, corpus_stats, project_slug_env, store_root_env, validate_slug, CorpusStats,
+    checksum, corpus_stats, fnv1a_hex, project_slug_env, store_root_env, validate_slug, CorpusStats,
     MigrationReport, MigrateOptions, Mission, Project, Scope, Store, CATEGORIES,
     DEFAULT_PROJECT_SLUG, PROJECT_ENV, STORE_ENV,
 };

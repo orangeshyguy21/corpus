@@ -5,6 +5,10 @@
 # app and are versioned (see AGENTS.md — templates are data, in the store).
 /store/*
 !/store/templates/
+# Test-run artifacts under corpus-app: the management chat writes its scoped
+# goose config/session tree to a store/ path relative to CARGO_MANIFEST_DIR
+# during integration/live runs. It is never source; ignore it wholesale.
+/crates/corpus-app/store/
 # Working plans, notes, and scratch — local to each developer.
 /dev
 # cdk-regtest plugin runtime state: sandbox evidence and compiled tools.

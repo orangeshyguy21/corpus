@@ -53,6 +53,8 @@ fn rig(tag: &str) -> TestRig {
         probe_ready: true,
         probe_notes: String::new(),
         last_probe: std::time::Instant::now(),
+        admin: false,
+        pending_confirms: std::collections::HashMap::new(),
     };
     TestRig { ctx, store, root }
 }

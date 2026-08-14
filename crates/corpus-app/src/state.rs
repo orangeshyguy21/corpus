@@ -27,8 +27,6 @@ pub struct AppState {
     pub current_screen: Screen,
     /// Whether the right chat panel is open (the top-bar toggle drives it).
     pub chat_open: bool,
-    /// The chat panel input buffer (content lands at chunk 6).
-    pub chat_draft: String,
     /// All projects as `(slug, spec)`, sorted by slug (corpus-core order).
     pub projects: Vec<(String, Project)>,
     /// The project the sidebar lists scope to (`None` = fall back to the
@@ -117,7 +115,6 @@ impl AppState {
             store,
             current_screen: Screen::Projects,
             chat_open: false,
-            chat_draft: String::new(),
             projects: Vec::new(),
             selected_project: None,
             source_pins: BTreeMap::new(),
