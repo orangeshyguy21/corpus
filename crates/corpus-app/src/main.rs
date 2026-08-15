@@ -403,7 +403,35 @@ impl App {
             .show(ctx, |ui| {
                 // Drain backend events into the view, then render. The model
                 // picker is the panel's own footer widget (by the input).
-                self.chat_panel.absorb(&self.chat);
+                let events = self.chat_panel.absorb(&self.chat);
+                // The chat mutated the store (a write tool succeeded):
+                // re-read projects/agents/missions so the sidebar lists the
+                // thing the chat just made.
+                let mut corpus_touched = false;
+                for ev in &events {
+                    if let chat::ChatEvent::StoreMutated { area } = ev {
+                        corpus_touched |= *area == "corpus";
+                        self.state.refresh();
+                    }
+                }
+                if corpus_touched {
+                    if let Some(p) = self.state.effective_project() {
+                        self.state.refresh_corpus_stats(&p);
+                    }
+                }
+                // The header names the project, never a bare UUID.
+                let label = self
+                    .state
+                    .effective_project()
+                    .and_then(|slug| {
+                        self.state
+                            .projects
+                            .iter()
+                            .find(|(s, _)| s == &slug)
+                            .map(|(_, p)| p.name.clone())
+                    })
+                    .unwrap_or_default();
+                self.chat_panel.set_project_label(&label);
                 self.ensure_chat_started();
                 // Juice the session with the operator's current position
                 // (re-pushed only when it changes).

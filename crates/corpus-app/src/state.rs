@@ -371,22 +371,38 @@ impl AppState {
     /// kebab-case slug, so it slots straight into the store layout
     /// (`store/projects/<id>/`), CLI scopes, and `CORPUS_PROJECT`.
     pub fn create_project(&self, name: &str, plugin: &str) -> Result<(String, Project), Error> {
-        let id = new_uuid_id();
-        self.store.create_project(&id, name, plugin).map(|p| (id, p))
+        // Human names mint human slugs ("Dep Scans" → "dep-scans"); only a
+        // name with no alphanumerics falls back to the opaque id. (UUID
+        // slugs made every chat/tool reference unreadable — 2026-08-14.)
+        let slug = {
+            let s = corpus_core::slugify(name);
+            if s.is_empty() { new_uuid_id() } else { s }
+        };
+        self.store.create_project(&slug, name, plugin).map(|p| (slug, p))
     }
 
-    /// Clone a project with a fresh auto-generated id; the copied name
-    /// falls back to the source's when none is given.
+    /// Clone a project; the copied name falls back to the source's when
+    /// none is given. The slug derives from the name (kebab), else an id.
     pub fn clone_project(
         &self,
         from: &str,
         name: Option<&str>,
         with_corpus: bool,
     ) -> Result<(String, Project), Error> {
-        let id = new_uuid_id();
+        let slug = name
+            .map(corpus_core::slugify)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("{from}-copy"));
+        // A taken slug gets a numeric suffix rather than an opaque id.
+        let slug = (2..)
+            .map(|n| {
+                if n == 2 { slug.clone() } else { format!("{slug}-{n}") }
+            })
+            .find(|s| !self.store.project_dir(s).exists())
+            .unwrap_or_else(new_uuid_id);
         self.store
-            .clone_project(from, &id, name, with_corpus)
-            .map(|p| (id, p))
+            .clone_project(from, &slug, name, with_corpus)
+            .map(|p| (slug, p))
     }
 
     pub fn delete_project(&self, slug: &str) -> Result<(), Error> {

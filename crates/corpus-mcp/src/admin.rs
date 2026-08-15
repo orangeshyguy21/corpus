@@ -116,6 +116,22 @@ pub fn catalog() -> Value {
             }
         },
         {
+            "name": "agent_new",
+            "description": "Create a NEW agent from structured fields — the server builds the opencode.json (prefer this over agent_save for creation; agent_save only edits existing agents). Pass 'from' to inherit an existing agent's permissions/prompts (e.g. \"researcher\") with your description/prompt overlaid.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "agent": {"type": "string", "description": "kebab-case slug; also the opencode agent name"},
+                    "description": {"type": "string"},
+                    "prompt": {"type": "string", "description": "the system prompt body"},
+                    "model": {"type": "string", "description": "optional model id"},
+                    "from": {"type": "string", "description": "optional existing agent to inherit permissions/prompts from"}
+                },
+                "required": ["project", "agent", "description", "prompt"]
+            }
+        },
+        {
             "name": "agent_save",
             "description": "Validate and save an agent's opencode.json. The core validator runs first; an invalid document is refused with the validator's message.",
             "inputSchema": {
@@ -290,6 +306,7 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         "agent_list" => agent_list(ctx, &project(args)?),
         "agent_get" => agent_get(ctx, &project(args)?, &require_str(args, "agent")?),
         "agent_save" => agent_save(ctx, args),
+        "agent_new" => agent_new(ctx, args),
         "agent_clone" => agent_clone(ctx, args),
         "agent_delete" => agent_delete(ctx, args),
         "mission_list" => mission_list(ctx, &project(args)?),
@@ -330,14 +347,14 @@ fn project_list(ctx: &mut Ctx) -> Result<String> {
         .iter()
         .map(|(slug, p)| {
             format!(
-                "{:<20} plugin={} gen={}{}",
-                slug,
+                "{slug} \"{name}\" plugin={} gen={}{}",
                 p.plugin,
                 p.corpus_generation,
                 p.cloned_from
                     .as_deref()
                     .map(|f| format!(" cloned-from={f}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                name = if p.name.is_empty() { slug } else { &p.name },
             )
         })
         .collect::<Vec<_>>()
@@ -428,10 +445,22 @@ fn agent_list(ctx: &mut Ctx, project: &str) -> Result<String> {
         .map_err(|e| Error::Args(e.to_string()))?;
     Ok(agents
         .iter()
-        .map(|(slug, _a)| {
+        .map(|(slug, a)| {
+            // One-line description from the primary agent's config, so the
+            // caller rarely needs the (huge) agent_get dump to know what an
+            // agent IS.
+            let desc = a
+                .doc
+                .get("agent")
+                .and_then(|m| m.as_object())
+                .and_then(|m| {
+                    m.values().find_map(|cfg| cfg.get("description").and_then(|d| d.as_str()))
+                })
+                .unwrap_or("")
+                .replace('\n', " ");
+            let desc: String = desc.chars().take(80).collect();
             format!(
-                "{:<20} hash={}",
-                slug,
+                "{slug} hash={} — {desc}",
                 ctx.store.agent_config_hash(project, slug).unwrap_or_default()
             )
         })
@@ -456,6 +485,23 @@ fn agent_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
         .save_agent(&project, &agent, doc)
         .map_err(|e| Error::Args(e.to_string()))?;
     Ok(format!("saved agent {project}/{agent} (validator passed)"))
+}
+
+fn agent_new(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let project = require_str(args, "project")?;
+    let agent = require_str(args, "agent")?;
+    let description = require_str(args, "description")?;
+    let prompt = require_str(args, "prompt")?;
+    let model = args.get("model").and_then(Value::as_str);
+    let from = args.get("from").and_then(Value::as_str);
+    // The core validator runs server-side on the built document.
+    ctx.store
+        .create_agent(&project, &agent, &description, &prompt, model, from)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    Ok(format!(
+        "created agent {project}/{agent}{} (validator passed)",
+        from.map(|f| format!(" from {f}")).unwrap_or_default()
+    ))
 }
 
 fn agent_clone(ctx: &mut Ctx, args: &Value) -> Result<String> {

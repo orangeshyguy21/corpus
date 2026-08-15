@@ -696,6 +696,11 @@ Use Markdown formatting for all responses.
             }
         };
         let mut stream = Box::pin(stream);
+        // Tool call id → tool name, for this turn: a successful WRITE tool
+        // emits StoreMutated (the app's nav refresh) — ToolResponse carries
+        // no name, only the id.
+        let mut call_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         while let Some(item) = stream.next().await {
             match item {
                 Ok(AgentEvent::Message(msg)) => {
@@ -758,7 +763,7 @@ Use Markdown formatting for all responses.
                             _ => {}
                         }
                     }
-                    translate_message(msg, &ev, turn);
+                    translate_message(msg, &ev, turn, &mut call_names);
                 }
                 Ok(AgentEvent::Usage(u)) => {
                     log_line(
@@ -787,10 +792,16 @@ Use Markdown formatting for all responses.
 
     /// Map a goose message's content blocks onto our event vocabulary:
     /// text → [`ChatEvent::TextChunk`], tool request → [`ChatEvent::ToolCallStart`],
-    /// tool response → [`ChatEvent::ToolCallResult`], and a pending tool
+    /// tool response → [`ChatEvent::ToolCallResult`] (+ [`ChatEvent::StoreMutated`]
+    /// when a WRITE tool succeeds), and a pending tool
     /// confirmation → [`ChatEvent::PermissionRequest`] (released later by the
     /// command loop's Approve/Reject via the confirmation router).
-    fn translate_message(msg: Message, ev: &StdSender<ChatEvent>, turn: u64) {
+    fn translate_message(
+        msg: Message,
+        ev: &StdSender<ChatEvent>,
+        turn: u64,
+        call_names: &mut std::collections::HashMap<String, String>,
+    ) {
         for block in msg.content {
             match block {
                 MessageContentBlock::Text(text) => {
@@ -809,6 +820,7 @@ Use Markdown formatting for all responses.
                 }
                 MessageContentBlock::ToolRequest(req) => {
                     if let Ok(params) = req.tool_call {
+                        call_names.insert(req.id.clone(), params.name.to_string());
                         let _ = ev.send(ChatEvent::ToolCallStart {
                             id: req.id.clone(),
                             name: params.name.to_string(),
@@ -830,6 +842,15 @@ Use Markdown formatting for all responses.
                         }
                         Err(err) => (true, format!("tool error: {}", err.message)),
                     };
+                    // A successful WRITE tool mutates the store — tell the
+                    // app to refresh its nav.
+                    if !is_error {
+                        if let Some(name) = call_names.get(&resp.id) {
+                            if let Some(area) = crate::chat::team::mutated_area(name) {
+                                let _ = ev.send(ChatEvent::StoreMutated { area });
+                            }
+                        }
+                    }
                     let _ = ev.send(ChatEvent::ToolCallResult {
                         id: resp.id.clone(),
                         is_error,
@@ -1037,8 +1058,9 @@ Use Markdown formatting for all responses.
         let mut report = String::new();
         let mut n_calls = 0u32;
         // The specialist's tool-response ids map back to our synthetic
-        // per-call ids (panel cards are keyed by id).
-        let mut call_ids: std::collections::HashMap<String, String> =
+        // per-call ids (panel cards are keyed by id) — value is
+        // (synthetic card id, bare tool name) for the StoreMutated check.
+        let mut call_ids: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
         // Confirmation ids WE registered (removed on exit — a cancelled turn
         // must not leak stale approvals into the router).
@@ -1053,7 +1075,10 @@ Use Markdown formatting for all responses.
                                 if let Ok(params) = req.tool_call {
                                     n_calls += 1;
                                     let synthetic = format!("{parent_call_id}:{n_calls}");
-                                    call_ids.insert(req.id.clone(), synthetic.clone());
+                                    call_ids.insert(
+                                        req.id.clone(),
+                                        (synthetic.clone(), params.name.to_string()),
+                                    );
                                     let _ = ev.send(ChatEvent::ToolCallStart {
                                         id: synthetic,
                                         name: format!("{role}›{}", params.name),
@@ -1075,7 +1100,14 @@ Use Markdown formatting for all responses.
                                     }
                                     Err(err) => (true, format!("tool error: {}", err.message)),
                                 };
-                                if let Some(synthetic) = call_ids.get(&resp.id) {
+                                if let Some((synthetic, tool_name)) = call_ids.get(&resp.id) {
+                                    // A successful specialist WRITE mutates
+                                    // the store — same nav-refresh signal.
+                                    if !is_error {
+                                        if let Some(area) = crate::chat::team::mutated_area(tool_name) {
+                                            let _ = ev.send(ChatEvent::StoreMutated { area });
+                                        }
+                                    }
                                     let _ = ev.send(ChatEvent::ToolCallResult {
                                         id: synthetic.clone(),
                                         is_error,
@@ -1277,6 +1309,29 @@ mod injection_probe {
     /// other under cargo's parallel test threads.
     static LIVE_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The probe chat model: `CORPUS_PROBE_MODEL` wins; else the first of
+    /// the preferred small models the local Ollama actually has (the
+    /// operator's model garden changes — a hardcoded name made the probes
+    /// rot). Panics with the available list when none fits.
+    fn probe_model() -> String {
+        let available: Vec<String> = corpus_core::ollama_models()
+            .expect("ollama must be running for the live probe")
+            .groups
+            .into_iter()
+            .flat_map(|g| g.models.into_iter().map(|m| m.model))
+            .collect();
+        if let Ok(m) = std::env::var("CORPUS_PROBE_MODEL") {
+            assert!(available.iter().any(|a| a == &m), "CORPUS_PROBE_MODEL={m} not pulled; available: {available:?}");
+            return m;
+        }
+        for preferred in ["qwen3.5:9b", "gemma4:e4b", "qwen3.8:27b-mlx"] {
+            if available.iter().any(|a| a == preferred) {
+                return preferred.to_string();
+            }
+        }
+        panic!("no preferred probe model pulled; set CORPUS_PROBE_MODEL to one of: {available:?}");
+    }
+
     /// END-TO-END LIVE PROBE (opt-in; needs Ollama + a built corpus-mcp):
     /// drives the REAL embedded backend against a small local model through
     /// the public ChatHandle seam — identity, tool use, the approval gate,
@@ -1313,15 +1368,10 @@ mod injection_probe {
         };
         std::env::set_var("CORPUS_MCP", &mcp);
         // Ollama reachable + model pulled?
-        let models = corpus_core::ollama_models().expect("ollama must be running for the live probe");
-        let model = "qwen3.5:9b";
-        assert!(
-            models.groups.iter().flat_map(|g| &g.models).any(|m| m.model == model),
-            "ollama model {model} must be pulled for the live probe"
-        );
+        let model = probe_model();
 
         let project = "liveprobe";
-        let mut chat = ChatHandle::start_scoped(project, model, crate::chat::team::TeamRole::Operator);
+        let mut chat = ChatHandle::start_scoped(project, &model, crate::chat::team::TeamRole::Operator);
 
         // --- drive the session: wait Ready, send prompts, auto-approve ---
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
@@ -1365,6 +1415,7 @@ mod injection_probe {
                     }
                     ChatEvent::TurnEnd { .. } => turn_open = false,
                     ChatEvent::Usage { .. } => {}
+                    ChatEvent::StoreMutated { .. } => {}
                     ChatEvent::Error(e) => panic!("backend error during probe: {e}"),
                 }
             }
@@ -1433,16 +1484,11 @@ mod injection_probe {
         let mcp = exe.parent().unwrap().join("../corpus-mcp");
         assert!(mcp.exists(), "corpus-mcp not built — cargo build -p corpus-mcp first");
         std::env::set_var("CORPUS_MCP", &mcp);
-        let models = corpus_core::ollama_models().expect("ollama must be running for the live probe");
-        let model = "qwen3.5:9b";
-        assert!(
-            models.groups.iter().flat_map(|g| &g.models).any(|m| m.model == model),
-            "ollama model {model} must be pulled for the live probe"
-        );
+        let model = probe_model();
 
         let mut chat = ChatHandle::start_scoped(
             "liveprobe",
-            model,
+            &model,
             crate::chat::team::TeamRole::Orchestrator,
         );
         let probe_project = format!("orchprobe{}", std::process::id());
@@ -1485,6 +1531,7 @@ mod injection_probe {
                     }
                     ChatEvent::TurnEnd { .. } => turn_open = false,
                     ChatEvent::Usage { .. } => {}
+                    ChatEvent::StoreMutated { .. } => {}
                     ChatEvent::Error(e) => panic!("backend error during probe: {e}"),
                 }
             }
@@ -1510,6 +1557,105 @@ mod injection_probe {
             "delegated project_new never landed at {created:?}; transcript:\n{transcript}"
         );
         eprintln!("[probe] OK — orchestrator delegated, specialist executed, project at {created:?}");
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// LIVE PROBE 3 (opt-in): the depbot-session REGRESSION — "create an
+    /// agent that scans deps for vulns" must succeed through `agent_new` in
+    /// a handful of calls with zero tool errors (the 2026-08-14 session
+    /// burned ~10 calls and three failures on clone-then-save + JSON-in-
+    /// JSON). Budget: ≤ 4 tool calls, 0 errors, doc on disk.
+    #[test]
+    #[ignore = "live probe: needs Ollama (qwen3.5:9b) and a built corpus-mcp"]
+    fn live_regression_depbot_agent_creation() {
+        use crate::chat::{Chat, ChatEvent, ChatHandle};
+
+        let _guard = LIVE_PROBE_LOCK.lock().unwrap();
+        let store = std::env::temp_dir().join(format!("corpus-live-probe-depbot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).expect("probe store dir");
+        std::env::set_var("CORPUS_STORE", &store);
+        super::init_goose_env();
+        let exe = std::env::current_exe().expect("current exe");
+        let mcp = exe.parent().unwrap().join("../corpus-mcp");
+        assert!(mcp.exists(), "corpus-mcp not built — cargo build -p corpus-mcp first");
+        std::env::set_var("CORPUS_MCP", &mcp);
+        let model = probe_model();
+
+        // Seed the project so a "researcher" base exists to model on.
+        let project = "liveprobe";
+        let core_store = corpus_core::Store::new(store.clone());
+        core_store.create_project(project, "Live Probe", "cdk-regtest").expect("seed project");
+
+        let mut chat = ChatHandle::start_scoped(project, &model, crate::chat::team::TeamRole::Operator);
+        let prompt = "Create an agent called depbot that scans dependencies for vulnerabilities, \
+                      modeled on the researcher agent (research role: reads sources and the web, \
+                      writes findings/techniques/hypotheses, never executes). Use your tools.";
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let mut ready = false;
+        let mut turn_open = false;
+        let mut saw_start = false;
+        let mut sent = false;
+        let mut n_calls = 0u32;
+        let mut n_errors = 0u32;
+        let mut transcript = String::new();
+        while std::time::Instant::now() < deadline {
+            for ev in chat.poll_events() {
+                match ev {
+                    ChatEvent::Ready { .. } => ready = true,
+                    ChatEvent::TurnStart { .. } => {
+                        turn_open = true;
+                        saw_start = true;
+                    }
+                    ChatEvent::TextChunk { delta, .. } => transcript.push_str(&delta),
+                    ChatEvent::ThinkingChunk { .. } => {}
+                    ChatEvent::ToolCallStart { name, .. } => {
+                        n_calls += 1;
+                        eprintln!("[probe] tool › {name}");
+                        transcript.push_str(&format!("\n[tool: {name}]\n"));
+                    }
+                    ChatEvent::ToolCallResult { is_error, .. } => {
+                        if is_error {
+                            n_errors += 1;
+                        }
+                    }
+                    ChatEvent::PermissionRequest { id, tool, .. } => {
+                        eprintln!("[probe] auto-approving {tool}");
+                        chat.approve(&id);
+                    }
+                    ChatEvent::TurnEnd { .. } => turn_open = false,
+                    ChatEvent::Usage { .. } => {}
+                    ChatEvent::StoreMutated { area } => {
+                        eprintln!("[probe] store mutated: {area}");
+                    }
+                    ChatEvent::Error(e) => panic!("backend error during probe: {e}"),
+                }
+            }
+            if ready && !turn_open && !sent {
+                eprintln!("[probe] send: {prompt}");
+                chat.send(prompt);
+                sent = true;
+            }
+            if sent && saw_start && !turn_open {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+        assert!(sent && saw_start && !turn_open, "probe timed out; transcript:\n{transcript}");
+        let doc = store
+            .join("projects")
+            .join(project)
+            .join("agents")
+            .join("depbot")
+            .join("opencode.json");
+        assert!(doc.exists(), "depbot never landed at {doc:?}; transcript:\n{transcript}");
+        assert_eq!(n_errors, 0, "tool errors during creation; transcript:\n{transcript}");
+        assert!(
+            n_calls <= 4,
+            "tool-call budget blown ({n_calls} > 4) — agent_new should make this short; transcript:\n{transcript}"
+        );
+        eprintln!("[probe] OK — depbot created in {n_calls} tool calls, 0 errors");
         let _ = std::fs::remove_dir_all(&store);
     }
 

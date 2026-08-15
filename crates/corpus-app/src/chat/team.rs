@@ -45,6 +45,7 @@ pub const WRITE_TOOLS: &[&str] = &[
     "project_new",
     "project_clone",
     "project_rebind",
+    "agent_new",
     "agent_save",
     "agent_clone",
     "mission_new",
@@ -56,6 +57,21 @@ pub const WRITE_TOOLS: &[&str] = &[
 /// → `agent_list`); un-prefixed names pass through.
 pub fn bare_tool_name(name: &str) -> &str {
     name.rsplit("__").next().unwrap_or(name)
+}
+
+/// Which store area a SUCCESSFUL call to this tool mutates ("projects" /
+/// "agents" / "missions" / "corpus"), if any. Drives the app's nav refresh:
+/// the sidebar re-reads the store when the chat changes it.
+pub fn mutated_area(tool: &str) -> Option<&'static str> {
+    match bare_tool_name(tool) {
+        "project_new" | "project_clone" | "project_rebind" | "project_delete" => Some("projects"),
+        "agent_new" | "agent_save" | "agent_clone" | "agent_delete" => Some("agents"),
+        "mission_new" | "mission_delete" | "mission_set_budget" | "mission_set_pins" => {
+            Some("missions")
+        }
+        "corpus_wipe" => Some("corpus"),
+        _ => None,
+    }
 }
 
 /// Whether a tool call needs the operator's inline Approve before dispatch.
@@ -90,6 +106,7 @@ pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "project_rebind",
     "agent_list",
     "agent_get",
+    "agent_new",
     "agent_save",
     "agent_clone",
     "agent_delete",
@@ -130,6 +147,7 @@ impl TeamRole {
             TeamRole::AgentBuilder => &[
                 "agent_list",
                 "agent_get",
+                "agent_new",
                 "agent_save",
                 "agent_clone",
             ],

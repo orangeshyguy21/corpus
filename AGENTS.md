@@ -150,8 +150,10 @@ agents) never enables it; the chat session config always does
 on the flag and the admin profile advertises NO sandbox/finding tools.
 
 Admin tools (all thin over corpus-core): `project_list/new/clone/delete/
-rebind`, `agent_list/get/save/clone/delete` (`agent_save` runs the core
-validator; invalid is refused with the validator's message), `mission_list/
+rebind`, `agent_list/get/new/save/clone/delete` (`agent_new` builds the
+opencode.json from structured fields — prefer it for creation; `agent_save`
+only edits existing agents and runs the core validator, refusing invalid
+documents with the validator's message), `mission_list/
 get/new/delete/set_budget/set_pins`, `corpus_wipe`, `corpus_stats/list/read`.
 
 - **Confirm-token gate (server-side, all four destructive ops):**

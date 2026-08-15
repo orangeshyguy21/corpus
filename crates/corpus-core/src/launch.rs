@@ -167,7 +167,7 @@ impl RunSession {
         let opencode = resolve_opencode()?;
         let tmux = resolve_tmux().ok_or_else(|| Error::Store("tmux vanished".into()))?;
         let ts = now_secs();
-        let agent_stem = slugify(agent);
+        let agent_stem = crate::store::slugify(agent);
         let session = format!("corpus-{agent_stem}-{ts}");
         let export_json = Self::runs_for(store, project, agent, ts, "json");
         let temp = std::env::temp_dir();
@@ -896,7 +896,7 @@ fn opencode_command(
     mission: &str,
 ) -> Command {
     let mut command = Command::new(opencode);
-    command.args(["run", "--agent", &slugify(agent)]);
+    command.args(["run", "--agent", &crate::store::slugify(agent)]);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(model) = model {
         command.args(["-m", model]);
@@ -922,19 +922,7 @@ fn opencode_command(
 
 /// The materialized agent file stem: bare (slugified) — no team prefix.
 pub fn agent_file_stem(agent: &str) -> String {
-    slugify(agent)
-}
-
-/// kebab-case a free-form agent name.
-fn slugify(name: &str) -> String {
-    name.to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
+    crate::store::slugify(agent)
 }
 
 /// A fresh transcript path + the epoch for headless runs.

@@ -417,9 +417,21 @@ impl Mission {
     }
 }
 
+/// kebab-case a free-form name ("Dep Bot!" → "dep-bot"). Returns "" when
+/// nothing alphanumeric survives — callers fall back to an id.
+pub fn slugify(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// Validate a project or agent/mission slug: kebab-case, no path escapes.
-pub fn validate_slug(slug: &str) -> Result<()> {
-    if slug.is_empty()
+pub fn validate_slug(slug: &str) -> Result<()> {    if slug.is_empty()
         || slug.len() > 64
         || slug == "."
         || slug == ".."

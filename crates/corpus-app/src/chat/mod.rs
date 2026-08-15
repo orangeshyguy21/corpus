@@ -67,6 +67,10 @@ pub enum ChatEvent {
         output_tokens: Option<i32>,
         total_tokens: Option<i32>,
     },
+    /// A write tool succeeded and mutated a store area ("projects" /
+    /// "agents" / "missions" / "corpus" — chat::team::mutated_area). The
+    /// app refreshes its nav from the store on this event.
+    StoreMutated { area: &'static str },
     /// The backend shut down / errored.
     Error(String),
 }
@@ -84,6 +88,7 @@ impl ChatEvent {
             ChatEvent::PermissionRequest { .. } => "permission_request",
             ChatEvent::TurnEnd { .. } => "turn_end",
             ChatEvent::Usage { .. } => "usage",
+            ChatEvent::StoreMutated { .. } => "store_mutated",
             ChatEvent::Error(_) => "error",
         }
     }

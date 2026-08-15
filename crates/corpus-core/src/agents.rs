@@ -158,7 +158,9 @@ impl Store {
         validate_slug(slug)?;
         let dir = self.project_agent_dir(project, slug);
         if !dir.join("opencode.json").is_file() {
-            return Err(Error::Store(format!("agent not found: {project}/{slug}")));
+            return Err(Error::Store(format!(
+                "agent not found: {project}/{slug} — create it first with agent_new or agent_clone"
+            )));
         }
         validate_agent_doc(doc, &dir).map_err(|e| Error::Store(format!("agent {slug}: {e}")))?;
         let pretty = serde_json::to_string_pretty(doc)?;
@@ -166,13 +168,79 @@ impl Store {
         Ok(())
     }
 
+    /// Create an agent from STRUCTURED content (the management chat's
+    /// `agent_new`) — the server builds the opencode.json; the caller never
+    /// hand-writes nested JSON (the depbot-session failure mode: the model
+    /// serialized the document as a string, twice).
+    ///
+    /// With `from`, the new agent starts from an existing project agent's
+    /// tree (permissions/prompts inherited — "a researcher like X but…")
+    /// with description/prompt/model overlaid and the primary key renamed
+    /// to `slug`. Without, a minimal doc: description + mode + prompt [+
+    /// model], no permission block.
+    pub fn create_agent(
+        &self,
+        project: &str,
+        slug: &str,
+        description: &str,
+        prompt: &str,
+        model: Option<&str>,
+        from: Option<&str>,
+    ) -> Result<()> {
+        validate_slug(slug)?;
+        let dir = self.project_agent_dir(project, slug);
+        if dir.join("opencode.json").is_file() {
+            return Err(Error::Store(format!("agent already exists: {project}/{slug}")));
+        }
+        fs::create_dir_all(&dir)?;
+
+        let mut cfg = serde_json::Map::new();
+        if let Some(from) = from {
+            let source = self.project_agent_dir(project, from);
+            let src_doc_path = source.join("opencode.json");
+            if !src_doc_path.is_file() {
+                return Err(Error::Store(format!(
+                    "agent not found: {project}/{from} — 'from' must name an existing agent in this project"
+                )));
+            }
+            copy_tree(&source, &dir)?;
+            let raw = fs::read_to_string(&src_doc_path)?;
+            let doc: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|e| Error::Store(format!("agent {project}/{from}: invalid opencode.json: {e}")))?;
+            // A blank base (seed-less stores) has no primary — nothing to
+            // inherit, start from empty.
+            cfg = primary_agent_cfg(&doc, project, from).unwrap_or_default();
+        }
+        cfg.insert("description".into(), description.into());
+        cfg.insert("mode".into(), "primary".into());
+        if !prompt.is_empty() {
+            cfg.insert("prompt".into(), prompt.into());
+        }
+        if let Some(model) = model {
+            cfg.insert("model".into(), model.into());
+        }
+        let doc = serde_json::json!({
+            "$schema": OPENCODE_SCHEMA,
+            "agent": { slug: cfg },
+        });
+        validate_agent_doc(&doc, &dir).map_err(|e| Error::Store(format!("agent {slug}: {e}")))?;
+        fs::write(dir.join("opencode.json"), serde_json::to_string_pretty(&doc)?)?;
+        write_sidecar(&dir, slug, from)?;
+        Ok(())
+    }
+
     /// Clone an agent (opencode.json + prompts); the sidecar records the
-    /// source, and the config hash is recomputed from the copy.
+    /// source, and the config hash is recomputed from the copy. The primary
+    /// agent key is renamed to the new slug — a verbatim copy left the old
+    /// name inside the new dir (`agent_get depbot` answered with a
+    /// "researcher" doc; the depbot session, 2026-08-14).
     pub fn clone_agent(&self, project: &str, from: &str, to: &str) -> Result<()> {
         validate_slug(to)?;
         let source = self.project_agent_dir(project, from);
         if !source.join("opencode.json").is_file() {
-            return Err(Error::Store(format!("agent not found: {project}/{from}")));
+            return Err(Error::Store(format!(
+                "agent not found: {project}/{from} — 'from' must name an existing agent in this project (see agent_list)"
+            )));
         }
         let dest = self.project_agent_dir(project, to);
         if dest.join("opencode.json").is_file() {
@@ -180,6 +248,19 @@ impl Store {
         }
         fs::create_dir_all(&dest)?;
         copy_tree(&source, &dest)?;
+        // Rename the primary key: dir slug == opencode name for the clone.
+        // (Seed-less stores have BLANK docs with an empty agent map —
+        // nothing to rename there.)
+        let raw = fs::read_to_string(dest.join("opencode.json"))?;
+        let mut doc: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| Error::Store(format!("agent {project}/{from}: invalid opencode.json: {e}")))?;
+        if let Ok(cfg) = primary_agent_cfg(&doc, project, from) {
+            if let Some(agents) = doc.get_mut("agent").and_then(|a| a.as_object_mut()) {
+                agents.clear();
+                agents.insert(to.to_string(), serde_json::Value::Object(cfg));
+            }
+            fs::write(dest.join("opencode.json"), serde_json::to_string_pretty(&doc)?)?;
+        }
         write_sidecar(&dest, to, Some(from))?;
         Ok(())
     }
@@ -445,10 +526,48 @@ fn inline_file_refs(dir: &Path, prompt: &str) -> Result<String> {
 
 /// Validate an agent opencode.json document. JSON already-parsed; checks the
 /// structural rules the plan mandates before a save is allowed.
-fn validate_agent_doc(doc: &serde_json::Value, dir: &Path) -> Result<()> {
-    let obj = doc
-        .as_object()
-        .ok_or_else(|| Error::Store("opencode.json must be a JSON object".into()))?;
+/// A JSON value's kind, for teaching error messages ("got a string — pass
+/// the object itself").
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// The PRIMARY agent's config object from an opencode.json document (exactly
+/// one primary is required — the same rule the validator enforces). Used by
+/// the create/clone paths to inherit a base config.
+fn primary_agent_cfg(
+    doc: &serde_json::Value,
+    project: &str,
+    slug: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let agents = doc
+        .get("agent")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| Error::Store(format!("agent {project}/{slug}: missing \"agent\" map")))?;
+    let primary = agents.iter().find(|(_, cfg)| {
+        cfg.get("mode").and_then(|v| v.as_str()).unwrap_or("primary") == "primary"
+    });
+    let Some((_, cfg)) = primary else {
+        return Err(Error::Store(format!(
+            "agent {project}/{slug}: no primary agent in opencode.json"
+        )));
+    };
+    Ok(cfg.as_object().cloned().unwrap_or_default())
+}
+
+fn validate_agent_doc(doc: &serde_json::Value, dir: &Path) -> Result<()> {    let obj = doc.as_object().ok_or_else(|| {
+        Error::Store(format!(
+            "opencode.json must be a JSON object, got {} — pass the object itself, not its string serialization",
+            json_kind(doc)
+        ))
+    })?;
     let agents = obj
         .get("agent")
         .and_then(|v| v.as_object())
@@ -679,6 +798,89 @@ mod tests {
         let agent = store.load_agent("p", "a").unwrap();
         let map = agent.doc.get("agent").unwrap().as_object().unwrap();
         assert!(map.contains_key("one") && map.contains_key("two"));
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn create_agent_builds_a_valid_doc_from_structured_fields() {
+        let store = tmp_store("create");
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        // Blank path: minimal doc, validator passes, key == slug.
+        store
+            .create_agent("p", "depbot", "scans deps", "you scan deps", None, None)
+            .unwrap();
+        let agent = store.load_agent("p", "depbot").unwrap();
+        let map = agent.doc.get("agent").unwrap().as_object().unwrap();
+        let cfg = map.get("depbot").expect("primary key is the slug");
+        assert_eq!(cfg.get("description").unwrap(), "scans deps");
+        assert_eq!(cfg.get("prompt").unwrap(), "you scan deps");
+        assert_eq!(cfg.get("mode").unwrap(), "primary");
+        assert!(cfg.get("permission").is_none(), "blank path has no permission block");
+        // Duplicate refused.
+        assert!(store
+            .create_agent("p", "depbot", "x", "y", None, None)
+            .is_err());
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn create_agent_from_inherits_and_overlays() {
+        let store = tmp_store("createfrom");
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent("p", "base", "base agent", "base prompt", None, None)
+            .unwrap();
+        // Give the base a permission block to inherit.
+        let mut doc = store.load_agent("p", "base").unwrap().doc;
+        doc["agent"]["base"]["permission"] = serde_json::json!({"bash": "deny"});
+        store.save_agent("p", "base", &doc).unwrap();
+        store
+            .create_agent("p", "child", "child desc", "child prompt", Some("ollama/x"), Some("base"))
+            .unwrap();
+        let agent = store.load_agent("p", "child").unwrap();
+        let map = agent.doc.get("agent").unwrap().as_object().unwrap();
+        // The key is RENAMED to the new slug (the depbot-session lie:
+        // agent_get depbot answered with a "researcher" doc).
+        assert!(!map.contains_key("base"), "the inherited key must be renamed");
+        let cfg = map.get("child").expect("primary key is the new slug");
+        assert_eq!(cfg.get("description").unwrap(), "child desc");
+        assert_eq!(cfg.get("prompt").unwrap(), "child prompt");
+        assert_eq!(cfg.get("model").unwrap(), "ollama/x");
+        assert_eq!(cfg["permission"]["bash"], serde_json::json!("deny"), "permissions inherited");
+        // Missing 'from' names the rule.
+        let err = store
+            .create_agent("p", "orphan", "d", "p", None, Some("ghost"))
+            .unwrap_err();
+        assert!(err.to_string().contains("'from' must name an existing agent"), "{err}");
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn clone_agent_renames_the_primary_key() {
+        let store = tmp_store("clonerename");
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        // The project seeds the core pair, but a seed-less temp store's
+        // "researcher" is BLANK — give it a real doc first (production
+        // seeds have content), then clone.
+        store
+            .save_agent(
+                "p",
+                "researcher",
+                &doc(serde_json::json!({
+                    "researcher": {"mode": "primary", "description": "r", "prompt": "x"},
+                })),
+            )
+            .unwrap();
+        store.clone_agent("p", "researcher", "depbot").unwrap();
+        let agent = store.load_agent("p", "depbot").unwrap();
+        let map = agent.doc.get("agent").unwrap().as_object().unwrap();
+        assert!(map.contains_key("depbot"), "clone must rename the primary key");
+        assert!(!map.contains_key("researcher"), "clone must not keep the old key");
+        // The not-found error teaches the create path.
+        let err = store.clone_agent("p", "ghost", "x").unwrap_err();
+        assert!(err.to_string().contains("agent_list"), "{err}");
+        let err = store.save_agent("p", "ghost", &doc(serde_json::json!({"a": {"prompt": "x"}}))).unwrap_err();
+        assert!(err.to_string().contains("agent_new"), "{err}");
         let _ = fs::remove_dir_all(store.root());
     }
 }
