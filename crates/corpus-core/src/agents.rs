@@ -15,13 +15,18 @@
 //! rejected by opencode's schema, so the document stays clean); corpus
 //! metadata lives in the `agent.yaml` sidecar, never in the JSON.
 //!
-//! The renderer materializes the launched agent into `.opencode/agent/<name>.md`
+//! The renderer materializes a project's agents into `.opencode/agent/<name>.md`
 //! — one file per `agent` map entry, frontmatter carrying description/mode/
 //! model/temperature/permission and a body of the prompt with `{file:}` refs
 //! inlined from the agent dir. `.opencode/agent/` is corpus-managed: a launch
-//! first clears the previous generated set, then renders the launched agent's
-//! files, so subagent names stay bare and the primary's `task:` permission
-//! keys match verbatim.
+//! first clears the previous generated set, then renders EVERY agent of the
+//! launched project, so the agent list opencode shows is scoped to the
+//! project (and subagent names stay bare so the primary's `task:` permission
+//! keys match verbatim). Every render BINDS the agent to its project:
+//! `store/projects/*` permission patterns are rewritten to the concrete
+//! project, wildcard read-allows gain the corpus boundary, and a Corpus
+//! scope section names the exact corpus dir — agents stay in their own
+//! project's corpus.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -226,8 +231,42 @@ impl Store {
         }
     }
 
+    /// Render EVERY agent of the project into `.opencode/agent/*.md` (bare
+    /// names) — after clearing the previous generated set, so the agent
+    /// list opencode shows is scoped to this project. Agents render in
+    /// slug order; an entry-name collision between two of the project's
+    /// agents resolves to the later slug. Returns the written paths.
+    pub fn render_project_agents(&self, project: &str) -> Result<Vec<PathBuf>> {
+        let agents = self.list_agents(project)?;
+        self.clear_opencode_agents();
+        let out_dir = self.opencode_agent_dir();
+        fs::create_dir_all(&out_dir)?;
+        let mut written = Vec::new();
+        for (slug, agent) in agents {
+            let dir = self.project_agent_dir(project, &slug);
+            let Some(agent_map) = agent.doc.get("agent").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let mut names: Vec<&String> = agent_map.keys().collect();
+            names.sort();
+            for name in names {
+                let cfg = agent_map[name]
+                    .as_object()
+                    .ok_or_else(|| Error::Store(format!("agent {slug}/{name}: not an object")))?;
+                let body = render_agent_file(cfg, &dir, project)?;
+                let dest = out_dir.join(format!("{name}.md"));
+                fs::write(&dest, body)?;
+                written.push(dest);
+            }
+        }
+        Ok(written)
+    }
+
     /// Render the launched agent into `.opencode/agent/*.md` (bare names) —
-    /// after clearing the previous generated set. Returns the written paths.
+    /// ADDITIVE (no clear): used to layer a follow-up agent (the CLI
+    /// `--research` pass) onto an already project-scoped set. Launch paths
+    /// scope the set with [`Store::render_project_agents`] instead.
+    /// Returns the written paths.
     pub fn render_agent(&self, project: &str, slug: &str) -> Result<Vec<PathBuf>> {
         let agent = self.load_agent(project, slug)?;
         let out_dir = self.opencode_agent_dir();
@@ -245,7 +284,7 @@ impl Store {
             let cfg = agent_map[name]
                 .as_object()
                 .ok_or_else(|| Error::Store(format!("agent {slug}/{name}: not an object")))?;
-            let body = render_agent_file(cfg, &dir)?;
+            let body = render_agent_file(cfg, &dir, project)?;
             let dest = out_dir.join(format!("{name}.md"));
             fs::write(&dest, body)?;
             written.push(dest);
@@ -255,7 +294,16 @@ impl Store {
 }
 
 /// Render one agent-map entry into the opencode agent-markdown body.
-fn render_agent_file(cfg: &serde_json::Map<String, serde_json::Value>, dir: &Path) -> Result<String> {
+/// The render BINDS the agent to its project: `store/projects/*`
+/// permission patterns are rewritten to the concrete project, a wildcard
+/// read-allow gains the corpus boundary (other projects' corpora denied),
+/// and a Corpus scope section is appended naming the exact corpus dir —
+/// a rendered agent never has to guess which project's corpus is home.
+fn render_agent_file(
+    cfg: &serde_json::Map<String, serde_json::Value>,
+    dir: &Path,
+    project: &str,
+) -> Result<String> {
     let mut out = String::with_capacity(256);
     out.push_str("---\n");
     let description = cfg.get("description").and_then(|v| v.as_str()).unwrap_or("");
@@ -278,7 +326,8 @@ fn render_agent_file(cfg: &serde_json::Map<String, serde_json::Value>, dir: &Pat
     }
     if let Some(permission) = cfg.get("permission") {
         out.push_str("permission:\n");
-        let yaml = serde_yaml::to_string(permission)
+        let bound = bind_permission_to_project(permission, project);
+        let yaml = serde_yaml::to_string(&canonical_json(&bound))
             .map_err(|e| Error::Store(format!("cannot serialize permission: {e}")))?;
         for line in yaml.lines() {
             out.push_str("  ");
@@ -290,11 +339,90 @@ fn render_agent_file(cfg: &serde_json::Map<String, serde_json::Value>, dir: &Pat
     if let Some(prompt) = cfg.get("prompt").and_then(|v| v.as_str()) {
         out.push_str(&inline_file_refs(dir, prompt)?);
     }
+    out.push_str(&corpus_scope_section(project));
     Ok(out)
 }
 
-/// Substitute every `{file:<rel>}` token in a prompt with the contents of the
-/// referenced file under the agent dir.
+/// The launch-bound orientation footer: which corpus is home, and the
+/// project-boundary rule. Appended after the agent's own prompt so stale
+/// prompt text (legacy flat-store paths) is overridden by recency.
+fn corpus_scope_section(project: &str) -> String {
+    format!(
+        "\n---\n\n## Corpus scope (bound at launch)\n\n\
+         You are bound to project `{project}`. Your corpus is\n\
+         `store/projects/{project}/corpus/` — categories: `hypotheses/`,\n\
+         `techniques/`, `findings/`, `attacks/`, `runs/`. Read and write\n\
+         ONLY inside it. Other projects' corpora are denied by\n\
+         permissions and strictly off-limits: reading them pollutes the\n\
+         project boundary. Any path in this prompt that names a corpus\n\
+         category without the `store/projects/{project}/` prefix means\n\
+         the one inside YOUR project corpus.\n"
+    )
+}
+
+/// Bind a permission document to a concrete project at render time:
+/// `store/projects/*` rule keys become `store/projects/<project>`, and a
+/// wildcard read-allow gains the corpus boundary (`store/projects/*`
+/// deny, own project allow — appended last so it wins the evaluation).
+fn bind_permission_to_project(
+    permission: &serde_json::Value,
+    project: &str,
+) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let Value::Object(map) = permission else {
+        return permission.clone();
+    };
+    let mut out = Map::new();
+    for (key, value) in map {
+        let mut value = bind_permission_to_project(value, project);
+        if key == "read" {
+            if let Value::Object(rules) = &mut value {
+                let wildcard_allow =
+                    rules.get("*").and_then(Value::as_str) == Some("allow");
+                let has_boundary = rules.keys().any(|k| k.starts_with("store/projects/"));
+                if wildcard_allow && !has_boundary {
+                    rules.insert(
+                        "store/projects/*".to_string(),
+                        Value::String("deny".to_string()),
+                    );
+                    rules.insert(
+                        format!("store/projects/{project}/**"),
+                        Value::String("allow".to_string()),
+                    );
+                }
+            }
+        }
+        let key = key.replace("store/projects/*", &format!("store/projects/{project}"));
+        out.insert(key, value);
+    }
+    Value::Object(out)
+}
+
+/// Recursively sort object keys so rendered bytes are identical no matter
+/// how feature unification ordered serde_json's map (`preserve_order`
+/// leaks in via sibling deps; without this, which binary rendered last
+/// decides the byte order and the checked-in agent files flip-flop).
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), canonical_json(v)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Substitute every `{file:<rel>}` token in a prompt with the contents of
+/// the referenced file under the agent dir.
 fn inline_file_refs(dir: &Path, prompt: &str) -> Result<String> {
     let mut out = String::with_capacity(prompt.len());
     let mut rest = prompt;
@@ -447,6 +575,49 @@ mod tests {
 
     fn doc(agent: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "$schema": OPENCODE_SCHEMA, "agent": agent })
+    }
+
+    #[test]
+    fn render_binds_permission_and_scope_to_project() {
+        let store = tmp_store("bind");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store.create_blank_agent("alpha", "a").unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "a",
+                &doc(serde_json::json!({
+                    "one": {
+                        "mode": "primary",
+                        "prompt": "hello",
+                        "permission": {
+                            "read": { "*": "allow", "benchmarks/**": "deny" },
+                            "write": { "*": "deny", "store/projects/*/corpus/**": "allow" },
+                            "bash": "deny"
+                        }
+                    },
+                })),
+            )
+            .unwrap();
+        let written = store.render_project_agents("alpha").unwrap();
+        let text = fs::read_to_string(&written[0]).unwrap();
+        // Wildcard store paths bound to the concrete project.
+        assert!(text.contains("store/projects/alpha/corpus/**"), "{text}");
+        assert!(!text.contains("store/projects/*/corpus/**"), "{text}");
+        // Read-allow gains the corpus boundary: other projects denied,
+        // own project allowed (appended last so it wins evaluation).
+        let fm = &text.split("---\n").nth(1).unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("{{{fm}}}").replace("---", ""))
+            .unwrap_or_else(|_| serde_yaml::from_str(fm).unwrap());
+        let read = &yaml["permission"]["read"];
+        assert_eq!(read["store/projects/*"].as_str(), Some("deny"));
+        assert_eq!(read["store/projects/alpha/**"].as_str(), Some("allow"));
+        // Scalar permissions untouched.
+        assert_eq!(yaml["permission"]["bash"].as_str(), Some("deny"));
+        // The scope section names the project corpus.
+        assert!(text.contains("## Corpus scope (bound at launch)"));
+        assert!(text.contains("You are bound to project `alpha`"));
+        let _ = fs::remove_dir_all(store.root());
     }
 
     #[test]

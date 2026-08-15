@@ -17,3 +17,24 @@ pub fn fmt_bytes(bytes: u64) -> String {
         format!("{:.1}gb", bytes as f64 / GIB)
     }
 }
+
+/// Compact token count (`950`, `12.3k`, `1.2M`) for the cost table.
+pub fn fmt_tokens(tokens: u64) -> String {
+    if tokens < 1_000 {
+        format!("{tokens}")
+    } else if tokens < 1_000_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    }
+}
+
+/// USD cost, cents precision (4 decimals below a dime so small runs stay
+/// distinguishable).
+pub fn fmt_usd(cost: f64) -> String {
+    if cost.abs() < 0.1 {
+        format!("${cost:.4}")
+    } else {
+        format!("${cost:.2}")
+    }
+}

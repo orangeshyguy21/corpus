@@ -61,34 +61,31 @@ impl MissionsView {
 
         // A just-created mission launches automatically (once): a BARE TUI
         // at an empty prompt. pending_launch is consumed even on failure.
+        // launch_mission REPLACES a live run (export + tear-down), so a
+        // new mission never inherits the previous mission's session.
         if state.pending_launch.as_deref() == Some(slug.as_str()) {
             state.pending_launch = None;
-            if !state.run_active() {
-                if let Err(error) = state.launch_mission(&project, &mission.agent, &slug) {
-                    toast(toasts, ToastKind::Error, error.to_string());
-                }
+            if let Err(error) = state.launch_mission(&project, &mission.agent, &slug) {
+                toast(toasts, ToastKind::Error, error.to_string());
             }
         }
 
         // Drain whatever the session produced since the last frame.
         state.poll_run();
 
-        // Attach precedence (state.rs): (1) the mission's recorded session
-        // when it's live on the tmux server, (2) the app-owned live run,
-        // (3) idle.
-        let target = if mission
-            .session
-            .as_ref()
-            .is_some_and(|s| state.live_sessions.contains(s))
-        {
-            let name = mission.session.clone().expect("checked above");
-            AppState::session_attach_command(&name).map(|argv| (name, argv))
-        } else if let Some(argv) = state.live_pty_attach() {
-            let name = AppState::pty_attach_session(&argv).unwrap_or_default();
-            Some((name, argv))
-        } else {
-            None
-        };
+        // Attach ONLY to the selected mission's own session: live on the
+        // tmux server, or the app-owned live run when it is this mission's
+        // (the live_sessions refresh can lag a launch). Another mission's
+        // run is never shown here — an idle mission shows idle.
+        let target = mission.session.clone().and_then(|name| {
+            let live = state.live_sessions.contains(&name)
+                || state.live_run_session().as_deref() == Some(name.as_str());
+            if live {
+                AppState::session_attach_command(&name).map(|argv| (name, argv))
+            } else {
+                None
+            }
+        });
         if let Err(error) = self.pane.sync_target(ui.ctx(), target) {
             toast(toasts, ToastKind::Error, error);
         }
@@ -96,8 +93,8 @@ impl MissionsView {
         if self.pane.attached().is_some() {
             // The embedded opencode TUI, edge-to-edge.
             self.pane.show(ui);
-        } else if state.run_active() {
-            // Piped fallback (no tmux): the bare transcript tail.
+        } else if state.run_active() && state.run_mission.as_deref() == Some(slug.as_str()) {
+            // Piped fallback (no tmux): this mission's transcript tail.
             self.tail(ui, state);
         } else if let Some(path) = &state.export_path {
             // Idle with a known transcript: one faint centered line.

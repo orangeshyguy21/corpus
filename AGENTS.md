@@ -39,7 +39,15 @@ store/               the corpus knowledge base. Core seed agents (versioned
                      store/projects/<slug>/corpus/             (the corpus)
                      store/projects/<slug>/agents/<slug>/      (agent configs)
                      store/projects/<slug>/missions/<slug>.md  (mission records)
-sources.toml         pinned target source manifest (repo → commit SHA)
+sources.toml         pinned target source manifest (repo → tag + sha; the
+                     DEFAULT pin per repo — the PLUGIN defines the revs
+                     available, the PROJECT owns the pick (persisted on
+                     project.yaml `pins`): the top-bar dropdown discovers
+                     tags via git ls-remote (cached under
+                     sources/.rev-cache/), launch resolves rev → sha +
+                     fetches the tree, and the sandbox is recreated when
+                     its mounts don't match the mission's pins, delivered
+                     via CORPUS_SOURCE_PINS)
 sources/             git-ignored fetch of pinned trees (sources/<name>/<sha>/)
 docs/                (gone — folded into dev/; see below)
 dev/                 everything uncommitted & machine-local: architecture,
@@ -90,9 +98,10 @@ Environment is checked via `corpus plugin probe cdk-regtest`. The CLI:
 corpus plugin list
 corpus plugin probe <name>
 corpus plugin call <name> <method> [params-json]
-# Run a mission; the agent is materialized to
-# .opencode/agent/ first (bare names), then opencode runs on the
-# CORPUS_PROJECT scope. The app launches the FULL opencode TUI in a
+# Run a mission; the project's agents are materialized to
+# .opencode/agent/ first (clear + render the whole project set, bare
+# names — the opencode agent list is project-scoped), then opencode runs
+# on the CORPUS_PROJECT scope. The app launches the FULL opencode TUI in a
 # DETACHED tmux session (corpus-<agent>-<ts>) and shows it in the
 # EMBEDDED terminal pane (egui_term; the pane runs `tmux attach`
 # in-process — no external-terminal popup): click the pane to steer,
@@ -219,18 +228,21 @@ extensions:
   builds opt out with `--no-default-features`, which ALSO drops the goose dep
   tree (`goose` is an optional dep); with it OFF the backend is a no-op stub
   that reports the feature is required. The panel (`chat/panel.rs`, native
-  egui) renders streaming markdown, collapsible tool-call cards, and the
+  egui) renders attributed message bubbles (you / corpus), collapsible
+  thought cards (the model's reasoning, chronological in the log),
+  collapsible tool-call cards, a live activity tail + stop button, and the
   confirm ritual as inline Approve/Reject (the operator releases every
-  mutating tool call). The chat model picker is its OWN source — corpus-core
+  mutating tool call). The chat model picker lives in the panel footer by
+  the input and is its OWN source — corpus-core
   `ollama_models()` (`ollama list`), because the chat talks to Ollama
   directly; the mission/agent picker keeps opencode's `model_list()`
   unchanged. New deps on corpus-app: `goose` (+ `tokio`/`tokio-util`/
-  `futures`/`anyhow`, and ICU resolver pins). The MANAGED `goose acp`
+  `futures`/`anyhow`/`rmcp`, and ICU resolver pins). The MANAGED `goose acp`
   subprocess arm it replaced is deleted (git history keeps it; the fallback
   story lives in dev/decisions.md).
-  **TEAM SHAPE** (dev/decisions.md): the panel runs a
-  role-scoped session (`chat/team.rs` — a ROLE selector, default
-  **Orchestrator**). `TeamRole` = `Operator` / `Orchestrator` /
+  **TEAM SHAPE** (dev/chat-harness-plan.md): the panel runs a
+  role-scoped session (`chat/team.rs` — a ROLE selector in the chat header,
+  default **Operator**). `TeamRole` = `Operator` / `Orchestrator` /
   `AgentBuilder` / `ProjectManager` / `MissionManager` / `CorpusInspector`.
   Each non-`Operator` role registers `corpus-mcp --admin` with
   `available_tools` = its scoped domain, so a specialist is scoped BY
@@ -238,13 +250,28 @@ extensions:
   destructive set (`corpus_wipe`/`project_delete`/`agent_delete`/
   `mission_delete`) is withheld from EVERY specialist and the orchestrator
   holds none (registers no admin extension); the Orchestrator delegates to
-  specialists via goose's **summon** platform extension (the only public
-  subagent hook — `run_subagent_task` is `pub(crate)`). **Destructive ops are
-  Operator-mode only** (switch the ROLE selector to Operator): there the full
+  specialists via OUR **`delegate` frontend tool** (`build_team_extension` in
+  `chat/embedded.rs`): goose yields the call to the app, which spawns the
+  specialist IN-PROCESS as a full goose Agent with its own scoped
+  corpus-admin extension, streaming its tool calls as `role›tool` cards.
+  (goose's summon platform extension was dropped 2026-08-14: a delegated
+  subagent inherits only the PARENT session's extensions, so per-specialist
+  scoping through summon is impossible — audit in dev/chat-harness-plan.md.)
+  **Destructive ops are Operator-mode only** (the default role): the full
   catalog is present and every destructive call is gated by the inline
-  Approve/Reject before dispatch — `delete this corpus` works by switching to
-  Operator and Approving. Session transcripts flush to
-  `<project scope>/var/chat/<session>.md` on each completed turn.
+  Approve/Reject before dispatch. **Approval policy** (`chat/team.rs` —
+  `needs_approval` over the pure-data whitelists `READ_ONLY_TOOLS` /
+  `WRITE_TOOLS` / `DESTRUCTIVE_TOOLS`, partition-tested): read-only tools
+  never ask (auto-released in-process — a smart agent reads freely); write
+  tools gate while `CORPUS_CHAT_APPROVE_WRITES` is unset/non-`0` (the
+  kill-switch NEVER covers the destructive set — that always gates);
+  unknown tools fail closed. Delegated specialists run the same policy —
+  their write calls surface as panel Approve/Reject cards routed back to
+  the specialist agent by the pending-confirmation router
+  (`deliver_confirmation`). Session transcripts flush to
+  `<project scope>/var/chat/<session>.md` on each completed turn; per-turn
+  harness diagnostics (lifecycle, tool calls, usage, errors) append to
+  `<project scope>/var/chat/chat.log`.
 
 The default write/read scope is project `default`
 (`CORPUS_PROJECT` overrides it). Agents write into the project corpus
@@ -295,7 +322,14 @@ The reference plugin is `plugins/cdk-regtest`.
 - Core seed agents live at `store/templates/agents/<slug>/` (opencode.json +
   prompts/) and are the one committed part of store/ (`.gitignore` carves them
   out of the otherwise-private store). The role agents in `.opencode/agent/`
-  are **generated** from them — hand-editing both is drift.
+  are **generated** from them — regenerate with
+  `cargo run -p corpus-core --example render_seeds` after editing a seed;
+  hand-editing both is drift (the `templates` test enforces byte equality).
+  Every render is **project-bound**: `store/projects/*` permission patterns
+  are rewritten to the concrete project, a wildcard read-allow gains the
+  boundary rules (`store/projects/*: deny`, own-project allow), and a
+  "Corpus scope" section is appended naming the exact corpus — a launched
+  agent cannot read or write another project's corpus.
 - Slugs are **kebab-case**, one card per technique (no `_` / title drift).
 - `findings/` and `runs/` filenames carry an **epoch-seconds prefix**
   (`<epoch>-<slug>`); they read newest-first. Other categories are A–Z.

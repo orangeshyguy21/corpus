@@ -23,6 +23,64 @@ use std::fmt;
 pub const DESTRUCTIVE_TOOLS: &[&str] =
     &["corpus_wipe", "project_delete", "agent_delete", "mission_delete"];
 
+/// Read-only admin tools: NO operator approval — a smart, effective agent
+/// reads freely (the blanket Approve mode buried every `agent_list` under an
+/// approval card).
+pub const READ_ONLY_TOOLS: &[&str] = &[
+    "project_list",
+    "agent_list",
+    "agent_get",
+    "mission_list",
+    "mission_get",
+    "corpus_stats",
+    "corpus_list",
+    "corpus_read",
+];
+
+/// Mutating-but-not-destructive admin tools: approval-gated FOR NOW (the
+/// operator watches mutations while the harness earns trust). Flip
+/// `CORPUS_CHAT_APPROVE_WRITES=0` to release the gate — destructive tools
+/// are NOT covered by that switch; they always gate.
+pub const WRITE_TOOLS: &[&str] = &[
+    "project_new",
+    "project_clone",
+    "project_rebind",
+    "agent_save",
+    "agent_clone",
+    "mission_new",
+    "mission_set_budget",
+    "mission_set_pins",
+];
+
+/// The bare tool name from a goose-prefixed call (`corpus-admin__agent_list`
+/// → `agent_list`); un-prefixed names pass through.
+pub fn bare_tool_name(name: &str) -> &str {
+    name.rsplit("__").next().unwrap_or(name)
+}
+
+/// Whether a tool call needs the operator's inline Approve before dispatch.
+/// Policy (dev/chat-harness-plan.md): reads never gate; writes gate while
+/// `CORPUS_CHAT_APPROVE_WRITES` is unset/non-"0"; the destructive set ALWAYS
+/// gates — the kill-switch never covers it. Whitelists are the pure-data
+/// tables above: adding/removing a tool is a one-line edit (the
+/// classification test keeps them disjoint and complete).
+pub fn needs_approval(tool: &str) -> bool {
+    let bare = bare_tool_name(tool);
+    if DESTRUCTIVE_TOOLS.contains(&bare) {
+        return true;
+    }
+    if READ_ONLY_TOOLS.contains(&bare) {
+        return false;
+    }
+    if WRITE_TOOLS.contains(&bare) {
+        return std::env::var("CORPUS_CHAT_APPROVE_WRITES")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    }
+    // Unknown tool: gate it (fail closed).
+    true
+}
+
 /// The bare corpus-admin tool names (the `corpus-mcp --admin` catalog).
 pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "project_list",
@@ -125,7 +183,7 @@ impl TeamRole {
 pub fn role_description(role: TeamRole) -> &'static str {
     match role {
         TeamRole::Operator => "unfiltered operator with the full corpus-admin catalog (destructive ops gated by Approve/Reject)",
-        TeamRole::Orchestrator => "co-ordinates the specialist team; holds no admin tools and delegates via summon",
+        TeamRole::Orchestrator => "co-ordinates the specialist team; holds no admin tools and delegates via the delegate tool",
         TeamRole::AgentBuilder => "agent-builder: creates and edits agent configs in the project scope",
         TeamRole::ProjectManager => "project-manager: creates and rebinds project scopes / plugin bindings",
         TeamRole::MissionManager => "mission-manager: creates and sizes missions and their budgets/pins",
@@ -151,6 +209,15 @@ pub fn role_from_label(label: &str) -> Option<TeamRole> {
 /// unfiltered default and not a team member).
 pub const SPECIALIST_ROLES: &[TeamRole] = &[
     TeamRole::Orchestrator,
+    TeamRole::AgentBuilder,
+    TeamRole::ProjectManager,
+    TeamRole::MissionManager,
+    TeamRole::CorpusInspector,
+];
+
+/// The roles the orchestrator may DELEGATE to via the `delegate` frontend
+/// tool: the four specialists (never Operator, never itself).
+pub const DELEGATABLE_ROLES: &[TeamRole] = &[
     TeamRole::AgentBuilder,
     TeamRole::ProjectManager,
     TeamRole::MissionManager,
@@ -262,5 +329,58 @@ mod tests {
             assert_eq!(role_from_label(role.label()), Some(*role));
         }
         assert_eq!(role_from_label("bogus"), None);
+    }
+
+    /// The approval whitelists must partition the catalog EXACTLY: every
+    /// admin tool is in precisely one of read-only / write / destructive.
+    /// This is what makes "add/remove from the whitelist" a safe one-line
+    /// edit — an unclassified tool fails here, not silently in production
+    /// (where `needs_approval` fails closed).
+    #[test]
+    fn approval_classification_partitions_the_catalog() {
+        for tool in ALL_ADMIN_TOOLS {
+            let n = [
+                READ_ONLY_TOOLS.contains(tool),
+                WRITE_TOOLS.contains(tool),
+                DESTRUCTIVE_TOOLS.contains(tool),
+            ]
+            .iter()
+            .filter(|b| **b)
+            .count();
+            assert_eq!(n, 1, "{tool} must be in exactly one approval class");
+        }
+        // And no whitelist entry dangles outside the catalog.
+        for tool in READ_ONLY_TOOLS
+            .iter()
+            .chain(WRITE_TOOLS)
+            .chain(DESTRUCTIVE_TOOLS)
+        {
+            assert!(
+                ALL_ADMIN_TOOLS.contains(tool),
+                "{tool} is whitelisted but not in the corpus-admin catalog"
+            );
+        }
+    }
+
+    /// The policy itself: reads never gate, writes gate (unless the
+    /// kill-switch is off), destruction ALWAYS gates, unknown gates.
+    #[test]
+    fn needs_approval_policy() {
+        // Env hygiene: the kill-switch is unset in the test process.
+        std::env::remove_var("CORPUS_CHAT_APPROVE_WRITES");
+        assert!(!needs_approval("agent_list"));
+        assert!(!needs_approval("corpus-admin__agent_list")); // prefixed form
+        assert!(!needs_approval("corpus_read"));
+        assert!(needs_approval("agent_save"));
+        assert!(needs_approval("project_new"));
+        for t in DESTRUCTIVE_TOOLS {
+            assert!(needs_approval(t), "{t} must always gate");
+        }
+        assert!(needs_approval("some_unknown_tool"), "unknown fails closed");
+        // The kill-switch releases WRITES only.
+        std::env::set_var("CORPUS_CHAT_APPROVE_WRITES", "0");
+        assert!(!needs_approval("agent_save"));
+        assert!(needs_approval("corpus_wipe"), "destructive gates even with the kill-switch off");
+        std::env::remove_var("CORPUS_CHAT_APPROVE_WRITES");
     }
 }

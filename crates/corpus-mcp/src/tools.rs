@@ -44,6 +44,10 @@ pub struct Ctx {
     /// Pending destructive-op confirmations keyed by their one-shot token.
     /// Minted by a dry-run call; consumed by the token-bearing re-call.
     pub pending_confirms: HashMap<String, PendingConfirm>,
+    /// The mission's resolved source pins (`repo -> sha`, from
+    /// CORPUS_SOURCE_PINS at launch) — forwarded to the plugin on every
+    /// sandbox_exec so the sandbox mounts the recorded revs.
+    pub source_pins: Option<serde_json::Map<String, Value>>,
 }
 
 /// A pending destructive-op confirmation: a single-use, short-TTL token
@@ -74,6 +78,10 @@ impl Ctx {
             ready: false,
             notes: format!("probe failed: {e}"),
         });
+        let source_pins = std::env::var(corpus_core::SOURCE_PINS_ENV)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|v| v.as_object().cloned());
         Ok(Self {
             plugin,
             store: Store::from_env(),
@@ -85,6 +93,7 @@ impl Ctx {
             last_probe: std::time::Instant::now(),
             admin: false,
             pending_confirms: HashMap::new(),
+            source_pins,
         })
     }
 
@@ -289,7 +298,8 @@ fn target_info(ctx: &mut Ctx) -> Result<String> {
 }
 
 fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
-    let result = resilient(ctx, |p| p.sandbox_exec(command))?;
+    let pins = ctx.source_pins.clone();
+    let result = resilient(ctx, |p| p.sandbox_exec_with_sources(command, pins.as_ref()))?;
     let mut combined = result.output;
     if combined.len() > OUTPUT_CAP_BYTES {
         combined.truncate(OUTPUT_CAP_BYTES);

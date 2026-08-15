@@ -44,10 +44,18 @@ pub const ROW_HL: Color32 = Color32::from_rgb(0x1e, 0x1f, 0x24);
 pub const ROW_HOVER: Color32 = Color32::from_rgb(0x16, 0x17, 0x1b);
 /// JSON editor frame fill (`#101114` — a hair lighter than BG).
 pub const EDITOR_BG: Color32 = Color32::from_rgb(0x10, 0x11, 0x14);
-/// The corpus stack graphic's plate stroke (`#3a3b44`).
-pub const PLATE_LINE: Color32 = Color32::from_rgb(0x3a, 0x3b, 0x44);
 /// The corpus stack graphic's front-plate fill (`#191a1f`).
 pub const PLATE_FRONT: Color32 = Color32::from_rgb(0x19, 0x1a, 0x1f);
+/// Category segment colors for the corpus visual (hypotheses, techniques,
+/// findings, attacks, runs, other) — muted, distinct on the dark panels.
+pub const CORPUS_PALETTE: [Color32; 6] = [
+    Color32::from_rgb(0x4a, 0x6e, 0x8f), // slate blue
+    Color32::from_rgb(0x6f, 0x8f, 0x5a), // moss
+    Color32::from_rgb(0xe5, 0x44, 0x2c), // corpus red (findings)
+    Color32::from_rgb(0x8f, 0x6f, 0x4a), // amber-brown
+    Color32::from_rgb(0x5c, 0x5d, 0x66), // faint grey (runs)
+    Color32::from_rgb(0x3a, 0x3b, 0x44), // plate grey (other)
+];
 /// The house-button resting fill (`#1c1d22`).
 const HOUSE_FILL: Color32 = Color32::from_rgb(0x1c, 0x1d, 0x22);
 /// The house-button hover fill (`#232429`).

@@ -13,6 +13,7 @@ mod models;
 mod plugin;
 mod registry;
 mod sensitivity;
+mod srcrev;
 mod store;
 
 pub use agents::{AgentConfig, AgentSidecar, CORE_SEEDS, OPENCODE_SCHEMA};
@@ -26,10 +27,12 @@ pub use plugin::{
     FaucetCall, FaucetResult, OracleInfo, OracleResult, Plugin, PluginManifest, ProbeResult,
     SandboxExecResult, SourceInfo,
 };
-pub use registry::{discover, plugin_sources, plugin_status, plugins_dir, PluginDir, PluginStatus, SourceRevs};
+pub use registry::{discover, plugin_sources, plugin_status, plugins_dir, prepare_source_pins, PluginDir, PluginStatus, SourceRevs};
 pub use sensitivity::Sensitivity;
+pub use srcrev::{ensure_source_tree, resolve_rev, selectable_revs};
 pub use store::{
-    checksum, corpus_stats, fnv1a_hex, project_slug_env, store_root_env, validate_slug, CorpusStats,
+    checksum, corpus_cost, corpus_stats, fnv1a_hex, project_slug_env, store_root_env, validate_slug,
+    CategoryStat, CorpusStats, CostReport, CostRow,
     MigrationReport, MigrateOptions, Mission, Project, Scope, Store, CATEGORIES,
-    DEFAULT_PROJECT_SLUG, PROJECT_ENV, STORE_ENV,
+    DEFAULT_PROJECT_SLUG, PROJECT_ENV, SOURCE_PINS_ENV, STORE_ENV,
 };

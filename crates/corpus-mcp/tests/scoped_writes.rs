@@ -55,6 +55,7 @@ fn rig(tag: &str) -> TestRig {
         last_probe: std::time::Instant::now(),
         admin: false,
         pending_confirms: std::collections::HashMap::new(),
+        source_pins: None,
     };
     TestRig { ctx, store, root }
 }

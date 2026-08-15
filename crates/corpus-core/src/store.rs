@@ -39,6 +39,10 @@ pub const DEFAULT_PROJECT_SLUG: &str = "default";
 /// Environment variables overriding the default scope.
 pub const STORE_ENV: &str = "CORPUS_STORE";
 pub const PROJECT_ENV: &str = "CORPUS_PROJECT";
+/// The launched mission's resolved source pins (`{"<repo>": "<sha>"}`
+/// JSON) — corpus-mcp forwards these to the plugin so the sandbox mounts
+/// the revs the mission recorded, not config.toml's defaults.
+pub const SOURCE_PINS_ENV: &str = "CORPUS_SOURCE_PINS";
 
 /// The corpus category layout.
 pub const CATEGORIES: [&str; 5] = ["hypotheses", "techniques", "findings", "attacks", "runs"];
@@ -149,6 +153,12 @@ pub struct Project {
     /// Bumped on every corpus wipe so old run logs stay attributable.
     #[serde(default)]
     pub corpus_generation: u64,
+    /// The project's chosen source revs (`repo -> rev`, edited in the top
+    /// bar): the revs available come from the plugin, the SELECTION is the
+    /// project's. Missions stamp these at creation. Empty = every source
+    /// at its default rev.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pins: BTreeMap<String, String>,
 }
 
 impl Project {
@@ -171,9 +181,22 @@ impl Project {
 
 /// The result of a corpus walk: file count + total bytes under
 /// `store/projects/<p>/corpus/` (every file in every category, attack
-/// directories included).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// directories included), broken down per category for the project
+/// view's corpus visual.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CorpusStats {
+    pub files: u64,
+    pub bytes: u64,
+    /// Per-category file/byte totals, in CATEGORIES order, plus an
+    /// `other` bucket when files sit outside a category dir. Empty
+    /// categories are not reported.
+    pub categories: Vec<CategoryStat>,
+}
+
+/// One corpus category's share of the summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryStat {
+    pub name: String,
     pub files: u64,
     pub bytes: u64,
 }
@@ -182,27 +205,153 @@ pub struct CorpusStats {
 /// (one `read_dir` pass) — the UI calls it on selection change and manual
 /// refresh, never per-frame. Mirrors `find store/projects/<p>/corpus -type f`
 /// plus the byte total: only regular files count, directories (including
-/// attack dirs) are descended into.
+/// attack dirs) are descended into; each file is attributed to its
+/// top-level category dir.
 pub fn corpus_stats(store: &Store, project: &str) -> Result<CorpusStats> {
     let root = store.project_corpus_dir(project);
     let mut stats = CorpusStats::default();
-    if !root.is_dir() {
-        return Ok(stats);
-    }
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if let Ok(meta) = fs::metadata(&path) {
-                stats.files += 1;
-                stats.bytes += meta.len();
+    let mut by_name: std::collections::BTreeMap<String, CategoryStat> = CATEGORIES
+        .iter()
+        .map(|c| {
+            (
+                c.to_string(),
+                CategoryStat { name: c.to_string(), files: 0, bytes: 0 },
+            )
+        })
+        .collect();
+    if root.is_dir() {
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(meta) = fs::metadata(&path) {
+                    stats.files += 1;
+                    stats.bytes += meta.len();
+                    let category = path
+                        .strip_prefix(&root)
+                        .ok()
+                        .and_then(|rel| rel.components().next())
+                        .and_then(|c| c.as_os_str().to_str())
+                        .unwrap_or("other");
+                    let slot = by_name
+                        .entry(category.to_string())
+                        .or_insert_with(|| CategoryStat {
+                            name: category.to_string(),
+                            files: 0,
+                            bytes: 0,
+                        });
+                    slot.files += 1;
+                    slot.bytes += meta.len();
+                }
             }
         }
     }
+    // CATEGORIES order first, then any extra bucket (e.g. "other");
+    // empty categories are not reported.
+    let mut categories: Vec<CategoryStat> = CATEGORIES
+        .iter()
+        .map(|c| by_name.remove(*c).expect("seeded above"))
+        .collect();
+    categories.extend(by_name.into_values());
+    categories.retain(|c| c.files > 0);
+    stats.categories = categories;
     Ok(stats)
+}
+
+/// Usage aggregation for one (provider, model) pair, summed over every
+/// exported run transcript in the project corpus.
+#[derive(Debug, Clone, Default)]
+pub struct CostRow {
+    pub provider: String,
+    pub model: String,
+    /// Assistant messages counted (each carries one usage record).
+    pub messages: u64,
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_reasoning: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// USD, as reported by opencode's export.
+    pub cost: f64,
+}
+
+/// The project view's Cost section: per-model rows (cost desc) + totals.
+/// Source data: `runs/<epoch>-<agent>.json` opencode exports (piped
+/// `.log` transcripts carry no usage; they are simply not counted).
+#[derive(Debug, Clone, Default)]
+pub struct CostReport {
+    pub rows: Vec<CostRow>,
+    pub tokens: u64,
+    pub cost: f64,
+}
+
+/// Aggregate token/cost usage across a project's exported run
+/// transcripts. Cheap (one parse per runs/*.json) and best-effort: an
+/// unparseable file is skipped, never fatal — a corrupt export must not
+/// blank the view.
+pub fn corpus_cost(store: &Store, project: &str) -> Result<CostReport> {
+    let runs = store.project_corpus_dir(project).join("runs");
+    let mut report = CostReport::default();
+    if !runs.is_dir() {
+        return Ok(report);
+    }
+    let mut rows: std::collections::BTreeMap<(String, String), CostRow> =
+        std::collections::BTreeMap::new();
+    for entry in fs::read_dir(&runs)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else { continue };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(messages) = doc.get("messages").and_then(|m| m.as_array()) else {
+            continue;
+        };
+        for message in messages {
+            let info = message.get("info").cloned().unwrap_or_default();
+            if info.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                continue;
+            }
+            let provider = info
+                .get("providerID")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let model = info
+                .get("modelID")
+                .and_then(|v| v.as_str())
+                .and_then(|m| m.rsplit('/').next())
+                .unwrap_or("unknown")
+                .to_string();
+            let row = rows.entry((provider.clone(), model.clone())).or_insert_with(|| {
+                CostRow { provider, model, ..CostRow::default() }
+            });
+            let tokens = info.get("tokens").cloned().unwrap_or_default();
+            let take = |v: &serde_json::Value, key: &str| {
+                v.get(key).and_then(|n| n.as_u64()).unwrap_or(0)
+            };
+            let cache = tokens.get("cache").cloned().unwrap_or_default();
+            row.messages += 1;
+            row.tokens_input += take(&tokens, "input");
+            row.tokens_output += take(&tokens, "output");
+            row.tokens_reasoning += take(&tokens, "reasoning");
+            row.cache_read += take(&cache, "read");
+            row.cache_write += take(&cache, "write");
+            row.cost += info.get("cost").and_then(|c| c.as_f64()).unwrap_or(0.0);
+            report.tokens += take(&tokens, "total");
+        }
+    }
+    report.rows = rows.into_values().collect();
+    report
+        .rows
+        .sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+    report.cost = report.rows.iter().map(|r| r.cost).sum();
+    Ok(report)
 }
 
 /// A mission record (`store/projects/<p>/missions/<slug>.md`): the
@@ -330,6 +479,7 @@ impl Store {
             created: now_epoch(),
             cloned_from: None,
             corpus_generation: 0,
+            pins: BTreeMap::new(),
         };
         fs::create_dir_all(self.project_agents_dir(slug))?;
         fs::create_dir_all(self.project_missions_dir(slug))?;
@@ -413,6 +563,19 @@ impl Store {
     pub fn rebind_project(&self, slug: &str, plugin: &str) -> Result<Project> {
         let mut project = Project::load(self, slug)?;
         project.plugin = plugin.to_string();
+        project.save(self, slug)?;
+        Ok(project)
+    }
+
+    /// Persist a project's source-rev selection (the top-bar dropdowns —
+    /// the plugin defines the revs available, the project owns the pick).
+    pub fn set_project_pins(
+        &self,
+        slug: &str,
+        pins: BTreeMap<String, String>,
+    ) -> Result<Project> {
+        let mut project = Project::load(self, slug)?;
+        project.pins = pins;
         project.save(self, slug)?;
         Ok(project)
     }
@@ -928,8 +1091,59 @@ mod tests {
             (12 + 4 + 11 + 10) as u64,
             "sum of exact byte lengths",
         );
+        // Category attribution, CATEGORIES order, attack dirs descended.
+        let names: Vec<&str> = stats.categories.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["techniques", "findings", "attacks"]);
+        assert_eq!(stats.categories[0].files, 1);
+        assert_eq!(stats.categories[1].bytes, 12);
+        assert_eq!(stats.categories[2].files, 2, "both attack files count");
         // a missing project corpus is empty, not an error
         assert_eq!(corpus_stats(&store, "ghost").unwrap(), CorpusStats::default());
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn corpus_cost_aggregates_exports_per_model() {
+        let store = tmp_store("cost");
+        seed_sample(&store);
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        let export = |cost: f64, input: u64, model: &str| {
+            serde_json::json!({
+                "info": {},
+                "messages": [{"info": {
+                    "role": "assistant",
+                    "providerID": "openrouter",
+                    "modelID": model,
+                    "cost": cost,
+                    "tokens": {
+                        "total": input + 8,
+                        "input": input,
+                        "output": 7,
+                        "reasoning": 1,
+                        "cache": {"read": 3, "write": 0}
+                    }
+                }}]
+            })
+            .to_string()
+        };
+        let runs = store.project_corpus_dir("p").join("runs");
+        write(&runs.join("1-operator.json"), &export(0.5, 100, "deepseek/deepseek-v4-flash"));
+        write(&runs.join("2-operator.json"), &export(0.25, 50, "deepseek/deepseek-v4-flash"));
+        write(&runs.join("3-operator.json"), &export(1.5, 200, "moonshotai/kimi-k3"));
+        write(&runs.join("4-operator.log"), "not json — skipped");
+        write(&runs.join("5-operator.json"), "{corrupt");
+        let report = corpus_cost(&store, "p").unwrap();
+        assert_eq!(report.rows.len(), 2);
+        // Cost-desc order: kimi first.
+        assert_eq!(report.rows[0].model, "kimi-k3");
+        assert_eq!(report.rows[0].provider, "openrouter");
+        assert!((report.rows[0].cost - 1.5).abs() < 1e-9);
+        assert_eq!(report.rows[1].messages, 2);
+        assert_eq!(report.rows[1].tokens_input, 150);
+        assert_eq!(report.rows[1].cache_read, 6);
+        assert!((report.cost - 2.25).abs() < 1e-9);
+        assert_eq!(report.tokens, 108 + 58 + 208);
+        assert!(corpus_cost(&store, "ghost").unwrap().rows.is_empty());
         let _ = fs::remove_dir_all(store.root());
     }
 

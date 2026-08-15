@@ -20,7 +20,8 @@ fn store() -> Store {
 }
 
 /// Render the two core agents via the seed→project→render pipeline into
-/// a temp dir (creates a temp project for the render call).
+/// a temp dir (a temp `default` project — the checked-in files carry the
+/// default scope, matching `examples/render_seeds.rs`).
 fn render_all(dest: &Path) -> Vec<(String, String)> {
     let store = store();
     let tmp = repo_root().join("target").join(format!("tpl-test-{}", std::process::id()));
@@ -32,10 +33,10 @@ fn render_all(dest: &Path) -> Vec<(String, String)> {
     if seed_src.is_dir() {
         copy_tree(&seed_src, &seed_dst);
     }
-    test_store.create_project("p", "P", "cdk-regtest").expect("create_project");
+    test_store.create_project("default", "Default corpus project", "cdk-regtest").expect("create_project");
     let mut out = Vec::new();
     for slug in ["operator", "researcher"] {
-        test_store.render_agent("p", slug).unwrap();
+        test_store.render_agent("default", slug).unwrap();
         let rendered_path = test_store.opencode_agent_dir().join(format!("{slug}.md"));
         let text = fs::read_to_string(&rendered_path).unwrap();
         fs::write(dest.join(format!("{slug}.md")), &text).unwrap();

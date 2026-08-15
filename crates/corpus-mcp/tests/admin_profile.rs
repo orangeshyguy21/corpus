@@ -53,6 +53,7 @@ fn rig(tag: &str) -> (Ctx, Store, PathBuf, String) {
         last_probe: std::time::Instant::now(),
         admin: true,
         pending_confirms: HashMap::new(),
+        source_pins: None,
     };
     (ctx, store, root, "proj".to_string())
 }

@@ -11,11 +11,18 @@ use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 
 use corpus_core::{
-    AgentConfig, CorpusStats, Error, Mission, PluginStatus, Project, RunLine, RunSession,
-    SourceRevs, Store,
+    AgentConfig, CorpusStats, CostReport, Error, Mission, PluginStatus, Project, RunLine,
+    RunSession, SourceRevs, Store,
 };
 
 use crate::nav::Screen;
+
+/// One project's subtree in the sidebar tree: its agents and missions.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectTree {
+    pub agents: Vec<(String, AgentConfig)>,
+    pub missions: Vec<(String, Mission)>,
+}
 
 /// App-wide state: the corpus-core store handle plus the data the
 /// screens render. Owned by `App`, passed by reference to the views.
@@ -49,9 +56,11 @@ pub struct AppState {
     pub missions: Vec<(String, Mission)>,
     /// Which project `missions` belongs to; a stale pair is never trusted.
     missions_project: Option<String>,
-    /// The last computed corpus summary (files/bytes) for
-    /// `corpus_stats_project` — refreshed on selection change + manually.
+    /// The last computed corpus summary (files/bytes per category) and
+    /// cost report for `corpus_stats_project` — refreshed on selection
+    /// change + manually.
     corpus_stats: Option<CorpusStats>,
+    corpus_cost: Option<CostReport>,
     corpus_stats_project: Option<String>,
     /// Discovered plugins with live probe results, refreshed on demand
     /// (`refresh_plugins`) — never per-frame: probing spawns processes
@@ -59,6 +68,10 @@ pub struct AppState {
     plugins: Vec<PluginStatus>,
     /// Agents of `agents_project`, sorted by slug (corpus-core order).
     pub agents: Vec<(String, AgentConfig)>,
+    /// The sidebar tree: every project's agents + missions, keyed by
+    /// project slug — rebuilt with `refresh`/`refresh_agents`/
+    /// `refresh_missions` (the CRUD paths), never per frame.
+    pub trees: BTreeMap<String, ProjectTree>,
     /// Which project `agents` belongs to; a stale pair is never trusted.
     pub agents_project: Option<String>,
     /// The agent the Agents screen edits (sidebar click sets it; the view
@@ -75,6 +88,9 @@ pub struct AppState {
     run: Option<RunSession>,
     /// Identity of the active (or last-finished) run.
     pub run_meta: Option<RunMeta>,
+    /// The mission the active run belongs to (None = not a mission run) —
+    /// the mission view never shows another mission's output.
+    pub run_mission: Option<String>,
     /// Transcript lines drained so far (the run view renders these).
     pub run_lines: Vec<RunLine>,
     /// None = still running; Some = final state (set once, at exit).
@@ -98,8 +114,8 @@ pub struct RunMeta {
 /// The final state of a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
-    /// Exited on its own with this code (piped headless only — a TUI
-    /// run never exits by itself).
+    /// Exited on its own with this code (piped headless, or a TUI run
+    /// whose tmux session ended — the operator quit opencode).
     Exited(i32),
     /// Torn down by the operator (best-effort transcript export first).
     Aborted,
@@ -123,7 +139,9 @@ impl AppState {
             env_project: None,
             missions: Vec::new(),
             missions_project: None,
+            trees: BTreeMap::new(),
             corpus_stats: None,
+            corpus_cost: None,
             corpus_stats_project: None,
             plugins: Vec::new(),
             agents: Vec::new(),
@@ -133,6 +151,7 @@ impl AppState {
             pending_launch: None,
             run: None,
             run_meta: None,
+            run_mission: None,
             run_lines: Vec::new(),
             run_status: None,
             export_path: None,
@@ -142,9 +161,30 @@ impl AppState {
         state
     }
 
-    /// Re-list the projects from the store.
+    /// Re-list the projects from the store (and rebuild the sidebar tree).
+    /// Newest-created first — the tree's default-open project is the most
+    /// recent (the selection fallback takes `projects.first()`).
     pub fn refresh(&mut self) {
         self.projects = self.store.list_projects().unwrap_or_default();
+        self.projects.sort_by(|a, b| b.1.created.cmp(&a.1.created));
+        self.refresh_trees();
+    }
+
+    /// Rebuild the sidebar tree: every project's agents + missions. One
+    /// dir scan per project — called from the refresh paths, never per
+    /// frame.
+    pub fn refresh_trees(&mut self) {
+        self.trees = self
+            .projects
+            .iter()
+            .map(|(slug, _)| {
+                let tree = ProjectTree {
+                    agents: self.store.list_agents(slug).unwrap_or_default(),
+                    missions: self.store.list_missions(slug).unwrap_or_default(),
+                };
+                (slug.clone(), tree)
+            })
+            .collect();
     }
 
     /// Re-probe the discovered plugins (host-side aggregation; the app
@@ -158,21 +198,30 @@ impl AppState {
         &self.plugins
     }
 
-    /// Re-list a project's agents.
+    /// Re-list a project's agents (and keep its tree subtree fresh).
     pub fn refresh_agents(&mut self, project: &str) {
         self.agents = self.store.list_agents(project).unwrap_or_default();
         self.agents_project = Some(project.to_string());
+        if let Some(tree) = self.trees.get_mut(project) {
+            tree.agents = self.agents.clone();
+        }
     }
 
-    /// Re-list a project's missions.
+    /// Re-list a project's missions (and keep its tree subtree fresh).
     pub fn refresh_missions(&mut self, project: &str) {
         self.missions = self.store.list_missions(project).unwrap_or_default();
         self.missions_project = Some(project.to_string());
+        if let Some(tree) = self.trees.get_mut(project) {
+            tree.missions = self.missions.clone();
+        }
     }
 
-    /// Re-walk a project's corpus (files/bytes) for the sidebar summary.
+    /// Re-walk a project's corpus (files/bytes per category, and the
+    /// token/cost aggregation over run exports) for the sidebar summary
+    /// and the project view.
     pub fn refresh_corpus_stats(&mut self, project: &str) {
         self.corpus_stats = corpus_core::corpus_stats(&self.store, project).ok();
+        self.corpus_cost = corpus_core::corpus_cost(&self.store, project).ok();
         self.corpus_stats_project = Some(project.to_string());
     }
 
@@ -197,22 +246,46 @@ impl AppState {
         self.refresh_env(slug);
     }
 
-    /// Load the source-rev dropdowns for the project's plugin, defaulting
-    /// `source_pins` to each repo's pinned rev. When the plugin/sources
-    /// can't be found the current pins are left untouched (the placeholder
-    /// defaults hold) rather than cleared.
+    /// Load the source-rev dropdowns for the project's plugin (the plugin
+    /// defines the revs AVAILABLE), seeding the selection from the
+    /// PROJECT's stored pins (the project owns the pick) with any unset
+    /// source at its default rev. When the plugin/sources can't be found
+    /// the current pins are left untouched (the placeholder defaults
+    /// hold) rather than cleared.
     pub fn refresh_source_revs(&mut self, project: &str) {
         let revs = corpus_core::plugin_sources(&self.store, project).unwrap_or_default();
         if !revs.is_empty() {
-            // Re-derive the pins from the plugin's pins: changing the
-            // project changes what pins are meaningful.
+            let stored: BTreeMap<String, String> = self
+                .projects
+                .iter()
+                .find(|(s, _)| s == project)
+                .map(|(_, p)| p.pins.clone())
+                .unwrap_or_default();
             self.source_pins = revs
                 .iter()
-                .map(|source| (source.name.clone(), source.pinned.clone()))
+                .map(|source| {
+                    let rev = stored
+                        .get(&source.name)
+                        .filter(|rev| source.revs.contains(rev))
+                        .cloned()
+                        .unwrap_or_else(|| source.default_rev().to_string());
+                    (source.name.clone(), rev)
+                })
                 .collect();
         }
         self.source_revs = revs;
         self.source_revs_project = Some(project.to_string());
+    }
+
+    /// The top-bar dropdown changed: update the in-memory selection and
+    /// persist the pick onto the project (missions stamp it at creation).
+    pub fn set_source_pin(&mut self, project: &str, repo: &str, rev: &str) -> Result<(), Error> {
+        self.source_pins.insert(repo.to_string(), rev.to_string());
+        let updated = self.store.set_project_pins(project, self.source_pins.clone())?;
+        if let Some((_, spec)) = self.projects.iter_mut().find(|(s, _)| s == project) {
+            *spec = updated;
+        }
+        Ok(())
     }
 
     /// The current env-status aggregation for a project's plugin, as a
@@ -284,8 +357,13 @@ impl AppState {
 
     /// The sidebar's corpus summary for the selected project (None = not
     /// computed yet, or no project).
-    pub fn corpus_stats(&self) -> Option<CorpusStats> {
-        self.corpus_stats
+    pub fn corpus_stats(&self) -> Option<&CorpusStats> {
+        self.corpus_stats.as_ref()
+    }
+
+    /// The project view's cost report for the selected project.
+    pub fn corpus_cost(&self) -> Option<&CostReport> {
+        self.corpus_cost.as_ref()
     }
 
     /// Create a project. The human gives the display name; the machine
@@ -398,24 +476,31 @@ impl AppState {
     }
 
     /// Materialize the agent and spawn the mission on the project
-    /// scope. One active run at a time.
+    /// scope. One active run at a time. `source_pins_json` is the
+    /// resolved `repo -> sha` map exported to the run (None = the
+    /// plugin's default pins).
     pub fn launch(
         &mut self,
         project: &str,
         agent: &str,
         model: Option<&str>,
         mission: &str,
+        source_pins_json: Option<&str>,
     ) -> Result<(), Error> {
         if self.run.is_some() {
             return Err(Error::Store(
                 "a run is already active — abort or wait for it first".into(),
             ));
         }
-        self.store.render_agent(project, agent)?;
-        let session = RunSession::spawn(project, agent, model, mission)?;
+        // Fail loudly on an unknown agent, then materialize the WHOLE
+        // project: the agent list opencode shows is project-scoped.
+        self.store.load_agent(project, agent)?;
+        self.store.render_project_agents(project)?;
+        let session = RunSession::spawn(project, agent, model, mission, source_pins_json)?;
         let pty_attach = session.pty_attach_command();
         self.run = Some(session);
         self.run_meta = Some(RunMeta { pty_attach });
+        self.run_mission = None;
         self.run_lines.clear();
         self.run_status = None;
         Ok(())
@@ -502,7 +587,7 @@ impl AppState {
     // --- mission bookkeeping (run attach + sidebar ops) ---
 
     /// The tmux session of the app-owned live run, if any.
-    fn live_run_session(&self) -> Option<String> {
+    pub(crate) fn live_run_session(&self) -> Option<String> {
         self.live_pty_attach()
             .and_then(|argv| AppState::pty_attach_session(&argv))
     }
@@ -510,10 +595,41 @@ impl AppState {
     /// Launch a mission's run: a BARE opencode TUI (empty prompt — the
     /// operator types the mission into opencode's own input), then persist
     /// the spawned tmux session on the mission record so a relaunched app
-    /// re-attaches by selection.
+    /// re-attaches by selection. One active run at a time: a live run is
+    /// REPLACED (transcript exported when possible, torn down either way)
+    /// so a new mission always lands on a fresh opencode session.
     pub fn launch_mission(&mut self, project: &str, agent: &str, slug: &str) -> Result<(), Error> {
+        // Resolve the mission's rev pins to shas + fetch trees FIRST —
+        // a failed resolution (offline, tag gone) must not tear down the
+        // working run for nothing.
+        let mission_record = self.store.load_mission(project, slug)?;
+        let prepared = corpus_core::prepare_source_pins(&self.store, project, &mission_record.pins)?;
+        let pins_json = if prepared.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&prepared)?)
+        };
+        if self.run_active() {
+            let replaced = self.live_run_session();
+            if self.dismiss_run().is_err() {
+                self.abort_run();
+            }
+            // Clear the replaced session off whichever mission held it —
+            // the tmux session is dead now; re-attach must not aim at it.
+            if let Some(replaced) = replaced {
+                let holder = self
+                    .missions
+                    .iter()
+                    .find(|(s, m)| s != slug && m.session.as_deref() == Some(replaced.as_str()))
+                    .map(|(s, _)| s.clone());
+                if let Some(holder) = holder {
+                    let _ = self.set_mission_session(project, &holder, None, None);
+                }
+            }
+        }
         let model = self.agent_default_model(project, agent);
-        self.launch(project, agent, model.as_deref(), "")?;
+        self.launch(project, agent, model.as_deref(), "", pins_json.as_deref())?;
+        self.run_mission = Some(slug.to_string());
         if let Some(session) = self.live_run_session() {
             self.set_mission_session(project, slug, Some(session), None)?;
         }

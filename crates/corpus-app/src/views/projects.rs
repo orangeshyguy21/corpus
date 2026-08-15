@@ -3,7 +3,9 @@
 //! Clone / Delete top-right + the dim `created:` stamp; a Plugin section
 //! (flat dropdown with a live probe badge, Saved via a rebind); a Corpus
 //! section (file/byte summary + an inline red Delete that wipes the corpus
-//! behind a confirm, and the painted stack-of-plates graphic); Save
+//! behind a confirm, then the data-driven visual: a proportional strip of
+//! category byte shares + legend); a Cost section (per-model token/cost
+//! table aggregated from the exported run transcripts, total row); Save
 //! bottom-right. The project LIST lives in the sidebar (chunk 1), so this
 //! screen is a detail view, not a table.
 //!
@@ -125,7 +127,8 @@ impl ProjectsView {
         ui.add_space(28.0);
 
         // --- Corpus section (spec §5): heading, then the stats row + the
-        // inline red Delete (wipe confirm), then the stack graphic.
+        // inline red Delete (wipe confirm), then the data-driven category
+        // visual (proportional strip + legend).
         ui.label(theme::section_heading("Corpus"));
         ui.add_space(12.0);
         ui.horizontal(|ui| {
@@ -154,12 +157,35 @@ impl ProjectsView {
                 }
             });
         });
-        ui.add_space(8.0);
+        ui.add_space(12.0);
+        if let Some(stats) = state.corpus_stats() {
+            if stats.files > 0 {
+                corpus_visual(ui, stats);
+            } else {
+                ui.label(
+                    RichText::new("empty — missions write findings, techniques, hypotheses, attacks and runs here")
+                        .size(12.0)
+                        .color(theme::TEXT_FAINT),
+                );
+            }
+        }
+        ui.add_space(28.0);
 
-        // The painted stack-of-plates graphic (decorative v1; the TODO
-        // marks the data-driven revision).
-        self.stack_graphic(ui);
-        ui.add_space(8.0);
+        // --- Cost section: per-model usage aggregated from the exported
+        // run transcripts (runs/*.json), cost-desc, with a total row.
+        ui.label(theme::section_heading("Cost"));
+        ui.add_space(12.0);
+        match state.corpus_cost() {
+            Some(report) if !report.rows.is_empty() => cost_table(ui, report),
+            _ => {
+                ui.label(
+                    RichText::new("no usage recorded — cost is aggregated from exported run transcripts (runs/*.json)")
+                        .size(12.0)
+                        .color(theme::TEXT_FAINT),
+                );
+            }
+        }
+        ui.add_space(28.0);
 
         // --- Save (rebind) bottom-right (spec §5).
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
@@ -291,45 +317,159 @@ impl ProjectsView {
         self.show_clone = open && !cloned;
     }
 
-    /// The decorative stack-of-plates graphic (spec §5, `paint_corpus_stack`):
-    /// N = 12 parallelograms receding up-right, drawn back-to-front; only
-    /// the front plate fills. Purely painted — no data binding.
-    /// TODO: data-driven plate count.
-    fn stack_graphic(&mut self, ui: &mut Ui) {
-        let avail = ui.available_width();
-        let size = egui::vec2(avail.min(760.0), 240.0);
-        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-        let painter = ui.painter_at(rect);
-        paint_corpus_stack(&painter, rect);
+}
+
+/// The corpus visual: a full-width strip segmented by each category's
+/// byte share (hover a segment for its files/bytes), with a legend row
+/// under it — the "what's in the corpus" answer at a glance.
+fn corpus_visual(ui: &mut Ui, stats: &corpus_core::CorpusStats) {
+    let width = ui.available_width().min(760.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 1.0, theme::PLATE_FRONT);
+    let mut x = rect.left();
+    for (i, category) in stats.categories.iter().enumerate() {
+        let share = category.bytes as f32 / stats.bytes.max(1) as f32;
+        let w = if i == stats.categories.len() - 1 {
+            rect.right() - x // last segment absorbs rounding
+        } else {
+            (rect.width() * share).max(2.0)
+        };
+        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height()));
+        let color = theme::CORPUS_PALETTE[i % theme::CORPUS_PALETTE.len()];
+        painter.rect_filled(seg, 0.0, color);
+        painter.rect_stroke(
+            seg,
+            0.0,
+            egui::Stroke::new(1.0_f32, theme::BG),
+            egui::StrokeKind::Inside,
+        );
+        ui.allocate_rect(seg, egui::Sense::hover()).on_hover_text(format!(
+            "{} — {} files, {}",
+            category.name,
+            category.files,
+            fmt_bytes(category.bytes)
+        ));
+        x += w;
+    }
+    ui.add_space(8.0);
+    // Legend: swatch + name + files + bytes per category.
+    for (i, category) in stats.categories.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let (dot, _) =
+                ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(dot, 1.0, theme::CORPUS_PALETTE[i % theme::CORPUS_PALETTE.len()]);
+            ui.label(RichText::new(&category.name).size(12.0).color(theme::TEXT));
+            ui.label(
+                RichText::new(format!("{} files", category.files))
+                    .size(12.0)
+                    .color(theme::TEXT_MUTED),
+            );
+            ui.label(
+                RichText::new(fmt_bytes(category.bytes))
+                    .size(12.0)
+                    .color(theme::TEXT_FAINT),
+            );
+        });
     }
 }
 
-/// The stack-of-plates painter (spec §5): plates recede up-right, stroke
-/// PLATE_LINE, the front (i = 0) plate also fills PLATE_FRONT.
-fn paint_corpus_stack(painter: &egui::Painter, rect: egui::Rect) {
-    let n = 12usize;
-    let x0 = 60.0;
-    let y0 = rect.bottom() - 60.0;
-    let stroke = egui::Stroke::new(1.0_f32, theme::PLATE_LINE);
-    for i in (0..n).rev() {
-        let ox = x0 + (i as f32) * 34.0;
-        let oy = y0 - (i as f32) * 15.0;
-        let corners = [
-            egui::pos2(ox, oy),
-            egui::pos2(ox + 300.0, oy),
-            egui::pos2(ox + 330.0, oy - 20.0),
-            egui::pos2(ox + 30.0, oy - 20.0),
-        ];
-        if i == 0 {
-            painter.add(egui::Shape::convex_polygon(
-                corners.to_vec(),
-                theme::PLATE_FRONT,
-                stroke,
-            ));
-        } else {
-            painter.add(egui::Shape::closed_line(corners.to_vec(), stroke));
-        }
-    }
+/// The Cost table: one row per (model, provider) with token breakdown,
+/// cost-desc; a bold total row closes it out.
+fn cost_table(ui: &mut Ui, report: &corpus_core::CostReport) {
+    use egui_extras::{Column, TableBuilder};
+    let heading = |text: &str| RichText::new(text).size(12.0).color(theme::TEXT_FAINT);
+    let cell = |text: String| RichText::new(text).size(12.5).color(theme::TEXT);
+    let num = |text: String| RichText::new(text).size(12.5).monospace().color(theme::TEXT_MUTED);
+    TableBuilder::new(ui)
+        .id_salt("project_cost_table")
+        .column(Column::initial(170.0).at_least(120.0)) // model
+        .column(Column::initial(110.0).at_least(80.0)) // provider
+        .column(Column::exact(70.0)) // input
+        .column(Column::exact(70.0)) // output
+        .column(Column::exact(70.0)) // reasoning
+        .column(Column::exact(70.0)) // cache read
+        .column(Column::exact(70.0)) // cache write
+        .column(Column::exact(90.0)) // cost
+        .header(20.0, |mut header| {
+            for title in ["model", "provider", "in", "out", "reason", "cache r", "cache w", "cost"] {
+                header.col(|ui| {
+                    ui.label(heading(title));
+                });
+            }
+        })
+        .body(|mut body| {
+            for row in &report.rows {
+                body.row(20.0, |mut tr| {
+                    tr.col(|ui| {
+                        ui.label(cell(row.model.clone()));
+                    });
+                    tr.col(|ui| {
+                        ui.label(cell(row.provider.clone()));
+                    });
+                    tr.col(|ui| {
+                        ui.label(num(crate::fmt::fmt_tokens(row.tokens_input)));
+                    });
+                    tr.col(|ui| {
+                        ui.label(num(crate::fmt::fmt_tokens(row.tokens_output)));
+                    });
+                    tr.col(|ui| {
+                        ui.label(num(crate::fmt::fmt_tokens(row.tokens_reasoning)));
+                    });
+                    tr.col(|ui| {
+                        ui.label(num(crate::fmt::fmt_tokens(row.cache_read)));
+                    });
+                    tr.col(|ui| {
+                        ui.label(num(crate::fmt::fmt_tokens(row.cache_write)));
+                    });
+                    tr.col(|ui| {
+                        ui.label(
+                            RichText::new(crate::fmt::fmt_usd(row.cost))
+                                .size(12.5)
+                                .monospace()
+                                .strong()
+                                .color(theme::TEXT),
+                        );
+                    });
+                });
+            }
+            // Total row.
+            body.row(22.0, |mut tr| {
+                let total_in: u64 = report.rows.iter().map(|r| r.tokens_input).sum();
+                let total_out: u64 = report.rows.iter().map(|r| r.tokens_output).sum();
+                let total_reason: u64 = report.rows.iter().map(|r| r.tokens_reasoning).sum();
+                let total_cr: u64 = report.rows.iter().map(|r| r.cache_read).sum();
+                let total_cw: u64 = report.rows.iter().map(|r| r.cache_write).sum();
+                let strong_num = |text: String| {
+                    RichText::new(text).size(12.5).monospace().strong().color(theme::TEXT)
+                };
+                tr.col(|ui| {
+                    ui.label(strong_num("total".to_string()));
+                });
+                tr.col(|ui| {
+                    ui.label(num(format!("{} tok", crate::fmt::fmt_tokens(report.tokens))));
+                });
+                tr.col(|ui| {
+                    ui.label(strong_num(crate::fmt::fmt_tokens(total_in)));
+                });
+                tr.col(|ui| {
+                    ui.label(strong_num(crate::fmt::fmt_tokens(total_out)));
+                });
+                tr.col(|ui| {
+                    ui.label(strong_num(crate::fmt::fmt_tokens(total_reason)));
+                });
+                tr.col(|ui| {
+                    ui.label(strong_num(crate::fmt::fmt_tokens(total_cr)));
+                });
+                tr.col(|ui| {
+                    ui.label(strong_num(crate::fmt::fmt_tokens(total_cw)));
+                });
+                tr.col(|ui| {
+                    ui.label(strong_num(crate::fmt::fmt_usd(report.cost)));
+                });
+            });
+        });
 }
 
 /// Add a timed toast to the overlay.

@@ -42,6 +42,10 @@ anyhow = "1"
 # (egui is sync); futures drives the reply stream (CancellationToken from
 # tokio-util::sync is always available in 0.7, no feature gate).
 futures = "0.3"
+# MCP model types (Tool, CallToolResult) for the chat's `delegate` frontend
+# tool — version-locked with goose's rmcp (a type-identity dependency, like
+# the ICU pins above; revisit on a deliberate goose bump).
+rmcp = { version = "3.0.0", default-features = false }
 eframe = { workspace = true }
 egui = { workspace = true }
 # Vendored per the deck-flow-plan table: egui_extras + egui-toast at
@@ -62,3 +66,10 @@ image.workspace = true
 # degrade arm (plain monospace TextEdit) stays if syntect fights egui 0.31
 # — see views/json_editor.rs.
 syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes"] }
+
+[dev-dependencies]
+# The chat probes parse the specialist discovery files' YAML frontmatter the
+# way goose's parse_agent_content does (regression probe for the 2026-08-14
+# "No sources available" bug).
+serde = { workspace = true }
+serde_yaml = { workspace = true }

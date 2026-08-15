@@ -26,6 +26,8 @@ pub mod panel;
 mod embedded;
 pub mod team;
 
+pub use embedded::init_goose_env;
+
 use std::sync::{Arc, Mutex};
 
 /// An event emitted by the chat runtime, in OUR vocabulary.
@@ -41,6 +43,9 @@ pub enum ChatEvent {
     TurnStart { turn: u64 },
     /// Streaming assistant text fragment (a `ContentChunk`-equivalent).
     TextChunk { turn: u64, delta: String },
+    /// A reasoning/thinking fragment (the model's thought process — rendered
+    /// as a collapsible thought card, chronological with text and tools).
+    ThinkingChunk { turn: u64, delta: String },
     /// The agent emitted a tool call (name + args).
     ToolCallStart { id: String, name: String, args_json: String },
     /// The agent tool call completed with this output.
@@ -56,6 +61,12 @@ pub enum ChatEvent {
     },
     /// The agent ended its turn.
     TurnEnd { turn: u64 },
+    /// Token accounting for a completed inference (per provider call).
+    Usage {
+        input_tokens: Option<i32>,
+        output_tokens: Option<i32>,
+        total_tokens: Option<i32>,
+    },
     /// The backend shut down / errored.
     Error(String),
 }
@@ -67,10 +78,12 @@ impl ChatEvent {
             ChatEvent::Ready { .. } => "ready",
             ChatEvent::TurnStart { .. } => "turn_start",
             ChatEvent::TextChunk { .. } => "text_chunk",
+            ChatEvent::ThinkingChunk { .. } => "thinking_chunk",
             ChatEvent::ToolCallStart { .. } => "tool_call_start",
             ChatEvent::ToolCallResult { .. } => "tool_call_result",
             ChatEvent::PermissionRequest { .. } => "permission_request",
             ChatEvent::TurnEnd { .. } => "turn_end",
+            ChatEvent::Usage { .. } => "usage",
             ChatEvent::Error(_) => "error",
         }
     }
@@ -202,7 +215,11 @@ impl ChatHandle {
 impl Chat for ChatHandle {
     fn send(&mut self, message: &str) {
         let _ = self.inner.lock().unwrap().tx.send(ChatCommand::Send(message.to_string()));
-        self.inner.lock().unwrap().transcript.push(format!("> {message}"));
+        self.inner
+            .lock()
+            .unwrap()
+            .transcript
+            .push(format!("## you\n\n{message}"));
     }
 
     fn approve(&mut self, id: &str) {
@@ -249,10 +266,34 @@ impl Chat for ChatHandle {
                     inner.session_id = Some(session_id.clone());
                     inner.phase = ChatPhase::Ready;
                 }
-                ChatEvent::Error(_) => inner.phase = ChatPhase::Finished,
-                ChatEvent::TextChunk { delta, .. } => {
-                    if let Some(last) = inner.transcript.last_mut() {
-                        last.push_str(delta);
+                ChatEvent::Error(e) => {
+                    inner.phase = ChatPhase::Finished;
+                    inner.transcript.push(format!("**error**: {e}"));
+                }
+                // The transcript is a STRUCTURED log (role headers, thought
+                // cards, tool calls) — the old format concatenated user and
+                // assistant text (`> helloHello! 👋…`) and dropped tools and
+                // thinking, making audits impossible (2026-08-14).
+                ChatEvent::TextChunk { delta, .. } => match inner.transcript.last_mut() {
+                    Some(last) if last.starts_with("## corpus") => last.push_str(delta),
+                    _ => inner.transcript.push(format!("## corpus\n\n{delta}")),
+                },
+                ChatEvent::ThinkingChunk { delta, .. } => match inner.transcript.last_mut() {
+                    Some(last) if last.starts_with("### thought") => last.push_str(delta),
+                    _ => inner.transcript.push(format!("### thought\n\n{delta}")),
+                },
+                ChatEvent::ToolCallStart { name, args_json, .. } => {
+                    inner
+                        .transcript
+                        .push(format!("### tool › {name}\n\n```json\n{args_json}\n```"));
+                }
+                ChatEvent::ToolCallResult { is_error, output, .. } => {
+                    let marker = if *is_error { "→ (error) " } else { "→ " };
+                    match inner.transcript.last_mut() {
+                        Some(last) if last.starts_with("### tool ›") => {
+                            last.push_str(&format!("\n\n{marker}{output}"));
+                        }
+                        _ => inner.transcript.push(format!("{marker}{output}")),
                     }
                 }
                 _ => {}
@@ -280,20 +321,28 @@ impl Chat for ChatHandle {
 /// path is unwritable.
 fn flush_transcript(project: &str, session_id: Option<&str>, transcript: &[String]) {
     let Some(session_id) = session_id else { return };
-    let store = std::env::var("CORPUS_STORE").unwrap_or_else(|_| "store".into());
-    let dir = std::path::PathBuf::from(store)
+    let dir = corpus_core::store_root_env()
         .join("projects")
         .join(project)
         .join("var/chat");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let body = transcript.join("\n");
+    let body = transcript.join("\n\n");
     let _ = std::fs::write(dir.join(format!("{session_id}.md")), body);
 }
 
-/// The corpus-admin destructive tool set. The embedded backend gates
-/// execution in-process: a mutating tool call is surfaced to the operator as
+/// Truncate a string for one-line diagnostics (char-safe, ellipsised).
+pub fn truncate(s: &str, max: usize) -> String {
+    let one_line = s.replace('\n', " ");
+    if one_line.chars().count() <= max {
+        return one_line;
+    }
+    let cut: String = one_line.chars().take(max).collect();
+    format!("{cut}…")
+}
+
+/// The corpus-admin destructive tool set. The embedded backend gates/// execution in-process: a mutating tool call is surfaced to the operator as
 /// an inline [`ChatEvent::PermissionRequest`] and only runs when the operator
 /// Approves (goose's `tool_confirmation_router` releases it before dispatch).
 /// See dev/decisions.md decision 5. This list keeps the gate explicit for
@@ -360,6 +409,7 @@ mod tests {
         assert_eq!(ChatEvent::Ready { session_id: "s".into(), project: "p".into() }.kind(), "ready");
         assert_eq!(ChatEvent::TurnStart { turn: 1 }.kind(), "turn_start");
         assert_eq!(ChatEvent::TextChunk { turn: 1, delta: "x".into() }.kind(), "text_chunk");
+        assert_eq!(ChatEvent::ThinkingChunk { turn: 1, delta: "x".into() }.kind(), "thinking_chunk");
         assert_eq!(ChatEvent::ToolCallStart { id: "i".into(), name: "n".into(), args_json: "{}".into() }.kind(), "tool_call_start");
         assert_eq!(ChatEvent::ToolCallResult { id: "i".into(), is_error: false, output: "o".into() }.kind(), "tool_call_result");
         assert_eq!(
@@ -367,6 +417,7 @@ mod tests {
             "permission_request"
         );
         assert_eq!(ChatEvent::TurnEnd { turn: 1 }.kind(), "turn_end");
+        assert_eq!(ChatEvent::Usage { input_tokens: Some(1), output_tokens: Some(2), total_tokens: Some(3) }.kind(), "usage");
         assert_eq!(ChatEvent::Error("e".into()).kind(), "error");
     }
 

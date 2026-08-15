@@ -42,6 +42,27 @@ fn sandbox_exec_returns_output_and_exit_code() {
 }
 
 #[test]
+fn sandbox_exec_forwards_source_pins() {
+    let mut plugin = spawn_echo();
+    let pins: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+        r#"{"cdk":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#,
+    )
+    .unwrap();
+    let result = plugin
+        .sandbox_exec_with_sources("ls", Some(&pins))
+        .expect("sandbox_exec_with_sources");
+    assert_eq!(
+        result.output,
+        r#"echo-container:ls:{"cdk":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#
+    );
+    // None sends no sources key at all (the echo shows nothing extra).
+    let plain = plugin
+        .sandbox_exec_with_sources("ls", None)
+        .expect("sandbox_exec plain");
+    assert_eq!(plain.output, "echo-container:ls");
+}
+
+#[test]
 fn oracles_and_call_oracle() {
     let mut plugin = spawn_echo();
     let oracles = plugin.oracles().expect("oracles");

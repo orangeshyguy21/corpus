@@ -54,6 +54,9 @@ struct App {
     /// The team role the current chat backend was launched as
     /// (dev/decisions.md chunk 3); a change restarts the scoped session.
     chat_role: chat::team::TeamRole,
+    /// The model the current chat backend was launched with; a picker change
+    /// restarts the session (the old code kept the old model silently).
+    chat_model: String,
     /// Last operator-position context pushed to the chat backend (re-pushed
     /// only on change).
     last_chat_context: String,
@@ -77,7 +80,8 @@ impl App {
             toasts: egui_toast::Toasts::new(),
             chat: chat::ChatHandle::idle(""),
             chat_panel: chat::panel::ChatPanelView::default(),
-            chat_role: chat::team::TeamRole::Orchestrator,
+            chat_role: chat::team::TeamRole::Operator,
+            chat_model: String::new(),
             last_chat_context: String::new(),
             chat_width: 360.0,
             state,
@@ -162,20 +166,21 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let total_w = ui.available_width();
                     // LEFT: the wordmark, height 20px, aspect maintained
                     // (source 1072×325 -> ~66px wide).
                     ui.add(
                         egui::Image::new(egui::include_image!("../assets/logo.png"))
                             .fit_to_exact_size(egui::vec2(66.0, 20.0)),
                     );
-                    // Roughly centre the source dropdowns between the logo
-                    // and the right zone.
+                    ui.add_space(theme::SPACING);
+                    self.breadcrumb(ui);
+                    // Roughly centre the source dropdowns in the space
+                    // left between the breadcrumb and the right zone.
+                    let remaining = ui.available_width();
                     let dropdown_count = self.state.source_revs.len().max(1);
                     let dropdown_w = (dropdown_count as f32) * 150.0;
                     let right_zone = 200.0;
-                    let logo_w = 66.0 + theme::SPACING;
-                    let spacer = ((total_w - logo_w - dropdown_w - right_zone) / 2.0).max(0.0);
+                    let spacer = ((remaining - dropdown_w - right_zone) / 2.0).max(0.0);
                     ui.add_space(spacer);
                     self.source_dropdowns(ui);
                     // Right zone (right_to_left places rightmost first): the
@@ -194,20 +199,60 @@ impl App {
             });
     }
 
+    /// The nav breadcrumb: `project > agent > mission` from the current
+    /// selections; each segment jumps to its screen. Faint, mono, compact.
+    fn breadcrumb(&mut self, ui: &mut egui::Ui) {
+        let project = self.state.effective_project().map(|slug| {
+            self.state
+                .projects
+                .iter()
+                .find(|(s, _)| s == &slug)
+                .map(|(_, p)| if p.name.is_empty() { slug.clone() } else { p.name.clone() })
+                .unwrap_or(slug)
+        });
+        let segments: [(Option<String>, Screen); 3] = [
+            (project, Screen::Projects),
+            (self.state.selected_agent.clone(), Screen::Agents),
+            (self.state.selected_mission.clone(), Screen::Missions),
+        ];
+        let mut first = true;
+        for (label, screen) in segments {
+            let Some(label) = label else { continue };
+            if !first {
+                ui.label(egui::RichText::new("›").size(12.0).color(theme::TEXT_FAINT));
+            }
+            first = false;
+            let active = self.state.current_screen == screen;
+            let color = if active { theme::TEXT } else { theme::TEXT_FAINT };
+            let response = ui.add(
+                egui::Label::new(egui::RichText::new(label).size(12.0).monospace().color(color))
+                    .sense(egui::Sense::click()),
+            );
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if response.clicked() {
+                self.state.current_screen = screen;
+            }
+        }
+    }
+
     /// The per-source `repo: rev` dropdowns (spec §3): flat PANEL fields,
     /// the `repo: rev` text in MONOSPACE 13px + a caret_down arrow. Options
-    /// come from the selected project's plugin (`source_revs`), the
-    /// selection lives in `source_pins` (stamped into missions at
-    /// creation). Declaration order is preserved (`source_revs` is a Vec).
+    /// come from the selected project's plugin (`source_revs`); the
+    /// selection is the PROJECT's — persisted on `project.yaml` and
+    /// stamped into missions at creation. Declaration order is preserved
+    /// (`source_revs` is a Vec).
     fn source_dropdowns(&mut self, ui: &mut egui::Ui) {
         let revs = self.state.source_revs.clone();
+        let project = self.state.effective_project();
         for source in &revs {
             let selected = self
                 .state
                 .source_pins
                 .get(&source.name)
                 .cloned()
-                .unwrap_or_else(|| source.pinned.clone());
+                .unwrap_or_else(|| source.default_rev().to_string());
             theme::combo_field(ui, |ui| {
                 egui::ComboBox::from_id_salt(format!("top_source_{}", source.name))
                     .icon(theme::combo_caret)
@@ -227,9 +272,20 @@ impl App {
                                 )
                                 .clicked()
                             {
-                                self.state
-                                    .source_pins
-                                    .insert(source.name.clone(), rev.clone());
+                                // Persist the pick onto the project.
+                                if let Some(project) = &project {
+                                    if let Err(error) = self.state.set_source_pin(
+                                        project,
+                                        &source.name,
+                                        rev,
+                                    ) {
+                                        self.toasts.add(
+                                            egui_toast::Toast::new()
+                                            .kind(egui_toast::ToastKind::Error)
+                                            .text(error.to_string()),
+                                        );
+                                    }
+                                }
                             }
                         }
                     });
@@ -319,9 +375,12 @@ impl App {
     }
 
     /// The management chat panel (dev/decisions.md chunk 3, native egui):
-    /// a model picker (reused from the app's model layer; Ollama group
-    /// default), a streaming markdown message view, tool-call cards, and the
-    /// confirm-token ritual as inline Approve/Reject.
+    /// attributed message bubbles (you / corpus / tool cards), a
+    /// chronological activity tail in the log, and the footer row — model
+    /// picker by the input, then the input + phase status. The picker is
+    /// driven by corpus-core's `ollama_models()` (the GDK chat talks to
+    /// Ollama DIRECTLY, never opencode's catalog); it lives in
+    /// `chat::panel::ChatPanelView`.
     fn chat_panel(&mut self, ctx: &egui::Context) {
         // Width policy: default ~360px, min 280px. The max clamp keeps the panel
         // from ever being forced wider than half the window. `show` returns the
@@ -342,8 +401,8 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(12, 12)),
             )
             .show(ctx, |ui| {
-                self.chat_model_picker(ui);
-                // Drain backend events into the view, then render.
+                // Drain backend events into the view, then render. The model
+                // picker is the panel's own footer widget (by the input).
                 self.chat_panel.absorb(&self.chat);
                 self.ensure_chat_started();
                 // Juice the session with the operator's current position
@@ -359,40 +418,8 @@ impl App {
         self.chat_width = inner.response.rect.width().clamp(280.0, max);
     }
 
-    /// The chat model picker: driven by corpus-core's `ollama_models()` — the
-    /// GDK chat talks to the Ollama server DIRECTLY, so it lists what Ollama
-    /// has pulled, never opencode's catalog (missions/agents keep `model_list`).
-    /// The selected value is the bare model name (the provider is pinned to
-    /// ollama in the chat backend's GOOSE_MODEL). Never an ambient default;
-    /// with no model selected the panel refuses to start.
-    fn chat_model_picker(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("model");
-            let current = self.chat_panel.model().to_string();
-            egui::ComboBox::from_id_salt("chat_model")
-                .selected_text(if current.is_empty() { "choose…".to_string() } else { current.clone() })
-                .show_ui(ui, |ui| {
-                    if let Ok(list) = corpus_core::ollama_models() {
-                        for g in &list.groups {
-                            if !g.label.is_empty() {
-                                ui.label(egui::RichText::new(&g.label).weak().small());
-                            }
-                            for m in &g.models {
-                                let label = if m.name.is_empty() { m.model.clone() } else { m.name.clone() };
-                                if ui.selectable_label(current == m.model, &label).clicked() {
-                                    self.chat_panel.set_model(&m.model);
-                                }
-                            }
-                        }
-                    } else {
-                        ui.label("ollama not available — a model is required");
-                    }
-                });
-        });
-    }
-
-    /// The chat is ALWAYS the Orchestrator — the operator never picks a
-    /// role; delegation to scoped specialists is the orchestrator's job.
+    /// The role + model the current chat backend was launched with; a change
+    /// in either (or a Finished backend) restarts the scoped session.
     fn ensure_chat_started(&mut self) {
         if self.chat_panel.model().is_empty() {
             return; // no model -> panel stays idle (refuses to start)
@@ -401,14 +428,23 @@ impl App {
             return;
         };
         let model = self.chat_panel.model().to_string();
-        let role = chat::team::TeamRole::Orchestrator;
+        let role = self.chat_panel.role();
+        // Live = same project + role + model AND a backend that isn't dead.
+        // (The old check treated ChatPhase::Finished as live — a failed
+        // backend was never restarted — and ignored the model entirely, so
+        // a picker change silently kept the old model.)
         let live = self.chat.project() == project
             && self.chat_role == role
-            && self.chat.phase() != chat::ChatPhase::Idle;
+            && self.chat_model == model
+            && matches!(
+                self.chat.phase(),
+                chat::ChatPhase::Connecting | chat::ChatPhase::Ready
+            );
         if live {
             return;
         }
         self.chat_role = role;
+        self.chat_model = model.clone();
         self.chat = chat::ChatHandle::start_scoped(&project, &model, role);
     }
 
@@ -439,6 +475,10 @@ fn padded<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 fn main() -> eframe::Result {
+    // Process-wide goose env (stream timeout, input limit, telemetry) —
+    // ONCE, before any goose call can lock Config::global(). No-op values
+    // when the operator already set them.
+    chat::init_goose_env();
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 900.0])
         .with_title("corpus-app");

@@ -19,10 +19,12 @@ handle() {
             printf '{"id":%s,"ok":true,"result":["/opt/tools/cdk-cli"]}\n' "$id"
             ;;
         sandbox_exec)
-            local command
+            local command sources
             command="$(jq -r '.command // ""' <<<"$params")"
-            printf '{"id":%s,"ok":true,"result":{"output":"echo-container:%s","exit_code":0}}\n' \
-                "$id" "$command"
+            # Reflect the source pins only when the caller sent them.
+            sources="$(jq -rnc --argjson p "$params" 'if $p.sources then ":" + ($p.sources|tostring) else "" end')"
+            jq -nc --argjson id "$id" --arg output "echo-container:${command}${sources}" \
+                '{id:$id, ok:true, result:{output:$output, exit_code:0}}'
             ;;
         oracles)
             printf '{"id":%s,"ok":true,"result":[{"name":"001-echo","description":"echo oracle"}]}\n' "$id"

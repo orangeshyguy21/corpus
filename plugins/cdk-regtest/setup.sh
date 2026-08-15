@@ -96,6 +96,15 @@ fetch_one() {
     fi
     got="$(git -C "$tmp" rev-parse HEAD)"
     if [ "$got" != "$sha" ]; then
+        # The pin may name a branch tip that has moved (e.g. nuts@main):
+        # fetch the pinned sha itself (GitHub allows sha fetch) rather
+        # than failing a fetch that would never match.
+        if GIT_CONFIG_GLOBAL="$CORPUS_NO_SCM" git -C "$tmp" fetch --quiet --depth 1 origin "$sha" 2>/dev/null \
+            && git -C "$tmp" checkout --quiet --detach "$sha" 2>/dev/null; then
+            got="$(git -C "$tmp" rev-parse HEAD)"
+        fi
+    fi
+    if [ "$got" != "$sha" ]; then
         echo "!! sources/$name: sha mismatch: expected $sha, got $got" >&2
         rm -rf "$tmp"
         return 1

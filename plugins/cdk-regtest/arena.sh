@@ -238,10 +238,15 @@ cmd_agent() {
         -e "CDK_TARGET_MINT_URL_2=$mint_url_2"
         -e "EVIDENCE_DIR=/evidence"
     )
-    # Pinned source corpus: /opt/src/<name>, read-only.
+    # Pinned source corpus: /opt/src/<name>, read-only. Captured (not
+    # process-substituted) so a die in source_mount_args aborts the run —
+    # a subshell die cannot kill the parent and would otherwise start the
+    # agent WITHOUT its sources mounted.
+    local mount_lines mount
+    mount_lines="$(source_mount_args)" || exit 1
     while IFS= read -r mount; do
-        run_args+=("$mount")
-    done < <(source_mount_args)
+        [ -n "$mount" ] && run_args+=("$mount")
+    done <<<"$mount_lines"
     if [ "$detach" = true ]; then
         run_args+=(-d)
     elif [ -t 1 ]; then
@@ -258,17 +263,20 @@ cmd_agent() {
 }
 
 # source_mount_args — the pinned research corpus at /opt/src/<name>, read-only.
-# Each host tree is sources/<name>/<sha>; config.toml [sources] selects the
-# sha, sources.toml is the manifest. Die loudly on missing pins: an agent
-# must never silently run without the source the mission pins assume.
+# Each host tree is sources/<name>/<sha>; the sha comes from the
+# CORPUS_SOURCE_SHA_<NAME> env override when set (a mission's resolved pin,
+# exported by the plugin), else config.toml [sources]. Die loudly on missing
+# pins: an agent must never silently run without the source the mission pins
+# assume.
 source_mount_args() {
-    local args=() name sha
+    local args=() name sha tree
     for name in cdk nuts; do
-        sha="$(cfg sources "${name}_sha" '')"
+        local var="CORPUS_SOURCE_SHA_$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+        sha="${!var:-$(cfg sources "${name}_sha" '')}"
         [ -n "$sha" ] || continue
-        local tree="$SOURCES_DIR/$name/$sha"
+        tree="$SOURCES_DIR/$name/$sha"
         if [ ! -d "$tree/.git" ]; then
-            die "sources/$name/$sha not fetched — run: bash plugins/cdk-regtest/setup.sh"
+            die "sources/$name/$sha not fetched — re-launch the mission (pins fetch at launch) or run: bash plugins/cdk-regtest/setup.sh"
         fi
         args+=(-v "$tree:/opt/src/$name:ro")
     done
@@ -330,7 +338,8 @@ cmd_doctor() {
     echo "sources (pinned research corpus)"
     local name sha tree
     for name in cdk nuts; do
-        sha="$(cfg sources "${name}_sha" '')"
+        local var="CORPUS_SOURCE_SHA_$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+        sha="${!var:-$(cfg sources "${name}_sha" '')}"
         if [ -z "$sha" ]; then
             check warn "sources/$name: not configured in config.toml [sources]"
             continue
@@ -343,7 +352,7 @@ cmd_doctor() {
         local head
         head="$(git -C "$tree" rev-parse HEAD 2>/dev/null || true)"
         if [ "$head" = "$sha" ]; then
-            check ok "sources/$name: HEAD == pin ($sha)"
+            check ok "sources/$name: HEAD == pin ($sha)${!var:+ (mission override)}"
         else
             check fail "sources/$name: HEAD $head != pinned $sha — re-fetch"
         fi

@@ -4,22 +4,22 @@ mode: subagent
 model: ollama/qwen3.8:27b
 permission:
   bash: deny
-  task: deny
-  webfetch: allow
-  websearch: allow
-  write: deny
+  corpus_attack_save: deny
+  corpus_faucet: deny
+  corpus_finding_write: deny
+  corpus_oracle_run: deny
+  corpus_sandbox_exec: deny
+  corpus_target_info: allow
+  corpus_technique_save: deny
+  corpus_wallet_fund: deny
   edit: deny
   read:
     '*': allow
     benchmarks/**: deny
-  corpus_sandbox_exec: deny
-  corpus_faucet: deny
-  corpus_wallet_fund: deny
-  corpus_oracle_run: deny
-  corpus_finding_write: deny
-  corpus_attack_save: deny
-  corpus_technique_save: deny
-  corpus_target_info: allow
+  task: deny
+  webfetch: allow
+  websearch: allow
+  write: deny
 ---
 
 You are the discover-scout SUBAGENT in the research zone of a CDK audit.

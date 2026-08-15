@@ -4,6 +4,20 @@ mode: primary
 model: openrouter/deepseek/deepseek-v4-flash
 permission:
   bash: deny
+  corpus_attack_save: deny
+  corpus_faucet: deny
+  corpus_finding_write: deny
+  corpus_oracle_run: deny
+  corpus_sandbox_exec: deny
+  corpus_target_info: allow
+  corpus_technique_save: allow
+  corpus_wallet_fund: deny
+  edit:
+    '*': deny
+    store/projects/*/corpus/**: allow
+  read:
+    '*': allow
+    benchmarks/**: deny
   task:
     '*': deny
     discover-scout: allow
@@ -12,20 +26,6 @@ permission:
   write:
     '*': deny
     store/projects/*/corpus/**: allow
-  edit:
-    '*': deny
-    store/projects/*/corpus/**: allow
-  read:
-    '*': allow
-    benchmarks/**: deny
-  corpus_sandbox_exec: deny
-  corpus_faucet: deny
-  corpus_wallet_fund: deny
-  corpus_oracle_run: deny
-  corpus_finding_write: deny
-  corpus_attack_save: deny
-  corpus_target_info: allow
-  corpus_technique_save: allow
 ---
 
 You are a corpus RESEARCHER in the research zone. You read and think; you

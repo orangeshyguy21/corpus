@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::models::ModelRegistry;
-use crate::store::{Store, PROJECT_ENV, STORE_ENV};
+use crate::store::{Store, PROJECT_ENV, SOURCE_PINS_ENV, STORE_ENV};
 
 /// One transcript line. In the piped backend the two child streams are
 /// kept apart; in the TUI backend lines come from the raw capture, so
@@ -72,6 +72,9 @@ enum Backend {
         script: PathBuf,
         file_pos: u64,
         pending: String,
+        /// Throttled `tmux has-session` verdict (a subprocess spawn —
+        /// re-checked at most once a second by `try_exit`).
+        liveness: (std::time::Instant, bool),
     },
     /// No tmux / headless automation: `opencode run` piped directly.
     Piped {
@@ -92,21 +95,25 @@ impl RunSession {
     /// APP launch: resolve the model (primary-model -> arg -> registry
     /// tool-use default, fail loudly if none), then run the FULL TUI in
     /// a detached tmux session, or the piped headless fallback when tmux
-    /// is absent.
+    /// is absent. `source_pins_json` is the RESOLVED `repo -> sha` map
+    /// (from `registry::prepare_source_pins`, trees already fetched) —
+    /// exported as CORPUS_SOURCE_PINS so the sandbox mounts exactly the
+    /// revs the mission recorded; None = the plugin's default pins.
     pub fn spawn(
         project: &str,
         agent: &str,
         model: Option<&str>,
         mission: &str,
+        source_pins_json: Option<&str>,
     ) -> Result<Self> {
         let store = Store::from_env();
         let runs_dir = store.project_corpus_dir(project).join("runs");
         let _ = fs::create_dir_all(&runs_dir);
         let model = resolve_launch_model(&store, project, agent, model)?;
         if tmux_available().is_some() {
-            Self::start_tui(&store, project, agent, &model, mission)
+            Self::start_tui(&store, project, agent, &model, mission, source_pins_json)
         } else {
-            Self::start_piped(&store, project, agent, Some(&model), mission, None)
+            Self::start_piped(&store, project, agent, Some(&model), mission, None, source_pins_json)
         }
     }
 
@@ -122,7 +129,7 @@ impl RunSession {
         let store = Store::from_env();
         let runs_dir = store.project_corpus_dir(project).join("runs");
         let _ = fs::create_dir_all(&runs_dir);
-        Self::start_piped(&store, project, agent, model, mission, None)
+        Self::start_piped(&store, project, agent, model, mission, None, None)
     }
 
     /// CLI automation APPENDING to an existing transcript (the
@@ -144,6 +151,7 @@ impl RunSession {
             model,
             mission,
             Some(append_to),
+            None,
         )
     }
 
@@ -154,6 +162,7 @@ impl RunSession {
         agent: &str,
         model: &str,
         mission: &str,
+        source_pins: Option<&str>,
     ) -> Result<Self> {
         let opencode = resolve_opencode()?;
         let tmux = resolve_tmux().ok_or_else(|| Error::Store("tmux vanished".into()))?;
@@ -171,17 +180,19 @@ impl RunSession {
         } else {
             Some(mission)
         };
-        write_tui_script(
-            &script,
-            &[
-                ("CORPUS_OPENCODE_BIN", &opencode.display().to_string()),
-                ("CORPUS_OPENCODE_AGENT", &agent_stem),
-                ("CORPUS_OPENCODE_MODEL", model),
-                (PROJECT_ENV, project),
-                (STORE_ENV, &store.root().to_string_lossy().into_owned()),
-            ],
-            prompt,
-        )?;
+        let opencode_bin = opencode.display().to_string();
+        let store_root = store.root().to_string_lossy().into_owned();
+        let mut env: Vec<(&str, &str)> = vec![
+            ("CORPUS_OPENCODE_BIN", &opencode_bin),
+            ("CORPUS_OPENCODE_AGENT", &agent_stem),
+            ("CORPUS_OPENCODE_MODEL", model),
+            (PROJECT_ENV, project),
+            (STORE_ENV, &store_root),
+        ];
+        if let Some(pins) = source_pins {
+            env.push((SOURCE_PINS_ENV, pins));
+        }
+        write_tui_script(&script, &env, prompt)?;
         let mut command = Command::new(&tmux);
         command.args(["new-session", "-d", "-s", &session]);
         command.arg("-c").arg(&repo);
@@ -217,6 +228,7 @@ impl RunSession {
                 script,
                 file_pos: 0,
                 pending: String::new(),
+                liveness: (std::time::Instant::now(), true),
             },
         })
     }
@@ -230,6 +242,7 @@ impl RunSession {
         model: Option<&str>,
         mission: &str,
         append_to: Option<&Path>,
+        source_pins: Option<&str>,
     ) -> Result<Self> {
         let opencode = resolve_opencode()?;
         let runs = store.project_corpus_dir(project).join("runs");
@@ -246,6 +259,9 @@ impl RunSession {
             log.write_all(header.as_bytes())?;
         }
         let mut command = opencode_command(&opencode, project, agent, model, mission);
+        if let Some(pins) = source_pins {
+            command.env(SOURCE_PINS_ENV, pins);
+        }
         let mut child = command.spawn().map_err(|e| {
             Error::Store(format!("failed to spawn opencode (on PATH?): {e}"))
         })?;
@@ -293,14 +309,24 @@ impl RunSession {
         }
     }
 
-    /// Non-blocking exit check. A TUI run never exits on its own — this
-    /// reports only an abort; the piped run surfaces its real status.
+    /// Non-blocking exit check. A TUI run exits when the operator aborts
+    /// it OR its tmux session dies (the operator quit opencode — the run
+    /// is over even though nobody told the app); the piped run surfaces
+    /// its real status.
     pub fn try_exit(&mut self) -> Option<ExitStatus> {
         match &mut self.backend {
             Backend::Piped { child, .. } => child.try_wait().ok().flatten(),
-            Backend::Tui { aborted, .. } => {
+            Backend::Tui {
+                aborted,
+                session,
+                liveness,
+                ..
+            } => {
                 if *aborted {
                     Some(abort_exit_status())
+                } else if !tui_session_live(session, liveness) {
+                    // opencode exited on its own: a clean exit.
+                    Some(ExitStatus::from_raw(0))
                 } else {
                     None
                 }
@@ -674,6 +700,28 @@ pub fn kill_tmux_session(session: &str) {
             .args(["kill-session", "-t", session])
             .status();
     }
+}
+
+/// Is this tmux session still alive? Throttled: the check is a
+/// subprocess spawn, so `try_exit` polls at most once a second and
+/// otherwise trusts the cached verdict. tmux itself unresolvable is
+/// treated as LIVE (never declare a run dead on a tooling failure).
+fn tui_session_live(session: &str, cache: &mut (std::time::Instant, bool)) -> bool {
+    if cache.0.elapsed() < Duration::from_secs(1) {
+        return cache.1;
+    }
+    let live = match resolve_tmux() {
+        Some(tmux) => Command::new(tmux)
+            .args(["has-session", "-t", session])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(true),
+        None => true,
+    };
+    *cache = (std::time::Instant::now(), live);
+    live
 }
 
 /// Export an opencode session's transcript of record to the project

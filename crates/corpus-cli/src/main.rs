@@ -127,8 +127,9 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    // Materialize the agent (clear + render to .opencode/agent/).
-    let written = store.render_agent(&scope.project, &agent)
+    // Materialize the project's agents (clear + render to .opencode/agent/):
+    // the agent list opencode shows is scoped to the project.
+    let written = store.render_project_agents(&scope.project)
         .map_err(|e| e.to_string())?;
     for path in &written {
         println!("materialized {}", path.display());
