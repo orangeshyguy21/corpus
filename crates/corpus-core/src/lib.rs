@@ -34,5 +34,5 @@ pub use store::{
     checksum, corpus_cost, corpus_stats, fnv1a_hex, project_slug_env, slugify, store_root_env,
     validate_slug, CategoryStat, CorpusStats, CostReport, CostRow,
     MigrationReport, MigrateOptions, Mission, Project, Scope, Store, CATEGORIES,
-    DEFAULT_PROJECT_SLUG, PROJECT_ENV, SOURCE_PINS_ENV, STORE_ENV,
+    DEFAULT_PROJECT_SLUG, PROJECT_ENV, RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV,
 };

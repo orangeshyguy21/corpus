@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::models::ModelRegistry;
-use crate::store::{Store, PROJECT_ENV, SOURCE_PINS_ENV, STORE_ENV};
+use crate::store::{Store, PROJECT_ENV, RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV};
 
 /// One transcript line. In the piped backend the two child streams are
 /// kept apart; in the TUI backend lines come from the raw capture, so
@@ -193,12 +193,17 @@ impl RunSession {
         };
         let opencode_bin = opencode.display().to_string();
         let store_root = store.root().to_string_lossy().into_owned();
+        let raw_log = raw
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut env: Vec<(&str, &str)> = vec![
             ("CORPUS_OPENCODE_BIN", &opencode_bin),
             ("CORPUS_OPENCODE_AGENT", &agent_stem),
             ("CORPUS_OPENCODE_MODEL", model),
             (PROJECT_ENV, project),
             (STORE_ENV, &store_root),
+            (RUN_LOG_ENV, &raw_log),
         ];
         if let Some(pins) = source_pins {
             env.push((SOURCE_PINS_ENV, pins));
@@ -273,6 +278,9 @@ impl RunSession {
         let mut command = opencode_command(&opencode, project, agent, model, mission);
         if let Some(pins) = source_pins {
             command.env(SOURCE_PINS_ENV, pins);
+        }
+        if let Some(name) = transcript.file_name() {
+            command.env(RUN_LOG_ENV, name);
         }
         let mut child = command.spawn().map_err(|e| {
             Error::Store(format!("failed to spawn opencode (on PATH?): {e}"))

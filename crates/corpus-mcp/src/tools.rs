@@ -48,6 +48,12 @@ pub struct Ctx {
     /// CORPUS_SOURCE_PINS at launch) — forwarded to the plugin on every
     /// sandbox_exec so the sandbox mounts the recorded revs.
     pub source_pins: Option<serde_json::Map<String, Value>>,
+    /// The basename of the current run's transcript in the project corpus
+    /// `runs/` (from CORPUS_RUN_LOG at launch). Surfaced in `target_info`
+    /// and used as the default `run_log` for `technique_save` when the
+    /// agent omits it — the sandbox has no host FS and cannot enumerate
+    /// `runs/`, so without this the agent must guess.
+    pub run_log: Option<String>,
 }
 
 /// A pending destructive-op confirmation: a single-use, short-TTL token
@@ -82,6 +88,7 @@ impl Ctx {
             .ok()
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .and_then(|v| v.as_object().cloned());
+        let run_log = std::env::var(corpus_core::RUN_LOG_ENV).ok().filter(|s| !s.is_empty());
         Ok(Self {
             plugin,
             store: Store::from_env(),
@@ -94,6 +101,7 @@ impl Ctx {
             admin: false,
             pending_confirms: HashMap::new(),
             source_pins,
+            run_log,
         })
     }
 
@@ -186,16 +194,16 @@ pub fn catalog() -> Value {
         },
         {
             "name": "technique_save",
-            "description": "Save a technique card into the project corpus. Working notes — no oracle gate — but run_log MUST name an existing file in the project corpus runs/. status: fired | analyzed-only | unresolved-lead. Write one after every mission, negative results included.",
+            "description": "Save a technique card into the project corpus. Working notes — no oracle gate — but run_log MUST name an existing file in the project corpus runs/. status: fired | analyzed-only | unresolved-lead. Write one after every mission, negative results included. Omit run_log to default to this mission's transcript (returned by target_info as run_log).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
                     "status": {"type": "string", "enum": ["fired", "analyzed-only", "unresolved-lead"]},
                     "body": {"type": "string"},
-                    "run_log": {"type": "string", "description": "basename of an existing file in runs/, e.g. 1786392937-operator-call-target-info.log"}
+                    "run_log": {"type": "string", "description": "basename of an existing file in runs/. Omit to default to this mission's run_log (from target_info)."}
                 },
-                "required": ["name", "status", "body", "run_log"]
+                "required": ["name", "status", "body"]
             }
         }
     ])
@@ -293,7 +301,9 @@ fn target_info(ctx: &mut Ctx) -> Result<String> {
             "session_budget_sats": ctx.faucet_budget_sats,
             "spent_this_session": ctx.faucet_spent_sats
         },
-        "funding_flow": "use the wallet_fund tool — it does quote -> pay -> claim deterministically"
+        "funding_flow": "use the wallet_fund tool — it does quote -> pay -> claim deterministically",
+        "run_log": ctx.run_log.clone(),
+        "run_log_note": "the basename of THIS mission's transcript in runs/. Cite it as the `run_log` argument to technique_save (or omit run_log entirely to default to this)."
     }))
     .unwrap_or_else(|_| "{}".to_string()))
 }
@@ -514,7 +524,22 @@ fn technique_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let name = require_str(args, "name")?;
     let status = require_str(args, "status")?;
     let body = require_str(args, "body")?;
-    let run_log = require_str(args, "run_log")?;
+    // run_log defaults to this mission's transcript (CORPUS_RUN_LOG at
+    // launch) when the agent omits it — the sandbox has no host FS and
+    // cannot enumerate runs/ to discover the name.
+    let run_log = args
+        .get("run_log")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| ctx.run_log.clone())
+        .ok_or_else(|| {
+            Error::Args(
+                "run_log not provided and no CORPUS_RUN_LOG is set for this mission \
+                 (call target_info to see the current run_log, then pass it here)"
+                    .to_string(),
+            )
+        })?;
     let scope = ctx.write_scope(args)?;
 
     if !matches!(status.as_str(), "fired" | "analyzed-only" | "unresolved-lead") {

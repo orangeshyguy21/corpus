@@ -137,17 +137,17 @@ impl Sidebar {
         let selected = state.effective_project();
         let projects = state.projects.clone();
         let trees = state.trees.clone();
-        // A live agent dot pulses: keep the repaint stream alive only while
-        // something is actually running (50 ms — visible pulse, near-idle
-        // cost; the run view itself animates at a far higher rate anyway).
+        // A live mission dot pulses: keep the repaint stream alive only
+        // while a mission is ACTUALLY running (50 ms — visible pulse,
+        // near-idle cost; an idle/ended run repaints never).
         let any_running = selected
             .as_deref()
             .and_then(|p| trees.get(p))
             .is_some_and(|tree| {
                 let project = selected.as_deref().unwrap_or_default();
-                tree.agents
+                tree.missions
                     .iter()
-                    .any(|(slug, _)| state.agent_running(project, slug))
+                    .any(|(slug, _)| state.mission_running(project, slug))
             });
         if any_running {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
@@ -278,13 +278,8 @@ impl Sidebar {
         let on_screen = project_selected && state.current_screen == Screen::Agents;
         for (slug, agent) in &tree.agents {
             let is_sel = on_screen && state.selected_agent.as_deref() == Some(slug.as_str());
-            let running = state.agent_running(project, slug);
             let Row { ui: mut rui, click, .. } = row_ui(ui, is_sel, false, (project, slug));
-            // Status dot inside the 24px tree indent: label x is unchanged.
-            rui.add_space(12.0);
-            let (dot_rect, _) =
-                rui.allocate_exact_size(egui::vec2(12.0, ROW_H), egui::Sense::hover());
-            status_dot(&rui, dot_rect, running);
+            rui.add_space(24.0);
             let label = rui.add(
                 egui::Label::new(RichText::new(slug.clone()).size(13.5).color(theme::TEXT))
                     .sense(egui::Sense::click())
@@ -297,8 +292,7 @@ impl Sidebar {
                 state.selected_agent = Some(slug.clone());
                 state.current_screen = Screen::Agents;
             }
-            let status = if running { "running" } else { "idle" };
-            click.on_hover_text(format!("{project} · {} · {status}", agent.meta.name));
+            click.on_hover_text(format!("{project} · {}", &agent.meta.name));
         }
         if tree.agents.is_empty() {
             row_hint(ui, 24.0, "no agents — press +");
@@ -324,6 +318,9 @@ impl Sidebar {
                 .session
                 .as_ref()
                 .is_some_and(|s| state.live_sessions.iter().any(|l| l == s));
+            // The status dot: pulses only while the run is ACTUALLY live —
+            // a finished/stopped run goes still the poll after it ends.
+            let running = state.mission_running(project, slug);
             // A mission row always reserves the kebab strip (⋮ shown on
             // the selected row and on row hover).
             let Row { ui: mut rui, rect, click, hovered } =
@@ -347,7 +344,14 @@ impl Sidebar {
                             .max_rect(label_rect)
                             .layout(egui::Layout::left_to_right(egui::Align::Center)),
                         |ui| {
-                            ui.add_space(24.0); // tree indent
+                            // Status dot inside the 24px tree indent:
+                            // the label's x is unchanged.
+                            ui.add_space(12.0);
+                            let (dot_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(12.0, ROW_H),
+                                egui::Sense::hover(),
+                            );
+                            status_dot(ui, dot_rect, running);
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(&label_text).size(13.5).color(theme::TEXT),
@@ -360,7 +364,10 @@ impl Sidebar {
                     .inner;
                 (resp, menu_w)
             } else {
-                rui.add_space(24.0);
+                rui.add_space(12.0);
+                let (dot_rect, _) =
+                    rui.allocate_exact_size(egui::vec2(12.0, ROW_H), egui::Sense::hover());
+                status_dot(&rui, dot_rect, running);
                 let resp = rui.add(
                     egui::Label::new(RichText::new(&label_text).size(13.5).color(theme::TEXT))
                         .sense(egui::Sense::click())
@@ -375,7 +382,12 @@ impl Sidebar {
                 state.selected_mission = Some(slug.clone());
                 state.current_screen = Screen::Missions;
             }
-            click.on_hover_text(format!("{project} · agent={} · {}", mission.agent, mission.status));
+            click.on_hover_text(format!(
+                "{project} · agent={} · {}{}",
+                mission.agent,
+                mission.status,
+                if running { " · running" } else { "" }
+            ));
         }
         if tree.missions.is_empty() {
             row_hint(ui, 24.0, "no missions — press +");
@@ -734,10 +746,11 @@ fn row_ui(ui: &mut Ui, selected: bool, has_kebab: bool, id_seed: impl std::hash:
     Row { ui: child, rect, click, hovered }
 }
 
-/// An agent row's status dot: idle = a steady faint dot; running (one of
-/// its missions has a live session) = an OK-green dot with a soft pulsing
-/// halo. The pulse is pure paint off the repaint clock — no widget, no
-/// state (the caller requests a 50 ms repaint while any dot is live).
+/// A mission row's status dot: idle = a steady faint dot; running (the
+/// mission's tmux session is live / the app run is going) = an OK-green
+/// dot with a soft pulsing halo. The pulse is pure paint off the repaint
+/// clock — no widget, no state (the caller requests a 50 ms repaint
+/// while any mission is live).
 fn status_dot(ui: &Ui, rect: egui::Rect, running: bool) {
     let center = rect.center();
     if running {

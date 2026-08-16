@@ -54,6 +54,7 @@ fn rig(tag: &str) -> (Ctx, Store, PathBuf, String) {
         admin: true,
         pending_confirms: HashMap::new(),
         source_pins: None,
+        run_log: None,
     };
     (ctx, store, root, "proj".to_string())
 }

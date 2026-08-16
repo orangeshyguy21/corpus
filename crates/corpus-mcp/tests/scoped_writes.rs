@@ -56,6 +56,7 @@ fn rig(tag: &str) -> TestRig {
         admin: false,
         pending_confirms: std::collections::HashMap::new(),
         source_pins: None,
+        run_log: None,
     };
     TestRig { ctx, store, root }
 }
@@ -123,6 +124,39 @@ fn roundtrip_project_scoped_writes_and_wipe() {
     )
     .expect_err("missing run_log must be refused");
     assert!(err.to_string().contains("run_log must name an existing file"));
+
+    // run_log defaults to CORPUS_RUN_LOG (ctx.run_log) when omitted.
+    ctx.run_log = Some("1700000000-op-run.log".to_string());
+    let out = tools::dispatch(
+        &mut ctx,
+        "technique_save",
+        &json!({
+            "name": "default-log-card",
+            "status": "analyzed-only",
+            "body": "omitted run_log -> defaults to ctx.run_log"
+        }),
+    )
+    .expect("technique_save with default run_log");
+    assert!(out.contains("technique card saved"), "{out}");
+    let card = std::fs::read_to_string(
+        proj_corpus(&store).join("techniques/default-log-card.md"),
+    )
+    .unwrap();
+    assert!(card.contains("run_log: 1700000000-op-run.log"), "{card}");
+
+    // run_log omitted AND no ctx.run_log -> helpful error.
+    ctx.run_log = None;
+    let err = tools::dispatch(
+        &mut ctx,
+        "technique_save",
+        &json!({
+            "name": "no-log-card",
+            "status": "analyzed-only",
+            "body": "x"
+        }),
+    )
+    .expect_err("no run_log and no CORPUS_RUN_LOG must be refused");
+    assert!(err.to_string().contains("run_log not provided"));
 
     // Wipe the project corpus: generation bumps, corpus gone, agents survive.
     let p = store.wipe_project_corpus("proj").expect("wipe");

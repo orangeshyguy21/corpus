@@ -44,6 +44,12 @@ pub const PROJECT_ENV: &str = "CORPUS_PROJECT";
 /// the revs the mission recorded, not config.toml's defaults.
 pub const SOURCE_PINS_ENV: &str = "CORPUS_SOURCE_PINS";
 
+/// The basename of the current run's transcript file in the project
+/// corpus `runs/` (e.g. `1786891368-verify.raw`). Set by the launcher
+/// so `technique_save`/`finding_write` can cite it without the agent
+/// guessing — the sandbox has no host FS and cannot enumerate `runs/`.
+pub const RUN_LOG_ENV: &str = "CORPUS_RUN_LOG";
+
 /// The corpus category layout.
 pub const CATEGORIES: [&str; 5] = ["hypotheses", "techniques", "findings", "attacks", "runs"];
 

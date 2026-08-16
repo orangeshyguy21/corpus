@@ -608,23 +608,29 @@ impl AppState {
         }
     }
 
-    /// Is `agent` of `project` ACTIVELY RUNNING right now? True when a
-    /// mission of that agent holds a session that is live on the tmux
-    /// server, or the app-owned run is live and belongs to one of its
-    /// missions (the live_sessions poll can lag a launch — the mission
-    /// view applies the same precedence). Drives the sidebar status dot.
-    pub fn agent_running(&self, project: &str, agent: &str) -> bool {
+    /// Is THIS mission's run actively going right now? True while the
+    /// app-owned run is live, belongs to this mission, and hasn't
+    /// finished (run_status set = exited/stopped = the dot goes still),
+    /// or while the mission's recorded tmux session is alive on the
+    /// server (covers a relaunched app and sessions the app doesn't own —
+    /// polled fresh every 2 s, so a just-ended run stops within one poll).
+    /// Drives the sidebar mission-row status dot.
+    pub fn mission_running(&self, project: &str, slug: &str) -> bool {
+        if self.run_active()
+            && self.run_status.is_none()
+            && self.run_mission.as_deref() == Some(slug)
+        {
+            return true;
+        }
         let Some(tree) = self.trees.get(project) else {
             return false;
         };
-        let app_run = self.live_run_session();
-        tree.missions.iter().any(|(slug, m)| {
-            m.agent == agent
-                && (self.run_active() && self.run_mission.as_deref() == Some(slug.as_str())
-                    || m.session.as_ref().is_some_and(|s| {
-                        self.live_sessions.iter().any(|l| l == s)
-                            || app_run.as_deref() == Some(s.as_str())
-                    }))
+        let Some((_, mission)) = tree.missions.iter().find(|(s, _)| s == slug) else {
+            return false;
+        };
+        mission.session.as_ref().is_some_and(|s| {
+            self.live_sessions.iter().any(|l| l == s)
+                || self.live_run_session().as_deref() == Some(s.as_str())
         })
     }
 
