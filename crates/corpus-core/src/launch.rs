@@ -13,14 +13,16 @@
 //! re-attach never kill the run, and attaching shows a steerable TUI,
 //! not a one-shot `[exited]` dump. The TUI has no stdout, so:
 //!   - tail           = `tmux pipe-pane` raw capture (ANSI-stripped for
-//!                      the app); the fallback transcript, not the
-//!                      record;
+//!                      the app), written into the project corpus runs/
+//!                      as `<epoch>-<agent>.raw` from the first output —
+//!                      the durable run log, not the record;
 //!   - record         = `opencode export <id>` (the newest session in the
 //!                      project dir) -> `<epoch>-<agent>.json` in the
-//!                      project corpus runs/ on Dismiss/abort;
+//!                      project corpus runs/ on Stop (best-effort — the
+//!                      .raw log is the durable fallback);
 //!   - completion     = operator-driven: a TUI session doesn't exit, a
-//!                      run stays live until Dismiss (export + close) or
-//!                      Abort (best-effort export + `tmux kill-session`).
+//!                      run stays live until Stop (best-effort export +
+//!                      `tmux kill-session`) or opencode itself exits.
 //! The app NEVER inherits opencode's ambient default model: the model
 //! is resolved primary-agent-model -> launch arg -> registry tool-use
 //! default, and a launch with none fails loudly instead of spawning.
@@ -53,7 +55,7 @@ pub struct RunLine {
 }
 
 /// Where the run actually executes. The app/CLI never branch on this —
-/// only `attach_command()` / `abort()` / `dismiss()` are backend-shaped.
+/// only `attach_command()` / `stop()` are backend-shaped.
 enum Backend {
     /// The full opencode TUI in a detached tmux session.
     Tui {
@@ -62,11 +64,13 @@ enum Backend {
         tui_session_id: Option<String>,
         /// Epoch-millis when we spawned; the discovery window anchors here.
         launched_at_ms: u64,
-        aborted: bool,
+        stopped: bool,
         exported: bool,
         /// `<epoch>-<agent>.json`: the exported transcript of record.
         export_json: PathBuf,
-        /// `tmux pipe-pane` raw capture: the live tail source.
+        /// `tmux pipe-pane` raw capture: the live tail source AND the
+        /// durable run log (`<epoch>-<agent>.raw` in the project corpus
+        /// runs/ — never deleted, survives app death and missing exports).
         raw: PathBuf,
         /// The tiny run script (temp file) the pane executed.
         script: PathBuf,
@@ -174,7 +178,11 @@ impl RunSession {
         let session = format!("corpus-{agent_stem}-{ts}");
         let export_json = Self::runs_for(store, project, agent, ts, "json");
         let temp = std::env::temp_dir();
-        let raw = temp.join(format!("{session}.raw"));
+        // The raw capture is a CORPUS ARTIFACT, not a temp file: pipe-pane
+        // appends to it from the first output, so the run leaves a durable
+        // log in the project corpus runs/ even if the app dies, the export
+        // never happens, or the session is never stopped.
+        let raw = Self::runs_for(store, project, agent, ts, "raw");
         let script = temp.join(format!("{session}.sh"));
 
         let repo = store.provision_run_dir(project)?; // the run's cwd
@@ -224,7 +232,7 @@ impl RunSession {
                 session,
                 tui_session_id: None,
                 launched_at_ms: now_millis(),
-                aborted: false,
+                stopped: false,
                 exported: false,
                 export_json,
                 raw,
@@ -313,7 +321,7 @@ impl RunSession {
         }
     }
 
-    /// Non-blocking exit check. A TUI run exits when the operator aborts
+    /// Non-blocking exit check. A TUI run exits when the operator stops
     /// it OR its tmux session dies (the operator quit opencode — the run
     /// is over even though nobody told the app); the piped run surfaces
     /// its real status.
@@ -321,13 +329,13 @@ impl RunSession {
         match &mut self.backend {
             Backend::Piped { child, .. } => child.try_wait().ok().flatten(),
             Backend::Tui {
-                aborted,
+                stopped,
                 session,
                 liveness,
                 ..
             } => {
-                if *aborted {
-                    Some(abort_exit_status())
+                if *stopped {
+                    Some(stop_exit_status())
                 } else if !tui_session_live(session, liveness) {
                     // opencode exited on its own: a clean exit.
                     Some(ExitStatus::from_raw(0))
@@ -360,33 +368,28 @@ impl RunSession {
         }
     }
 
-    /// Dismiss: export the transcript of record, then close the run.
-    pub fn dismiss(&mut self) -> Result<PathBuf> {
+    /// Stop: the ONE run teardown verb. Best-effort transcript-of-record
+    /// export, then kill the run. Always succeeds (stopping is the
+    /// operator's final word) and always returns the durable transcript
+    /// path — the exported JSON when the export lands, else the raw
+    /// capture (TUI) or .log (piped), both durable by design.
+    pub fn stop(&mut self) -> PathBuf {
         match &mut self.backend {
             Backend::Piped { child, .. } => {
                 kill_tree(child);
-                Ok(self.transcript.clone())
+                self.transcript.clone()
             }
             Backend::Tui { .. } => {
-                let path = self.export_transcript()?;
+                let fallback = match &self.backend {
+                    Backend::Tui { raw, .. } => raw.clone(),
+                    Backend::Piped { .. } => self.transcript.clone(),
+                };
+                let path = self.export_transcript().unwrap_or(fallback);
                 self.close_tui();
-                Ok(path)
-            }
-        }
-    }
-
-    /// Abort: best-effort export (if the session is findable), then kill
-    /// the whole session tree. Never fails the caller — the operator's
-    /// abort is final regardless.
-    pub fn abort(&mut self) {
-        match &mut self.backend {
-            Backend::Piped { child, .. } => kill_tree(child),
-            Backend::Tui { .. } => {
-                let _ = self.export_transcript();
-                self.close_tui();
-                if let Backend::Tui { aborted, .. } = &mut self.backend {
-                    *aborted = true;
+                if let Backend::Tui { stopped, .. } = &mut self.backend {
+                    *stopped = true;
                 }
+                path
             }
         }
     }
@@ -427,10 +430,11 @@ impl RunSession {
     }
 
     /// Kill the tmux session (the whole TUI process tree) and drop the
-    /// temp script/raw files.
+    /// temp script. The raw capture in the project corpus runs/ is KEPT:
+    /// it is the durable run log.
     fn close_tui(&mut self) {
         let Backend::Tui {
-            session, script, raw, ..
+            session, script, ..
         } = &self.backend
         else {
             return;
@@ -441,7 +445,6 @@ impl RunSession {
                 .status();
         }
         let _ = fs::remove_file(script);
-        let _ = fs::remove_file(raw);
     }
 
     fn runs_for(store: &Store, project: &str, agent: &str, ts: u64, ext: &str) -> PathBuf {
@@ -695,7 +698,7 @@ pub fn live_tui_sessions() -> Vec<String> {
         .collect()
 }
 
-/// Kill a corpus tmux session (Abort for a re-attached run). No-op when
+/// Kill a corpus tmux session (Stop for a re-attached run). No-op when
 /// tmux is unavailable; the session may already be dead.
 pub fn kill_tmux_session(session: &str) {
     if let Some(tmux) = resolve_tmux() {
@@ -728,7 +731,7 @@ fn tui_session_live(session: &str, cache: &mut (std::time::Instant, bool)) -> bo
 }
 
 /// Export an opencode session's transcript of record to the project
-/// corpus `runs/<epoch>-<agent>.json` (Dismiss for a re-attached run
+/// corpus `runs/<epoch>-<agent>.json` (Stop for a re-attached run
 /// that no longer has an app-owned handle). Reuses the pretty-export
 /// internals of the TUI backend.
 pub fn export_session(project: &str, agent: &str, opencode_session_id: &str) -> Result<PathBuf> {
@@ -747,9 +750,9 @@ pub fn export_session(project: &str, agent: &str, opencode_session_id: &str) -> 
     Ok(path)
 }
 
-/// Signal-shaped exit for an aborted TUI run (the transcript documents
+/// Signal-shaped exit for a stopped TUI run (the transcript documents
 /// the rest).
-fn abort_exit_status() -> ExitStatus {
+fn stop_exit_status() -> ExitStatus {
     ExitStatus::from_raw(130 << 8)
 }
 
@@ -1074,11 +1077,11 @@ mod tests {
         );
     }
 
-    /// Integration test (env-locked): the spawn/abort/dismiss machinery
+    /// Integration test (env-locked): the spawn/stop machinery
     /// runs against a temp store seeded with the core agent pair,
     /// exercising the v2 teamless paths.
     #[test]
-    fn spawn_abort_and_piped_headless() {
+    fn spawn_stop_and_piped_headless() {
         let _guard = env_lock();
         let _ = Command::new("pkill").args(["-f", "sleep 90127"]).status();
         let bin = std::env::temp_dir().join(format!("corpus-fake-bin-{}", std::process::id()));
@@ -1091,7 +1094,7 @@ mod tests {
         path = format!("{}:{}", bin.display(), path);
         std::env::set_var("PATH", &path);
 
-        let (store, store_dir) = tmp_store("abort-v2");
+        let (store, store_dir) = tmp_store("stop-v2");
         std::env::set_var("CORPUS_STORE", &store_dir);
         core_project(&store);
 
@@ -1101,7 +1104,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(800));
 
         let started = std::time::Instant::now();
-        session.abort();
+        let stopped_at = session.stop();
+        assert_eq!(stopped_at, session.transcript, "stop returns the transcript");
         let mut exited = false;
         while started.elapsed() < Duration::from_secs(5) {
             if session.try_exit().is_some() {
@@ -1110,7 +1114,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(exited, "abort reaps the run within 5s");
+        assert!(exited, "stop reaps the run within 5s");
         let alive = Command::new("pgrep")
             .args(["-f", "sleep 90127"])
             .output()
@@ -1122,6 +1126,56 @@ mod tests {
         let runs_dir = store.project_corpus_dir("default").join("runs");
         assert!(runs_dir.join(session.transcript.file_name().unwrap()).exists(),
             "transcript in project corpus");
+
+        std::env::remove_var("CORPUS_STORE");
+        std::env::remove_var("PATH");
+        let _ = fs::remove_dir_all(&bin);
+        let _ = fs::remove_dir_all(&store_dir);
+    }
+
+    /// TUI backend: the pipe-pane raw capture is a durable corpus
+    /// artifact — it lands in the project corpus runs/ (never /tmp) and
+    /// survives stop/close.
+    #[test]
+    fn tui_raw_capture_is_durable_in_project_corpus() {
+        let _guard = env_lock();
+        if tmux_available().is_none() {
+            return; // no tmux on this host — nothing to exercise
+        }
+        let _ = Command::new("pkill").args(["-f", "sleep 90128"]).status();
+        let bin = std::env::temp_dir().join(format!("corpus-fake-tui-bin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&bin);
+        fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("opencode");
+        fs::write(&fake, "#!/bin/sh\nsleep 90128\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut path = std::env::var("PATH").unwrap_or_default();
+        path = format!("{}:{}", bin.display(), path);
+        std::env::set_var("PATH", &path);
+
+        let (store, store_dir) = tmp_store("tui-raw");
+        std::env::set_var("CORPUS_STORE", &store_dir);
+        core_project(&store);
+
+        let mut session =
+            RunSession::spawn("default", "operator", Some("test/model"), "probe", None)
+                .expect("tui spawn");
+        let raw = match &session.backend {
+            Backend::Tui { raw, .. } => raw.clone(),
+            _ => panic!("expected the TUI backend (tmux is available)"),
+        };
+        let runs_dir = store.project_corpus_dir("default").join("runs");
+        assert_eq!(
+            raw.parent(),
+            Some(runs_dir.as_path()),
+            "raw capture lives in the project corpus runs/, not /tmp"
+        );
+        assert_eq!(raw.extension().and_then(|e| e.to_str()), Some("raw"));
+
+        // Simulate pane output, then stop: the run log must survive.
+        fs::write(&raw, "pane output\n").unwrap();
+        session.stop();
+        assert!(raw.exists(), "stop keeps the durable run log");
 
         std::env::remove_var("CORPUS_STORE");
         std::env::remove_var("PATH");

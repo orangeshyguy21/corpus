@@ -95,7 +95,7 @@ pub struct AppState {
     pub run_lines: Vec<RunLine>,
     /// None = still running; Some = final state (set once, at exit).
     pub run_status: Option<RunStatus>,
-    /// The exported transcript path for a dismissed run.
+    /// The durable transcript path of the last stopped run.
     pub export_path: Option<String>,
     /// Live corpus tmux sessions seen at the last `refresh_live_sessions`
     /// — the re-attach list a relaunched app offers (chunk 7).
@@ -117,10 +117,8 @@ pub enum RunStatus {
     /// Exited on its own with this code (piped headless, or a TUI run
     /// whose tmux session ended — the operator quit opencode).
     Exited(i32),
-    /// Torn down by the operator (best-effort transcript export first).
-    Aborted,
-    /// Gracefully closed by the operator: transcript exported first.
-    Dismissed,
+    /// Stopped by the operator (best-effort transcript export first).
+    Stopped,
 }
 
 impl AppState {
@@ -509,7 +507,7 @@ impl AppState {
     ) -> Result<(), Error> {
         if self.run.is_some() {
             return Err(Error::Store(
-                "a run is already active — abort or wait for it first".into(),
+                "a run is already active — stop it or wait for it first".into(),
             ));
         }
         // Fail loudly on an unknown agent, then materialize the WHOLE
@@ -536,9 +534,9 @@ impl AppState {
             self.run_lines.push(line);
         }
         if let Some(status) = session.try_exit() {
-            // An operator abort already recorded its terminal state;
+            // An operator stop already recorded its terminal state;
             // everything else surfaces as its exit code.
-            if self.run_status != Some(RunStatus::Aborted) {
+            if self.run_status != Some(RunStatus::Stopped) {
                 self.run_status = Some(RunStatus::Exited(status.code().unwrap_or(1)));
             }
             return;
@@ -546,33 +544,15 @@ impl AppState {
         self.run = Some(session);
     }
 
-    /// Operator-initiated tear-down: best-effort transcript export,
-    /// then kill the whole session tree. The run is immediately over.
-    pub fn abort_run(&mut self) {
-        if let Some(mut session) = self.run.take() {
-            session.abort();
-        }
-        self.run_status = Some(RunStatus::Aborted);
-    }
-
-    /// Graceful close: export the transcript of record (a TUI run's
-    /// `<epoch>-<agent>.json`), then close the run. On export failure
-    /// the run stays live so the operator can abort instead.
-    pub fn dismiss_run(&mut self) -> Result<(), Error> {
-        let Some(mut session) = self.run.take() else {
-            return Err(Error::Store("no run to dismiss".into()));
-        };
-        match session.dismiss() {
-            Ok(export) => {
-                self.export_path = Some(export.display().to_string());
-                self.run_status = Some(RunStatus::Dismissed);
-                Ok(())
-            }
-            Err(error) => {
-                self.run = Some(session);
-                Err(error)
-            }
-        }
+    /// Operator-initiated stop: best-effort transcript-of-record export,
+    /// then kill the run. Returns the durable transcript path (the
+    /// exported JSON when it lands, else the raw/.log fallback).
+    pub fn stop_run(&mut self) -> Option<PathBuf> {
+        let mut session = self.run.take()?;
+        let path = session.stop();
+        self.export_path = Some(path.display().to_string());
+        self.run_status = Some(RunStatus::Stopped);
+        Some(path)
     }
 
     /// The embedded-PTY attach argv of the LIVE run (chunk 7): Some for
@@ -663,17 +643,15 @@ impl AppState {
         Ok((mission_record, pinned, pins_json))
     }
 
-    /// One active run at a time: dismiss (transcript export when
-    /// possible) or abort the live run, and clear the dead tmux session
+    /// One active run at a time: stop the live run (best-effort
+    /// transcript export first), and clear the dead tmux session
     /// off whichever mission held it so re-attach never aims at a corpse.
     fn teardown_active_run(&mut self, project: &str, incoming_slug: &str) {
         if !self.run_active() {
             return;
         }
         let replaced = self.live_run_session();
-        if self.dismiss_run().is_err() {
-            self.abort_run();
-        }
+        self.stop_run();
         if let Some(replaced) = replaced {
             let holder = self
                 .missions
@@ -715,48 +693,35 @@ impl AppState {
         self.store.update_mission(project, slug, &mission)
     }
 
-    /// Abort a mission's run: `tmux kill-session` on its recorded session
-    /// (works whether the app owns the run or it survived an app relaunch).
-    pub fn abort_mission(&mut self, project: &str, slug: &str) -> Result<(), Error> {
+    /// Stop a mission's run: best-effort transcript-of-record export,
+    /// then kill — whether the app owns the run or it survived an app
+    /// relaunch. Clears the mission's run bookkeeping and returns the
+    /// durable transcript path when known.
+    pub fn stop_mission(&mut self, project: &str, slug: &str) -> Result<String, Error> {
         let mission = self.store.load_mission(project, slug)?;
         let session = mission.session.as_deref().ok_or_else(|| {
-            Error::Store("no live session on this mission — nothing to abort".into())
+            Error::Store("no live session on this mission — nothing to stop".into())
         })?;
-        if self.live_run_session().as_deref() == Some(session) {
-            self.abort_run();
+        let path = if self.live_run_session().as_deref() == Some(session) {
+            self.stop_run().map(|p| p.display().to_string())
         } else {
+            // A run that outlived the app: export via the recorded
+            // opencode session when we have one (best-effort — the raw
+            // capture is the durable fallback), then kill the tmux session.
+            let exported = mission
+                .opencode_session
+                .as_deref()
+                .and_then(|id| corpus_core::export_session(project, &mission.agent, id).ok())
+                .map(|p| p.display().to_string());
             corpus_core::kill_tmux_session(session);
-        }
-        self.refresh_live_sessions();
-        Ok(())
-    }
-
-    /// Dismiss a mission: export the transcript of record to the project
-    /// corpus `runs/`, kill the run, and clear its bookkeeping. Uses the
-    /// stored opencode session for re-attached runs; the app-owned run
-    /// exports through its own handle.
-    pub fn dismiss_mission(&mut self, project: &str, slug: &str) -> Result<(), Error> {
-        let mission = self.store.load_mission(project, slug)?;
-        let session = mission.session.as_deref();
-        let is_owned = session.is_some()
-            && self.live_run_session().as_deref() == session;
-        let path = if is_owned {
-            self.dismiss_run()?;
-            self.export_path.clone().unwrap_or_default()
-        } else {
-            let opencode_id = mission.opencode_session.as_deref().ok_or_else(|| {
-                Error::Store("no opencode session recorded — cannot export".into())
-            })?;
-            let path = corpus_core::export_session(project, &mission.agent, opencode_id)?;
-            if let Some(sref) = session {
-                corpus_core::kill_tmux_session(sref);
-            }
-            path.display().to_string()
+            exported
         };
-        self.export_path = Some(path);
+        if let Some(path) = &path {
+            self.export_path = Some(path.clone());
+        }
         self.set_mission_session(project, slug, None, None)?;
         self.refresh_live_sessions();
-        Ok(())
+        Ok(path.unwrap_or_default())
     }
 
     /// The model the launch dialog pre-fills: the registry's curated

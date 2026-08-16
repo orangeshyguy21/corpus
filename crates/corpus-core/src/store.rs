@@ -400,7 +400,7 @@ pub struct Mission {
     /// Per-mission execution budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<String>,
-    /// Lifecycle status (queued | running | done | aborted).
+    /// Lifecycle status (queued | running | done | stopped).
     #[serde(default)]
     pub status: String,
     /// Epoch seconds of creation.
@@ -414,7 +414,7 @@ pub struct Mission {
     /// when live — re-attach after an app relaunch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// The opencode session id (transcript of record) — export-on-dismiss.
+    /// The opencode session id (transcript of record) — export-on-stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_session: Option<String>,
 }

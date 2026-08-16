@@ -405,7 +405,7 @@ impl Sidebar {
         }
     }
 
-    /// The mission-row `⋮` menu: Abort run / Dismiss (gated on a live
+    /// The mission-row `⋮` menu: Stop run (gated on a live
     /// session), Rename…, Delete. Operates on the mission record of the
     /// row's OWN project (tree rows can belong to a non-selected
     /// project), so it works regardless of the view.
@@ -428,14 +428,9 @@ impl Sidebar {
             ))
             .frame(false),
             |ui| {
-                let abort = ui.add_enabled(live, egui::Button::new("Abort run"));
-                if abort.clicked() {
-                    abort_mission(state, toasts, project, slug);
-                    ui.close_menu();
-                }
-                let dismiss = ui.add_enabled(live, egui::Button::new("Dismiss"));
-                if dismiss.clicked() {
-                    dismiss_mission(state, toasts, project, slug);
+                let stop = ui.add_enabled(live, egui::Button::new("Stop run"));
+                if stop.clicked() {
+                    stop_mission(state, toasts, project, slug);
                     ui.close_menu();
                 }
                 if ui.button("Rename…").clicked() {
@@ -815,27 +810,17 @@ fn seed_note(seed: &str) -> &'static str {
     }
 }
 
-/// Abort a mission's run (Mission ⋮ -> Abort run): kills the tmux session.
-fn abort_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
-    match state.abort_mission(project, slug) {
-        Ok(()) => {
-            toast(toasts, ToastKind::Success, format!("aborted mission {slug}"));
-            state.refresh_missions(project);
-        }
-        Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
-    }
-}
-
-/// Dismiss a mission (Mission ⋮ -> Dismiss): export + close the run,
-/// clearing its bookkeeping.
-fn dismiss_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
-    match state.dismiss_mission(project, slug) {
-        Ok(()) => {
-            toast(
-                toasts,
-                ToastKind::Success,
-                format!("dismissed mission {slug} — transcript exported"),
-            );
+/// Stop a mission's run (Mission ⋮ -> Stop run): best-effort transcript
+/// export, then kill the run and clear its bookkeeping.
+fn stop_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
+    match state.stop_mission(project, slug) {
+        Ok(path) => {
+            let detail = if path.is_empty() {
+                format!("stopped mission {slug}")
+            } else {
+                format!("stopped mission {slug} — transcript: {path}")
+            };
+            toast(toasts, ToastKind::Success, detail);
             state.refresh_missions(project);
         }
         Err(error) => toast(toasts, ToastKind::Error, error.to_string()),

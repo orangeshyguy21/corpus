@@ -112,10 +112,13 @@ corpus plugin call <name> <method> [params-json]
 # and the run survives attach/detach/app-close; a relaunched app lists
 # live corpus-* sessions for in-pane re-attach. `corpus run` is the
 # HEADLESS `opencode run` (automation): transcript .log in the project
-# corpus runs/. Transcript of record for TUI runs: Dismiss/abort
-# exports the session to <epoch>-<agent>.json in the project corpus
+# corpus runs/. Transcript of record for TUI runs: Stop (the ONE run
+# teardown verb — the run menu is Stop / Rename… / Delete) exports
+# the session to <epoch>-<agent>.json best-effort in the project corpus
 # runs/; the live tail is tmux pipe-pane raw capture
-# (ANSI-stripped). The model is ALWAYS explicit (primary agent entry
+# (ANSI-stripped), written into the SAME runs/ as <epoch>-<agent>.raw
+# from the first output — a durable run log that survives app death,
+# missing exports, and never-stopped sessions. The model is ALWAYS explicit (primary agent entry
 # -> launch arg -> registry tool-use default; never opencode's ambient
 # default — a launch with none refuses). App model fields are ONE shared
 # picker (search + provider-grouped, views/model_picker.rs over
