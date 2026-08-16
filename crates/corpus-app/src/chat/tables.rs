@@ -231,7 +231,7 @@ pub fn show_table(ui: &mut egui::Ui, table: &Table) {
     p.rect_stroke(
         rect,
         CORNER,
-        egui::Stroke::new(1.0, crate::theme::HAIRLINE),
+        egui::Stroke::new(1.0_f32, crate::theme::HAIRLINE),
         egui::StrokeKind::Outside,
     );
 
@@ -247,14 +247,14 @@ pub fn show_table(ui: &mut egui::Ui, table: &Table) {
         },
         crate::theme::PANEL,
     );
-    p.hline(rect.left()..=rect.right(), band.bottom(), egui::Stroke::new(1.0, crate::theme::HAIRLINE));
+    p.hline(rect.left()..=rect.right(), band.bottom(), egui::Stroke::new(1.0_f32, crate::theme::HAIRLINE));
 
     // Row separators.
     let mut y = band.bottom();
     for (i, (_, rh)) in row_galleys.iter().enumerate() {
         y += rh;
         if i + 1 < row_galleys.len() {
-            p.hline(rect.left()..=rect.right(), y, egui::Stroke::new(0.5, crate::theme::HAIRLINE));
+            p.hline(rect.left()..=rect.right(), y, egui::Stroke::new(0.5_f32, crate::theme::HAIRLINE));
         }
     }
 

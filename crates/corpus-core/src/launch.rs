@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::models::ModelRegistry;
-use crate::store::{Store, PROJECT_ENV, RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV};
+use crate::store::{Store, AGENT_ENV, PROJECT_ENV, RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV};
 
 /// One transcript line. In the piped backend the two child streams are
 /// kept apart; in the TUI backend lines come from the raw capture, so
@@ -79,6 +79,9 @@ enum Backend {
         /// Throttled `tmux has-session` verdict (a subprocess spawn —
         /// re-checked at most once a second by `try_exit`).
         liveness: (std::time::Instant, bool),
+        /// Last `opencode session list` lookup by `opencode_session_id`
+        /// (also a subprocess — the app asks every poll until it lands).
+        discovery: std::time::Instant,
         /// The project run dir the TUI runs in: the cwd opencode keys its
         /// sessions by, needed to find/export this run's session.
         repo: PathBuf,
@@ -118,10 +121,73 @@ impl RunSession {
         let _ = fs::create_dir_all(&runs_dir);
         let model = resolve_launch_model(&store, project, agent, model)?;
         if tmux_available().is_some() {
-            Self::start_tui(&store, project, agent, &model, mission, source_pins_json)
+            Self::start_tui(&store, project, agent, &model, mission, source_pins_json, None)
         } else {
             Self::start_piped(&store, project, agent, Some(&model), mission, None, source_pins_json)
         }
+    }
+
+    /// Re-open an EXISTING opencode session in a fresh TUI
+    /// (`opencode --session <id>`): the conversation comes back with its
+    /// history, so a mission whose tmux session is long dead is steerable
+    /// again instead of being a dead record.
+    ///
+    /// The session id is known up front, so it seeds `tui_session_id` —
+    /// a resumed run can export from its first moment (the launch-window
+    /// search that a fresh spawn needs would never match an old session).
+    /// TUI only: resuming is an interactive act, and the piped backend
+    /// has no session to return to.
+    pub fn resume(
+        project: &str,
+        agent: &str,
+        model: Option<&str>,
+        opencode_session_id: &str,
+        source_pins_json: Option<&str>,
+    ) -> Result<Self> {
+        if tmux_available().is_none() {
+            return Err(Error::Store(
+                "resume needs tmux — the piped backend has no session to re-open".into(),
+            ));
+        }
+        let store = Store::from_env();
+        let runs_dir = store.project_corpus_dir(project).join("runs");
+        let _ = fs::create_dir_all(&runs_dir);
+        let model = resolve_launch_model(&store, project, agent, model)?;
+        Self::start_tui(
+            &store,
+            project,
+            agent,
+            &model,
+            "",
+            source_pins_json,
+            Some(opencode_session_id),
+        )
+    }
+
+    /// The opencode session id backing this run, discovered on demand and
+    /// cached: the app persists it on the mission record so the session
+    /// can be exported or RESUMED later. `None` until opencode has
+    /// actually created the session (a TUI takes a moment to boot), and
+    /// always `None` for the piped backend.
+    ///
+    /// Throttled to one lookup a second — each call is an `opencode
+    /// session list` subprocess, and the app asks on its poll beat.
+    pub fn opencode_session_id(&mut self) -> Option<String> {
+        let Backend::Tui { tui_session_id, launched_at_ms, repo, discovery, .. } =
+            &mut self.backend
+        else {
+            return None;
+        };
+        if let Some(id) = tui_session_id {
+            return Some(id.clone());
+        }
+        if discovery.elapsed() < Duration::from_secs(1) {
+            return None;
+        }
+        *discovery = std::time::Instant::now();
+        let found = find_opencode_session(repo.as_path(), *launched_at_ms).ok()?;
+        *tui_session_id = Some(found.clone());
+        Some(found)
     }
 
     /// CLI automation: always the headless `opencode run` piped path.
@@ -162,7 +228,9 @@ impl RunSession {
         )
     }
 
-    /// The full opencode TUI in a detached tmux session.
+    /// The full opencode TUI in a detached tmux session. `resume` carries
+    /// an existing opencode session id to re-open (`--session`) instead of
+    /// starting a fresh conversation.
     fn start_tui(
         store: &Store,
         project: &str,
@@ -170,6 +238,7 @@ impl RunSession {
         model: &str,
         mission: &str,
         source_pins: Option<&str>,
+        resume: Option<&str>,
     ) -> Result<Self> {
         let opencode = resolve_opencode()?;
         let tmux = resolve_tmux().ok_or_else(|| Error::Store("tmux vanished".into()))?;
@@ -199,7 +268,7 @@ impl RunSession {
             .unwrap_or_default();
         let mut env: Vec<(&str, &str)> = vec![
             ("CORPUS_OPENCODE_BIN", &opencode_bin),
-            ("CORPUS_OPENCODE_AGENT", &agent_stem),
+            (AGENT_ENV, &agent_stem),
             ("CORPUS_OPENCODE_MODEL", model),
             (PROJECT_ENV, project),
             (STORE_ENV, &store_root),
@@ -208,7 +277,7 @@ impl RunSession {
         if let Some(pins) = source_pins {
             env.push((SOURCE_PINS_ENV, pins));
         }
-        write_tui_script(&script, &env, prompt)?;
+        write_tui_script(&script, &env, prompt, resume)?;
         let mut command = Command::new(&tmux);
         command.args(["new-session", "-d", "-s", &session]);
         command.arg("-c").arg(&repo);
@@ -235,7 +304,9 @@ impl RunSession {
             transcript: export_json.clone(),
             backend: Backend::Tui {
                 session,
-                tui_session_id: None,
+                // A resume already knows its session; a fresh spawn
+                // discovers one once opencode has created it.
+                tui_session_id: resume.map(str::to_string),
                 launched_at_ms: now_millis(),
                 stopped: false,
                 exported: false,
@@ -245,6 +316,7 @@ impl RunSession {
                 file_pos: 0,
                 pending: String::new(),
                 liveness: (std::time::Instant::now(), true),
+                discovery: std::time::Instant::now(),
                 repo,
             },
         })
@@ -547,15 +619,24 @@ fn pick_model(primary: Option<&str>, arg: Option<&str>) -> Option<String> {
 /// per-session env (which a freshly-started server may drop).
 /// An EMPTY `prompt` spawns a bare opencode TUI (no `--prompt`), so the
 /// operator types the mission into opencode's own input.
-fn write_tui_script(script: &Path, params: &[(&str, &str)], prompt: Option<&str>) -> Result<()> {
+fn write_tui_script(
+    script: &Path,
+    params: &[(&str, &str)],
+    prompt: Option<&str>,
+    resume: Option<&str>,
+) -> Result<()> {
     let mut out = String::from("#!/bin/sh\n");
     for (key, value) in params {
         out.push_str(&format!("export {key}={}\n", shell_quote(value)));
     }
-    let exec = match prompt {
-        Some(prompt) => format!("{} --prompt {}", make_exec_vars(), shell_quote(prompt)),
-        None => make_exec_vars(),
-    };
+    let mut exec = make_exec_vars();
+    // `--session <id>` re-opens an existing conversation with its history.
+    if let Some(id) = resume {
+        exec.push_str(&format!(" --session {}", shell_quote(id)));
+    }
+    if let Some(prompt) = prompt {
+        exec.push_str(&format!(" --prompt {}", shell_quote(prompt)));
+    }
     out.push_str(&format!("exec {exec}\n"));
     fs::write(script, out)?;
     let mut perms = fs::metadata(script)?.permissions();
@@ -704,6 +785,45 @@ pub fn live_tui_sessions() -> Vec<String> {
         .filter(|name| name.starts_with("corpus-"))
         .map(str::to_string)
         .collect()
+}
+
+/// The raw capture a TUI session appends to, derived from the session
+/// name: `start_tui` builds both from the same launch stamp, so
+/// `corpus-<agent>-<ts>` pairs with `runs/<ts>-<agent>.raw`. Lets the app
+/// find the log of a run it does NOT own (re-attached after a relaunch)
+/// without a handle. None when the name isn't ours or carries no stamp.
+pub fn session_raw_log(store: &Store, project: &str, session: &str) -> Option<PathBuf> {
+    // `<agent>` may itself contain `-`, so split the STAMP off the tail.
+    let stem = session.strip_prefix("corpus-")?;
+    let (agent, ts) = stem.rsplit_once('-')?;
+    if agent.is_empty() || ts.parse::<u64>().is_err() {
+        return None;
+    }
+    Some(
+        store
+            .project_corpus_dir(project)
+            .join(crate::store::RUNS)
+            .join(format!("{ts}-{agent}.raw")),
+    )
+}
+
+/// How long a run's TUI has been producing NOTHING, in seconds — the
+/// "is the agent actually working" signal.
+///
+/// A live opencode TUI is not the same as a busy one: a session sits at
+/// its prompt indefinitely waiting on the operator. But everything the
+/// TUI paints (streamed tokens, the working spinner, tool output) flows
+/// through `tmux pipe-pane` into the run's raw capture, and an idle TUI
+/// paints nothing at all — so the capture's mtime IS the last moment the
+/// agent did something. Costs one `stat`, no subprocess.
+///
+/// None when there is no capture yet (a just-launched run that hasn't
+/// printed) or the mtime is unreadable — callers treat that as "not
+/// working" rather than guessing.
+pub fn run_idle_secs(log: &Path) -> Option<u64> {
+    let modified = fs::metadata(log).ok()?.modified().ok()?;
+    // A capture written a hair in the future (clock skew) reads as 0.
+    Some(modified.elapsed().map(|d| d.as_secs()).unwrap_or(0))
 }
 
 /// Kill a corpus tmux session (Stop for a re-attached run). No-op when
@@ -910,7 +1030,8 @@ fn opencode_command(
     mission: &str,
 ) -> Command {
     let mut command = Command::new(opencode);
-    command.args(["run", "--agent", &crate::store::slugify(agent)]);
+    let agent_stem = crate::store::slugify(agent);
+    command.args(["run", "--agent", &agent_stem]);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(model) = model {
         command.args(["-m", model]);
@@ -929,7 +1050,13 @@ fn opencode_command(
     command.current_dir(cwd);
     command
         .env(PROJECT_ENV, project)
-        .env(STORE_ENV, store.root());
+        .env(STORE_ENV, store.root())
+        // The agent identity must reach the MCP server, not just opencode:
+        // corpus-mcp inherits this environment and resolves the run's agent
+        // (and its role) from it. The TUI path exports the same var via its
+        // launch script; without it here, every headless run is anonymous
+        // to the server.
+        .env(AGENT_ENV, &agent_stem);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1189,6 +1316,121 @@ mod tests {
         std::env::remove_var("PATH");
         let _ = fs::remove_dir_all(&bin);
         let _ = fs::remove_dir_all(&store_dir);
+    }
+
+    /// BOTH launch paths must carry the run's agent identity in the
+    /// ENVIRONMENT, not just as a CLI arg: corpus-mcp inherits the env and
+    /// resolves the agent's role from it, so a path that omits it leaves
+    /// the server unable to tell a researcher from an operator. The piped
+    /// path used to pass `--agent` only, which is invisible to the server.
+    #[test]
+    fn both_launch_paths_export_the_agent_identity() {
+        let _guard = env_lock();
+        let (_store, store_dir) = tmp_store("agent-env");
+        std::env::set_var("CORPUS_STORE", &store_dir);
+
+        // Piped path: the identity rides the child's environment.
+        let command = opencode_command(
+            Path::new("/bin/echo"),
+            "default",
+            "discover",
+            Some("test/model"),
+            "probe",
+        );
+        let exported: Vec<(String, String)> = command
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned()))
+            })
+            .collect();
+        let agent_env = exported.iter().find(|(k, _)| k == AGENT_ENV);
+        assert_eq!(
+            agent_env.map(|(_, v)| v.as_str()),
+            Some("discover"),
+            "the piped path must export {AGENT_ENV}; exported: {exported:?}"
+        );
+
+        // TUI path: the identity is exported by the launch script.
+        let script = std::env::temp_dir().join(format!("corpus-idscript-{}.sh", std::process::id()));
+        write_tui_script(&script, &[(AGENT_ENV, "discover")], None, None).unwrap();
+        let body = fs::read_to_string(&script).unwrap();
+        assert!(
+            body.contains(&format!("export {AGENT_ENV}='discover'")),
+            "the TUI path must export {AGENT_ENV}: {body}"
+        );
+        let _ = fs::remove_file(&script);
+
+        std::env::remove_var("CORPUS_STORE");
+        let _ = fs::remove_dir_all(&store_dir);
+    }
+
+    /// The run script's exec line: agent+model always explicit, and
+    /// `--session` only when resuming an existing conversation.
+    #[test]
+    fn tui_script_carries_session_and_prompt_flags() {
+        let dir = std::env::temp_dir().join(format!("corpus-script-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("run.sh");
+        let read = |script: &Path| fs::read_to_string(script).unwrap();
+
+        // Bare launch: no --session, no --prompt.
+        write_tui_script(&script, &[], None, None).unwrap();
+        let bare = read(&script);
+        assert!(bare.contains("--agent \"$CORPUS_OPENCODE_AGENT\""), "{bare}");
+        assert!(!bare.contains("--session"), "a fresh launch resumes nothing: {bare}");
+        assert!(!bare.contains("--prompt"), "{bare}");
+
+        // Resume: the recorded id re-opens that conversation.
+        write_tui_script(&script, &[], None, Some("ses_ff783a74dffeyTn76osPWIUX3L")).unwrap();
+        let resumed = read(&script);
+        assert!(
+            resumed.contains("--session 'ses_ff783a74dffeyTn76osPWIUX3L'"),
+            "{resumed}"
+        );
+
+        // A session id is quoted like every other dynamic value, so a
+        // hostile one cannot break out of the exec line.
+        write_tui_script(&script, &[], Some("go"), Some("x'; rm -rf /tmp/nope; #")).unwrap();
+        let quoted = read(&script);
+        assert!(quoted.contains(r"'x'\''; rm -rf /tmp/nope; #'"), "{quoted}");
+        assert!(quoted.contains("--prompt 'go'"), "{quoted}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The session name round-trips to the raw capture `start_tui`
+    /// writes — the app finds the log of a run it never owned.
+    #[test]
+    fn session_raw_log_pairs_with_the_launch_stamp() {
+        let (store, dir) = tmp_store("raw-pair");
+        let runs = store.project_corpus_dir("p").join("runs");
+        assert_eq!(
+            session_raw_log(&store, "p", "corpus-discover-1786911614"),
+            Some(runs.join("1786911614-discover.raw"))
+        );
+        // An agent stem with its own dashes keeps them: only the trailing
+        // stamp is split off.
+        assert_eq!(
+            session_raw_log(&store, "p", "corpus-web-scanner-1786911614"),
+            Some(runs.join("1786911614-web-scanner.raw"))
+        );
+        // Not ours / no stamp / no agent: no guessing.
+        assert_eq!(session_raw_log(&store, "p", "my-editor"), None);
+        assert_eq!(session_raw_log(&store, "p", "corpus-discover-later"), None);
+        assert_eq!(session_raw_log(&store, "p", "corpus-1786911614"), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `run_idle_secs` reads the capture's age — the busy signal. A
+    /// missing capture is None (no evidence), a fresh write is ~0s.
+    #[test]
+    fn run_idle_secs_reads_capture_age() {
+        let dir = std::env::temp_dir().join(format!("corpus-idle-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("run.raw");
+        assert_eq!(run_idle_secs(&log), None, "no capture yet is not activity");
+        fs::write(&log, "painting\n").unwrap();
+        assert!(run_idle_secs(&log).unwrap() < 2, "a just-written capture reads as fresh");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// materialize_agent renders the launched agent's files into

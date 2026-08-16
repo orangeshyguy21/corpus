@@ -3,7 +3,6 @@
 //! (dry-run without token, one-shot token completes), the agent validator
 //! round-trip, and rebind plugin validation against the registry.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use corpus_core::{Project, Scope, Store};
@@ -42,20 +41,15 @@ fn rig(tag: &str) -> (Ctx, Store, PathBuf, String) {
     seed_core(&store);
     store.create_project("proj", "Proj", "echo-plugin").expect("create project");
     store.create_blank_agent("proj", "appsec").expect("agent");
-    let ctx = Ctx {
-        plugin: corpus_core::Plugin::spawn(&echo_plugin()).expect("spawn echo plugin"),
-        store: store.clone(),
-        scope: Scope::new("proj"),
-        faucet_spent_sats: 0,
-        faucet_budget_sats: 1_000_000,
-        probe_ready: true,
-        probe_notes: String::new(),
-        last_probe: std::time::Instant::now(),
-        admin: true,
-        pending_confirms: HashMap::new(),
-        source_pins: None,
-        run_log: None,
-    };
+    // The admin profile has no agent identity — the role is irrelevant to
+    // it by design (see the orthogonality test below).
+    let mut ctx = Ctx::for_test(
+        corpus_core::Plugin::spawn(&echo_plugin()).expect("spawn echo plugin"),
+        store.clone(),
+        Scope::new("proj"),
+        corpus_core::AgentRole::Super,
+    );
+    ctx.admin = true;
     (ctx, store, root, "proj".to_string())
 }
 

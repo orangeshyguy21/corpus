@@ -50,15 +50,19 @@ pub const EDITOR_BG: Color32 = Color32::from_rgb(0x10, 0x11, 0x14);
 /// The corpus stack graphic's front-plate fill (`#191a1f`).
 pub const PLATE_FRONT: Color32 = Color32::from_rgb(0x19, 0x1a, 0x1f);
 /// Category segment colors for the corpus visual (hypotheses, techniques,
-/// findings, attacks, runs, other) — muted, distinct on the dark panels.
-pub const CORPUS_PALETTE: [Color32; 6] = [
+/// findings, attacks, then any extra bucket) — muted, distinct on the dark
+/// panels. Mission logs are not a segment here; they carry `MISSION_LOG`
+/// in their own section.
+pub const CORPUS_PALETTE: [Color32; 5] = [
     Color32::from_rgb(0x4a, 0x6e, 0x8f), // slate blue
     Color32::from_rgb(0x6f, 0x8f, 0x5a), // moss
     Color32::from_rgb(0xe5, 0x44, 0x2c), // corpus red (findings)
     Color32::from_rgb(0x8f, 0x6f, 0x4a), // amber-brown
-    Color32::from_rgb(0x5c, 0x5d, 0x66), // faint grey (runs)
     Color32::from_rgb(0x3a, 0x3b, 0x44), // plate grey (other)
 ];
+/// The mission-log accent (`#5c5d66`) — deliberately the quietest tone in
+/// the set: transcripts are bulk, not signal.
+pub const MISSION_LOG: Color32 = Color32::from_rgb(0x5c, 0x5d, 0x66);
 /// The house-button resting fill (`#1c1d22`).
 const HOUSE_FILL: Color32 = Color32::from_rgb(0x1c, 0x1d, 0x22);
 /// The house-button hover fill (`#232429`).

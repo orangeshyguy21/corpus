@@ -77,3 +77,9 @@ pulldown-cmark = { version = "0.12", default-features = false }
 # "No sources available" bug).
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+# TEST-ONLY: the chat's tool tables (team.rs) must stay in step with the
+# server's real `--admin` catalog. The app spawns corpus-mcp as a
+# subprocess at runtime — it is NOT a runtime dependency — but without this
+# nothing catches a tool added to the server and never classified here,
+# which silently withholds it from the specialists that should have it.
+corpus-mcp = { path = "../corpus-mcp" }

@@ -21,6 +21,16 @@ use crate::state::AppState;
 use crate::theme;
 use crate::views::json_editor;
 
+/// Which editor the screen is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    /// Field-by-field forms: each control writes ONE field through a
+    /// granular core call, so nothing else in the document is touched.
+    Forms,
+    /// The raw document, for anything the forms don't cover.
+    Json,
+}
+
 /// Widget state for the Agent view: the editor buffer + validation banner.
 /// The selected agent lives on `AppState`.
 pub struct AgentsView {
@@ -31,6 +41,32 @@ pub struct AgentsView {
     /// Last save attempt from the core validator; None = clean.
     error: Option<String>,
     dirty: bool,
+    tab: Tab,
+    /// Which entry the forms are editing: None = the primary, Some = a
+    /// subagent by entry name.
+    entry: Option<String>,
+    /// Buffered text fields, flushed to the store on focus loss so every
+    /// keystroke isn't a disk write. Keyed by the entry they belong to so
+    /// switching entries can never write one's text onto another.
+    buffers: Option<FieldBuffers>,
+    /// The new-subagent form, when open.
+    new_subagent: Option<NewSubagent>,
+    /// opencode's model catalog, fetched on demand (a subprocess).
+    models: Option<corpus_core::ModelList>,
+}
+
+/// Text fields being edited, with the entry they belong to.
+struct FieldBuffers {
+    entry_key: String,
+    description: String,
+    prompt: String,
+}
+
+#[derive(Default)]
+struct NewSubagent {
+    name: String,
+    description: String,
+    prompt: String,
 }
 
 impl Default for AgentsView {
@@ -40,6 +76,11 @@ impl Default for AgentsView {
             editor_text: String::new(),
             error: None,
             dirty: true,
+            tab: Tab::Forms,
+            entry: None,
+            buffers: None,
+            new_subagent: None,
+            models: None,
         }
     }
 }
@@ -123,6 +164,31 @@ impl AgentsView {
         theme::hairline(ui);
         ui.add_space(8.0);
 
+        // --- Forms | JSON toggle. Forms edits one field at a time through
+        // the granular core calls; JSON is the escape hatch for anything
+        // the forms don't model.
+        ui.horizontal(|ui| {
+            for (tab, label) in [(Tab::Forms, "Forms"), (Tab::Json, "JSON")] {
+                let selected = self.tab == tab;
+                if ui.selectable_label(selected, RichText::new(label).size(13.0)).clicked()
+                    && !selected
+                {
+                    self.tab = tab;
+                    self.error = None;
+                    // Re-read on the way into JSON so it shows what the
+                    // forms just wrote, and drop stale field buffers.
+                    self.viewed_agent = None;
+                    self.buffers = None;
+                }
+            }
+        });
+        ui.add_space(10.0);
+
+        if self.tab == Tab::Forms {
+            self.forms(ui, state, toasts, &project, &slug, &agent);
+            return;
+        }
+
         // --- JSON editor (spec §6): monospace 13.5px, fills the width,
         // min height 480, in a Frame (EDITOR_BG fill, 1px HAIRLINE, radius 2).
         egui::Frame::default()
@@ -162,6 +228,475 @@ impl AgentsView {
                 self.save(state, toasts, &project, &slug);
             }
         });
+    }
+
+    /// The Forms tab. Every control writes ONE field through a granular
+    /// core call and then refreshes — there is no "form state" to save, so
+    /// there is no way to lose an edit by navigating away, and no way for
+    /// the form to clobber a field it doesn't display.
+    fn forms(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        project: &str,
+        slug: &str,
+        agent: &corpus_core::AgentConfig,
+    ) {
+        let Some(entries) = agent.doc.get("agent").and_then(|a| a.as_object()) else {
+            ui.label(RichText::new("this agent has no `agent` map — use the JSON tab").color(theme::DANGER));
+            return;
+        };
+        // Entry picker: the primary plus each subagent. Subagents are
+        // edited with the SAME controls as the primary.
+        let mut subagents: Vec<String> = entries
+            .iter()
+            .filter(|(name, cfg)| {
+                **name != slug
+                    && cfg.get("mode").and_then(|m| m.as_str()) == Some("subagent")
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        subagents.sort();
+        // A stale selection (subagent just removed) falls back to primary.
+        if self.entry.as_ref().is_some_and(|e| !subagents.contains(e)) {
+            self.entry = None;
+            self.buffers = None;
+        }
+        if !subagents.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("editing").size(12.0).color(theme::TEXT_MUTED));
+                if ui.selectable_label(self.entry.is_none(), slug).clicked() {
+                    self.entry = None;
+                    self.buffers = None;
+                }
+                for sub in &subagents {
+                    let selected = self.entry.as_deref() == Some(sub.as_str());
+                    if ui.selectable_label(selected, sub).clicked() {
+                        self.entry = Some(sub.clone());
+                        self.buffers = None;
+                    }
+                }
+            });
+            ui.add_space(12.0);
+        }
+
+        let entry_key = self.entry.clone().unwrap_or_else(|| slug.to_string());
+        let Some(cfg) = entries.get(&entry_key).and_then(|c| c.as_object()) else {
+            return;
+        };
+        let is_primary = self.entry.is_none();
+        // Re-seed the text buffers when the target changes.
+        let stale = self
+            .buffers
+            .as_ref()
+            .is_none_or(|b| b.entry_key != entry_key);
+        if stale {
+            self.buffers = Some(FieldBuffers {
+                entry_key: entry_key.clone(),
+                description: cfg
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                prompt: cfg
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+
+        egui::ScrollArea::vertical()
+            .id_salt("agent_forms")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.role_section(ui, state, toasts, project, slug, agent, cfg, is_primary);
+                ui.add_space(20.0);
+                self.model_section(ui, state, toasts, project, slug, cfg);
+                ui.add_space(20.0);
+                self.text_section(ui, state, toasts, project, slug);
+                ui.add_space(20.0);
+                if is_primary {
+                    self.subagents_section(ui, state, toasts, project, slug, &subagents);
+                }
+            });
+    }
+
+    /// Role: the server-enforced ceiling. Shows what it grants and warns
+    /// when the stored permission block disagrees — divergence is silent
+    /// at launch (the render derives from the role), so it must not be
+    /// silent here.
+    #[allow(clippy::too_many_arguments)]
+    fn role_section(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        project: &str,
+        slug: &str,
+        agent: &corpus_core::AgentConfig,
+        cfg: &serde_json::Map<String, serde_json::Value>,
+        is_primary: bool,
+    ) {
+        use corpus_core::AgentRole;
+        ui.label(theme::section_heading("Role"));
+        ui.add_space(8.0);
+        let current = if is_primary {
+            agent.meta.role()
+        } else {
+            let sub = self.entry.clone().unwrap_or_default();
+            agent
+                .meta
+                .subagent_roles
+                .get(&sub)
+                .copied()
+                .unwrap_or(agent.meta.role())
+                .min(agent.meta.role())
+        };
+        ui.horizontal(|ui| {
+            for role in AgentRole::ALL {
+                let selected = current == role;
+                if ui
+                    .selectable_label(selected, RichText::new(role.as_str()).size(13.0))
+                    .on_hover_text(role_hint(role))
+                    .clicked()
+                    && !selected
+                {
+                    match state.set_agent_role(project, slug, self.entry.as_deref(), role) {
+                        Ok(()) => {
+                            toast(toasts, ToastKind::Success, format!("role -> {}", role.as_str()));
+                            state.refresh_agents(project);
+                        }
+                        Err(e) => toast(toasts, ToastKind::Error, e.to_string()),
+                    }
+                }
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!(
+                "grants: {}",
+                current
+                    .tools()
+                    .iter()
+                    .map(|t| t.trim_start_matches("corpus_"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .size(11.5)
+            .color(theme::TEXT_FAINT),
+        );
+        if !is_primary {
+            ui.label(
+                RichText::new(format!(
+                    "capped by the primary's role ({}) — the server cannot tell a subagent \
+                     from its parent at runtime",
+                    agent.meta.role().as_str()
+                ))
+                .size(11.0)
+                .color(theme::TEXT_FAINT),
+            );
+        }
+
+        // Divergence: stored corpus_* allows the role will overrule.
+        let diverging: Vec<&str> = corpus_core::CORPUS_TOOLS
+            .into_iter()
+            .filter(|tool| {
+                let stored = cfg
+                    .get("permission")
+                    .and_then(|p| p.get(*tool))
+                    .and_then(|v| v.as_str());
+                stored == Some("allow") && !current.allows(tool)
+            })
+            .collect();
+        if !diverging.is_empty() {
+            ui.add_space(8.0);
+            egui::Frame::default()
+                .fill(theme::PANEL)
+                .stroke(egui::Stroke::new(1.0_f32, theme::WARN))
+                .corner_radius(egui::CornerRadius::same(2))
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "this agent's stored permissions grant {} — the {} role denies \
+                             them, and the launch will too",
+                            diverging.join(", "),
+                            current.as_str()
+                        ))
+                        .size(11.5)
+                        .color(theme::WARN),
+                    );
+                    ui.add_space(6.0);
+                    if theme::house_button(ui, "Rewrite permissions from role").clicked() {
+                        let patch: serde_json::Map<String, serde_json::Value> = diverging
+                            .iter()
+                            .map(|t| (t.to_string(), "deny".into()))
+                            .collect();
+                        match state.patch_agent_permission(
+                            project,
+                            slug,
+                            self.entry.as_deref(),
+                            &serde_json::Value::Object(patch),
+                        ) {
+                            Ok(()) => {
+                                toast(toasts, ToastKind::Success, "permissions match the role");
+                                state.refresh_agents(project);
+                            }
+                            Err(e) => toast(toasts, ToastKind::Error, e.to_string()),
+                        }
+                    }
+                });
+        }
+    }
+
+    /// Model: opencode's own catalog, so an id here is one a mission can
+    /// actually launch with.
+    fn model_section(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        project: &str,
+        slug: &str,
+        cfg: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        ui.label(theme::section_heading("Model"));
+        ui.add_space(8.0);
+        let current = cfg
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        ui.horizontal(|ui| {
+            theme::combo_field(ui, |ui| {
+                egui::ComboBox::from_id_salt("agent_model")
+                    .icon(theme::combo_caret)
+                    .width(340.0)
+                    .selected_text(
+                        RichText::new(if current.is_empty() {
+                            "(inherit launch default)".to_string()
+                        } else {
+                            current.clone()
+                        })
+                        .size(13.0),
+                    )
+                    .show_ui(ui, |ui| {
+                        // Fetched lazily: this shells out to opencode.
+                        if self.models.is_none() {
+                            self.models = state.opencode_models(false);
+                        }
+                        let Some(list) = &self.models else {
+                            ui.label(
+                                RichText::new("opencode catalog unavailable")
+                                    .size(12.0)
+                                    .color(theme::DANGER),
+                            );
+                            return;
+                        };
+                        let mut picked: Option<String> = None;
+                        if ui.selectable_label(current.is_empty(), "(inherit launch default)").clicked() {
+                            picked = Some(String::new());
+                        }
+                        for group in &list.groups {
+                            ui.label(RichText::new(&group.label).weak().size(11.0));
+                            for m in &group.models {
+                                if ui
+                                    .selectable_label(current == m.id, RichText::new(&m.id).size(12.5))
+                                    .on_hover_text(&m.name)
+                                    .clicked()
+                                {
+                                    picked = Some(m.id.clone());
+                                }
+                            }
+                        }
+                        if let Some(id) = picked {
+                            let value = if id.is_empty() {
+                                serde_json::Value::Null // clears the field
+                            } else {
+                                id.clone().into()
+                            };
+                            match state.set_agent_field(
+                                project,
+                                slug,
+                                self.entry.as_deref(),
+                                "model",
+                                value,
+                            ) {
+                                Ok(()) => {
+                                    toast(toasts, ToastKind::Success, "model updated");
+                                    state.refresh_agents(project);
+                                }
+                                Err(e) => toast(toasts, ToastKind::Error, e.to_string()),
+                            }
+                        }
+                    });
+            });
+            if theme::house_button(ui, "Refresh").on_hover_text("re-pull opencode's catalog").clicked() {
+                self.models = state.opencode_models(true);
+            }
+        });
+    }
+
+    /// Description + prompt. Buffered locally and written on focus loss so
+    /// typing isn't a disk write per keystroke.
+    fn text_section(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        project: &str,
+        slug: &str,
+    ) {
+        let Some(buffers) = &mut self.buffers else { return };
+        ui.label(theme::section_heading("Description"));
+        ui.add_space(8.0);
+        let desc = ui.add(
+            egui::TextEdit::multiline(&mut buffers.description)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+        let desc_value = buffers.description.clone();
+        ui.add_space(20.0);
+        ui.label(theme::section_heading("Prompt"));
+        ui.add_space(8.0);
+        let prompt = ui.add(
+            egui::TextEdit::multiline(&mut buffers.prompt)
+                .font(egui::TextStyle::Monospace)
+                .desired_rows(14)
+                .desired_width(f32::INFINITY),
+        );
+        let prompt_value = buffers.prompt.clone();
+
+        let entry = self.entry.clone();
+        let mut write = |field: &str, value: String| {
+            match state.set_agent_field(project, slug, entry.as_deref(), field, value.into()) {
+                Ok(()) => {
+                    toast(toasts, ToastKind::Success, format!("{field} saved"));
+                    state.refresh_agents(project);
+                }
+                Err(e) => toast(toasts, ToastKind::Error, e.to_string()),
+            }
+        };
+        if desc.lost_focus() && desc.changed() {
+            write("description", desc_value);
+        }
+        if prompt.lost_focus() && prompt.changed() {
+            write("prompt", prompt_value);
+        }
+    }
+
+    /// Subagents: add and remove, each editable with the same controls via
+    /// the entry picker above.
+    fn subagents_section(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        project: &str,
+        slug: &str,
+        subagents: &[String],
+    ) {
+        ui.label(theme::section_heading("Subagents"));
+        ui.add_space(8.0);
+        if subagents.is_empty() {
+            ui.label(
+                RichText::new("none — a subagent is an entry the primary may delegate to")
+                    .size(12.0)
+                    .color(theme::TEXT_FAINT),
+            );
+        }
+        for sub in subagents {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(sub).size(13.0).color(theme::TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::destructive_button(ui, "Remove")
+                        .on_hover_text("also drops its delegation rule and role")
+                        .clicked()
+                    {
+                        match state.remove_subagent(project, slug, sub) {
+                            Ok(()) => {
+                                toast(toasts, ToastKind::Success, format!("removed {sub}"));
+                                self.entry = None;
+                                self.buffers = None;
+                                state.refresh_agents(project);
+                            }
+                            Err(e) => toast(toasts, ToastKind::Error, e.to_string()),
+                        }
+                    }
+                    if theme::house_button(ui, "Edit").clicked() {
+                        self.entry = Some(sub.clone());
+                        self.buffers = None;
+                    }
+                });
+            });
+        }
+        ui.add_space(10.0);
+        match &mut self.new_subagent {
+            None => {
+                if theme::house_button(ui, format!("{}  Add subagent", ph::PLUS)).clicked() {
+                    self.new_subagent = Some(NewSubagent {
+                        // Default to the conventional `<primary>-scout`.
+                        name: format!("{slug}-scout"),
+                        ..Default::default()
+                    });
+                }
+            }
+            Some(form) => {
+                let mut submit = false;
+                let mut cancel = false;
+                egui::Frame::default()
+                    .fill(theme::PANEL)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::HAIRLINE))
+                    .corner_radius(egui::CornerRadius::same(2))
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("name (unique across the project)").size(11.5).color(theme::TEXT_MUTED));
+                        ui.text_edit_singleline(&mut form.name);
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("description").size(11.5).color(theme::TEXT_MUTED));
+                        ui.text_edit_singleline(&mut form.description);
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("prompt").size(11.5).color(theme::TEXT_MUTED));
+                        ui.add(
+                            egui::TextEdit::multiline(&mut form.prompt)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_rows(5)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            submit = theme::house_button(ui, "Add").clicked();
+                            cancel = theme::house_button(ui, "Cancel").clicked();
+                        });
+                    });
+                if submit {
+                    let form = self.new_subagent.take().unwrap_or_default();
+                    match state.add_subagent(
+                        project,
+                        slug,
+                        form.name.trim(),
+                        form.description.trim(),
+                        form.prompt.trim(),
+                        None,
+                        None,
+                    ) {
+                        Ok(()) => {
+                            toast(toasts, ToastKind::Success, format!("added {}", form.name.trim()));
+                            state.refresh_agents(project);
+                        }
+                        Err(e) => {
+                            toast(toasts, ToastKind::Error, e.to_string());
+                            // Keep the form open so the input isn't lost.
+                            self.new_subagent = Some(form);
+                        }
+                    }
+                } else if cancel {
+                    self.new_subagent = None;
+                }
+            }
+        }
     }
 
     /// Save via the core validator: JSON must parse and the agent document
@@ -229,6 +764,21 @@ impl AgentsView {
             }
             Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
         }
+    }
+}
+
+/// One line on what a role means, for the picker's tooltip.
+fn role_hint(role: corpus_core::AgentRole) -> &'static str {
+    match role {
+        corpus_core::AgentRole::Researcher => {
+            "reads and curates: target_info + technique_save, plus the open internet. \
+             No execution — enforced by the corpus server, not just by config."
+        }
+        corpus_core::AgentRole::Tester => {
+            "acts in the regtest arena: sandbox, oracles, faucet, findings, attacks. \
+             No open internet, so an execution turn cannot pull in untrusted text."
+        }
+        corpus_core::AgentRole::Super => "everything: research and penetration both.",
     }
 }
 

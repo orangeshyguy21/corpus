@@ -42,6 +42,157 @@ use crate::store::{now_epoch, validate_slug, Store};
 /// The two core seed agents every project starts with.
 pub const CORE_SEEDS: [&str; 2] = ["operator", "researcher"];
 
+// ---------------------------------------------------------------------
+// Roles
+// ---------------------------------------------------------------------
+
+/// What an agent is ALLOWED TO DO, as a first-class record rather than a
+/// hand-maintained permission block.
+///
+/// Why this exists: an agent's `opencode.json` `permission` block is
+/// enforced by opencode, not by us. corpus-mcp had no idea which agent was
+/// calling, so it would run any tool for anyone opencode routed — the
+/// block was the only dam, it is open-by-omission (add a tool, forget to
+/// deny it), and `agent_save` can rewrite it wholesale. A role is stored in
+/// the corpus sidecar (which no agent config can reach), resolved by the
+/// server from the run's identity, and enforced there.
+///
+/// TRUST BOUNDARY: this is enforceable only for agents WITHOUT a host
+/// shell. An agent holding `bash: allow` can re-exec corpus-mcp with a
+/// forged identity, or edit the sidecar through the `store` symlink that
+/// `provision_run_dir` creates. `role_grants_shell` refuses that pairing
+/// so the contradiction is caught at save time rather than believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentRole {
+    /// Reads and curates; never executes. The contamination-sensitive
+    /// role, and the one the server enforces hardest. Also the safe
+    /// default for an agent whose intent we cannot infer.
+    #[default]
+    Researcher,
+    /// Acts in the regtest arena: sandbox, oracles, faucet, findings.
+    /// No open internet — execution turns must not pull in untrusted
+    /// external text.
+    Tester,
+    /// Everything: research and penetration both.
+    Super,
+}
+
+/// The sandbox tool catalog, as the permission-block keys spell them
+/// (`corpus_` + the MCP tool name). One list, so a tool added to
+/// corpus-mcp without a role decision fails the totality test rather
+/// than silently defaulting to allowed.
+pub const CORPUS_TOOLS: [&str; 8] = [
+    "corpus_target_info",
+    "corpus_technique_save",
+    "corpus_sandbox_exec",
+    "corpus_oracle_run",
+    "corpus_faucet",
+    "corpus_wallet_fund",
+    "corpus_attack_save",
+    "corpus_finding_write",
+];
+
+/// Tools a researcher may call: read the target, and write working notes.
+/// Everything else is execution or publication.
+const RESEARCHER_TOOLS: [&str; 2] = ["corpus_target_info", "corpus_technique_save"];
+
+impl AgentRole {
+    /// Parse a role name (config, CLI flag, sidecar).
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "researcher" => Some(Self::Researcher),
+            "tester" => Some(Self::Tester),
+            "super" => Some(Self::Super),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Researcher => "researcher",
+            Self::Tester => "tester",
+            Self::Super => "super",
+        }
+    }
+
+    /// Every role, for UI pickers and exhaustiveness tests.
+    pub const ALL: [Self; 3] = [Self::Researcher, Self::Tester, Self::Super];
+
+    /// The `corpus_*` tools this role may call. THE source of truth: both
+    /// the permission generator and the corpus-mcp gate read this, so they
+    /// cannot drift apart.
+    pub fn tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Researcher => &RESEARCHER_TOOLS,
+            // Tester and Super hold the same corpus tools by operator
+            // decision; they differ in open-internet access, which is
+            // opencode-enforced (see `grants_web`). The server-enforced
+            // boundary is researcher-vs-rest.
+            Self::Tester | Self::Super => &CORPUS_TOOLS,
+        }
+    }
+
+    /// May this role call `tool` (a bare MCP name like `sandbox_exec` or a
+    /// permission key like `corpus_sandbox_exec`)?
+    pub fn allows(self, tool: &str) -> bool {
+        let key = if tool.starts_with("corpus_") {
+            tool.to_string()
+        } else {
+            format!("corpus_{tool}")
+        };
+        self.tools().contains(&key.as_str())
+    }
+
+    /// Open-internet access. NOT server-enforced — `webfetch`/`websearch`
+    /// are opencode's own tools and never reach corpus-mcp — so this is
+    /// rendered into the permission block and honoured by opencode only.
+    pub fn grants_web(self) -> bool {
+        matches!(self, Self::Researcher | Self::Super)
+    }
+
+    /// Would granting a host shell to this role make its tool ceiling a
+    /// fiction? True for any role that is server-restricted: a shell can
+    /// forge the identity the server trusts.
+    pub fn shell_would_defeat_gate(self) -> bool {
+        self.tools().len() < CORPUS_TOOLS.len()
+    }
+}
+
+/// Infer the role an existing agent entry is ALREADY operating under, by
+/// reading what its permission block actually grants. Used to migrate
+/// legacy agents (written before roles existed) without changing their
+/// behaviour: the result is the SMALLEST role that still covers everything
+/// the config allows, so nothing silently loses a capability it had.
+///
+/// Faithful to opencode's semantics, which is why this can over-grant:
+/// a key that is absent is ALLOWED, and an entry with no permission block
+/// at all is allowed everything — so it infers `Super`. That is an
+/// authoring accident far more often than an intent, which is why
+/// migration reports every inference for review instead of applying
+/// silently.
+pub fn infer_role(cfg: &serde_json::Map<String, serde_json::Value>) -> AgentRole {
+    let Some(perm) = cfg.get("permission").and_then(|p| p.as_object()) else {
+        // No block: opencode allows everything.
+        return AgentRole::Super;
+    };
+    // "deny"/"ask" withhold the tool; "allow" or ABSENT grant it.
+    let granted = |tool: &str| {
+        !matches!(
+            perm.get(tool).and_then(|v| v.as_str()),
+            Some("deny") | Some("ask")
+        )
+    };
+    let wants_web = ["webfetch", "websearch"].iter().any(|k| granted(k));
+    let needed: Vec<&str> = CORPUS_TOOLS.into_iter().filter(|t| granted(t)).collect();
+    AgentRole::ALL
+        .into_iter()
+        .find(|role| {
+            needed.iter().all(|t| role.allows(t)) && (!wants_web || role.grants_web())
+        })
+        .unwrap_or(AgentRole::Super)
+}
+
 /// The corpus metadata sidecar (`agent.yaml`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSidecar {
@@ -50,6 +201,53 @@ pub struct AgentSidecar {
     pub created: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloned_from: Option<String>,
+    /// The PRIMARY agent's role — the capability ceiling corpus-mcp
+    /// enforces for any mission launched as this agent. Lives here, out of
+    /// `opencode.json`, so no agent config (and no `agent_save`) can raise
+    /// it.
+    ///
+    /// `None` means NEVER ASSIGNED (a sidecar written before roles existed)
+    /// and reads as the safest role. It is deliberately distinguishable
+    /// from an explicit `role: researcher`, so `corpus agent migrate-roles`
+    /// can be re-run without silently re-inferring — and re-widening — an
+    /// agent the operator had tightened by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<AgentRole>,
+    /// Per-subagent roles, keyed by the subagent's entry name. Capped by
+    /// the primary's role: corpus-mcp cannot tell a subagent from its
+    /// parent at runtime (one MCP server serves the whole opencode
+    /// session), so these shape the rendered permission block and are
+    /// enforced by opencode, never by the server.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub subagent_roles: std::collections::BTreeMap<String, AgentRole>,
+}
+
+impl AgentSidecar {
+    /// The effective role: an unassigned sidecar reads as the SAFEST role,
+    /// never as a permissive default — a capability ceiling must not be
+    /// widened by a missing field.
+    pub fn role(&self) -> AgentRole {
+        self.role.unwrap_or_default()
+    }
+
+    /// Has a role ever been assigned? False for sidecars predating roles.
+    pub fn has_role(&self) -> bool {
+        self.role.is_some()
+    }
+}
+
+/// One agent's row in a role migration: what it holds now, what its
+/// permissions imply, and whether the run wrote anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleMigration {
+    pub agent: String,
+    /// `None` = never assigned (the rows a migration is actually for).
+    pub current: Option<AgentRole>,
+    pub inferred: AgentRole,
+    pub applied: bool,
+    /// The inference came from an ABSENT permission block (opencode treats
+    /// silence as allow), so `Super` here is a guess worth eyeballing.
+    pub needs_review: bool,
 }
 
 /// A loaded agent: the sidecar metadata plus the parsed opencode.json doc.
@@ -78,8 +276,11 @@ impl Store {
     }
 
     /// Create an agent directory from a core seed name (or blank when the
-    /// seed is missing). The seed's opencode.json + prompts/ are copied and a
-    /// fresh sidecar is written.
+    /// seed is missing). The seed's opencode.json + prompts/ are copied,
+    /// the primary key is renamed to the new slug, and a fresh sidecar is
+    /// written with the role INFERRED from the seed's own permissions (so a
+    /// seeded operator stays as capable as its seed, and a seeded
+    /// researcher stays restricted).
     pub fn create_agent_from_seed(&self, project: &str, slug: &str, seed: &str) -> Result<()> {
         validate_slug(slug)?;
         let dir = self.project_agent_dir(project, slug);
@@ -94,7 +295,12 @@ impl Store {
         } else {
             write_blank_opencode(&dir)?;
         }
-        write_sidecar(&dir, slug, None)?;
+        // Rename the primary key to the destination slug. Without this a
+        // seeded agent in a UUID-named dir keeps the SEED's entry name, so
+        // it renders as `<seed>.md` while the launcher execs `--agent
+        // <slug>` — the identity the role gate keys on would not exist.
+        let role = rename_primary_to_slug(&dir, project, slug)?;
+        write_sidecar(&dir, slug, None, role, Default::default())?;
         Ok(())
     }
 
@@ -107,7 +313,9 @@ impl Store {
         }
         fs::create_dir_all(&dir)?;
         write_blank_opencode(&dir)?;
-        write_sidecar(&dir, slug, None)?;
+        // A blank agent has no permissions to infer from: start at the
+        // safest role and let the operator raise it deliberately.
+        write_sidecar(&dir, slug, None, AgentRole::Researcher, Default::default())?;
         Ok(())
     }
 
@@ -222,13 +430,21 @@ impl Store {
         if let Some(model) = model {
             cfg.insert("model".into(), model.into());
         }
+        // The role the built config implies. With `from`, the inherited
+        // permission block decides; without, there is no block, so start at
+        // the safest role rather than letting silence mean allow.
+        let role = if from.is_some() {
+            infer_role(&cfg)
+        } else {
+            AgentRole::Researcher
+        };
         let doc = serde_json::json!({
             "$schema": OPENCODE_SCHEMA,
             "agent": { slug: cfg },
         });
         validate_agent_doc(&doc, &dir).map_err(|e| Error::Store(format!("agent {slug}: {e}")))?;
         fs::write(dir.join("opencode.json"), serde_json::to_string_pretty(&doc)?)?;
-        write_sidecar(&dir, slug, from)?;
+        write_sidecar(&dir, slug, from, role, Default::default())?;
         Ok(())
     }
 
@@ -251,21 +467,413 @@ impl Store {
         }
         fs::create_dir_all(&dest)?;
         copy_tree(&source, &dest)?;
-        // Rename the primary key: dir slug == opencode name for the clone.
-        // (Seed-less stores have BLANK docs with an empty agent map —
-        // nothing to rename there.)
+        // Rename the primary key (dir slug == opencode name for the clone)
+        // while KEEPING every subagent entry: the old code cleared the whole
+        // map and reinserted only the primary, silently dropping a clone's
+        // subagents along with the `task:` rules that name them.
         let raw = fs::read_to_string(dest.join("opencode.json"))?;
         let mut doc: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| Error::Store(format!("agent {project}/{from}: invalid opencode.json: {e}")))?;
         if let Ok(cfg) = primary_agent_cfg(&doc, project, from) {
             if let Some(agents) = doc.get_mut("agent").and_then(|a| a.as_object_mut()) {
-                agents.clear();
+                // Drop only the OLD primary entry, whatever it was named.
+                let old_primary: Vec<String> = agents
+                    .iter()
+                    .filter(|(_, c)| {
+                        c.get("mode").and_then(|m| m.as_str()).unwrap_or("primary") == "primary"
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for name in old_primary {
+                    agents.remove(&name);
+                }
                 agents.insert(to.to_string(), serde_json::Value::Object(cfg));
             }
             fs::write(dest.join("opencode.json"), serde_json::to_string_pretty(&doc)?)?;
         }
-        write_sidecar(&dest, to, Some(from))?;
+        // A clone INHERITS its source's role: cloning is an operator act on
+        // an agent that already holds those powers, so it grants nothing new
+        // — and silently downgrading would break "copy this agent" in a way
+        // that only shows up as a refused tool mid-mission.
+        let src_meta = read_sidecar(&source, from);
+        write_sidecar(&dest, to, Some(from), src_meta.role(), src_meta.subagent_roles)?;
         Ok(())
+    }
+
+    /// Edit ONE field of one agent-map entry, leaving the rest of the
+    /// document byte-identical.
+    ///
+    /// Why this exists: the only write path used to be `agent_save`, which
+    /// takes the WHOLE document — so changing a model meant a model
+    /// re-emitting every nested prompt and permission map verbatim. A local
+    /// 27B model burned ~25k tokens on exactly that and still failed. Here
+    /// the server does the read-modify-write; the caller sends one value.
+    ///
+    /// `entry` names the map key (the primary is the dir slug); `None`
+    /// targets the primary. `value` of `Null` REMOVES the field.
+    pub fn set_agent_field(
+        &self,
+        project: &str,
+        slug: &str,
+        entry: Option<&str>,
+        field: &str,
+        value: serde_json::Value,
+    ) -> Result<()> {
+        // Structural keys are owned by the document's invariants (exactly
+        // one primary; entry name == dir slug) — they are not fields.
+        if matches!(field, "mode" | "permission") {
+            return Err(Error::Store(format!(
+                "{field:?} is not settable here: use set_agent_role / set_agent_permission \
+                 (mode is fixed by the entry's position in the document)"
+            )));
+        }
+        let mut config = self.load_agent(project, slug)?;
+        let target = entry.unwrap_or(slug).to_string();
+        let dir = self.project_agent_dir(project, slug);
+        let agents = config
+            .doc
+            .get_mut("agent")
+            .and_then(|a| a.as_object_mut())
+            .ok_or_else(|| Error::Store(format!("agent {project}/{slug}: missing agent map")))?;
+        let cfg = agents.get_mut(&target).and_then(|c| c.as_object_mut()).ok_or_else(|| {
+            Error::Store(format!("agent {project}/{slug} has no entry named {target:?}"))
+        })?;
+        if value.is_null() {
+            cfg.remove(field);
+        } else {
+            cfg.insert(field.to_string(), value);
+        }
+        validate_agent_doc(&config.doc, &dir)
+            .map_err(|e| Error::Store(format!("agent {slug}: {e}")))?;
+        fs::write(
+            dir.join("opencode.json"),
+            serde_json::to_string_pretty(&config.doc)?,
+        )?;
+        Ok(())
+    }
+
+    /// Merge a permission PATCH into one entry's block (top-level keys
+    /// replace; a `null` value removes). Never a wholesale replace, so a
+    /// caller changing one rule cannot drop the rest by omission.
+    ///
+    /// Note the ceiling still wins at render: a patch granting a
+    /// `corpus_*` tool outside the agent's role renders as `deny`.
+    pub fn patch_agent_permission(
+        &self,
+        project: &str,
+        slug: &str,
+        entry: Option<&str>,
+        patch: &serde_json::Value,
+    ) -> Result<()> {
+        let patch = patch
+            .as_object()
+            .ok_or_else(|| Error::Store("permission patch must be an object".into()))?;
+        let mut config = self.load_agent(project, slug)?;
+        let target = entry.unwrap_or(slug).to_string();
+        let dir = self.project_agent_dir(project, slug);
+        let agents = config
+            .doc
+            .get_mut("agent")
+            .and_then(|a| a.as_object_mut())
+            .ok_or_else(|| Error::Store(format!("agent {project}/{slug}: missing agent map")))?;
+        let cfg = agents.get_mut(&target).and_then(|c| c.as_object_mut()).ok_or_else(|| {
+            Error::Store(format!("agent {project}/{slug} has no entry named {target:?}"))
+        })?;
+        let mut block = cfg
+            .get("permission")
+            .and_then(|p| p.as_object())
+            .cloned()
+            .unwrap_or_default();
+        for (key, value) in patch {
+            if value.is_null() {
+                block.remove(key);
+            } else {
+                block.insert(key.clone(), value.clone());
+            }
+        }
+        cfg.insert("permission".into(), serde_json::Value::Object(block));
+        validate_agent_doc(&config.doc, &dir)
+            .map_err(|e| Error::Store(format!("agent {slug}: {e}")))?;
+        fs::write(
+            dir.join("opencode.json"),
+            serde_json::to_string_pretty(&config.doc)?,
+        )?;
+        Ok(())
+    }
+
+    /// Add a subagent entry to an agent's document, and allow the primary
+    /// to delegate to it (`task: {<name>: allow}`) — the two halves are
+    /// useless apart, so they are one operation.
+    pub fn add_subagent(
+        &self,
+        project: &str,
+        slug: &str,
+        name: &str,
+        description: &str,
+        prompt: &str,
+        model: Option<&str>,
+        role: Option<AgentRole>,
+    ) -> Result<()> {
+        validate_slug(name)?;
+        if name == slug {
+            return Err(Error::Store(format!(
+                "subagent {name:?} would collide with its primary"
+            )));
+        }
+        let mut config = self.load_agent(project, slug)?;
+        let dir = self.project_agent_dir(project, slug);
+        let agents = config
+            .doc
+            .get_mut("agent")
+            .and_then(|a| a.as_object_mut())
+            .ok_or_else(|| Error::Store(format!("agent {project}/{slug}: missing agent map")))?;
+        if agents.contains_key(name) {
+            return Err(Error::Store(format!(
+                "agent {project}/{slug} already has an entry named {name:?}"
+            )));
+        }
+        let mut cfg = serde_json::Map::new();
+        cfg.insert("description".into(), description.into());
+        cfg.insert("mode".into(), "subagent".into());
+        if !prompt.is_empty() {
+            cfg.insert("prompt".into(), prompt.into());
+        }
+        if let Some(model) = model {
+            cfg.insert("model".into(), model.into());
+        }
+        agents.insert(name.to_string(), serde_json::Value::Object(cfg));
+        // Let the primary delegate to it, without widening `task` generally.
+        if let Some(primary) = agents.get_mut(slug).and_then(|c| c.as_object_mut()) {
+            let mut block = primary
+                .get("permission")
+                .and_then(|p| p.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let mut task = match block.get("task") {
+                Some(serde_json::Value::Object(existing)) => existing.clone(),
+                // A scalar `task` becomes a rule map keyed by that action.
+                Some(serde_json::Value::String(action)) => {
+                    let mut m = serde_json::Map::new();
+                    m.insert("*".into(), action.clone().into());
+                    m
+                }
+                _ => {
+                    let mut m = serde_json::Map::new();
+                    m.insert("*".into(), "deny".into());
+                    m
+                }
+            };
+            task.insert(name.to_string(), "allow".into());
+            block.insert("task".into(), serde_json::Value::Object(task));
+            primary.insert("permission".into(), serde_json::Value::Object(block));
+        }
+        validate_agent_doc(&config.doc, &dir)
+            .map_err(|e| Error::Store(format!("agent {slug}: {e}")))?;
+        fs::write(
+            dir.join("opencode.json"),
+            serde_json::to_string_pretty(&config.doc)?,
+        )?;
+        if let Some(role) = role {
+            self.set_subagent_role(project, slug, name, role)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a subagent entry, its `task:` allow, and its sidecar role —
+    /// leaving no dangling delegation rule pointing at a missing entry.
+    pub fn remove_subagent(&self, project: &str, slug: &str, name: &str) -> Result<()> {
+        let mut config = self.load_agent(project, slug)?;
+        let dir = self.project_agent_dir(project, slug);
+        let agents = config
+            .doc
+            .get_mut("agent")
+            .and_then(|a| a.as_object_mut())
+            .ok_or_else(|| Error::Store(format!("agent {project}/{slug}: missing agent map")))?;
+        let removed = agents.remove(name);
+        if removed.is_none() {
+            return Err(Error::Store(format!(
+                "agent {project}/{slug} has no entry named {name:?}"
+            )));
+        }
+        if let Some(primary) = agents.get_mut(slug).and_then(|c| c.as_object_mut()) {
+            if let Some(task) = primary
+                .get_mut("permission")
+                .and_then(|p| p.as_object_mut())
+                .and_then(|b| b.get_mut("task"))
+                .and_then(|t| t.as_object_mut())
+            {
+                task.remove(name);
+            }
+        }
+        validate_agent_doc(&config.doc, &dir)
+            .map_err(|e| Error::Store(format!("agent {slug}: {e}")))?;
+        fs::write(
+            dir.join("opencode.json"),
+            serde_json::to_string_pretty(&config.doc)?,
+        )?;
+        let mut meta = read_sidecar(&dir, slug);
+        if meta.subagent_roles.remove(name).is_some() {
+            fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&meta)?)?;
+        }
+        Ok(())
+    }
+
+    /// Copy an agent BETWEEN PROJECTS (or within one). The gap that made
+    /// "copy these agents into the new project" impossible: `clone_agent`
+    /// resolves `from` and `to` in a single project, so a cross-project
+    /// copy could not be expressed at all and the management chat burned a
+    /// whole session failing to work around it.
+    ///
+    /// Carries the whole tree — prompts, subagents, and the role.
+    pub fn copy_agent(
+        &self,
+        from_project: &str,
+        from: &str,
+        to_project: &str,
+        to: &str,
+    ) -> Result<()> {
+        validate_slug(to)?;
+        let source = self.project_agent_dir(from_project, from);
+        if !source.join("opencode.json").is_file() {
+            return Err(Error::Store(format!(
+                "agent not found: {from_project}/{from} (see agent_list)"
+            )));
+        }
+        if !self.project_dir(to_project).is_dir() {
+            return Err(Error::Store(format!("project not found: {to_project}")));
+        }
+        let dest = self.project_agent_dir(to_project, to);
+        if dest.join("opencode.json").is_file() {
+            return Err(Error::Store(format!("agent already exists: {to_project}/{to}")));
+        }
+        fs::create_dir_all(&dest)?;
+        copy_tree(&source, &dest)?;
+        // Same primary-key rename as a same-project clone, subagents kept.
+        let raw = fs::read_to_string(dest.join("opencode.json"))?;
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            Error::Store(format!("agent {from_project}/{from}: invalid opencode.json: {e}"))
+        })?;
+        if let Ok(cfg) = primary_agent_cfg(&doc, from_project, from) {
+            if let Some(agents) = doc.get_mut("agent").and_then(|a| a.as_object_mut()) {
+                let old: Vec<String> = agents
+                    .iter()
+                    .filter(|(_, c)| {
+                        c.get("mode").and_then(|m| m.as_str()).unwrap_or("primary") == "primary"
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for name in old {
+                    agents.remove(&name);
+                }
+                agents.insert(to.to_string(), serde_json::Value::Object(cfg));
+            }
+            fs::write(dest.join("opencode.json"), serde_json::to_string_pretty(&doc)?)?;
+        }
+        let src_meta = read_sidecar(&source, from);
+        write_sidecar(
+            &dest,
+            to,
+            Some(&format!("{from_project}/{from}")),
+            src_meta.role(),
+            src_meta.subagent_roles,
+        )?;
+        Ok(())
+    }
+
+    /// Set an agent's role — the capability ceiling corpus-mcp enforces.
+    /// Preserves the rest of the sidecar (name, created, provenance).
+    pub fn set_agent_role(&self, project: &str, slug: &str, role: AgentRole) -> Result<()> {
+        let dir = self.project_agent_dir(project, slug);
+        if !dir.join("opencode.json").is_file() {
+            return Err(Error::Store(format!("agent not found: {project}/{slug}")));
+        }
+        let mut meta = read_sidecar(&dir, slug);
+        meta.role = Some(role);
+        fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&meta)?)?;
+        Ok(())
+    }
+
+    /// Set a SUBAGENT's role (capped by the primary's at render time).
+    /// An unknown entry name is refused — a typo would otherwise sit in
+    /// the sidecar doing nothing.
+    pub fn set_subagent_role(
+        &self,
+        project: &str,
+        slug: &str,
+        subagent: &str,
+        role: AgentRole,
+    ) -> Result<()> {
+        let config = self.load_agent(project, slug)?;
+        let known = config
+            .doc
+            .get("agent")
+            .and_then(|a| a.as_object())
+            .is_some_and(|m| m.contains_key(subagent));
+        if !known {
+            return Err(Error::Store(format!(
+                "agent {project}/{slug} has no entry named {subagent:?}"
+            )));
+        }
+        let dir = self.project_agent_dir(project, slug);
+        let mut meta = read_sidecar(&dir, slug);
+        meta.subagent_roles.insert(subagent.to_string(), role);
+        fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&meta)?)?;
+        Ok(())
+    }
+
+    /// Assign roles to agents that predate the role system, INFERRING each
+    /// from what its permission block already grants so nothing changes
+    /// what it can do. Reports every agent (including ones already
+    /// assigned, marked `applied: false`) so the operator can review before
+    /// committing; `apply: false` is a dry run.
+    ///
+    /// Idempotent: an agent that already carries an explicit role is left
+    /// alone, so re-running can never re-widen a hand-tightened agent.
+    pub fn migrate_agent_roles(
+        &self,
+        project: &str,
+        apply: bool,
+    ) -> Result<Vec<RoleMigration>> {
+        let mut out = Vec::new();
+        for (slug, config) in self.list_agents(project)? {
+            let already = config.meta.has_role();
+            let inferred = config
+                .doc
+                .get("agent")
+                .and_then(|a| a.as_object())
+                .and_then(|m| {
+                    m.iter()
+                        .find(|(name, cfg)| {
+                            **name == slug
+                                || cfg.get("mode").and_then(|v| v.as_str()).unwrap_or("primary")
+                                    == "primary"
+                        })
+                        .and_then(|(_, cfg)| cfg.as_object())
+                        .map(infer_role)
+                })
+                .unwrap_or(AgentRole::Researcher);
+            // An entry with no permission block at all infers Super purely
+            // because opencode treats silence as allow — far more often an
+            // authoring accident than an intent. Flag it for review.
+            let silent = config
+                .doc
+                .get("agent")
+                .and_then(|a| a.as_object())
+                .and_then(|m| m.get(&slug))
+                .map(|cfg| cfg.get("permission").is_none())
+                .unwrap_or(false);
+            if apply && !already {
+                self.set_agent_role(project, &slug, inferred)?;
+            }
+            out.push(RoleMigration {
+                agent: slug,
+                current: config.meta.role,
+                inferred,
+                applied: apply && !already,
+                needs_review: silent && inferred == AgentRole::Super,
+            });
+        }
+        Ok(out)
     }
 
     /// Delete an agent directory.
@@ -335,6 +943,12 @@ impl Store {
         let out_dir = self.opencode_agent_dir(project)?;
         fs::create_dir_all(&out_dir)?;
         let mut written = Vec::new();
+        // Entry names are FLAT across the project's agents (one
+        // `.opencode/agent/<name>.md` each), so a collision would let one
+        // agent's entry silently replace another's — different prompt,
+        // different role. Refuse loudly instead of letting slug order pick.
+        let mut claimed: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
         for (slug, agent) in agents {
             let dir = self.project_agent_dir(project, &slug);
             let Some(agent_map) = agent.doc.get("agent").and_then(|v| v.as_object()) else {
@@ -343,10 +957,18 @@ impl Store {
             let mut names: Vec<&String> = agent_map.keys().collect();
             names.sort();
             for name in names {
+                if let Some(owner) = claimed.get(name) {
+                    return Err(Error::Store(format!(
+                        "agent entry {name:?} is declared by both {owner:?} and {slug:?} in project \
+                         {project} — entry names are flat across a project's agents; rename one"
+                    )));
+                }
+                claimed.insert(name.clone(), slug.clone());
                 let cfg = agent_map[name]
                     .as_object()
                     .ok_or_else(|| Error::Store(format!("agent {slug}/{name}: not an object")))?;
-                let body = render_agent_file(cfg, &dir, project, pinned)?;
+                let role = entry_role(&agent.meta, name, &slug);
+                let body = render_agent_file(cfg, &dir, project, pinned, role)?;
                 let dest = out_dir.join(format!("{name}.md"));
                 fs::write(&dest, body)?;
                 written.push(dest);
@@ -384,12 +1006,28 @@ impl Store {
             let cfg = agent_map[name]
                 .as_object()
                 .ok_or_else(|| Error::Store(format!("agent {slug}/{name}: not an object")))?;
-            let body = render_agent_file(cfg, &dir, project, pinned)?;
+            let role = entry_role(&agent.meta, name, slug);
+            let body = render_agent_file(cfg, &dir, project, pinned, role)?;
             let dest = out_dir.join(format!("{name}.md"));
             fs::write(&dest, body)?;
             written.push(dest);
         }
         Ok(written)
+    }
+}
+
+/// The role an agent-map ENTRY renders under. The primary carries the
+/// sidecar's role; a subagent carries its own, capped by the primary's —
+/// corpus-mcp cannot distinguish a subagent from its parent at runtime, so
+/// a subagent must never render wider than the ceiling the server enforces
+/// for the whole session.
+fn entry_role(meta: &AgentSidecar, entry: &str, slug: &str) -> AgentRole {
+    if entry == slug {
+        return meta.role();
+    }
+    match meta.subagent_roles.get(entry) {
+        Some(sub) => (*sub).min(meta.role()),
+        None => meta.role(),
     }
 }
 
@@ -414,12 +1052,16 @@ pub struct SourcePin {
 /// read-allow gains the corpus boundary (other projects' corpora denied),
 /// and a Corpus scope section is appended naming the exact corpus dir —
 /// a rendered agent never has to guess which project's corpus is home.
-/// A non-empty `pinned` appends the launch's source pins too.
+/// A non-empty `pinned` appends the launch's source pins too. `role` is
+/// the entry's capability ceiling — the permission block is DERIVED from
+/// it here, so it is emitted for every entry, including ones authored
+/// without a `permission` key (silence must never mean allow).
 fn render_agent_file(
     cfg: &serde_json::Map<String, serde_json::Value>,
     dir: &Path,
     project: &str,
     pinned: &[SourcePin],
+    role: AgentRole,
 ) -> Result<String> {
     let mut out = String::with_capacity(256);
     out.push_str("---\n");
@@ -441,16 +1083,18 @@ fn render_agent_file(
         out.push_str(&format!("{temperature}"));
         out.push('\n');
     }
-    if let Some(permission) = cfg.get("permission") {
-        out.push_str("permission:\n");
-        let bound = bind_permission_to_project(permission, project);
-        let yaml = serde_yaml::to_string(&canonical_json(&bound))
-            .map_err(|e| Error::Store(format!("cannot serialize permission: {e}")))?;
-        for line in yaml.lines() {
-            out.push_str("  ");
-            out.push_str(line);
-            out.push('\n');
-        }
+    // ALWAYS emitted, even with no stored block: the role ceiling is the
+    // point, and an entry without permissions would otherwise inherit
+    // opencode's defaults.
+    out.push_str("permission:\n");
+    let stored = cfg.get("permission").cloned().unwrap_or(serde_json::Value::Null);
+    let bound = bind_permission(&stored, project, role);
+    let yaml = serde_yaml::to_string(&canonical_json(&bound))
+        .map_err(|e| Error::Store(format!("cannot serialize permission: {e}")))?;
+    for line in yaml.lines() {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
     }
     out.push_str("---\n");
     if let Some(prompt) = cfg.get("prompt").and_then(|v| v.as_str()) {
@@ -507,36 +1151,92 @@ fn pinned_sources_section(pinned: &[SourcePin]) -> String {
     out
 }
 
-/// Bind a permission document to a concrete project at render time:
-/// `store/projects/*` rule keys become `store/projects/<project>`, and a
-/// wildcard read-allow gains the corpus boundary (`store/projects/*`
-/// deny, own project allow — appended last so it wins the evaluation).
-/// The trust red lines are INJECTED, not trusted: every rendered agent
-/// with a read rule map gets `benchmarks/**` and `plugins/**` denies
-/// regardless of what the (hand-editable) agent JSON says — the answer
-/// key and harness internals stay unreadable even if someone edits them
-/// out of a config.
-fn bind_permission_to_project(
+/// Bind a permission document to a concrete project AND a role at render
+/// time. The rendered artifact — not the stored JSON — is what opencode
+/// obeys, so deriving here means role and document can never contradict in
+/// the dangerous direction, however the stored block was edited.
+///
+/// Applied, in order:
+/// - `store/projects/*` rule keys become `store/projects/<project>`.
+/// - Scalar `read`/`edit`/`write` values are normalized to rule maps FIRST,
+///   so the red lines below always land (a scalar `read: "allow"` used to
+///   skip them entirely).
+/// - Trust red lines, INJECTED not trusted: `benchmarks/**` and
+///   `plugins/**` read denies, plus `store/projects/*/agents/**` edit and
+///   write denies — the agent tree holds the sidecars this whole gate
+///   trusts, and `provision_run_dir` symlinks `store` into the run cwd.
+/// - A wildcard read-allow gains the corpus boundary (own project allow,
+///   everything else deny — appended last so it wins evaluation).
+/// - The 8 `corpus_*` keys are force-written from the ROLE with a
+///   deny-wins merge: a stored `deny` survives (hand-tightening works), a
+///   stored `allow` beyond the role becomes `deny`.
+fn bind_permission(
     permission: &serde_json::Value,
     project: &str,
+    role: AgentRole,
 ) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let mut out = match bind_paths(permission, project) {
+        Value::Object(map) => map,
+        // A non-object permission (scalar or absent) still gets a full
+        // role block — an entry authored without one must not inherit
+        // "silence means allow".
+        _ => Map::new(),
+    };
+
+    // Web access is opencode-enforced; the role decides whether to offer it.
+    if !role.grants_web() {
+        for key in ["webfetch", "websearch"] {
+            out.insert(key.to_string(), Value::String("deny".to_string()));
+        }
+    }
+
+    // Deny-wins merge of the corpus tool ceiling. Every one of the 8 keys
+    // is written explicitly, so the rendered file never relies on
+    // omission-means-allow.
+    for tool in CORPUS_TOOLS {
+        let stored = out.get(tool).and_then(Value::as_str);
+        let action = match role.allows(tool) {
+            // Outside the ceiling: denied regardless of what was stored.
+            false => "deny",
+            // Inside it: a stored `deny`/`ask` tightens and is kept.
+            true => stored.unwrap_or("allow"),
+        };
+        out.insert(tool.to_string(), Value::String(action.to_string()));
+    }
+    Value::Object(out)
+}
+
+/// Rewrite project wildcards, normalize path-rule scalars to maps, and
+/// inject the trust red lines. Split from the role merge so the recursion
+/// stays simple.
+fn bind_paths(permission: &serde_json::Value, project: &str) -> serde_json::Value {
     use serde_json::{Map, Value};
     let Value::Object(map) = permission else {
         return permission.clone();
     };
     let mut out = Map::new();
     for (key, value) in map {
-        let mut value = bind_permission_to_project(value, project);
-        if key == "read" {
-            if let Value::Object(rules) = &mut value {
-                // Red lines, unconditionally (contamination rule).
+        let mut value = bind_paths(value, project);
+        // Path-rule keys carry red lines; a bare scalar becomes `{"*": v}`
+        // so the injection below has somewhere to land.
+        if matches!(key.as_str(), "read" | "edit" | "write") {
+            if let Value::String(action) = &value {
+                let mut rules = Map::new();
+                rules.insert("*".to_string(), Value::String(action.clone()));
+                value = Value::Object(rules);
+            }
+        }
+        if let Value::Object(rules) = &mut value {
+            if key == "read" {
+                // Contamination rule: the answer key and harness internals
+                // stay unreadable even if edited out of a config.
                 for red in ["benchmarks/**", "plugins/**"] {
                     rules
                         .entry(red.to_string())
                         .or_insert_with(|| Value::String("deny".to_string()));
                 }
-                let wildcard_allow =
-                    rules.get("*").and_then(Value::as_str) == Some("allow");
+                let wildcard_allow = rules.get("*").and_then(Value::as_str) == Some("allow");
                 let has_boundary = rules.keys().any(|k| k.starts_with("store/projects/"));
                 if wildcard_allow && !has_boundary {
                     rules.insert(
@@ -548,6 +1248,14 @@ fn bind_permission_to_project(
                         Value::String("allow".to_string()),
                     );
                 }
+            }
+            if matches!(key.as_str(), "edit" | "write") {
+                // The agent tree holds the role sidecars this gate trusts,
+                // and the run cwd symlinks `store` — no agent may write there.
+                rules.insert(
+                    "store/projects/*/agents/**".to_string(),
+                    Value::String("deny".to_string()),
+                );
             }
         }
         let key = key.replace("store/projects/*", &format!("store/projects/{project}"));
@@ -718,16 +1426,67 @@ fn write_blank_opencode(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_sidecar(dir: &Path, name: &str, cloned_from: Option<&str>) -> Result<()> {
+/// Rename a freshly copied agent doc's PRIMARY entry to `slug` and report
+/// the role its permissions imply. Subagent entries are left alone (their
+/// names are referenced by the primary's `task:` rules). A blank doc has
+/// no primary — nothing to rename, safest role.
+fn rename_primary_to_slug(dir: &Path, project: &str, slug: &str) -> Result<AgentRole> {
+    let path = dir.join("opencode.json");
+    let raw = fs::read_to_string(&path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| Error::Store(format!("agent {project}/{slug}: invalid opencode.json: {e}")))?;
+    let Some(agents) = doc.get_mut("agent").and_then(|a| a.as_object_mut()) else {
+        return Ok(AgentRole::Researcher);
+    };
+    let primary = agents
+        .iter()
+        .find(|(_, cfg)| {
+            cfg.get("mode").and_then(|m| m.as_str()).unwrap_or("primary") == "primary"
+        })
+        .map(|(name, cfg)| (name.clone(), cfg.clone()));
+    let Some((old_name, cfg)) = primary else {
+        return Ok(AgentRole::Researcher);
+    };
+    let role = cfg
+        .as_object()
+        .map(infer_role)
+        .unwrap_or(AgentRole::Researcher);
+    if old_name != slug {
+        agents.remove(&old_name);
+        agents.insert(slug.to_string(), cfg);
+        fs::write(&path, serde_json::to_string_pretty(&doc)?)?;
+    }
+    Ok(role)
+}
+
+/// Write the sidecar. The role is EXPLICIT because this runs after
+/// `copy_tree` on the create/clone paths and would otherwise silently
+/// reset a copied `agent.yaml` back to the default — turning a clone of a
+/// `super` agent into a `researcher` (or worse, the reverse) with no
+/// diagnostic.
+fn write_sidecar(
+    dir: &Path,
+    name: &str,
+    cloned_from: Option<&str>,
+    role: AgentRole,
+    subagent_roles: std::collections::BTreeMap<String, AgentRole>,
+) -> Result<()> {
     let sidecar = AgentSidecar {
         name: name.to_string(),
         created: now_epoch(),
         cloned_from: cloned_from.map(str::to_string),
+        // Always written explicitly: a newly created agent has a decided
+        // role, not an inherited absence.
+        role: Some(role),
+        subagent_roles,
     };
     fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&sidecar)?)?;
     Ok(())
 }
 
+/// Read the sidecar, falling back to the SAFEST role when it is missing or
+/// unparseable — a capability ceiling must never be widened by a damaged
+/// file. `corpus agents migrate-roles` assigns real roles to legacy agents.
 fn read_sidecar(dir: &Path, slug: &str) -> AgentSidecar {
     fs::read_to_string(dir.join("agent.yaml"))
         .ok()
@@ -736,6 +1495,10 @@ fn read_sidecar(dir: &Path, slug: &str) -> AgentSidecar {
             name: slug.to_string(),
             created: 0,
             cloned_from: None,
+            // Unreadable/absent sidecar: NEVER assigned, so it reads as
+            // the safest role via `role()` and migration can still see it.
+            role: None,
+            subagent_roles: std::collections::BTreeMap::new(),
         })
 }
 
@@ -771,6 +1534,508 @@ mod tests {
 
     fn doc(agent: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "$schema": OPENCODE_SCHEMA, "agent": agent })
+    }
+
+    /// Parse the rendered frontmatter's permission block.
+    fn rendered_permission(text: &str) -> serde_yaml::Value {
+        let fm = text.split("---\n").nth(1).unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(fm).unwrap();
+        yaml["permission"].clone()
+    }
+
+    /// Every corpus tool is classified by every role — a tool added to
+    /// corpus-mcp without a role decision must fail here, not silently
+    /// default to allowed somewhere.
+    #[test]
+    fn every_corpus_tool_is_classified_by_every_role() {
+        for role in AgentRole::ALL {
+            for tool in CORPUS_TOOLS {
+                // `allows` accepts both the bare and the corpus_-prefixed
+                // spelling; they must agree.
+                let bare = tool.strip_prefix("corpus_").unwrap();
+                assert_eq!(
+                    role.allows(tool),
+                    role.allows(bare),
+                    "{role:?} disagrees about {tool} vs {bare}"
+                );
+            }
+            // Roles form a chain: researcher ⊆ tester ⊆ super.
+            for tool in role.tools() {
+                assert!(
+                    AgentRole::Super.allows(tool),
+                    "super must cover {tool} held by {role:?}"
+                );
+            }
+        }
+        assert!(AgentRole::Researcher.tools().len() < CORPUS_TOOLS.len());
+        assert_eq!(AgentRole::Super.tools().len(), CORPUS_TOOLS.len());
+        // A restricted role's ceiling is a fiction if it also has a shell.
+        assert!(AgentRole::Researcher.shell_would_defeat_gate());
+        assert!(!AgentRole::Super.shell_would_defeat_gate());
+        // Round-trip every name.
+        for role in AgentRole::ALL {
+            assert_eq!(AgentRole::parse(role.as_str()), Some(role));
+        }
+        assert_eq!(AgentRole::parse("root"), None);
+    }
+
+    /// The render DERIVES the permission block from the role, so a stored
+    /// block that grants beyond the role cannot take effect — this is the
+    /// property the whole role system rests on.
+    #[test]
+    fn render_denies_corpus_tools_outside_the_role() {
+        let store = tmp_store("role-deny");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store.create_blank_agent("alpha", "a").unwrap();
+        // The stored doc tries to grant EVERYTHING.
+        let mut perm = serde_json::Map::new();
+        for tool in CORPUS_TOOLS {
+            perm.insert(tool.to_string(), "allow".into());
+        }
+        store
+            .save_agent(
+                "alpha",
+                "a",
+                &doc(serde_json::json!({
+                    "a": { "mode": "primary", "permission": perm },
+                })),
+            )
+            .unwrap();
+        // ...but the sidecar says researcher (create_blank_agent's default).
+        let text = fs::read_to_string(&store.render_project_agents("alpha", &[]).unwrap()[0])
+            .unwrap();
+        let perm = rendered_permission(&text);
+        assert_eq!(perm["corpus_target_info"].as_str(), Some("allow"));
+        assert_eq!(perm["corpus_technique_save"].as_str(), Some("allow"));
+        for denied in [
+            "corpus_sandbox_exec",
+            "corpus_oracle_run",
+            "corpus_faucet",
+            "corpus_wallet_fund",
+            "corpus_attack_save",
+            "corpus_finding_write",
+        ] {
+            assert_eq!(
+                perm[denied].as_str(),
+                Some("deny"),
+                "a stored allow must not raise a researcher's ceiling: {denied}\n{text}"
+            );
+        }
+    }
+
+    /// Hand-tightening still works (deny-wins), and an entry authored with
+    /// NO permission block still gets a full explicit block — silence must
+    /// never mean allow in the rendered artifact.
+    #[test]
+    fn render_keeps_tightening_and_never_relies_on_omission() {
+        let store = tmp_store("role-tighten");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store.create_blank_agent("alpha", "a").unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "a",
+                &doc(serde_json::json!({
+                    // No permission key at all.
+                    "a": { "mode": "primary", "prompt": "hi" },
+                })),
+            )
+            .unwrap();
+        let text = fs::read_to_string(&store.render_project_agents("alpha", &[]).unwrap()[0])
+            .unwrap();
+        let perm = rendered_permission(&text);
+        for tool in CORPUS_TOOLS {
+            assert!(
+                perm[tool].as_str().is_some(),
+                "{tool} must be written explicitly even with no stored block\n{text}"
+            );
+        }
+    }
+
+    /// A scalar `read`/`edit`/`write` used to skip red-line injection
+    /// entirely; it must be normalized to a map so the denies always land.
+    /// The agent tree itself is unwritable — it holds the role sidecars.
+    #[test]
+    fn red_lines_survive_scalar_permissions() {
+        let store = tmp_store("role-scalar");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store.create_blank_agent("alpha", "a").unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "a",
+                &doc(serde_json::json!({
+                    "a": {
+                        "mode": "primary",
+                        // Scalars, the shape that bypassed injection.
+                        "permission": { "read": "allow", "write": "allow" },
+                    },
+                })),
+            )
+            .unwrap();
+        let text = fs::read_to_string(&store.render_project_agents("alpha", &[]).unwrap()[0])
+            .unwrap();
+        let perm = rendered_permission(&text);
+        assert_eq!(perm["read"]["benchmarks/**"].as_str(), Some("deny"), "{text}");
+        assert_eq!(perm["read"]["plugins/**"].as_str(), Some("deny"), "{text}");
+        assert_eq!(
+            perm["write"]["store/projects/*/agents/**"].as_str(),
+            Some("deny"),
+            "no agent may rewrite the sidecars the role gate trusts\n{text}"
+        );
+    }
+
+    /// Inference reproduces the seeds' current behaviour, so migrating a
+    /// legacy agent changes nothing about what it can do.
+    #[test]
+    fn infer_role_matches_the_seed_permissions() {
+        // The researcher seed: only target_info + technique_save allowed.
+        let researcher = serde_json::json!({
+            "permission": {
+                "corpus_sandbox_exec": "deny", "corpus_faucet": "deny",
+                "corpus_wallet_fund": "deny", "corpus_oracle_run": "deny",
+                "corpus_finding_write": "deny", "corpus_attack_save": "deny",
+                "corpus_target_info": "allow", "corpus_technique_save": "allow",
+                "webfetch": "allow", "websearch": "allow",
+            }
+        });
+        assert_eq!(
+            infer_role(researcher.as_object().unwrap()),
+            AgentRole::Researcher
+        );
+        // The operator seed names no corpus_* key: silence means allow,
+        // so it infers the full role rather than silently losing powers.
+        let operator = serde_json::json!({ "permission": { "bash": "deny", "read": "deny" } });
+        assert_eq!(infer_role(operator.as_object().unwrap()), AgentRole::Super);
+        // No block at all: opencode allows everything.
+        let bare = serde_json::json!({ "mode": "primary" });
+        assert_eq!(infer_role(bare.as_object().unwrap()), AgentRole::Super);
+    }
+
+    /// A subagent can be narrower than its parent but never wider — the
+    /// server cannot tell them apart at runtime, so the parent's ceiling
+    /// binds the whole session.
+    #[test]
+    fn subagent_role_is_capped_by_the_primary() {
+        let mut meta = AgentSidecar {
+            name: "discover".into(),
+            created: 0,
+            cloned_from: None,
+            role: Some(AgentRole::Researcher),
+            subagent_roles: Default::default(),
+        };
+        meta.subagent_roles.insert("scout".into(), AgentRole::Super);
+        assert_eq!(
+            entry_role(&meta, "scout", "discover"),
+            AgentRole::Researcher,
+            "a subagent must not exceed its parent"
+        );
+        meta.role = Some(AgentRole::Super);
+        meta.subagent_roles
+            .insert("scout".into(), AgentRole::Researcher);
+        assert_eq!(
+            entry_role(&meta, "scout", "discover"),
+            AgentRole::Researcher,
+            "a narrower subagent stays narrow"
+        );
+        assert_eq!(entry_role(&meta, "discover", "discover"), AgentRole::Super);
+    }
+
+    /// Cloning preserves subagents (it used to drop them) and carries the
+    /// role across.
+    #[test]
+    fn clone_preserves_subagents_and_role() {
+        let store = tmp_store("clone-subs");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store.create_blank_agent("alpha", "src").unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "src",
+                &doc(serde_json::json!({
+                    "src": {
+                        "mode": "primary",
+                        "permission": { "task": { "*": "deny", "src-scout": "allow" } },
+                    },
+                    "src-scout": { "mode": "subagent", "description": "scout" },
+                })),
+            )
+            .unwrap();
+        store.clone_agent("alpha", "src", "dst").unwrap();
+        let cloned = store.load_agent("alpha", "dst").unwrap();
+        let map = cloned.doc["agent"].as_object().unwrap();
+        assert!(map.contains_key("dst"), "primary renamed: {map:?}");
+        assert!(!map.contains_key("src"), "old primary removed: {map:?}");
+        assert!(
+            map.contains_key("src-scout"),
+            "subagents must survive a clone: {map:?}"
+        );
+    }
+
+    /// A field edit touches ONE key and leaves the rest of the document
+    /// byte-identical — the whole point of the granular tools.
+    #[test]
+    fn set_agent_field_is_surgical() {
+        let store = tmp_store("field");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store.create_blank_agent("alpha", "a").unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "a",
+                &doc(serde_json::json!({
+                    "a": {
+                        "mode": "primary",
+                        "description": "before",
+                        "prompt": "keep me",
+                        "permission": { "bash": "deny" },
+                    },
+                    "a-scout": { "mode": "subagent", "description": "scout" },
+                })),
+            )
+            .unwrap();
+        store
+            .set_agent_field("alpha", "a", None, "model", "maple/deepseek-v4-flash".into())
+            .unwrap();
+        store
+            .set_agent_field("alpha", "a", None, "description", "after".into())
+            .unwrap();
+        let after = store.load_agent("alpha", "a").unwrap();
+        let primary = &after.doc["agent"]["a"];
+        assert_eq!(primary["model"].as_str(), Some("maple/deepseek-v4-flash"));
+        assert_eq!(primary["description"].as_str(), Some("after"));
+        // Untouched neighbours survive verbatim.
+        assert_eq!(primary["prompt"].as_str(), Some("keep me"));
+        assert_eq!(primary["permission"]["bash"].as_str(), Some("deny"));
+        assert!(after.doc["agent"]["a-scout"].is_object(), "subagent untouched");
+
+        // A subagent can be targeted by name.
+        store
+            .set_agent_field("alpha", "a", Some("a-scout"), "model", "ollama/x".into())
+            .unwrap();
+        let after = store.load_agent("alpha", "a").unwrap();
+        assert_eq!(after.doc["agent"]["a-scout"]["model"].as_str(), Some("ollama/x"));
+
+        // Null removes; structural keys are refused.
+        store.set_agent_field("alpha", "a", None, "model", serde_json::Value::Null).unwrap();
+        assert!(store.load_agent("alpha", "a").unwrap().doc["agent"]["a"]
+            .get("model")
+            .is_none());
+        let err = store
+            .set_agent_field("alpha", "a", None, "mode", "subagent".into())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not settable"), "{err}");
+        // An unknown entry is refused rather than silently created.
+        let err = store
+            .set_agent_field("alpha", "a", Some("ghost"), "model", "x".into())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no entry named"), "{err}");
+    }
+
+    /// A permission patch merges — a caller changing one rule must not
+    /// drop the others by omission.
+    #[test]
+    fn permission_patch_merges_and_removes() {
+        let store = tmp_store("perm-patch");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store.create_blank_agent("alpha", "a").unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "a",
+                &doc(serde_json::json!({
+                    "a": {
+                        "mode": "primary",
+                        "permission": { "bash": "deny", "webfetch": "allow" },
+                    },
+                })),
+            )
+            .unwrap();
+        store
+            .patch_agent_permission(
+                "alpha",
+                "a",
+                None,
+                &serde_json::json!({ "websearch": "allow", "webfetch": null }),
+            )
+            .unwrap();
+        let perm = &store.load_agent("alpha", "a").unwrap().doc["agent"]["a"]["permission"];
+        assert_eq!(perm["bash"].as_str(), Some("deny"), "untouched key survives");
+        assert_eq!(perm["websearch"].as_str(), Some("allow"), "added");
+        assert!(perm.get("webfetch").is_none(), "null removes");
+    }
+
+    /// Adding a subagent also wires the primary's `task:` allow; removing
+    /// it takes the rule and the sidecar role back out.
+    #[test]
+    fn subagent_add_and_remove_keep_delegation_consistent() {
+        let store = tmp_store("subagent");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store.create_blank_agent("alpha", "a").unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "a",
+                &doc(serde_json::json!({ "a": { "mode": "primary" } })),
+            )
+            .unwrap();
+        store
+            .add_subagent(
+                "alpha",
+                "a",
+                "a-scout",
+                "scouts ahead",
+                "You scout.",
+                Some("ollama/x"),
+                Some(AgentRole::Researcher),
+            )
+            .unwrap();
+        let after = store.load_agent("alpha", "a").unwrap();
+        assert_eq!(after.doc["agent"]["a-scout"]["mode"].as_str(), Some("subagent"));
+        let task = &after.doc["agent"]["a"]["permission"]["task"];
+        assert_eq!(task["a-scout"].as_str(), Some("allow"), "delegation wired: {task}");
+        assert_eq!(task["*"].as_str(), Some("deny"), "others still denied: {task}");
+        assert_eq!(
+            after.meta.subagent_roles.get("a-scout"),
+            Some(&AgentRole::Researcher)
+        );
+        // Duplicates and self-collisions refused.
+        assert!(store
+            .add_subagent("alpha", "a", "a-scout", "d", "p", None, None)
+            .is_err());
+        assert!(store.add_subagent("alpha", "a", "a", "d", "p", None, None).is_err());
+
+        store.remove_subagent("alpha", "a", "a-scout").unwrap();
+        let after = store.load_agent("alpha", "a").unwrap();
+        assert!(after.doc["agent"].get("a-scout").is_none(), "entry gone");
+        assert!(
+            after.doc["agent"]["a"]["permission"]["task"].get("a-scout").is_none(),
+            "no dangling delegation rule"
+        );
+        assert!(after.meta.subagent_roles.is_empty(), "sidecar role cleaned up");
+    }
+
+    /// Cross-project copy — the operation that did not exist, and whose
+    /// absence cost a whole management-chat session.
+    #[test]
+    fn copy_agent_across_projects_carries_tree_and_role() {
+        let store = tmp_store("copy");
+        store.create_project("src", "S", "cdk-regtest").unwrap();
+        store.create_project("dst", "D", "cdk-regtest").unwrap();
+        store.create_blank_agent("src", "hunter").unwrap();
+        store
+            .save_agent(
+                "src",
+                "hunter",
+                &doc(serde_json::json!({
+                    "hunter": { "mode": "primary", "prompt": "hunt" },
+                    "hunter-scout": { "mode": "subagent", "description": "s" },
+                })),
+            )
+            .unwrap();
+        store.set_agent_role("src", "hunter", AgentRole::Tester).unwrap();
+
+        store.copy_agent("src", "hunter", "dst", "hunter").unwrap();
+        let copied = store.load_agent("dst", "hunter").unwrap();
+        assert_eq!(copied.doc["agent"]["hunter"]["prompt"].as_str(), Some("hunt"));
+        assert!(
+            copied.doc["agent"]["hunter-scout"].is_object(),
+            "subagents cross with it"
+        );
+        assert_eq!(copied.meta.role(), AgentRole::Tester, "role carries over");
+        assert_eq!(copied.meta.cloned_from.as_deref(), Some("src/hunter"));
+        // The source is untouched, and a second copy is refused.
+        assert!(store.load_agent("src", "hunter").is_ok());
+        assert!(store.copy_agent("src", "hunter", "dst", "hunter").is_err());
+        let err = store
+            .copy_agent("src", "hunter", "ghost", "hunter")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("project not found"), "{err}");
+    }
+
+    /// Migration assigns a role only to agents that never had one, and is
+    /// safe to re-run: an agent the operator tightened by hand must never
+    /// be silently re-widened by a second pass.
+    #[test]
+    fn migrate_roles_is_idempotent_and_never_rewidens() {
+        let store = tmp_store("migrate");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store.create_blank_agent("alpha", "a").unwrap();
+        // An agent whose permissions grant everything, with NO role yet:
+        // strip the sidecar's role to simulate a pre-roles install.
+        let mut perm = serde_json::Map::new();
+        for tool in CORPUS_TOOLS {
+            perm.insert(tool.to_string(), "allow".into());
+        }
+        store
+            .save_agent(
+                "alpha",
+                "a",
+                &doc(serde_json::json!({
+                    "a": { "mode": "primary", "permission": perm },
+                })),
+            )
+            .unwrap();
+        let dir = store.project_agent_dir("alpha", "a");
+        fs::write(
+            dir.join("agent.yaml"),
+            "name: a\ncreated: 0\n", // legacy sidecar: no role key
+        )
+        .unwrap();
+        assert!(!read_sidecar(&dir, "a").has_role(), "precondition: unassigned");
+
+        // Dry run reports without writing.
+        let preview = store.migrate_agent_roles("alpha", false).unwrap();
+        let row = preview.iter().find(|r| r.agent == "a").unwrap();
+        assert_eq!(row.current, None);
+        assert_eq!(row.inferred, AgentRole::Super, "permissions grant everything");
+        assert!(!row.applied);
+        assert!(!read_sidecar(&dir, "a").has_role(), "a dry run writes nothing");
+
+        // Apply.
+        let applied = store.migrate_agent_roles("alpha", true).unwrap();
+        assert!(applied.iter().find(|r| r.agent == "a").unwrap().applied);
+        assert_eq!(read_sidecar(&dir, "a").role(), AgentRole::Super);
+
+        // The operator now tightens it by hand...
+        store.set_agent_role("alpha", "a", AgentRole::Researcher).unwrap();
+        // ...and a second migration must LEAVE IT ALONE, even though the
+        // permission block still says "allow everything".
+        let again = store.migrate_agent_roles("alpha", true).unwrap();
+        let row = again.iter().find(|r| r.agent == "a").unwrap();
+        assert!(!row.applied, "an assigned role is never re-inferred");
+        assert_eq!(
+            read_sidecar(&dir, "a").role(),
+            AgentRole::Researcher,
+            "re-running migration must not undo a hand tightening"
+        );
+    }
+
+    /// Entry names are flat across a project's agents, so a collision must
+    /// be refused rather than silently resolved by slug order.
+    #[test]
+    fn render_refuses_colliding_entry_names() {
+        let store = tmp_store("collide");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        for slug in ["one", "two"] {
+            store.create_blank_agent("alpha", slug).unwrap();
+            store
+                .save_agent(
+                    "alpha",
+                    slug,
+                    &doc(serde_json::json!({
+                        slug: { "mode": "primary" },
+                        "shared-scout": { "mode": "subagent", "description": "d" },
+                    })),
+                )
+                .unwrap();
+        }
+        let error = store.render_project_agents("alpha", &[]).unwrap_err().to_string();
+        assert!(error.contains("shared-scout"), "{error}");
+        assert!(error.contains("rename one"), "{error}");
     }
 
     #[test]

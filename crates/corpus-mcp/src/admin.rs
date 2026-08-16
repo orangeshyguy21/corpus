@@ -146,7 +146,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "agent_clone",
-            "description": "Clone an agent (config + prompts) to a new slug.",
+            "description": "Clone an agent (config + prompts + subagents) to a new slug WITHIN one project. To copy into a DIFFERENT project use agent_copy.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -155,6 +155,93 @@ pub fn catalog() -> Value {
                     "to": {"type": "string"}
                 },
                 "required": ["project", "from", "to"]
+            }
+        },
+        {
+            "name": "agent_copy",
+            "description": "Copy an agent BETWEEN projects (prompts, subagents and role included). This is the tool for 'copy these agents into that project' — agent_clone cannot cross a project boundary.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_project": {"type": "string"},
+                    "from": {"type": "string"},
+                    "to_project": {"type": "string"},
+                    "to": {"type": "string", "description": "destination slug; defaults to the source slug"}
+                },
+                "required": ["from_project", "from", "to_project"]
+            }
+        },
+        {
+            "name": "agent_set",
+            "description": "Set ONE field of an agent (or of one of its subagents) without resending the whole document: model, description, prompt, or temperature. Prefer this over agent_save for a single change. Pass null to clear a field.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "subagent": {"type": "string", "description": "target this subagent entry instead of the primary"},
+                    "field": {"type": "string", "enum": ["model", "description", "prompt", "temperature"]},
+                    "value": {"description": "the new value; null clears the field"}
+                },
+                "required": ["project", "agent", "field", "value"]
+            }
+        },
+        {
+            "name": "agent_set_role",
+            "description": "Set an agent's ROLE — the capability ceiling the corpus server enforces for missions launched as it. researcher = read + technique_save only; tester = the full sandbox/oracle/faucet/findings set, no open internet; super = everything. A role also regenerates the corpus_* permissions at launch.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "subagent": {"type": "string", "description": "set a subagent's role instead (capped by the primary's)"},
+                    "role": {"type": "string", "enum": ["researcher", "tester", "super"]}
+                },
+                "required": ["project", "agent", "role"]
+            }
+        },
+        {
+            "name": "agent_set_permission",
+            "description": "MERGE a permission patch into an agent (or subagent) entry — top-level keys replace, null removes, everything else is left alone. Note the role ceiling still wins: granting a corpus_* tool outside the agent's role has no effect at launch.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "subagent": {"type": "string"},
+                    "patch": {"type": "object", "description": "e.g. {\"webfetch\": \"allow\", \"bash\": null}"}
+                },
+                "required": ["project", "agent", "patch"]
+            }
+        },
+        {
+            "name": "agent_subagent_add",
+            "description": "Add a subagent to an agent's document and wire the primary's task: permission to allow delegating to it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "name": {"type": "string", "description": "kebab-case entry name, unique across the PROJECT"},
+                    "description": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "model": {"type": "string"},
+                    "role": {"type": "string", "enum": ["researcher", "tester", "super"]}
+                },
+                "required": ["project", "agent", "name", "description", "prompt"]
+            }
+        },
+        {
+            "name": "agent_subagent_remove",
+            "description": "Remove a subagent entry, its delegation rule, and its role.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "name": {"type": "string"}
+                },
+                "required": ["project", "agent", "name"]
             }
         },
         {
@@ -321,6 +408,12 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         "agent_save" => agent_save(ctx, args),
         "agent_new" => agent_new(ctx, args),
         "agent_clone" => agent_clone(ctx, args),
+        "agent_copy" => agent_copy(ctx, args),
+        "agent_set" => agent_set(ctx, args),
+        "agent_set_role" => agent_set_role(ctx, args),
+        "agent_set_permission" => agent_set_permission(ctx, args),
+        "agent_subagent_add" => agent_subagent_add(ctx, args),
+        "agent_subagent_remove" => agent_subagent_remove(ctx, args),
         "agent_delete" => agent_delete(ctx, args),
         "mission_list" => mission_list(ctx, &project(args)?),
         "mission_get" => mission_get(ctx, &project(args)?, &require_str(args, "mission")?),
@@ -528,6 +621,130 @@ fn agent_clone(ctx: &mut Ctx, args: &Value) -> Result<String> {
     Ok(format!("cloned agent {project}/{from} -> {to}"))
 }
 
+/// Cross-project copy — the operation `agent_clone` cannot express.
+fn agent_copy(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let from_project = require_str(args, "from_project")?;
+    let from = require_str(args, "from")?;
+    let to_project = require_str(args, "to_project")?;
+    // Defaulting `to` to the source slug makes the common case ("copy this
+    // agent over there") a three-argument call.
+    let to = args
+        .get("to")
+        .and_then(Value::as_str)
+        .unwrap_or(&from)
+        .to_string();
+    ctx.store
+        .copy_agent(&from_project, &from, &to_project, &to)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    Ok(format!(
+        "copied agent {from_project}/{from} -> {to_project}/{to}"
+    ))
+}
+
+/// The `subagent` argument, shared by the granular editors.
+fn subagent_arg(args: &Value) -> Option<String> {
+    args.get("subagent")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn agent_set(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let project = require_str(args, "project")?;
+    let agent = require_str(args, "agent")?;
+    let field = require_str(args, "field")?;
+    let value = args
+        .get("value")
+        .cloned()
+        .ok_or_else(|| Error::Args("missing value (pass null to clear)".into()))?;
+    let subagent = subagent_arg(args);
+    ctx.store
+        .set_agent_field(&project, &agent, subagent.as_deref(), &field, value)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    let target = subagent.unwrap_or_else(|| agent.clone());
+    Ok(format!("set {field} on {project}/{agent} entry {target} (validator passed)"))
+}
+
+fn agent_set_role(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let project = require_str(args, "project")?;
+    let agent = require_str(args, "agent")?;
+    let raw = require_str(args, "role")?;
+    let role = corpus_core::AgentRole::parse(&raw).ok_or_else(|| {
+        Error::Args(format!("unknown role {raw:?} — one of researcher|tester|super"))
+    })?;
+    match subagent_arg(args) {
+        Some(sub) => {
+            ctx.store
+                .set_subagent_role(&project, &agent, &sub, role)
+                .map_err(|e| Error::Args(e.to_string()))?;
+            Ok(format!(
+                "{project}/{agent} subagent {sub}: role -> {} (capped by the primary's at launch)",
+                role.as_str()
+            ))
+        }
+        None => {
+            ctx.store
+                .set_agent_role(&project, &agent, role)
+                .map_err(|e| Error::Args(e.to_string()))?;
+            Ok(format!(
+                "{project}/{agent}: role -> {} (server-enforced; grants {})",
+                role.as_str(),
+                role.tools()
+                    .iter()
+                    .map(|t| t.trim_start_matches("corpus_"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    }
+}
+
+fn agent_set_permission(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let project = require_str(args, "project")?;
+    let agent = require_str(args, "agent")?;
+    let patch = args
+        .get("patch")
+        .ok_or_else(|| Error::Args("missing patch object".into()))?;
+    let subagent = subagent_arg(args);
+    ctx.store
+        .patch_agent_permission(&project, &agent, subagent.as_deref(), patch)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    let target = subagent.unwrap_or_else(|| agent.clone());
+    Ok(format!("patched permissions on {project}/{agent} entry {target} (validator passed)"))
+}
+
+fn agent_subagent_add(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let project = require_str(args, "project")?;
+    let agent = require_str(args, "agent")?;
+    let name = require_str(args, "name")?;
+    let description = require_str(args, "description")?;
+    let prompt = require_str(args, "prompt")?;
+    let model = args.get("model").and_then(Value::as_str);
+    let role = args
+        .get("role")
+        .and_then(Value::as_str)
+        .map(|r| {
+            corpus_core::AgentRole::parse(r).ok_or_else(|| {
+                Error::Args(format!("unknown role {r:?} — one of researcher|tester|super"))
+            })
+        })
+        .transpose()?;
+    ctx.store
+        .add_subagent(&project, &agent, &name, &description, &prompt, model, role)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    Ok(format!("added subagent {name} to {project}/{agent} (delegation wired)"))
+}
+
+fn agent_subagent_remove(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let project = require_str(args, "project")?;
+    let agent = require_str(args, "agent")?;
+    let name = require_str(args, "name")?;
+    ctx.store
+        .remove_subagent(&project, &agent, &name)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    Ok(format!("removed subagent {name} from {project}/{agent}"))
+}
+
 fn agent_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let project = require_str(args, "project")?;
     let agent = require_str(args, "agent")?;
@@ -694,7 +911,15 @@ fn corpus_wipe(ctx: &mut Ctx, args: &Value) -> Result<String> {
 
 fn corpus_stats(ctx: &mut Ctx, project: &str) -> Result<String> {
     let stats = walk_corpus_stats(&ctx.store, project).map_err(|e| Error::Args(e.to_string()))?;
-    Ok(format!("corpus {project}: {} files, {} bytes", stats.files, stats.bytes))
+    // Mission logs are reported apart from the knowledge categories —
+    // transcripts dominate the byte total and would hide the rest.
+    Ok(format!(
+        "corpus {project}: {} files, {} bytes; mission logs: {} files, {} bytes",
+        stats.knowledge_files(),
+        stats.knowledge_bytes(),
+        stats.logs.files,
+        stats.logs.bytes
+    ))
 }
 
 fn corpus_list(ctx: &mut Ctx, args: &Value) -> Result<String> {

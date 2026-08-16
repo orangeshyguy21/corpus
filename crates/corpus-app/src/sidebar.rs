@@ -24,7 +24,7 @@ use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
 use crate::fmt::fmt_bytes;
 use crate::nav::Screen;
-use crate::state::AppState;
+use crate::state::{AppState, MissionActivity};
 use crate::theme;
 use crate::views::plugin_picker::plugin_picker;
 
@@ -80,7 +80,7 @@ impl Default for Sidebar {
 impl Sidebar {
     pub fn show(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
         let max = ui.available_rect_before_wrap();
-        let footer_h = 44.0;
+        let footer_h = 50.0;
         let scroll_max = egui::Rect::from_min_max(
             max.min,
             egui::pos2(max.max.x, (max.max.y - footer_h).max(max.min.y)),
@@ -137,20 +137,34 @@ impl Sidebar {
         let selected = state.effective_project();
         let projects = state.projects.clone();
         let trees = state.trees.clone();
-        // A live mission dot pulses: keep the repaint stream alive only
-        // while a mission is ACTUALLY running (50 ms — visible pulse,
-        // near-idle cost; an idle/ended run repaints never).
-        let any_running = selected
-            .as_deref()
-            .and_then(|p| trees.get(p))
-            .is_some_and(|tree| {
-                let project = selected.as_deref().unwrap_or_default();
+        // Repaint budget follows what the dots are actually doing. Only a
+        // WORKING agent animates, so only that needs the 50 ms stream; a
+        // live-but-waiting session still needs a slow beat so the frame
+        // that notices work STARTING ever gets drawn (the activity poll
+        // rides on update()). Nothing live = no repaints at all.
+        let project = selected.as_deref().unwrap_or_default();
+        let busiest = trees
+            .get(project)
+            .map(|tree| {
                 tree.missions
                     .iter()
-                    .any(|(slug, _)| state.mission_running(project, slug))
-            });
-        if any_running {
-            ui.ctx().request_repaint_after(Duration::from_millis(50));
+                    .map(|(slug, _)| state.mission_activity(project, slug))
+                    .max_by_key(|activity| match activity {
+                        MissionActivity::Working => 2,
+                        MissionActivity::Waiting => 1,
+                        MissionActivity::Idle => 0,
+                    })
+                    .unwrap_or(MissionActivity::Idle)
+            })
+            .unwrap_or(MissionActivity::Idle);
+        match busiest {
+            MissionActivity::Working => {
+                ui.ctx().request_repaint_after(Duration::from_millis(50))
+            }
+            MissionActivity::Waiting => {
+                ui.ctx().request_repaint_after(Duration::from_millis(400))
+            }
+            MissionActivity::Idle => {}
         }
         for (slug, project) in &projects {
             let open = selected.as_deref() == Some(slug.as_str());
@@ -318,9 +332,10 @@ impl Sidebar {
                 .session
                 .as_ref()
                 .is_some_and(|s| state.live_sessions.iter().any(|l| l == s));
-            // The status dot: pulses only while the run is ACTUALLY live —
-            // a finished/stopped run goes still the poll after it ends.
-            let running = state.mission_running(project, slug);
+            // The status dot: pulses only while the agent is ACTUALLY
+            // producing. A session parked at its prompt is live, not
+            // busy, and shows a steady dot instead.
+            let activity = state.mission_activity(project, slug);
             // A mission row always reserves the kebab strip (⋮ shown on
             // the selected row and on row hover).
             let Row { ui: mut rui, rect, click, hovered } =
@@ -351,7 +366,7 @@ impl Sidebar {
                                 egui::vec2(12.0, ROW_H),
                                 egui::Sense::hover(),
                             );
-                            status_dot(ui, dot_rect, running);
+                            status_dot(ui, dot_rect, activity);
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(&label_text).size(13.5).color(theme::TEXT),
@@ -367,7 +382,7 @@ impl Sidebar {
                 rui.add_space(12.0);
                 let (dot_rect, _) =
                     rui.allocate_exact_size(egui::vec2(12.0, ROW_H), egui::Sense::hover());
-                status_dot(&rui, dot_rect, running);
+                status_dot(&rui, dot_rect, activity);
                 let resp = rui.add(
                     egui::Label::new(RichText::new(&label_text).size(13.5).color(theme::TEXT))
                         .sense(egui::Sense::click())
@@ -386,7 +401,11 @@ impl Sidebar {
                 "{project} · agent={} · {}{}",
                 mission.agent,
                 mission.status,
-                if running { " · running" } else { "" }
+                match activity {
+                    MissionActivity::Working => " · working",
+                    MissionActivity::Waiting => " · session live, waiting",
+                    MissionActivity::Idle => "",
+                }
             ));
         }
         if tree.missions.is_empty() {
@@ -515,45 +534,49 @@ impl Sidebar {
         }
     }
 
-    /// The pinned footer (spec §4): ↔ `arrow_clockwise` (TEXT_FAINT, hover
-    /// TEXT_MUTED) + `Corpus` 12px TEXT_FAINT on the left; right-aligned two
-    /// stacked lines — `{files} files` 13px TEXT over `{bytes}` 11px
-    /// TEXT_FAINT.
+    /// The pinned footer: a caption row — `Corpus` on the left, the
+    /// `{files} · {bytes}` count on the right — over a full-width
+    /// segmented bar of the knowledge categories (same colors as the
+    /// project view, no legend). Mission logs are excluded, matching the
+    /// count. Self-updating: the corpus is re-walked on a throttle
+    /// (`poll_corpus_stats`), so there is no refresh button.
     fn footer(&mut self, ui: &mut Ui, state: &mut AppState) {
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let refresh =
-                    theme::icon_button(ui, ph::ARROW_CLOCKWISE, 16.0)
-                        .on_hover_text("re-walk the corpus");
-                if refresh.clicked() {
-                    if let Some(project) = state.effective_project() {
-                        state.refresh_corpus_stats(&project);
-                    }
-                }
-                ui.add(
-                    egui::Label::new(
-                        RichText::new("Corpus").size(12.0).color(theme::TEXT_FAINT),
-                    ),
+        // Corpus-only totals: mission logs live in the project view's own
+        // section, never folded into the line that says `Corpus`.
+        let (files, bytes, categories) = match state.corpus_stats() {
+            Some(stats) => (
+                stats.knowledge_files(),
+                stats.knowledge_bytes(),
+                stats.categories.clone(),
+            ),
+            None => (0, 0, Vec::new()),
+        };
+
+        // A hairline across the top edge divides the footer from the
+        // scrolling tree above it.
+        let top = ui.max_rect();
+        ui.painter().hline(
+            top.left()..=top.right(),
+            top.top(),
+            egui::Stroke::new(1.0_f32, theme::HAIRLINE),
+        );
+
+        ui.add_space(10.0);
+        // Caption row: label left, count right — one clean line.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Corpus").size(12.0).color(theme::TEXT_MUTED));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(fmt_bytes(bytes)).size(11.0).color(theme::TEXT_FAINT),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                    ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
-                        let (files, bytes) = match state.corpus_stats() {
-                            Some(stats) => (stats.files, fmt_bytes(stats.bytes)),
-                            None => (0, "–".to_string()),
-                        };
-                        ui.label(
-                            RichText::new(format!("{files} files"))
-                                .size(13.0)
-                                .color(theme::TEXT),
-                        );
-                        ui.label(
-                            RichText::new(bytes).size(11.0).color(theme::TEXT_FAINT),
-                        );
-                    });
-                });
+                ui.label(RichText::new("·").size(11.0).color(theme::TEXT_FAINT));
+                ui.label(
+                    RichText::new(format!("{files} files")).size(11.5).color(theme::TEXT_MUTED),
+                );
             });
         });
+        ui.add_space(6.0);
+        corpus_strip(ui, &categories, bytes);
     }
 
     // --- create flows (modal windows) ---
@@ -746,24 +769,82 @@ fn row_ui(ui: &mut Ui, selected: bool, has_kebab: bool, id_seed: impl std::hash:
     Row { ui: child, rect, click, hovered }
 }
 
-/// A mission row's status dot: idle = a steady faint dot; running (the
-/// mission's tmux session is live / the app run is going) = an OK-green
-/// dot with a soft pulsing halo. The pulse is pure paint off the repaint
-/// clock — no widget, no state (the caller requests a 50 ms repaint
-/// while any mission is live).
-fn status_dot(ui: &Ui, rect: egui::Rect, running: bool) {
+/// A mission row's status dot, one glyph per activity state:
+///   - `Idle`    — steady faint dot: nothing is up.
+///   - `Waiting` — steady OK-green dot, no halo: the opencode session is
+///                 live but the agent is parked at its prompt. Motion
+///                 here would claim work that isn't happening, so the
+///                 dot only says "attached".
+///   - `Working` — OK-green with a soft pulsing halo: producing now.
+/// The pulse is pure paint off the repaint clock — no widget, no state
+/// (the caller requests a 50 ms repaint while a mission is working).
+fn status_dot(ui: &Ui, rect: egui::Rect, activity: MissionActivity) {
     let center = rect.center();
-    if running {
-        // Smooth ease-in-out pulse at ~1.4 Hz (two full breaths).
-        let t = ui.ctx().input(|i| i.time) as f32;
-        let pulse = ((t * std::f32::consts::TAU * 1.4).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-        let halo_r = 3.0 + 4.0 * pulse;
-        let core_r = 2.2 + 0.6 * (pulse - 0.5).abs() * -2.0; // slimmer at the extremes
-        let halo = theme::OK.gamma_multiply(0.10 + 0.20 * pulse);
-        ui.painter().circle_filled(center, halo_r, halo);
-        ui.painter().circle_filled(center, core_r, theme::OK);
-    } else {
-        ui.painter().circle_filled(center, 2.2, theme::TEXT_FAINT);
+    match activity {
+        MissionActivity::Working => {
+            // Smooth ease-in-out pulse at ~1.4 Hz (two full breaths).
+            let t = ui.ctx().input(|i| i.time) as f32;
+            let pulse = ((t * std::f32::consts::TAU * 1.4).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+            let halo_r = 3.0 + 4.0 * pulse;
+            let core_r = 2.2 + 0.6 * (pulse - 0.5).abs() * -2.0; // slimmer at the extremes
+            let halo = theme::OK.gamma_multiply(0.10 + 0.20 * pulse);
+            ui.painter().circle_filled(center, halo_r, halo);
+            ui.painter().circle_filled(center, core_r, theme::OK);
+        }
+        MissionActivity::Waiting => {
+            ui.painter().circle_filled(center, 2.2, theme::OK.gamma_multiply(0.55));
+        }
+        MissionActivity::Idle => {
+            ui.painter().circle_filled(center, 2.2, theme::TEXT_FAINT);
+        }
+    }
+}
+
+/// The sidebar's compact corpus bar: a full-width strip segmented by each
+/// knowledge category's byte share, palette-colored to match the project
+/// view (no legend — the colors carry it). Hover a segment for its
+/// files/bytes. An empty corpus paints just the faint plate.
+fn corpus_strip(ui: &mut Ui, categories: &[corpus_core::CategoryStat], total: u64) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 9.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, theme::PLATE_FRONT);
+    if total == 0 || categories.is_empty() {
+        return;
+    }
+    let mut x = rect.left();
+    for (i, category) in categories.iter().enumerate() {
+        let share = category.bytes as f32 / total.max(1) as f32;
+        let w = if i == categories.len() - 1 {
+            rect.right() - x // last segment absorbs rounding
+        } else {
+            (rect.width() * share).max(2.0)
+        };
+        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height()));
+        let color = theme::CORPUS_PALETTE[i % theme::CORPUS_PALETTE.len()];
+        // Round only the outer ends so the strip reads as one pill.
+        let rounding = if i == 0 {
+            egui::CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 }
+        } else if i == categories.len() - 1 {
+            egui::CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 }
+        } else {
+            egui::CornerRadius::ZERO
+        };
+        painter.rect_filled(seg, rounding, color);
+        // Hairline gap so adjacent segments stay distinct.
+        painter.rect_stroke(
+            seg,
+            rounding,
+            egui::Stroke::new(1.0_f32, theme::BG),
+            egui::StrokeKind::Inside,
+        );
+        ui.allocate_rect(seg, egui::Sense::hover()).on_hover_text(format!(
+            "{} — {} files, {}",
+            category.name,
+            category.files,
+            fmt_bytes(category.bytes)
+        ));
+        x += w;
     }
 }
 

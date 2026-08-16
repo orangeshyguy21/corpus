@@ -64,7 +64,14 @@ fn serve(admin: bool) -> Result<()> {
             }
             "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
             "tools/list" => {
-                let tools = if admin { admin::catalog() } else { tools::catalog() };
+                // The sandbox profile advertises only what this run's role
+                // can actually call; the admin profile has no agent
+                // identity and is gated by its own confirm-token rules.
+                let tools = if admin {
+                    admin::catalog()
+                } else {
+                    tools::catalog_for(&ctx.role)
+                };
                 json!({"jsonrpc": "2.0", "id": id, "result": { "tools": tools }})
             }
             "tools/call" => handle_call(&mut ctx, id, &request, admin),

@@ -1436,6 +1436,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "corpus-core",
+ "corpus-mcp",
  "eframe",
  "egui",
  "egui-phosphor",

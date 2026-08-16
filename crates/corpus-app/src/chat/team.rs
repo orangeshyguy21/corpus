@@ -49,6 +49,15 @@ pub const WRITE_TOOLS: &[&str] = &[
     "agent_new",
     "agent_save",
     "agent_clone",
+    "agent_copy",
+    // The granular editors: one field per call instead of resending the
+    // whole document. `agent_set_role` moves a SERVER-ENFORCED capability
+    // ceiling, so it gates like any other write.
+    "agent_set",
+    "agent_set_role",
+    "agent_set_permission",
+    "agent_subagent_add",
+    "agent_subagent_remove",
     "mission_new",
     "mission_set_budget",
     "mission_set_pins",
@@ -66,7 +75,9 @@ pub fn bare_tool_name(name: &str) -> &str {
 pub fn mutated_area(tool: &str) -> Option<&'static str> {
     match bare_tool_name(tool) {
         "project_new" | "project_clone" | "project_rebind" | "project_delete" => Some("projects"),
-        "agent_new" | "agent_save" | "agent_clone" | "agent_delete" => Some("agents"),
+        "agent_new" | "agent_save" | "agent_clone" | "agent_delete" | "agent_copy"
+        | "agent_set" | "agent_set_role" | "agent_set_permission" | "agent_subagent_add"
+        | "agent_subagent_remove" => Some("agents"),
         "mission_new" | "mission_delete" | "mission_set_budget" | "mission_set_pins" => {
             Some("missions")
         }
@@ -110,6 +121,12 @@ pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "agent_new",
     "agent_save",
     "agent_clone",
+    "agent_copy",
+    "agent_set",
+    "agent_set_role",
+    "agent_set_permission",
+    "agent_subagent_add",
+    "agent_subagent_remove",
     "agent_delete",
     "mission_list",
     "mission_get",
@@ -152,6 +169,16 @@ impl TeamRole {
                 "agent_new",
                 "agent_save",
                 "agent_clone",
+                // Cross-project copy + the granular editors: this
+                // specialist's whole job is editing agents, and doing it a
+                // field at a time is what keeps a local model from having
+                // to re-emit an entire nested document.
+                "agent_copy",
+                "agent_set",
+                "agent_set_role",
+                "agent_set_permission",
+                "agent_subagent_add",
+                "agent_subagent_remove",
                 // Model discovery: an edited config's model ids must resolve
                 // against the real opencode catalog, never be guessed.
                 "model_list",
@@ -324,6 +351,33 @@ mod tests {
                 "corpus-inspector must retain {required}"
             );
         }
+    }
+
+    /// `ALL_ADMIN_TOOLS` must be EXACTLY the server's `--admin` catalog.
+    /// Nothing else can catch this: the two crates are independent, so a
+    /// tool added to corpus-mcp and never classified here is invisible to
+    /// every specialist and to the approval policy's read/write partition —
+    /// a silent capability loss, in the direction that looks like nothing
+    /// is wrong.
+    #[test]
+    fn admin_tool_table_matches_the_server_catalog() {
+        let mut server: Vec<String> = corpus_mcp::admin::catalog()
+            .as_array()
+            .expect("catalog is an array")
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .collect();
+        server.sort();
+        let mut ours: Vec<String> = ALL_ADMIN_TOOLS.iter().map(|s| s.to_string()).collect();
+        ours.sort();
+        let missing: Vec<_> = server.iter().filter(|t| !ours.contains(t)).collect();
+        let extra: Vec<_> = ours.iter().filter(|t| !server.contains(t)).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "team.rs drifted from the corpus-mcp --admin catalog.\n\
+             in the server but unclassified here: {missing:?}\n\
+             listed here but not in the server: {extra:?}"
+        );
     }
 
     /// Every specialist domain is non-empty and every manifest entry is a real

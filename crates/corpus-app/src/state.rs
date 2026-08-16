@@ -17,6 +17,21 @@ use corpus_core::{
 
 use crate::nav::Screen;
 
+/// How recently a run's TUI must have painted for the agent to count as
+/// WORKING. opencode animates while a turn is in flight (spinner, token
+/// stream, tool output), so a live-but-quiet capture for this long means
+/// the turn is over and it's waiting on the operator. Long enough to ride
+/// out a slow frame, short enough that the dot settles as soon as the
+/// answer lands.
+const WORKING_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+/// How often the raw captures are re-stat'd. Cheap next to the tmux
+/// listing (no subprocess), so it runs on the faster beat.
+const ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How often the corpus is re-walked to keep the sidebar summary current.
+/// Slower than the activity beat — the count moving a second or two after
+/// a write lands is fine, and this touches every corpus file's metadata.
+const CORPUS_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// One project's subtree in the sidebar tree: its agents and missions.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectTree {
@@ -63,7 +78,14 @@ pub struct AppState {
     /// change + manually.
     corpus_stats: Option<CorpusStats>,
     corpus_cost: Option<CostReport>,
+    /// The project's mission transcripts (`corpus/runs/`), newest first —
+    /// refreshed on the same beat as `corpus_stats`.
+    mission_logs: Vec<corpus_core::MissionLog>,
     corpus_stats_project: Option<String>,
+    /// When the corpus was last auto-re-walked (the sidebar summary keeps
+    /// itself current on a throttle — no manual refresh). Independent of
+    /// selection-change refreshes, which are immediate.
+    corpus_polled_at: Option<std::time::Instant>,
     /// Discovered plugins with live probe results, refreshed on demand
     /// (`refresh_plugins`) — never per-frame: probing spawns processes
     /// on the host.
@@ -105,6 +127,43 @@ pub struct AppState {
     /// When `live_sessions` was last polled (polled on a throttle, never
     /// per frame — the poll spawns `tmux list-sessions`).
     live_sessions_polled_at: Option<std::time::Instant>,
+    /// Per tmux session, the moment its TUI last painted anything —
+    /// derived from the run's raw capture mtime and aged forward between
+    /// polls, so it stays honest without re-statting every frame. This is
+    /// what separates a WORKING agent from one parked at its prompt.
+    session_activity: BTreeMap<String, std::time::Instant>,
+    /// When `session_activity` was last refreshed (a `stat` per live
+    /// session — cheap, so polled faster than the tmux listing).
+    session_activity_polled_at: Option<std::time::Instant>,
+}
+
+/// What a mission's row is showing: nothing live, a live session parked
+/// at its prompt, or an agent actually producing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionActivity {
+    /// No live run and no live session — the mission is not up.
+    Idle,
+    /// The opencode session is live but quiet: the turn is finished and
+    /// it is waiting on the operator (or on a reply). Not work.
+    Waiting,
+    /// The agent is producing right now — streaming, spinning, running
+    /// tools. The only state that earns the pulse.
+    Working,
+}
+
+/// The status dot's decision, given whether the session is up and when
+/// its TUI last painted. Split out from `AppState` so the rule itself is
+/// testable: a LIVE session is only `Working` when something was painted
+/// inside `WORKING_WINDOW` — no capture reading is not evidence of work,
+/// which is precisely the case that used to pulse forever.
+fn activity_for(live: bool, last_paint: Option<std::time::Instant>) -> MissionActivity {
+    if !live {
+        return MissionActivity::Idle;
+    }
+    match last_paint {
+        Some(painted) if painted.elapsed() < WORKING_WINDOW => MissionActivity::Working,
+        _ => MissionActivity::Waiting,
+    }
 }
 
 /// Who the active (or last-finished) run was.
@@ -144,8 +203,10 @@ impl AppState {
             missions_project: None,
             trees: BTreeMap::new(),
             corpus_stats: None,
+            mission_logs: Vec::new(),
             corpus_cost: None,
             corpus_stats_project: None,
+            corpus_polled_at: None,
             plugins: Vec::new(),
             agents: Vec::new(),
             agents_project: None,
@@ -160,6 +221,8 @@ impl AppState {
             export_path: None,
             live_sessions: Vec::new(),
             live_sessions_polled_at: None,
+            session_activity: BTreeMap::new(),
+            session_activity_polled_at: None,
         };
         state.refresh();
         state
@@ -221,13 +284,15 @@ impl AppState {
         }
     }
 
-    /// Re-walk a project's corpus (files/bytes per category, and the
-    /// token/cost aggregation over run exports) for the sidebar summary
-    /// and the project view.
+    /// Re-walk a project's corpus (files/bytes per category, the mission
+    /// transcripts, and the token/cost aggregation over run exports) for
+    /// the sidebar summary and the project view.
     pub fn refresh_corpus_stats(&mut self, project: &str) {
         self.corpus_stats = corpus_core::corpus_stats(&self.store, project).ok();
+        self.mission_logs = corpus_core::mission_logs(&self.store, project).unwrap_or_default();
         self.corpus_cost = corpus_core::corpus_cost(&self.store, project).ok();
         self.corpus_stats_project = Some(project.to_string());
+        self.corpus_polled_at = Some(std::time::Instant::now());
     }
 
     /// The sidebar's selected project — held by slug, falling back to the
@@ -325,6 +390,7 @@ impl AppState {
             self.agents.clear();
             self.missions.clear();
             self.corpus_stats = None;
+            self.mission_logs.clear();
             self.agents_project = None;
             self.missions_project = None;
             self.corpus_stats_project = None;
@@ -364,6 +430,12 @@ impl AppState {
     /// computed yet, or no project).
     pub fn corpus_stats(&self) -> Option<&CorpusStats> {
         self.corpus_stats.as_ref()
+    }
+
+    /// The project view's mission logs for the selected project, newest
+    /// first (empty = none written yet, or no project).
+    pub fn mission_logs(&self) -> &[corpus_core::MissionLog] {
+        &self.mission_logs
     }
 
     /// The project view's cost report for the selected project.
@@ -436,6 +508,73 @@ impl AppState {
         doc: &serde_json::Value,
     ) -> Result<(), Error> {
         self.store.save_agent(project, slug, doc)
+    }
+
+    // --- granular agent edits (the Forms tab) -------------------------
+    // Each is a read-modify-validate-write in corpus-core, so the form
+    // sends one value instead of rewriting the whole document.
+
+    /// Set one field of an agent entry (`None` = the primary).
+    pub fn set_agent_field(
+        &self,
+        project: &str,
+        slug: &str,
+        entry: Option<&str>,
+        field: &str,
+        value: serde_json::Value,
+    ) -> Result<(), Error> {
+        self.store.set_agent_field(project, slug, entry, field, value)
+    }
+
+    /// Set the agent's (or a subagent's) role — the server-enforced ceiling.
+    pub fn set_agent_role(
+        &self,
+        project: &str,
+        slug: &str,
+        entry: Option<&str>,
+        role: corpus_core::AgentRole,
+    ) -> Result<(), Error> {
+        match entry {
+            Some(sub) => self.store.set_subagent_role(project, slug, sub, role),
+            None => self.store.set_agent_role(project, slug, role),
+        }
+    }
+
+    /// Merge a permission patch into an entry.
+    pub fn patch_agent_permission(
+        &self,
+        project: &str,
+        slug: &str,
+        entry: Option<&str>,
+        patch: &serde_json::Value,
+    ) -> Result<(), Error> {
+        self.store.patch_agent_permission(project, slug, entry, patch)
+    }
+
+    pub fn add_subagent(
+        &self,
+        project: &str,
+        slug: &str,
+        name: &str,
+        description: &str,
+        prompt: &str,
+        model: Option<&str>,
+        role: Option<corpus_core::AgentRole>,
+    ) -> Result<(), Error> {
+        self.store
+            .add_subagent(project, slug, name, description, prompt, model, role)
+    }
+
+    pub fn remove_subagent(&self, project: &str, slug: &str, name: &str) -> Result<(), Error> {
+        self.store.remove_subagent(project, slug, name)
+    }
+
+    /// opencode's launchable model ids — the catalog an AGENT config must
+    /// resolve against. Deliberately NOT `ollama_models()`, which is the
+    /// chat's own (locally-pulled) list and would offer ids a mission
+    /// cannot launch with. TTL-cached in corpus-core; `refresh` re-pulls.
+    pub fn opencode_models(&self, refresh: bool) -> Option<corpus_core::ModelList> {
+        corpus_core::model_list(refresh).ok()
     }
 
     /// Clone an agent.
@@ -522,13 +661,21 @@ impl AppState {
         self.store.load_agent(project, agent)?;
         self.store.render_project_agents(project, pinned)?;
         let session = RunSession::spawn(project, agent, model, mission, source_pins_json)?;
+        self.adopt_run(session);
+        Ok(())
+    }
+
+    /// Take ownership of a freshly spawned run and reset the per-run
+    /// bookkeeping (attach argv, drained lines, terminal status). Shared
+    /// by `launch` and `resume_mission` so a resumed run is wired exactly
+    /// like a fresh one.
+    fn adopt_run(&mut self, session: RunSession) {
         let pty_attach = session.pty_attach_command();
         self.run = Some(session);
         self.run_meta = Some(RunMeta { pty_attach });
         self.run_mission = None;
         self.run_lines.clear();
         self.run_status = None;
-        Ok(())
     }
 
     /// Drain any new transcript lines; mark the run finished the moment
@@ -606,32 +753,103 @@ impl AppState {
         if due {
             self.refresh_live_sessions();
         }
+        // Activity is a `stat` per live session — no subprocess, so it
+        // polls faster: the dot should catch a turn starting, not lag it
+        // by the tmux listing's throttle.
+        let activity_due = self
+            .session_activity_polled_at
+            .is_none_or(|t| t.elapsed() > ACTIVITY_POLL);
+        if activity_due {
+            self.refresh_session_activity();
+            // Same beat: catch the live run's opencode session id as soon
+            // as the TUI has created it (self-throttled, and a no-op once
+            // the mission record has one).
+            self.capture_opencode_session();
+        }
     }
 
-    /// Is THIS mission's run actively going right now? True while the
-    /// app-owned run is live, belongs to this mission, and hasn't
-    /// finished (run_status set = exited/stopped = the dot goes still),
-    /// or while the mission's recorded tmux session is alive on the
-    /// server (covers a relaunched app and sessions the app doesn't own —
-    /// polled fresh every 2 s, so a just-ended run stops within one poll).
-    /// Drives the sidebar mission-row status dot.
-    pub fn mission_running(&self, project: &str, slug: &str) -> bool {
-        if self.run_active()
-            && self.run_status.is_none()
-            && self.run_mission.as_deref() == Some(slug)
-        {
-            return true;
+    /// Keep the sidebar's corpus summary current on its own, so new
+    /// findings/attacks a running mission writes just appear — no manual
+    /// refresh. The walk is a cheap `read_dir` + `stat` pass (bounded by
+    /// file COUNT, not size), so a throttle this tight is comfortable.
+    /// Selection-change refreshes still happen immediately elsewhere;
+    /// this only fills the gaps between them.
+    pub fn poll_corpus_stats(&mut self) {
+        let Some(project) = self.effective_project() else {
+            return;
+        };
+        let due = self
+            .corpus_polled_at
+            .is_none_or(|t| t.elapsed() > CORPUS_POLL);
+        if due {
+            self.refresh_corpus_stats(&project);
         }
-        let Some(tree) = self.trees.get(project) else {
-            return false;
+    }
+
+    /// Re-stat the raw capture of every mission session we know of, and
+    /// record WHEN it last grew as an `Instant`. Storing the instant (not
+    /// the age) means the reading keeps aging correctly between polls, so
+    /// a 500 ms poll still gives a dot that goes still the moment output
+    /// stops.
+    fn refresh_session_activity(&mut self) {
+        self.session_activity_polled_at = Some(std::time::Instant::now());
+        let sessions: Vec<(String, String)> = self
+            .trees
+            .iter()
+            .flat_map(|(project, tree)| {
+                tree.missions.iter().filter_map(move |(_, mission)| {
+                    mission.session.clone().map(|s| (project.clone(), s))
+                })
+            })
+            .collect();
+        self.session_activity.clear();
+        for (project, session) in sessions {
+            let Some(log) = corpus_core::session_raw_log(&self.store, &project, &session) else {
+                continue;
+            };
+            let Some(idle) = corpus_core::run_idle_secs(&log) else {
+                continue;
+            };
+            let last_paint = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(idle))
+                .unwrap_or_else(std::time::Instant::now);
+            self.session_activity.insert(session, last_paint);
+        }
+    }
+
+    /// What the mission's status dot should say: `Idle` (nothing up),
+    /// `Waiting` (session live, agent quiet), or `Working` (producing
+    /// right now).
+    ///
+    /// A run is UP when the app-owned run is live and belongs to this
+    /// mission (run_status set = exited/stopped = down), or when the
+    /// mission's recorded tmux session is alive on the server — which
+    /// covers a relaunched app and sessions the app never owned.
+    ///
+    /// The busy signal is the run's raw capture: everything the TUI
+    /// paints flows through `tmux pipe-pane` into it, and a TUI waiting
+    /// at its prompt paints nothing — so a capture that grew within
+    /// `WORKING_WINDOW` means the agent is mid-turn. A piped headless run
+    /// has no TUI to watch and is one-shot by nature: while it is up, it
+    /// IS working.
+    pub fn mission_activity(&self, project: &str, slug: &str) -> MissionActivity {
+        let owned = self.run_active()
+            && self.run_status.is_none()
+            && self.run_mission.as_deref() == Some(slug);
+        let session = self
+            .trees
+            .get(project)
+            .and_then(|tree| tree.missions.iter().find(|(s, _)| s == slug))
+            .and_then(|(_, mission)| mission.session.clone());
+        let Some(session) = session else {
+            // No tmux session: the only thing that can be up is an
+            // app-owned piped run, which is busy for its whole life.
+            return if owned { MissionActivity::Working } else { MissionActivity::Idle };
         };
-        let Some((_, mission)) = tree.missions.iter().find(|(s, _)| s == slug) else {
-            return false;
-        };
-        mission.session.as_ref().is_some_and(|s| {
-            self.live_sessions.iter().any(|l| l == s)
-                || self.live_run_session().as_deref() == Some(s.as_str())
-        })
+        let live = self.live_sessions.iter().any(|l| l == &session)
+            || self.live_run_session().as_deref() == Some(session.as_str())
+            || owned;
+        activity_for(live, self.session_activity.get(&session).copied())
     }
 
     /// The attach argv for a discovered live session (re-attach after an
@@ -661,7 +879,41 @@ impl AppState {
         self.launch(project, agent, model.as_deref(), "", &pinned, pins_json.as_deref())?;
         self.run_mission = Some(slug.to_string());
         if let Some(session) = self.live_run_session() {
-            self.set_mission_session(project, slug, Some(session), None)?;
+            self.set_tmux_session(project, slug, Some(session))?;
+        }
+        // A fresh launch is a NEW conversation: drop any id from a
+        // previous run so discovery records the right one.
+        self.set_opencode_session(project, slug, None)?;
+        self.refresh_missions(project);
+        Ok(())
+    }
+
+    /// Re-open a mission's recorded opencode conversation in a fresh TUI
+    /// (`opencode --session <id>`), so an old mission whose tmux session
+    /// died is steerable again with its history intact. Same one-run-at-a-
+    /// time rule as `launch_mission`: a live run is replaced.
+    pub fn resume_mission(&mut self, project: &str, slug: &str) -> Result<(), Error> {
+        let (record, pinned, pins_json) = self.prepare_launch(project, slug)?;
+        let id = record.opencode_session.clone().ok_or_else(|| {
+            Error::Store("no opencode session recorded for this mission — nothing to resume".into())
+        })?;
+        self.teardown_active_run(project, slug);
+        // Same materialization as a launch: the resumed conversation runs
+        // against this project's agent set.
+        self.store.load_agent(project, &record.agent)?;
+        self.store.render_project_agents(project, &pinned)?;
+        let model = self.agent_default_model(project, &record.agent);
+        let run = corpus_core::RunSession::resume(
+            project,
+            &record.agent,
+            model.as_deref(),
+            &id,
+            pins_json.as_deref(),
+        )?;
+        self.adopt_run(run);
+        self.run_mission = Some(slug.to_string());
+        if let Some(session) = self.live_run_session() {
+            self.set_tmux_session(project, slug, Some(session))?;
         }
         self.refresh_missions(project);
         Ok(())
@@ -717,24 +969,70 @@ impl AppState {
                 })
                 .map(|(s, _)| s.clone());
             if let Some(holder) = holder {
-                let _ = self.set_mission_session(project, &holder, None, None);
+                // Only the dead tmux session goes; the displaced mission
+                // keeps its opencode id so it can be resumed later.
+                let _ = self.set_tmux_session(project, &holder, None);
             }
         }
     }
 
-    /// Write the run bookkeeping (tmux session / opencode session) onto a
-    /// mission record, preserving its brief.
-    fn set_mission_session(
+    /// Point a mission at a tmux session (or clear a dead one). The
+    /// opencode session is left alone: the tmux session is where the run
+    /// is ATTACHED, while the opencode session is what the mission IS —
+    /// it outlives every attach and is what `resume_mission` re-opens.
+    fn set_tmux_session(
         &mut self,
         project: &str,
         slug: &str,
         session: Option<String>,
-        opencode_session: Option<String>,
     ) -> Result<(), Error> {
         let mut mission = self.store.load_mission(project, slug)?;
         mission.session = session;
-        mission.opencode_session = opencode_session;
         self.store.update_mission(project, slug, &mission)
+    }
+
+    /// Record (or clear) the opencode conversation a mission owns. A
+    /// fresh launch clears it — opencode starts a new conversation, so
+    /// the old id would resume the WRONG one — and discovery fills it
+    /// back in once the TUI has created its session.
+    fn set_opencode_session(
+        &mut self,
+        project: &str,
+        slug: &str,
+        id: Option<String>,
+    ) -> Result<(), Error> {
+        let mut mission = self.store.load_mission(project, slug)?;
+        mission.opencode_session = id;
+        self.store.update_mission(project, slug, &mission)
+    }
+
+    /// Catch the opencode session id of the live run and persist it on
+    /// its mission. Called on the poll beat: the id doesn't exist at
+    /// launch (the TUI has to boot first), and without it a mission can
+    /// be neither exported after an app restart nor resumed. Cheap once
+    /// it lands — the lookup stops the moment the record has an id.
+    fn capture_opencode_session(&mut self) {
+        let (Some(project), Some(slug)) = (self.effective_project(), self.run_mission.clone())
+        else {
+            return;
+        };
+        if !self.run_active() || self.run_status.is_some() {
+            return;
+        }
+        let known = self
+            .store
+            .load_mission(&project, &slug)
+            .ok()
+            .and_then(|m| m.opencode_session);
+        if known.is_some() {
+            return;
+        }
+        let Some(id) = self.run.as_mut().and_then(|run| run.opencode_session_id()) else {
+            return;
+        };
+        if self.set_opencode_session(&project, &slug, Some(id)).is_ok() {
+            self.refresh_missions(&project);
+        }
     }
 
     /// Rename a mission (its display label) while keeping the slug.
@@ -751,8 +1049,10 @@ impl AppState {
 
     /// Stop a mission's run: best-effort transcript-of-record export,
     /// then kill — whether the app owns the run or it survived an app
-    /// relaunch. Clears the mission's run bookkeeping and returns the
-    /// durable transcript path when known.
+    /// relaunch. Clears the dead tmux session and returns the durable
+    /// transcript path when known. The opencode session id STAYS on the
+    /// record: stopping ends the attach, not the conversation, and that
+    /// id is what `resume_mission` re-opens.
     pub fn stop_mission(&mut self, project: &str, slug: &str) -> Result<String, Error> {
         let mission = self.store.load_mission(project, slug)?;
         let session = mission.session.as_deref().ok_or_else(|| {
@@ -775,7 +1075,7 @@ impl AppState {
         if let Some(path) = &path {
             self.export_path = Some(path.clone());
         }
-        self.set_mission_session(project, slug, None, None)?;
+        self.set_tmux_session(project, slug, None)?;
         self.refresh_live_sessions();
         Ok(path.unwrap_or_default())
     }
@@ -873,6 +1173,22 @@ mod tests {
             session: None,
             opencode_session: None,
         }
+    }
+
+    #[test]
+    fn only_a_painting_session_counts_as_working() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        // Nothing up: the session state below is irrelevant.
+        assert_eq!(activity_for(false, Some(now)), MissionActivity::Idle);
+        // Live and painting right now — the pulse is earned.
+        assert_eq!(activity_for(true, Some(now)), MissionActivity::Working);
+        // Live but quiet past the window: an opencode TUI parked at its
+        // prompt. This is the case that used to pulse forever.
+        let stale = now - (WORKING_WINDOW + Duration::from_secs(1));
+        assert_eq!(activity_for(true, Some(stale)), MissionActivity::Waiting);
+        // Live with no capture to read: absence of evidence, not work.
+        assert_eq!(activity_for(true, None), MissionActivity::Waiting);
     }
 
     #[test]

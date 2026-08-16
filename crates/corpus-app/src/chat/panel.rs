@@ -26,6 +26,17 @@ pub struct ChatPanelView {
     activity: Activity,
     /// When the current activity began (for the animated elapsed timer).
     activity_since: std::time::Instant,
+    /// When the CURRENT turn started (reset on TurnStart) — drives the
+    /// live throughput read, which must span the whole turn, not just the
+    /// latest activity phase.
+    turn_since: std::time::Instant,
+    /// Streamed characters (thinking + text) this turn — an approximate
+    /// live output size so a long turn shows visible progress, not a frozen
+    /// spinner. Reset on TurnStart.
+    turn_stream_chars: usize,
+    /// Whether any content chunk has arrived this turn yet: before the
+    /// first, the model is prefilling/loading, not thinking.
+    turn_saw_output: bool,
     /// The turn we last saw start — a `TurnEnd` for an OLDER turn must not
     /// idle the status (stale-task guard; turns are serialized backend-side,
     /// this is belt-and-braces).
@@ -62,6 +73,9 @@ enum BubbleKind {
     Tool,
     /// A backend failure, rendered as red text in the log (never silent).
     Error,
+    /// A neutral, operator-facing marker (e.g. "— stopped —") — faint, not
+    /// an error.
+    Notice,
 }
 
 /// What the backend is doing right now, for the status line (the "no
@@ -103,6 +117,9 @@ impl Default for ChatPanelView {
             pending: Vec::new(),
             activity: Activity::Idle,
             activity_since: std::time::Instant::now(),
+            turn_since: std::time::Instant::now(),
+            turn_stream_chars: 0,
+            turn_saw_output: false,
             live_turn: 0,
             last_error: None,
             usage: (0, 0),
@@ -138,6 +155,12 @@ pub fn human_tool_name(raw: &str) -> String {
             "agent_new" => "create agent".into(),
             "agent_save" => "save agent".into(),
             "agent_clone" => "clone agent".into(),
+            "agent_copy" => "copy agent to project".into(),
+            "agent_set" => "edit agent field".into(),
+            "agent_set_role" => "set agent role".into(),
+            "agent_set_permission" => "edit agent permissions".into(),
+            "agent_subagent_add" => "add subagent".into(),
+            "agent_subagent_remove" => "remove subagent".into(),
             "agent_delete" => "delete agent".into(),
             "mission_list" => "list missions".into(),
             "mission_get" => "read mission".into(),
@@ -210,6 +233,8 @@ impl ChatPanelView {
             match ev {
                 ChatEvent::TextChunk { delta, .. } => {
                     self.set_activity(Activity::Streaming);
+                    self.turn_saw_output = true;
+                    self.turn_stream_chars += delta.chars().count();
                     // Coalesce streamed chunks into the open assistant bubble.
                     match self.messages.last_mut() {
                         Some(m) if m.kind == BubbleKind::Assistant => m.text.push_str(&delta),
@@ -223,6 +248,8 @@ impl ChatPanelView {
                 }
                 ChatEvent::ThinkingChunk { delta, .. } => {
                     self.set_activity(Activity::Thinking);
+                    self.turn_saw_output = true;
+                    self.turn_stream_chars += delta.chars().count();
                     // Coalesce streamed reasoning into the open thought card.
                     match self.messages.last_mut() {
                         Some(m) if m.kind == BubbleKind::Thought => m.text.push_str(&delta),
@@ -302,6 +329,9 @@ impl ChatPanelView {
                 ChatEvent::TurnStart { turn } => {
                     self.set_activity(Activity::Thinking);
                     self.live_turn = turn;
+                    self.turn_since = std::time::Instant::now();
+                    self.turn_stream_chars = 0;
+                    self.turn_saw_output = false;
                     // The oldest queued message's turn just started.
                     if let Some(m) = self.messages.iter_mut().find(|m| m.queued) {
                         m.queued = false;
@@ -311,6 +341,17 @@ impl ChatPanelView {
                     if turn >= self.live_turn {
                         self.set_activity(Activity::Idle);
                     }
+                }
+                ChatEvent::Stopped { .. } => {
+                    // Any queued sends were dropped backend-side; drop their
+                    // bubbles too so the log matches what will actually run.
+                    self.messages.retain(|m| !m.queued);
+                    self.messages.push(Rendered {
+                        text: "— stopped —".into(),
+                        tools: Vec::new(),
+                        kind: BubbleKind::Notice,
+                        queued: false,
+                    });
                 }
                 ChatEvent::Usage { input_tokens, output_tokens, .. } => {
                     self.usage.0 += input_tokens.unwrap_or(0) as i64;
@@ -343,26 +384,47 @@ impl ChatPanelView {
     /// timer counts (main.rs repaints at 250 ms for the toast loop anyway).
     fn live_activity(&self, chat: &dyn Chat) -> Option<(String, egui::Color32)> {
         let busy = crate::theme::rgb(200, 150, 80);
-        let elapsed = self.activity_since.elapsed().as_secs();
         let dots = match (self.activity_since.elapsed().as_millis() / 400) % 4 {
             0 => "",
             1 => ".",
             2 => "..",
             _ => "...",
         };
-        let timer = if elapsed >= 1 {
-            format!(" {}:{:02}", elapsed / 60, elapsed % 60)
-        } else {
-            String::new()
+        // The timer spans the whole TURN (not the latest phase), so a long
+        // think doesn't reset to 0:00 the moment it starts writing.
+        let secs = self.turn_since.elapsed().as_secs();
+        let timer = format!("{}:{:02}", secs / 60, secs % 60);
+        // Approx output so far: ~4 chars/token, shown once enough has
+        // streamed to be meaningful, with a rate so a slow local model
+        // reads as "working", not "stuck".
+        let throughput = |color: egui::Color32| {
+            let toks = self.turn_stream_chars / 4;
+            if toks < 5 {
+                return (String::new(), color);
+            }
+            let rate = toks as f32 / self.turn_since.elapsed().as_secs_f32().max(0.1);
+            (format!(" · ~{toks} tok · {rate:.0}/s"), color)
         };
         match chat.phase() {
             ChatPhase::Connecting => Some((format!("connecting / model loading{dots}"), busy)),
             ChatPhase::Ready => match &self.activity {
                 Activity::Idle => None,
-                Activity::Thinking => Some((format!("corpus is thinking{dots}{timer}"), busy)),
-                Activity::Streaming => Some((format!("corpus is replying{dots}{timer}"), busy)),
+                // Before the first token the model is loading/prefilling the
+                // (often large) context — say so instead of "thinking", which
+                // read as a hang when nothing moved for minutes.
+                Activity::Thinking if !self.turn_saw_output => {
+                    Some((format!("preparing · prefilling context{dots} {timer}"), busy))
+                }
+                Activity::Thinking => {
+                    let (rate, _) = throughput(busy);
+                    Some((format!("thinking{dots} {timer}{rate}"), busy))
+                }
+                Activity::Streaming => {
+                    let (rate, _) = throughput(busy);
+                    Some((format!("writing{dots} {timer}{rate}"), busy))
+                }
                 Activity::Tool(name) => {
-                    Some((format!("running {}…{timer}", human_tool_name(name)), busy))
+                    Some((format!("running {}… {timer}", human_tool_name(name)), busy))
                 }
             },
             _ => None,
@@ -451,6 +513,8 @@ impl ChatPanelView {
                 }
                 let messages = &self.messages;
                 let md = &mut self.md;
+                let last_i = messages.len().saturating_sub(1);
+                let thinking_live = matches!(self.activity, Activity::Thinking);
                 for (mi, m) in messages.iter().enumerate() {
                     // Every bubble is namespaced by its index: id-bearing
                     // widgets inside (egui_commonmark's table Grid among
@@ -486,14 +550,19 @@ impl ChatPanelView {
                             ui.add_space(4.0);
                             // The model's reasoning, collapsed by default
                             // (traces run to thousands of tokens) but always
-                            // present in the log, in order.
+                            // present in the log, in order. The ACTIVE thought
+                            // (last bubble while thinking) opens itself so a
+                            // long reasoning phase visibly streams instead of
+                            // hiding behind a collapsed header.
+                            let live = mi == last_i && thinking_live;
                             egui::CollapsingHeader::new(
-                                egui::RichText::new("thought")
+                                egui::RichText::new(if live { "thinking…" } else { "thought" })
                                     .small()
                                     .italics()
                                     .color(crate::theme::TEXT_FAINT),
                             )
                             .id_salt(format!("thought_{mi}"))
+                            .open(live.then_some(true))
                             .default_open(false)
                             .show(ui, |ui| {
                                 ui.label(
@@ -523,6 +592,17 @@ impl ChatPanelView {
                                     .small(),
                             );
                         }
+                        BubbleKind::Notice => {
+                            ui.add_space(6.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&m.text)
+                                        .color(crate::theme::TEXT_FAINT)
+                                        .italics()
+                                        .small(),
+                                );
+                            });
+                        }
                     });
                 }
                 // Inline approve/reject cards.
@@ -543,48 +623,14 @@ impl ChatPanelView {
         // default: with no model selected, SEND stays gated.
         self.model_picker(ui);
 
-        // Input row: the text edit is ALWAYS editable once a model is
-        // chosen (typing must not be silently gated); only SEND is gated
-        // on readiness + non-empty. The send button's space is reserved
-        // first so both stay fully visible at the 280px min width.
-        ui.horizontal(|ui| {
-            let can_send = self.can_send(chat);
-            let text_w =
-                (ui.available_width() - 64.0).max(20.0); // 64 = button + spacing
-            let response = ui.add_enabled(
-                !self.model.is_empty(),
-                egui::TextEdit::singleline(&mut self.input)
-                    .hint_text("message…")
-                    .desired_width(text_w),
-            );
-            let submit = ui
-                .add_enabled(can_send, egui::Button::new("send"))
-                .clicked()
-                || (can_send
-                    && response.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-            if submit {
-                let msg = self.input.trim().to_string();
-                if !msg.is_empty() {
-                    // A send while a turn is live QUEUES backend-side (turns
-                    // are serialized) — mark the bubble until its turn
-                    // starts so the wait reads as queued, not lost.
-                    let queued = !matches!(self.activity, Activity::Idle);
-                    self.messages.push(Rendered {
-                        text: msg.clone(),
-                        tools: Vec::new(),
-                        kind: BubbleKind::User,
-                        queued,
-                    });
-                    chat.send(&msg);
-                    self.input.clear();
-                }
-            }
-        });
+        // Input row: an auto-growing multiline box (grows with content up to
+        // a cap, then scrolls) beside ONE button that transforms — `send`
+        // while idle, a red `stop` while a turn is live. Enter sends,
+        // Shift+Enter inserts a newline; Esc stops a live turn.
+        self.input_row(ui, chat);
 
-        // Visible backend status line (connecting / ready / failed:<err>),
-        // with a stop affordance while a turn is live (a thinking model can
-        // run for minutes — the operator must be able to cut it).
+        // Status line: backend phase + cumulative usage. The stop affordance
+        // now lives in the transforming button above, not here.
         let (text, color) = self.status(chat);
         ui.horizontal(|ui| {
             ui.colored_label(color, egui::RichText::new(text).small());
@@ -595,12 +641,87 @@ impl ChatPanelView {
                         .color(crate::theme::TEXT_FAINT),
                 );
             }
-            if chat.phase() == ChatPhase::Ready && !matches!(self.activity, Activity::Idle) {
-                if ui.small_button("stop").clicked() {
+        });
+    }
+
+    /// The composer: the auto-growing input + the transforming send/stop
+    /// button, plus the keyboard contract (Enter send, Shift+Enter newline,
+    /// Esc stop).
+    fn input_row(&mut self, ui: &mut egui::Ui, chat: &mut dyn Chat) {
+        let is_live = chat.phase() == ChatPhase::Ready && !matches!(self.activity, Activity::Idle);
+        // Esc is a global stop while a turn runs, wherever focus is.
+        if is_live && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            chat.stop();
+        }
+        ui.horizontal_top(|ui| {
+            let btn_w = 58.0;
+            let text_w = (ui.available_width() - btn_w - 8.0).max(20.0);
+
+            // The box grows with its content: 1 row minimum, capped so a
+            // long paste scrolls instead of eating the log. Its width is
+            // reserved explicitly so the button always keeps its slot.
+            let editor = egui::TextEdit::multiline(&mut self.input)
+                .hint_text("message…")
+                .desired_width(text_w)
+                .desired_rows(1)
+                .id_salt("chat_input");
+            let response = ui
+                .allocate_ui(egui::vec2(text_w, 0.0), |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .id_salt("chat_input_scroll")
+                        .show(ui, |ui| ui.add_enabled(!self.model.is_empty(), editor))
+                        .inner
+                })
+                .inner;
+
+            // Enter submits; Shift+Enter is a newline (left for the editor).
+            // The editor has already inserted the '\n' for a plain Enter, so
+            // strip it back off before sending.
+            let plain_enter = response.has_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+            if plain_enter && self.input.ends_with('\n') {
+                self.input.pop();
+            }
+
+            let can_send = self.can_send(chat);
+            let clicked = if is_live {
+                ui.add(egui::Button::new(
+                    egui::RichText::new("stop").color(crate::theme::DANGER),
+                ))
+                .clicked()
+            } else {
+                ui.add_enabled(can_send, egui::Button::new("send")).clicked()
+            };
+
+            if is_live {
+                if clicked {
                     chat.stop();
                 }
+            } else if clicked || (plain_enter && can_send) {
+                self.submit(chat);
             }
         });
+    }
+
+    /// Send the current input as a new turn and clear the box.
+    fn submit(&mut self, chat: &mut dyn Chat) {
+        let msg = self.input.trim().to_string();
+        if msg.is_empty() {
+            return;
+        }
+        // A send while a turn is live QUEUES backend-side (turns are
+        // serialized) — mark the bubble until its turn starts so the wait
+        // reads as queued, not lost.
+        let queued = !matches!(self.activity, Activity::Idle);
+        self.messages.push(Rendered {
+            text: msg.clone(),
+            tools: Vec::new(),
+            kind: BubbleKind::User,
+            queued,
+        });
+        chat.send(&msg);
+        self.input.clear();
     }
 
     /// A user message: right-aligned boxed bubble with a "you" tag, so every

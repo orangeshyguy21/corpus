@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use corpus_core::{FaucetCall, Plugin, ProbeResult, Scope, Store};
+use corpus_core::{AgentRole, FaucetCall, Plugin, ProbeResult, Scope, Store};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -41,6 +41,18 @@ pub struct Ctx {
     /// Admin profile on: the corpus-admin tool group is exposed and the
     /// probe-required gate is bypassed (admin is store-only, host-side).
     pub admin: bool,
+    /// The capability ceiling of the agent this server is serving, resolved
+    /// from the run's identity (`CORPUS_OPENCODE_AGENT`) at startup.
+    ///
+    /// `Err` means the identity could not be established — the server then
+    /// refuses every sandbox tool with that message rather than guessing.
+    /// Fail-closed on purpose: a gate that is bypassed by UNSETTING a
+    /// variable is not a gate. The `--role` flag is the explicit escape
+    /// hatch for manual invocation.
+    ///
+    /// This is the ONLY capability authority; the agent's permission block
+    /// is opencode's business and is never consulted here.
+    pub role: std::result::Result<AgentRole, String>,
     /// Pending destructive-op confirmations keyed by their one-shot token.
     /// Minted by a dry-run call; consumed by the token-bearing re-call.
     pub pending_confirms: HashMap<String, PendingConfirm>,
@@ -89,20 +101,50 @@ impl Ctx {
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .and_then(|v| v.as_object().cloned());
         let run_log = std::env::var(corpus_core::RUN_LOG_ENV).ok().filter(|s| !s.is_empty());
+        let store = Store::from_env();
+        let scope = Scope::from_env();
+        let role = resolve_role(&store, &scope);
+        if let Err(why) = &role {
+            // Loud, because every sandbox tool is about to be refused.
+            eprintln!("corpus-mcp: no agent role resolved — {why}");
+        }
         Ok(Self {
             plugin,
-            store: Store::from_env(),
-            scope: Scope::from_env(),
+            store,
+            scope,
             faucet_spent_sats: 0,
             faucet_budget_sats: 1_000_000,
             probe_ready: probe.ready,
             probe_notes: probe.notes,
             last_probe: std::time::Instant::now(),
             admin: false,
+            role,
             pending_confirms: HashMap::new(),
             source_pins,
             run_log,
         })
+    }
+
+    /// A Ctx for tests: probe pre-cleared, no environment read, an explicit
+    /// role. Not `#[cfg(test)]` because the integration tests in `tests/`
+    /// are separate crates; it exists so adding a field here doesn't force
+    /// every one of them to restate the whole struct.
+    pub fn for_test(plugin: Plugin, store: Store, scope: Scope, role: AgentRole) -> Self {
+        Self {
+            plugin,
+            store,
+            scope,
+            faucet_spent_sats: 0,
+            faucet_budget_sats: 1_000_000,
+            probe_ready: true,
+            probe_notes: String::new(),
+            last_probe: std::time::Instant::now(),
+            admin: false,
+            role: Ok(role),
+            pending_confirms: HashMap::new(),
+            source_pins: None,
+            run_log: None,
+        }
     }
 
     /// The scope for a write: the configured project scope. The `team`
@@ -111,6 +153,73 @@ impl Ctx {
     fn write_scope(&self, _args: &Value) -> Result<Scope> {
         Ok(self.scope.clone())
     }
+}
+
+/// Resolve the run's capability ceiling from its identity. Every failure
+/// is distinct: debugging a blanket deny-all across three different causes
+/// is otherwise miserable.
+///
+/// An explicit `--role <name>` argv flag wins — the escape hatch for
+/// invoking the server by hand. It is no more secure than the env var, but
+/// it is explicit and shows up in process listings rather than pretending
+/// to be a security control.
+fn resolve_role(store: &Store, scope: &Scope) -> std::result::Result<AgentRole, String> {
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(pos) = argv.iter().position(|a| a == "--role") {
+        let raw = argv.get(pos + 1).ok_or("--role needs a value")?;
+        return AgentRole::parse(raw)
+            .ok_or_else(|| format!("--role {raw:?} is not one of researcher|tester|super"));
+    }
+    let agent = std::env::var(corpus_core::AGENT_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{} is unset — a mission launch always sets it; pass --role <researcher|tester|super> \
+                 to run this server by hand",
+                corpus_core::AGENT_ENV
+            )
+        })?;
+    // A silently-defaulted project would resolve the agent against the
+    // WRONG store subtree and look like it worked.
+    if std::env::var(corpus_core::PROJECT_ENV).ok().filter(|s| !s.is_empty()).is_none() {
+        return Err(format!(
+            "{} is unset, so agent {agent:?} cannot be resolved to a project",
+            corpus_core::PROJECT_ENV
+        ));
+    }
+    let config = store.load_agent(&scope.project, &agent).map_err(|e| {
+        format!(
+            "agent {:?} not found in project {:?} ({e}) — the launched identity must name an agent \
+             directory under store/projects/<project>/agents/",
+            agent, scope.project
+        )
+    })?;
+    // An agent that predates roles reads as the safest role, never as a
+    // permissive default.
+    Ok(config.meta.role())
+}
+
+/// The catalog as advertised to THIS run: the full sandbox catalog minus
+/// anything the resolved role cannot call. One server serves one identity,
+/// so filtering here is safe — and it stops a researcher burning turns on
+/// tools it will be refused, and keeps attack-relevant tool descriptions
+/// out of a low-trust agent's context. An unresolved role advertises
+/// nothing, matching the deny-all `dispatch` applies.
+pub fn catalog_for(role: &std::result::Result<AgentRole, String>) -> Value {
+    let Ok(role) = role else {
+        return Value::Array(Vec::new());
+    };
+    let mut out = catalog();
+    if let Some(list) = out.as_array_mut() {
+        list.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(|n| role.allows(n))
+                .unwrap_or(false)
+        });
+    }
+    out
 }
 
 /// The tool catalog advertised in tools/list.
@@ -211,6 +320,39 @@ pub fn catalog() -> Value {
 
 /// Dispatch a tools/call.
 pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
+    // The ROLE gate runs first — before the probe — so a refused call never
+    // drives a docker/curl re-probe, and so an agent outside its ceiling
+    // gets the same answer whether or not the arena happens to be healthy.
+    // This is the authority: the agent's opencode permission block is
+    // opencode's to enforce and is never consulted here.
+    //
+    // Only KNOWN tools are judged here. An unrecognized name falls through
+    // to the match below and reports "unknown tool" — a typo must not be
+    // explained as a permissions problem.
+    let known = corpus_core::CORPUS_TOOLS
+        .iter()
+        .any(|t| t.trim_start_matches("corpus_") == name);
+    if known {
+        match &ctx.role {
+            Err(why) => {
+                return Err(Error::Args(format!(
+                    "refusing {name}: this run has no resolved agent role — {why}"
+                )));
+            }
+            Ok(role) if !role.allows(name) => {
+                return Err(Error::Args(format!(
+                    "refusing {name}: agent role {:?} does not grant it (allowed: {})",
+                    role.as_str(),
+                    role.tools()
+                        .iter()
+                        .map(|t| t.trim_start_matches("corpus_"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            Ok(_) => {}
+        }
+    }
     // Fail loud: while the environment probe says not-ready (mints down,
     // version-pin mismatch, arena torn down), no tool runs. The notes ARE
     // the error so the agent sees exactly what to fix. The probe is a

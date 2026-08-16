@@ -4,10 +4,13 @@
 //! (flat dropdown with a live probe badge, Saved via a rebind); a Corpus
 //! section (file/byte summary + an inline red Delete that wipes the corpus
 //! behind a confirm, then the data-driven visual: a proportional strip of
-//! category byte shares + legend); a Cost section (per-model token/cost
-//! table aggregated from the exported run transcripts, total row); Save
-//! bottom-right. The project LIST lives in the sidebar (chunk 1), so this
-//! screen is a detail view, not a table.
+//! category byte shares + legend); a Mission Logs section (the
+//! `corpus/runs/` transcripts, summarized and listed on their own — they
+//! outweigh the knowledge categories by orders of magnitude, so mixing
+//! them into the Corpus numbers hides everything else); a Cost section
+//! (per-model token/cost table aggregated from the exported run
+//! transcripts, total row); Save bottom-right. The project LIST lives in
+//! the sidebar (chunk 1), so this screen is a detail view, not a table.
 //!
 //! No business logic here: corpus-core calls go through `AppState`;
 //! results surface as toasts. Probing is a corpus-core aggregation
@@ -164,21 +167,24 @@ impl ProjectsView {
 
         // --- Corpus section (spec §5): heading, then the stats row + the
         // inline red Delete (wipe confirm), then the data-driven category
-        // visual (proportional strip + legend).
+        // visual (proportional strip + legend). Knowledge categories only
+        // — mission logs get their own section below, since a single run
+        // transcript outweighs the whole corpus and would flatten the
+        // strip to one grey bar.
         ui.label(theme::section_heading("Corpus"));
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             match state.corpus_stats() {
                 Some(stats) => {
                     ui.label(
-                        RichText::new(format!("{} files", stats.files))
+                        RichText::new(format!("{} files", stats.knowledge_files()))
                             .size(14.0)
                             .strong()
                             .color(theme::TEXT),
                     );
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(fmt_bytes(stats.bytes))
+                        RichText::new(fmt_bytes(stats.knowledge_bytes()))
                             .size(14.0)
                             .color(theme::TEXT_MUTED),
                     );
@@ -188,22 +194,54 @@ impl ProjectsView {
                 }
             };
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::destructive_button(ui, "Delete").clicked() {
+                // The wipe is corpus-wide — say so, now that the mission
+                // logs are shown as a section of their own.
+                let delete = theme::destructive_button(ui, "Delete")
+                    .on_hover_text("wipe the whole corpus — mission logs included");
+                if delete.clicked() {
                     self.confirm_wipe = true;
                 }
             });
         });
         ui.add_space(12.0);
         if let Some(stats) = state.corpus_stats() {
-            if stats.files > 0 {
-                corpus_visual(ui, stats);
+            if stats.knowledge_files() > 0 {
+                corpus_visual(ui, &stats.categories);
             } else {
                 ui.label(
-                    RichText::new("empty — missions write findings, techniques, hypotheses, attacks and runs here")
+                    RichText::new("empty — missions write findings, techniques, hypotheses and attacks here")
                         .size(12.0)
                         .color(theme::TEXT_FAINT),
                 );
             }
+        }
+        ui.add_space(28.0);
+
+        // --- Mission Logs section: the `corpus/runs/` transcripts, kept
+        // apart from the corpus above. Summary row, then one row per log
+        // (newest first) with its share of the total as a bar.
+        ui.label(theme::section_heading("Mission Logs"));
+        ui.add_space(12.0);
+        let logs = state.corpus_stats().map(|s| s.logs.clone()).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{} logs", logs.files))
+                    .size(14.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.add_space(4.0);
+            ui.label(RichText::new(fmt_bytes(logs.bytes)).size(14.0).color(theme::TEXT_MUTED));
+        });
+        ui.add_space(12.0);
+        if logs.files == 0 {
+            ui.label(
+                RichText::new("no runs yet — each launched mission writes its transcript here")
+                    .size(12.0)
+                    .color(theme::TEXT_FAINT),
+            );
+        } else {
+            mission_log_list(ui, state.mission_logs(), logs.bytes);
         }
         ui.add_space(28.0);
 
@@ -357,16 +395,19 @@ impl ProjectsView {
 
 /// The corpus visual: a full-width strip segmented by each category's
 /// byte share (hover a segment for its files/bytes), with a legend row
-/// under it — the "what's in the corpus" answer at a glance.
-fn corpus_visual(ui: &mut Ui, stats: &corpus_core::CorpusStats) {
+/// under it — the "what's in the corpus" answer at a glance. Shares are
+/// taken over the categories PASSED IN (mission logs are excluded by the
+/// caller), so the knowledge mix stays readable.
+fn corpus_visual(ui: &mut Ui, categories: &[corpus_core::CategoryStat]) {
+    let total: u64 = categories.iter().map(|c| c.bytes).sum();
     let width = ui.available_width().min(760.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 1.0, theme::PLATE_FRONT);
     let mut x = rect.left();
-    for (i, category) in stats.categories.iter().enumerate() {
-        let share = category.bytes as f32 / stats.bytes.max(1) as f32;
-        let w = if i == stats.categories.len() - 1 {
+    for (i, category) in categories.iter().enumerate() {
+        let share = category.bytes as f32 / total.max(1) as f32;
+        let w = if i == categories.len() - 1 {
             rect.right() - x // last segment absorbs rounding
         } else {
             (rect.width() * share).max(2.0)
@@ -390,7 +431,7 @@ fn corpus_visual(ui: &mut Ui, stats: &corpus_core::CorpusStats) {
     }
     ui.add_space(8.0);
     // Legend: swatch + name + files + bytes per category.
-    for (i, category) in stats.categories.iter().enumerate() {
+    for (i, category) in categories.iter().enumerate() {
         ui.horizontal(|ui| {
             let (dot, _) =
                 ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -408,6 +449,69 @@ fn corpus_visual(ui: &mut Ui, stats: &corpus_core::CorpusStats) {
                     .color(theme::TEXT_FAINT),
             );
         });
+    }
+}
+
+/// How many mission logs the list shows before folding the rest into a
+/// tail line — the newest runs are the ones anyone reads.
+const MISSION_LOG_ROWS: usize = 12;
+
+/// The Mission Logs list: one row per transcript (newest first) — mission
+/// name, run stamp, file name, size, and a bar sized to its share of the
+/// logs total, so a runaway run is obvious at a glance.
+fn mission_log_list(ui: &mut Ui, logs: &[corpus_core::MissionLog], total: u64) {
+    let width = ui.available_width().min(760.0);
+    for log in logs.iter().take(MISSION_LOG_ROWS) {
+        // Fixed row width so the right-aligned file name tracks the strip
+        // above it instead of the window edge.
+        ui.allocate_ui(egui::vec2(width, 16.0), |ui| {
+            ui.horizontal(|ui| {
+                let (bar, _) =
+                    ui.allocate_exact_size(egui::vec2(90.0, 10.0), egui::Sense::hover());
+                let painter = ui.painter_at(bar);
+                painter.rect_filled(bar, 1.0, theme::PLATE_FRONT);
+                let share = log.bytes as f32 / total.max(1) as f32;
+                let filled = egui::Rect::from_min_size(
+                    bar.min,
+                    egui::vec2((bar.width() * share).max(1.0), bar.height()),
+                );
+                painter.rect_filled(filled, 1.0, theme::MISSION_LOG);
+                ui.label(RichText::new(&log.mission).size(12.0).color(theme::TEXT));
+                ui.label(
+                    RichText::new(fmt_bytes(log.bytes))
+                        .size(12.0)
+                        .monospace()
+                        .color(theme::TEXT_MUTED),
+                );
+                if log.started > 0 {
+                    ui.label(
+                        RichText::new(fmt_epoch(log.started))
+                            .size(12.0)
+                            .color(theme::TEXT_FAINT),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&log.name)
+                                .size(11.0)
+                                .monospace()
+                                .color(theme::TEXT_FAINT),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(format!("corpus/runs/{}", log.name));
+                });
+            });
+        });
+    }
+    if logs.len() > MISSION_LOG_ROWS {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("+{} older", logs.len() - MISSION_LOG_ROWS))
+                .size(12.0)
+                .color(theme::TEXT_FAINT),
+        );
     }
 }
 

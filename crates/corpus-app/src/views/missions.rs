@@ -6,14 +6,21 @@
 //! in the sidebar mission-row menu; a mission is created AND launched by
 //! the Missions `+` in one click, landing at an empty opencode prompt.
 //!
-//! Show() = resolve selection -> consume `pending_launch` once -> poll the
-//! run -> aim the pane (see the attach precedence) -> show the pane
-//! filling the rect, or the fallback transcript tail (piped no-tmux), or a
-//! single faint centered line when idle.
+//! Show() = resolve selection -> consume `pending_launch` once -> auto-
+//! restore a dead-but-resumable mission -> poll the run -> aim the pane
+//! (see the attach precedence) -> show the pane filling the rect, the
+//! fallback transcript tail (piped no-tmux), a brief restoring line, or
+//! the idle state.
+//!
+//! Auto-restore: selecting a mission whose tmux session has died silently
+//! re-opens its opencode conversation (`opencode --session <id>`) — no
+//! button, no prompt. It fires once per selection, only when nothing else
+//! is running (a live run is never torn down to restore a dead one) and
+//! only when the mission actually recorded a session to return to.
 
 use std::time::Duration;
 
-use egui::{Align2, Ui};
+use egui::{RichText, Ui};
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
 use crate::state::AppState;
@@ -27,6 +34,10 @@ pub struct MissionsView {
     pane: TerminalPane,
     /// Auto-follow the tail (piped-fallback runs only).
     follow: bool,
+    /// The mission auto-restore has already been attempted for, so a
+    /// failed restore (or one the operator then stopped) doesn't respawn
+    /// every frame. Cleared by selecting a different mission.
+    restored: Option<String>,
 }
 
 impl Default for MissionsView {
@@ -34,6 +45,7 @@ impl Default for MissionsView {
         Self {
             pane: TerminalPane::default(),
             follow: true,
+            restored: None,
         }
     }
 }
@@ -70,22 +82,48 @@ impl MissionsView {
             }
         }
 
+        // Auto-restore: landing on a mission whose session has died just
+        // brings it back — no button. Fire ONCE per selection (the guard),
+        // and only when nothing else is running (a live run is never torn
+        // down for this) and the mission actually recorded a conversation
+        // to return to. A mission that is already live falls through to
+        // the attach below untouched.
+        let selection_changed = self.restored.as_deref() != Some(slug.as_str());
+        if selection_changed {
+            self.restored = Some(slug.clone());
+            let session_live = mission.session.as_deref().is_some_and(|name| {
+                state.live_sessions.iter().any(|l| l == name)
+                    || state.live_run_session().as_deref() == Some(name)
+            });
+            if !session_live
+                && !state.run_active()
+                && mission.opencode_session.is_some()
+            {
+                if let Err(error) = state.resume_mission(&project, &slug) {
+                    toast(toasts, ToastKind::Error, error.to_string());
+                }
+            }
+        }
+
         // Drain whatever the session produced since the last frame.
         state.poll_run();
 
-        // Attach ONLY to the selected mission's own session: live on the
-        // tmux server, or the app-owned live run when it is this mission's
-        // (the live_sessions refresh can lag a launch). Another mission's
-        // run is never shown here — an idle mission shows idle.
-        let target = mission.session.clone().and_then(|name| {
-            let live = state.live_sessions.contains(&name)
-                || state.live_run_session().as_deref() == Some(name.as_str());
-            if live {
-                AppState::session_attach_command(&name).map(|argv| (name, argv))
-            } else {
-                None
-            }
-        });
+        // Attach ONLY to the selected mission's own session: the app-owned
+        // live run when it is this mission's (so a just-restored run
+        // attaches immediately, before the live_sessions poll catches up),
+        // else the recorded tmux session if it is live on the server.
+        let own_run =
+            state.run_active() && state.run_mission.as_deref() == Some(slug.as_str());
+        let attach_name = if own_run {
+            state.live_run_session()
+        } else {
+            mission
+                .session
+                .clone()
+                .filter(|name| state.live_sessions.iter().any(|l| l == name))
+        };
+        let target = attach_name
+            .and_then(|name| AppState::session_attach_command(&name).map(|argv| (name, argv)));
         if let Err(error) = self.pane.sync_target(ui.ctx(), target) {
             toast(toasts, ToastKind::Error, error);
         }
@@ -93,23 +131,68 @@ impl MissionsView {
         if self.pane.attached().is_some() {
             // The embedded opencode TUI, edge-to-edge.
             self.pane.show(ui);
-        } else if state.run_active() && state.run_mission.as_deref() == Some(slug.as_str()) {
+        } else if own_run && state.live_run_session().is_some() {
+            // A tmux run booting (or between frames): the pane attaches
+            // the instant the session is up. Say so rather than flashing
+            // the piped tail's checkbox.
+            self.centered(ui, "restoring session…", theme::TEXT_FAINT);
+        } else if own_run {
             // Piped fallback (no tmux): this mission's transcript tail.
             self.tail(ui, state);
-        } else if let Some(path) = &state.export_path {
-            // Idle with a known transcript: one faint centered line.
-            let rect = ui.max_rect();
-            ui.painter().text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                format!("no live session — transcript: {path}"),
-                egui::FontId::monospace(12.0),
-                theme::TEXT_FAINT,
-            );
+        } else {
+            // Nothing to attach and nothing to restore: a mission that
+            // never ran (or ran before ids were kept). One quiet line —
+            // creating a run is the sidebar `+`'s job.
+            self.idle(ui, &slug, &mission);
         }
-        // else: nothing — an empty central column.
 
         ui.ctx().request_repaint_after(Duration::from_millis(2500));
+    }
+
+    /// The idle state for a mission with no session to attach and none to
+    /// restore: its name + a faint reason. No actions — a mission is
+    /// launched from the sidebar, and a resumable one restores itself.
+    fn idle(&mut self, ui: &mut Ui, slug: &str, mission: &corpus_core::Mission) {
+        let label = mission
+            .name
+            .clone()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| slug.to_string());
+        let rect = ui.max_rect();
+        ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+            |ui| {
+                ui.add_space((rect.height() * 0.36).max(24.0));
+                ui.label(RichText::new(&label).size(15.0).color(theme::TEXT));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("agent={} · {}", mission.agent, mission.status))
+                        .size(12.0)
+                        .color(theme::TEXT_FAINT),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("no session yet — launch this mission from the sidebar")
+                        .size(11.0)
+                        .color(theme::TEXT_FAINT),
+                );
+            },
+        );
+    }
+
+    /// One faint centered line in the pane rect — the transient states
+    /// (restoring…) that aren't worth a full idle block.
+    fn centered(&self, ui: &mut Ui, text: &str, color: egui::Color32) {
+        let rect = ui.max_rect();
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::monospace(12.0),
+            color,
+        );
     }
 
     /// The piped no-tmux fallback transcript tail: full width, follow-tail

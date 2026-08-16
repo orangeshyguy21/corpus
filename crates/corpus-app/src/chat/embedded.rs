@@ -241,7 +241,12 @@ mod live {
         // session interleave/corrupt the conversation — the old fire-and-
         // forget spawn). The cancellation token is PER-TURN: the old
         // session-wide token meant one Stop pre-cancelled every later turn.
-        let mut live: Option<CancellationToken> = None;
+        // A live turn is its cancel token PLUS its task handle: Stop cancels
+        // the token (cooperative — the stream loop bails on it) AND aborts
+        // the handle (hard backstop), so a turn stuck in a multi-minute
+        // local generation dies immediately instead of running to the 900 s
+        // stream timeout.
+        let mut live: Option<(CancellationToken, tokio::task::JoinHandle<()>)> = None;
         let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<u64>(8);
         let mut turn_started = std::time::Instant::now();
@@ -274,8 +279,21 @@ mod live {
                             ));
                         }
                         ChatCommand::Stop => {
-                            if let Some(token) = &live {
+                            if let Some((token, handle)) = live.take() {
+                                // Cooperative first (lets the stream loop close
+                                // the provider connection cleanly), then a hard
+                                // abort so nothing can outlive the operator's
+                                // click. The aborted task never signals `done`,
+                                // so retire the turn inline here.
                                 token.cancel();
+                                handle.abort();
+                                let dropped = queued.len();
+                                queued.clear();
+                                log_line(&log, &format!(
+                                    "turn {turn} stopped by operator ({dropped} queued dropped)"
+                                ));
+                                let _ = ev_tx.send(ChatEvent::Stopped { turn });
+                                let _ = ev_tx.send(ChatEvent::TurnEnd { turn });
                             }
                         }
                         ChatCommand::SetContext(ctx) => {
@@ -292,6 +310,12 @@ mod live {
                 }
                 finished = done_rx.recv() => {
                     let Some(_finished_turn) = finished else { break };
+                    // A turn the operator already stopped took `live`; its task
+                    // may still send a late `done` before the abort lands.
+                    // Ignore it — the Stop handler already retired the turn.
+                    if live.is_none() {
+                        continue;
+                    }
                     live = None;
                     log_line(&log, &format!("turn {turn} end ({:.1}s)", turn_started.elapsed().as_secs_f32()));
                     // TurnEnd is emitted HERE (after every event of the turn
@@ -342,9 +366,12 @@ mod live {
             .await;
     }
 
-    /// Start one turn task and return ITS cancellation token. The task
-    /// streams events, then signals `done_tx`; the command loop owns
-    /// `TurnEnd` and the queued-next-turn handoff.
+    /// Start one turn task and return ITS cancellation token AND task
+    /// handle. The token drives a cooperative stop (the stream loop selects
+    /// on it); the handle is the hard-abort backstop. The task streams
+    /// events, then signals `done_tx`; the command loop owns `TurnEnd` and
+    /// the queued-next-turn handoff.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_turn(
         agent: &Arc<Agent>,
         goose_session: &str,
@@ -357,7 +384,7 @@ mod live {
         model: &str,
         turn: u64,
         msg: String,
-    ) -> CancellationToken {
+    ) -> (CancellationToken, tokio::task::JoinHandle<()>) {
         let token = CancellationToken::new();
         let _ = ev_tx.send(ChatEvent::TurnStart { turn });
         let ev = ev_tx.clone();
@@ -386,11 +413,11 @@ mod live {
         let pending = pending.clone();
         let project = project.to_string();
         let model = model.to_string();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             translate_turn(agent, msg, session_cfg, cancel, ev, log, pending, project, model, turn).await;
             let _ = done.send(turn).await;
         });
-        token
+        (token, handle)
     }
 
     /// Append one timestamped diagnostics line to the session's chat.log.
@@ -701,7 +728,22 @@ Use Markdown formatting for all responses.
         // no name, only the id.
         let mut call_names: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        while let Some(item) = stream.next().await {
+        loop {
+            // Race the next stream item against the cancel token so Stop
+            // bails immediately: on cancel we drop the stream future, which
+            // closes the provider connection and halts the local generation
+            // — no waiting on goose to notice, no 900 s stream-timeout hang.
+            let item = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    log_line(&log, &format!("turn {turn} cancelled mid-stream"));
+                    break;
+                }
+                item = stream.next() => match item {
+                    Some(item) => item,
+                    None => break,
+                },
+            };
             match item {
                 Ok(AgentEvent::Message(msg)) => {
                     // Delegate execution: a `delegate` FRONTEND tool call is
@@ -1414,6 +1456,7 @@ mod injection_probe {
                         chat.approve(&id);
                     }
                     ChatEvent::TurnEnd { .. } => turn_open = false,
+                    ChatEvent::Stopped { .. } => turn_open = false,
                     ChatEvent::Usage { .. } => {}
                     ChatEvent::StoreMutated { .. } => {}
                     ChatEvent::Error(e) => panic!("backend error during probe: {e}"),
@@ -1530,6 +1573,7 @@ mod injection_probe {
                         chat.approve(&id);
                     }
                     ChatEvent::TurnEnd { .. } => turn_open = false,
+                    ChatEvent::Stopped { .. } => turn_open = false,
                     ChatEvent::Usage { .. } => {}
                     ChatEvent::StoreMutated { .. } => {}
                     ChatEvent::Error(e) => panic!("backend error during probe: {e}"),
@@ -1625,6 +1669,7 @@ mod injection_probe {
                         chat.approve(&id);
                     }
                     ChatEvent::TurnEnd { .. } => turn_open = false,
+                    ChatEvent::Stopped { .. } => turn_open = false,
                     ChatEvent::Usage { .. } => {}
                     ChatEvent::StoreMutated { area } => {
                         eprintln!("[probe] store mutated: {area}");

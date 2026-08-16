@@ -50,8 +50,20 @@ pub const SOURCE_PINS_ENV: &str = "CORPUS_SOURCE_PINS";
 /// guessing — the sandbox has no host FS and cannot enumerate `runs/`.
 pub const RUN_LOG_ENV: &str = "CORPUS_RUN_LOG";
 
+/// The slug of the agent this run was launched as — the run's IDENTITY.
+/// Exported by BOTH launch paths into the opencode process, which
+/// corpus-mcp inherits: the server resolves the agent's role from it and
+/// gates its tool catalog accordingly. Without it the server cannot tell
+/// a researcher from an operator and can only fail closed.
+pub const AGENT_ENV: &str = "CORPUS_OPENCODE_AGENT";
+
 /// The corpus category layout.
 pub const CATEGORIES: [&str; 5] = ["hypotheses", "techniques", "findings", "attacks", "runs"];
+
+/// The mission-log category: a corpus dir like any other on disk, but
+/// summarized on its own (see `CorpusStats`) — run transcripts dwarf the
+/// knowledge categories and would swamp any shared byte breakdown.
+pub const RUNS: &str = "runs";
 
 /// Resolve the store root: `CORPUS_STORE`, else `~/Sites/corpus/store`.
 pub fn store_root_env() -> PathBuf {
@@ -222,18 +234,39 @@ impl Project {
 /// `store/projects/<p>/corpus/` (every file in every category, attack
 /// directories included), broken down per category for the project
 /// view's corpus visual.
+///
+/// `runs/` is kept OUT of `categories` and reported separately as
+/// `logs`: mission transcripts run orders of magnitude larger than the
+/// knowledge categories, so folding them in would leave every other
+/// category an invisible sliver of the strip. `files`/`bytes` stay the
+/// grand totals (knowledge + logs); use `knowledge_files`/
+/// `knowledge_bytes` for the corpus-only summary.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CorpusStats {
     pub files: u64,
     pub bytes: u64,
-    /// Per-category file/byte totals, in CATEGORIES order, plus an
-    /// `other` bucket when files sit outside a category dir. Empty
+    /// Per-category file/byte totals, in CATEGORIES order minus `runs`,
+    /// plus an `other` bucket for files outside a category dir. Empty
     /// categories are not reported.
     pub categories: Vec<CategoryStat>,
+    /// The `runs/` bucket — mission logs. Zeroed when there are none.
+    pub logs: CategoryStat,
+}
+
+impl CorpusStats {
+    /// Files excluding mission logs (the Corpus section's count).
+    pub fn knowledge_files(&self) -> u64 {
+        self.files.saturating_sub(self.logs.files)
+    }
+
+    /// Bytes excluding mission logs (the Corpus section's size).
+    pub fn knowledge_bytes(&self) -> u64 {
+        self.bytes.saturating_sub(self.logs.bytes)
+    }
 }
 
 /// One corpus category's share of the summary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CategoryStat {
     pub name: String,
     pub files: u64,
@@ -269,9 +302,12 @@ pub fn corpus_stats(store: &Store, project: &str) -> Result<CorpusStats> {
                 } else if let Ok(meta) = fs::metadata(&path) {
                     stats.files += 1;
                     stats.bytes += meta.len();
-                    let category = path
-                        .strip_prefix(&root)
-                        .ok()
+                    // Top-level dir the file sits under; a file loose at
+                    // the corpus root belongs to no category, so it lands
+                    // in `other` rather than becoming a bucket of one.
+                    let rel = path.strip_prefix(&root).ok();
+                    let category = rel
+                        .filter(|rel| rel.components().count() > 1)
                         .and_then(|rel| rel.components().next())
                         .and_then(|c| c.as_os_str().to_str())
                         .unwrap_or("other");
@@ -288,16 +324,76 @@ pub fn corpus_stats(store: &Store, project: &str) -> Result<CorpusStats> {
             }
         }
     }
+    // `runs/` is reported on its own (mission logs), never as a category.
+    stats.logs = by_name
+        .remove(RUNS)
+        .unwrap_or_else(|| CategoryStat { name: RUNS.to_string(), ..CategoryStat::default() });
     // CATEGORIES order first, then any extra bucket (e.g. "other");
     // empty categories are not reported.
     let mut categories: Vec<CategoryStat> = CATEGORIES
         .iter()
+        .filter(|c| **c != RUNS)
         .map(|c| by_name.remove(*c).expect("seeded above"))
         .collect();
     categories.extend(by_name.into_values());
     categories.retain(|c| c.files > 0);
     stats.categories = categories;
     Ok(stats)
+}
+
+/// One mission transcript in the project corpus `runs/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionLog {
+    /// File name as it sits in `runs/` (e.g. `1786891368-verify.raw`) —
+    /// the value `CORPUS_RUN_LOG` carries and findings cite.
+    pub name: String,
+    /// The agent/mission slug parsed out of `<epoch>-<name>.<ext>`;
+    /// the whole stem when the name predates that convention.
+    pub mission: String,
+    /// Run-start epoch seconds from the name prefix (0 when absent).
+    pub started: u64,
+    pub bytes: u64,
+    /// Extension: `raw` (piped transcript), `json` (opencode export).
+    pub kind: String,
+}
+
+/// List a project's mission logs, newest first. Cheap (one `read_dir`,
+/// no parsing) — the project view calls it alongside `corpus_stats`.
+/// Only regular files directly under `runs/` count, matching what the
+/// stats walk attributes to the logs bucket.
+pub fn mission_logs(store: &Store, project: &str) -> Result<Vec<MissionLog>> {
+    let runs = store.project_corpus_dir(project).join(RUNS);
+    let mut logs = Vec::new();
+    if !runs.is_dir() {
+        return Ok(logs);
+    }
+    for entry in fs::read_dir(&runs)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let kind = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_string();
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+        // `<epoch>-<mission>`: split once, and only when the prefix really
+        // is a number (a mission named `2fa-probe` must not lose its head).
+        let (started, mission) = match stem.split_once('-') {
+            Some((head, rest)) if !rest.is_empty() => match head.parse::<u64>() {
+                Ok(epoch) => (epoch, rest.to_string()),
+                Err(_) => (0, stem.to_string()),
+            },
+            _ => (0, stem.to_string()),
+        };
+        logs.push(MissionLog { name: name.to_string(), mission, started, bytes, kind });
+    }
+    logs.sort_by(|a, b| b.started.cmp(&a.started).then_with(|| a.name.cmp(&b.name)));
+    Ok(logs)
 }
 
 /// Usage aggregation for one (provider, model) pair, summed over every
@@ -581,8 +677,11 @@ impl Store {
     }
 
     /// Clone a project: config + agents + missions, corpus copy optional.
-    /// `create_project` seeds the fresh pair; the source's agent/mission
-    /// trees overwrite it so the clone carries the source's set.
+    /// The clone MIRRORS its source — `create_project` seeds a fresh
+    /// `operator`/`researcher` pair, so those are cleared before the
+    /// source's agent tree is copied in. Without that, cloning a project
+    /// whose agents are named anything else left the clone holding the
+    /// source's agents PLUS two seeded strays that were never in it.
     pub fn clone_project(
         &self,
         from: &str,
@@ -598,6 +697,8 @@ impl Store {
             ..source
         };
         project.save(self, to)?;
+        // Drop the seeded pair so the clone is a mirror, not a merge.
+        let _ = fs::remove_dir_all(self.project_agents_dir(to));
         copy_tree(&self.project_agents_dir(from), &self.project_agents_dir(to))?;
         copy_tree(&self.project_missions_dir(from), &self.project_missions_dir(to))?;
         if with_corpus {
@@ -1030,11 +1131,20 @@ mod tests {
                 "probe",
             )
             .unwrap();
+        // A distinctly-named agent, so the clone's agent set is checkable
+        // against the source's rather than against the seeded pair.
+        store.create_agent_from_seed("cdk-a", "hunter", "researcher").unwrap();
         store.clone_project("cdk-a", "cdk-b", None, false).unwrap();
         let b = Project::load(&store, "cdk-b").unwrap();
         assert_eq!(b.cloned_from.as_deref(), Some("cdk-a"));
         assert!(store.project_agent_dir("cdk-b", "operator").join("opencode.json").is_file());
         assert!(store.load_mission("cdk-b", "m1").is_ok(), "clone carries missions");
+        // A clone MIRRORS its source: same agents, no seeded strays.
+        let names = |p: &str| -> Vec<String> {
+            store.list_agents(p).unwrap().into_iter().map(|(s, _)| s).collect()
+        };
+        assert_eq!(names("cdk-b"), names("cdk-a"), "clone carries exactly the source's agents");
+        assert!(names("cdk-b").contains(&"hunter".to_string()));
         // delete
         store.delete_project("cdk-b").unwrap();
         assert!(Project::load(&store, "cdk-b").is_err());
@@ -1141,12 +1251,21 @@ mod tests {
         let _ = fs::remove_dir_all(store.root());
     }
 
+    /// A walk of an empty corpus: totals zeroed, no categories, and the
+    /// logs bucket present-but-empty.
+    fn empty_stats() -> CorpusStats {
+        CorpusStats {
+            logs: CategoryStat { name: RUNS.to_string(), files: 0, bytes: 0 },
+            ..CorpusStats::default()
+        }
+    }
+
     #[test]
     fn corpus_stats_counts_files_and_bytes() {
         let store = tmp_store("stats");
         seed_sample(&store);
         store.create_project("p", "P", "cdk-regtest").unwrap();
-        assert_eq!(corpus_stats(&store, "p").unwrap(), CorpusStats::default());
+        assert_eq!(corpus_stats(&store, "p").unwrap(), empty_stats());
         write(&store.project_corpus_dir("p").join("findings/1.md"), "hello world\n");
         write(&store.project_corpus_dir("p").join("techniques/quote.md"), "abcd");
         // attack dirs are directories; their FILE contents count.
@@ -1166,7 +1285,42 @@ mod tests {
         assert_eq!(stats.categories[1].bytes, 12);
         assert_eq!(stats.categories[2].files, 2, "both attack files count");
         // a missing project corpus is empty, not an error
-        assert_eq!(corpus_stats(&store, "ghost").unwrap(), CorpusStats::default());
+        assert_eq!(corpus_stats(&store, "ghost").unwrap(), empty_stats());
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn mission_logs_are_split_out_of_the_categories() {
+        let store = tmp_store("stats-logs");
+        seed_sample(&store);
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        let corpus = store.project_corpus_dir("p");
+        write(&corpus.join("findings/1.md"), "hello world\n"); // 12
+        write(&corpus.join("runs/1786891368-verify.raw"), "transcript\n"); // 11
+        write(&corpus.join("runs/1786856299-discover.json"), "{}"); // 2
+        // A file loose at the corpus root belongs to no category.
+        write(&corpus.join("triage-report.md"), "note\n"); // 5
+
+        let stats = corpus_stats(&store, "p").unwrap();
+        assert_eq!(stats.files, 4, "grand total still counts every file");
+        assert_eq!(stats.bytes, 30);
+        assert_eq!(stats.knowledge_files(), 2, "logs excluded from the corpus count");
+        assert_eq!(stats.knowledge_bytes(), 17);
+        let names: Vec<&str> = stats.categories.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["findings", "other"], "runs is never a category");
+        assert_eq!(stats.logs.files, 2);
+        assert_eq!(stats.logs.bytes, 13);
+
+        // Listing: newest first, epoch/mission/kind parsed off the name.
+        let logs = mission_logs(&store, "p").unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].name, "1786891368-verify.raw");
+        assert_eq!(logs[0].mission, "verify");
+        assert_eq!(logs[0].started, 1_786_891_368);
+        assert_eq!(logs[0].kind, "raw");
+        assert_eq!(logs[0].bytes, 11);
+        assert_eq!(logs[1].mission, "discover");
+        assert!(mission_logs(&store, "ghost").unwrap().is_empty(), "no runs dir is not an error");
         let _ = fs::remove_dir_all(store.root());
     }
 

@@ -188,8 +188,67 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
             println!("deleted agent {project}/{slug}");
             Ok(())
         }
+        "role" => {
+            let slug = args
+                .get(2)
+                .ok_or("usage: corpus agent role <project> <slug> [<researcher|tester|super>]")?;
+            match args.get(3) {
+                None => {
+                    let config = store.load_agent(project, slug).map_err(|e| e.to_string())?;
+                    let assigned = if config.meta.has_role() { "" } else { " (unassigned — defaults)" };
+                    println!("{project}/{slug}: {}{assigned}", config.meta.role().as_str());
+                }
+                Some(raw) => {
+                    let role = corpus_core::AgentRole::parse(raw).ok_or_else(|| {
+                        format!("unknown role {raw:?} — one of researcher|tester|super")
+                    })?;
+                    store.set_agent_role(project, slug, role).map_err(|e| e.to_string())?;
+                    println!("{project}/{slug}: role -> {}", role.as_str());
+                }
+            }
+            Ok(())
+        }
+        // Assign roles to agents that predate the role system, inferring
+        // each from what its permission block already grants. Dry run by
+        // default: a capability change is reviewed before it is written.
+        "migrate-roles" => {
+            let apply = args.iter().any(|a| a == "--apply");
+            let rows = store
+                .migrate_agent_roles(project, apply)
+                .map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                println!("no agents in project {project}");
+                return Ok(());
+            }
+            println!("{:<24} {:<14} {:<10} {}", "AGENT", "CURRENT", "INFERRED", "ACTION");
+            for row in &rows {
+                let current = match row.current {
+                    Some(r) => r.as_str().to_string(),
+                    None => "—".to_string(),
+                };
+                let action = if row.applied {
+                    "assigned"
+                } else if row.current.is_some() {
+                    "kept (already assigned)"
+                } else {
+                    "would assign"
+                };
+                let flag = if row.needs_review { "  ⚠ no permission block — verify" } else { "" };
+                println!(
+                    "{:<24} {:<14} {:<10} {action}{flag}",
+                    row.agent,
+                    current,
+                    row.inferred.as_str()
+                );
+            }
+            if !apply {
+                println!("\ndry run — re-run with --apply to write these roles");
+            }
+            Ok(())
+        }
         _ => Err(
-            "usage: corpus agent list|new|clone|delete <project> [<slug>] ...".to_string(),
+            "usage: corpus agent list|new|clone|delete|role|migrate-roles <project> [<slug>] ..."
+                .to_string(),
         ),
     }
 }

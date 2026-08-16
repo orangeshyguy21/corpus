@@ -65,6 +65,10 @@ pub enum ChatEvent {
     },
     /// The agent ended its turn.
     TurnEnd { turn: u64 },
+    /// The operator hard-stopped the turn (distinct from a natural TurnEnd
+    /// so the log can mark it and the queue is cleared). Always followed by
+    /// a `TurnEnd` for the same turn.
+    Stopped { turn: u64 },
     /// Token accounting for a completed inference (per provider call).
     Usage {
         input_tokens: Option<i32>,
@@ -91,6 +95,7 @@ impl ChatEvent {
             ChatEvent::ToolCallResult { .. } => "tool_call_result",
             ChatEvent::PermissionRequest { .. } => "permission_request",
             ChatEvent::TurnEnd { .. } => "turn_end",
+            ChatEvent::Stopped { .. } => "stopped",
             ChatEvent::Usage { .. } => "usage",
             ChatEvent::StoreMutated { .. } => "store_mutated",
             ChatEvent::Error(_) => "error",

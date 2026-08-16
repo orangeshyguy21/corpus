@@ -143,6 +143,9 @@ impl eframe::App for App {
         // Keep the sidebar's agent status dots honest: poll tmux on a
         // throttle when a live session can exist (never per frame).
         self.state.poll_live_sessions();
+        // Keep the sidebar's corpus summary current as missions write
+        // (throttled re-walk — replaces the old manual refresh button).
+        self.state.poll_corpus_stats();
         self.clamp_panel_widths(ctx);
         // Screen-change hooks.
         if self.state.current_screen != self.last_screen {

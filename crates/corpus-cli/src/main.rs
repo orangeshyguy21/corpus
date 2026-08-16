@@ -34,6 +34,13 @@ corpus — local-first vulnerability research platform
                                Project CRUD (store/projects/<slug>/)
   corpus agent list|new|clone|delete <project> ...
                                Agent CRUD (store/projects/<p>/agents/<slug>/)
+  corpus agent role <project> <slug> [researcher|tester|super]
+                               Show or set an agent's ROLE — the capability
+                               ceiling corpus-mcp enforces server-side.
+  corpus agent migrate-roles <project> [--apply]
+                               Assign roles to agents predating the role
+                               system, inferred from what their permissions
+                               already grant. Dry run without --apply.
   corpus mission list|new|delete <project> ...
                                Mission CRUD
   corpus store migrate [--dry-run] [--project <slug>] [--confirm]
