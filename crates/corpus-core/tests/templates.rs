@@ -36,8 +36,8 @@ fn render_all(dest: &Path) -> Vec<(String, String)> {
     test_store.create_project("default", "Default corpus project", "cdk-regtest").expect("create_project");
     let mut out = Vec::new();
     for slug in ["operator", "researcher"] {
-        test_store.render_agent("default", slug).unwrap();
-        let rendered_path = test_store.opencode_agent_dir().join(format!("{slug}.md"));
+        test_store.render_agent("default", slug, &[]).unwrap();
+        let rendered_path = test_store.opencode_agent_dir("default").unwrap().join(format!("{slug}.md"));
         let text = fs::read_to_string(&rendered_path).unwrap();
         fs::write(dest.join(format!("{slug}.md")), &text).unwrap();
         out.push((slug.to_string(), text));

@@ -207,7 +207,8 @@ cmd_agent() {
     fi
     docker network inspect "$net" >/dev/null 2>&1 || die "network $net missing; run: arena.sh up"
     docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1 || die "image missing; run: arena.sh up"
-    docker inspect "$GW_NAME" >/dev/null 2>&1 || die "target gateway not running; run: arena.sh up"
+    docker inspect "$GW_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -qx true \
+        || die "target gateway not running; run: arena.sh up"
 
     # Agents never see real host addresses — only the gateway. No model
     # endpoint is passed in: inference is an orchestrator-side concern.

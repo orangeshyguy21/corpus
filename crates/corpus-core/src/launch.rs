@@ -75,6 +75,9 @@ enum Backend {
         /// Throttled `tmux has-session` verdict (a subprocess spawn —
         /// re-checked at most once a second by `try_exit`).
         liveness: (std::time::Instant, bool),
+        /// The project run dir the TUI runs in: the cwd opencode keys its
+        /// sessions by, needed to find/export this run's session.
+        repo: PathBuf,
     },
     /// No tmux / headless automation: `opencode run` piped directly.
     Piped {
@@ -174,7 +177,7 @@ impl RunSession {
         let raw = temp.join(format!("{session}.raw"));
         let script = temp.join(format!("{session}.sh"));
 
-        let repo = repo_root(store);
+        let repo = store.provision_run_dir(project)?; // the run's cwd
         let prompt = if mission.trim().is_empty() {
             None
         } else {
@@ -229,6 +232,7 @@ impl RunSession {
                 file_pos: 0,
                 pending: String::new(),
                 liveness: (std::time::Instant::now(), true),
+                repo,
             },
         })
     }
@@ -396,6 +400,7 @@ impl RunSession {
             exported,
             tui_session_id,
             launched_at_ms,
+            repo,
             ..
         } = &mut self.backend
         else {
@@ -404,17 +409,15 @@ impl RunSession {
         if *exported {
             return Ok(export_json.clone());
         }
-        let store = Store::from_env();
-        let repo = repo_root(&store);
         let id = match tui_session_id.clone() {
             Some(id) => id,
             None => {
-                let found = find_opencode_session(&repo, *launched_at_ms)?;
+                let found = find_opencode_session(repo.as_path(), *launched_at_ms)?;
                 *tui_session_id = Some(found.clone());
                 found
             }
         };
-        let json = export_opencode_json(&repo, &id)?;
+        let json = export_opencode_json(repo.as_path(), &id)?;
         if let Some(parent) = export_json.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -730,7 +733,7 @@ fn tui_session_live(session: &str, cache: &mut (std::time::Instant, bool)) -> bo
 /// internals of the TUI backend.
 pub fn export_session(project: &str, agent: &str, opencode_session_id: &str) -> Result<PathBuf> {
     let store = Store::from_env();
-    let repo = repo_root(&store);
+    let repo = store.provision_run_dir(project)?;
     let json = export_opencode_json(&repo, opencode_session_id)?;
     let ts = now_secs();
     let path = store
@@ -906,9 +909,13 @@ fn opencode_command(
         command.arg(mission);
     }
     let store = Store::from_env();
-    if let Some(repo_root) = store.root().parent() {
-        command.current_dir(repo_root);
-    }
+    // The run's cwd is the PROJECT's run dir (own .opencode/agent set,
+    // own opencode session pool); provisioning failure falls back to the
+    // repo root rather than refusing the launch.
+    let cwd = store
+        .provision_run_dir(project)
+        .unwrap_or_else(|_| repo_root(&store));
+    command.current_dir(cwd);
     command
         .env(PROJECT_ENV, project)
         .env(STORE_ENV, store.root());
@@ -1129,7 +1136,7 @@ mod tests {
         let (store, dir) = tmp_store("mat-v2");
         seed_core(&store);
         store.create_project("p", "P", "cdk-regtest").unwrap();
-        let written = store.render_agent("p", "operator").unwrap();
+        let written = store.render_agent("p", "operator", &[]).unwrap();
         assert!(!written.is_empty());
         let dest = &written[0];
         assert!(dest.ends_with("operator.md"), "{dest:?}");

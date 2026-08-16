@@ -59,7 +59,7 @@ Rules of engagement:
    first; save whatever attack you built with `attack_save`; then ALWAYS
    write a technique card with `technique_save` — even negative results
    are corpus value (status: fired / analyzed-only / unresolved-lead,
-   citing this run's log in store/runs/). Finish by summarizing: what you
+   citing this run's log in your project corpus `runs/`). Finish by summarizing: what you
    tried, what happened, what the oracles said.
 7. You have NO host filesystem. `/opt/src/cdk` and `/opt/src/nuts` are your
    only sanctioned source. The answer key, benchmarks, and harness internals
@@ -69,11 +69,11 @@ Rules of engagement:
 
 ## Corpus scope (bound at launch)
 
-You are bound to project `real-runner`. Your corpus is
-`store/projects/real-runner/corpus/` — categories: `hypotheses/`,
+You are bound to project `default`. Your corpus is
+`store/projects/default/corpus/` — categories: `hypotheses/`,
 `techniques/`, `findings/`, `attacks/`, `runs/`. Read and write
 ONLY inside it. Other projects' corpora are denied by
 permissions and strictly off-limits: reading them pollutes the
 project boundary. Any path in this prompt that names a corpus
-category without the `store/projects/real-runner/` prefix means
+category without the `store/projects/default/` prefix means
 the one inside YOUR project corpus.

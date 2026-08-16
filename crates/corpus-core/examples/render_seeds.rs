@@ -38,7 +38,7 @@ fn main() {
 
     let out_dir = repo.join(".opencode").join("agent");
     for slug in corpus_core::CORE_SEEDS {
-        let written = store.render_agent("default", slug).expect("render agent");
+        let written = store.render_agent("default", slug, &[]).expect("render agent");
         for path in written {
             let dest = out_dir.join(path.file_name().unwrap());
             fs::copy(&path, &dest).expect("copy into .opencode/agent");

@@ -98,10 +98,14 @@ Environment is checked via `corpus plugin probe cdk-regtest`. The CLI:
 corpus plugin list
 corpus plugin probe <name>
 corpus plugin call <name> <method> [params-json]
-# Run a mission; the project's agents are materialized to
-# .opencode/agent/ first (clear + render the whole project set, bare
-# names — the opencode agent list is project-scoped), then opencode runs
-# on the CORPUS_PROJECT scope. The app launches the FULL opencode TUI in a
+# Run a mission; the project's agents are materialized to the PROJECT's
+# OWN .opencode/agent/ inside its run directory
+# (store/projects/<p>/var/run/ — provisioned per launch with symlinks to
+# the repo's store/, sources/, and .opencode/opencode.json so relative
+# paths and the MCP config resolve). opencode runs with that dir as cwd:
+# each project owns its agent set AND its opencode session pool — one
+# project never overwrites another's materialized agents. The app
+# launches the FULL opencode TUI in a
 # DETACHED tmux session (corpus-<agent>-<ts>) and shows it in the
 # EMBEDDED terminal pane (egui_term; the pane runs `tmux attach`
 # in-process — no external-terminal popup): click the pane to steer,
@@ -320,7 +324,12 @@ The reference plugin is `plugins/cdk-regtest`.
 ## Store conventions
 
 - Categories: `store/projects/<project>/corpus/{hypotheses,techniques,findings,attacks,runs}/`
-  on the **project-global** corpus (the ONLY corpus scope).
+  on the **project-global** corpus (the ONLY corpus scope). The five
+  categories are the machine-readable core (runs are harness-written,
+  findings oracle-gated, techniques schema'd) — NOT a filing
+  requirement: permissions cover `corpus/**`, so agents may invent any
+  subpath; out-of-category files surface in the project view's `other`
+  bucket.
 - Core seed agents live at `store/templates/agents/<slug>/` (opencode.json +
   prompts/) and are the one committed part of store/ (`.gitignore` carves them
   out of the otherwise-private store). The role agents in `.opencode/agent/`
@@ -329,7 +338,9 @@ The reference plugin is `plugins/cdk-regtest`.
   hand-editing both is drift (the `templates` test enforces byte equality).
   Every render is **project-bound**: `store/projects/*` permission patterns
   are rewritten to the concrete project, a wildcard read-allow gains the
-  boundary rules (`store/projects/*: deny`, own-project allow), and a
+  boundary rules (`store/projects/*: deny`, own-project allow), the trust
+  red lines (`benchmarks/**`, `plugins/**` read denies) are injected
+  unconditionally (they cannot be edited out of an agent JSON), and a
   "Corpus scope" section is appended naming the exact corpus — a launched
   agent cannot read or write another project's corpus.
 - Slugs are **kebab-case**, one card per technique (no `_` / title drift).

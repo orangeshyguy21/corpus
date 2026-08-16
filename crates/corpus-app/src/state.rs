@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use corpus_core::{
     AgentConfig, CorpusStats, CostReport, Error, Mission, PluginStatus, Project, RunLine,
-    RunSession, SourceRevs, Store,
+    RunSession, SourcePin, SourceRevs, Store,
 };
 
 use crate::nav::Screen;
@@ -492,7 +492,10 @@ impl AppState {
     }
 
     /// Materialize the agent and spawn the mission on the project
-    /// scope. One active run at a time. `source_pins_json` is the
+    /// scope. One active run at a time. `pinned` is the launch's source
+    /// pins (rev + resolved sha), rendered into the materialized agent
+    /// files so research-zone agents read the right `sources/<name>/<sha>/`
+    /// tree; empty for a launch with none. `source_pins_json` is the
     /// resolved `repo -> sha` map exported to the run (None = the
     /// plugin's default pins).
     pub fn launch(
@@ -501,6 +504,7 @@ impl AppState {
         agent: &str,
         model: Option<&str>,
         mission: &str,
+        pinned: &[SourcePin],
         source_pins_json: Option<&str>,
     ) -> Result<(), Error> {
         if self.run.is_some() {
@@ -511,7 +515,7 @@ impl AppState {
         // Fail loudly on an unknown agent, then materialize the WHOLE
         // project: the agent list opencode shows is project-scoped.
         self.store.load_agent(project, agent)?;
-        self.store.render_project_agents(project)?;
+        self.store.render_project_agents(project, pinned)?;
         let session = RunSession::spawn(project, agent, model, mission, source_pins_json)?;
         let pty_attach = session.pty_attach_command();
         self.run = Some(session);
@@ -615,9 +619,26 @@ impl AppState {
     /// REPLACED (transcript exported when possible, torn down either way)
     /// so a new mission always lands on a fresh opencode session.
     pub fn launch_mission(&mut self, project: &str, agent: &str, slug: &str) -> Result<(), Error> {
-        // Resolve the mission's rev pins to shas + fetch trees FIRST —
-        // a failed resolution (offline, tag gone) must not tear down the
-        // working run for nothing.
+        let (_record, pinned, pins_json) = self.prepare_launch(project, slug)?;
+        self.teardown_active_run(project, slug);
+        let model = self.agent_default_model(project, agent);
+        self.launch(project, agent, model.as_deref(), "", &pinned, pins_json.as_deref())?;
+        self.run_mission = Some(slug.to_string());
+        if let Some(session) = self.live_run_session() {
+            self.set_mission_session(project, slug, Some(session), None)?;
+        }
+        self.refresh_missions(project);
+        Ok(())
+    }
+
+    /// The shared launch preamble: load the mission, resolve its rev
+    /// pins to shas + fetch trees (loud failure here must never tear
+    /// down a working run — that happens only after this returns).
+    fn prepare_launch(
+        &self,
+        project: &str,
+        slug: &str,
+    ) -> Result<(Mission, Vec<SourcePin>, Option<String>), Error> {
         let mission_record = self.store.load_mission(project, slug)?;
         let prepared = corpus_core::prepare_source_pins(&self.store, project, &mission_record.pins)?;
         let pins_json = if prepared.is_empty() {
@@ -625,32 +646,46 @@ impl AppState {
         } else {
             Some(serde_json::to_string(&prepared)?)
         };
-        if self.run_active() {
-            let replaced = self.live_run_session();
-            if self.dismiss_run().is_err() {
-                self.abort_run();
-            }
-            // Clear the replaced session off whichever mission held it —
-            // the tmux session is dead now; re-attach must not aim at it.
-            if let Some(replaced) = replaced {
-                let holder = self
-                    .missions
-                    .iter()
-                    .find(|(s, m)| s != slug && m.session.as_deref() == Some(replaced.as_str()))
-                    .map(|(s, _)| s.clone());
-                if let Some(holder) = holder {
-                    let _ = self.set_mission_session(project, &holder, None, None);
-                }
+        // The renderer's pin list: the mission's rev labels + the resolved
+        // shas, so the materialized agents read the named trees.
+        let pinned: Vec<SourcePin> = mission_record
+            .pins
+            .iter()
+            .filter_map(|(name, rev)| {
+                let sha = prepared.get(name)?.clone();
+                Some(SourcePin {
+                    name: name.clone(),
+                    rev: rev.clone(),
+                    sha,
+                })
+            })
+            .collect();
+        Ok((mission_record, pinned, pins_json))
+    }
+
+    /// One active run at a time: dismiss (transcript export when
+    /// possible) or abort the live run, and clear the dead tmux session
+    /// off whichever mission held it so re-attach never aims at a corpse.
+    fn teardown_active_run(&mut self, project: &str, incoming_slug: &str) {
+        if !self.run_active() {
+            return;
+        }
+        let replaced = self.live_run_session();
+        if self.dismiss_run().is_err() {
+            self.abort_run();
+        }
+        if let Some(replaced) = replaced {
+            let holder = self
+                .missions
+                .iter()
+                .find(|(s, m)| {
+                    s.as_str() != incoming_slug && m.session.as_deref() == Some(replaced.as_str())
+                })
+                .map(|(s, _)| s.clone());
+            if let Some(holder) = holder {
+                let _ = self.set_mission_session(project, &holder, None, None);
             }
         }
-        let model = self.agent_default_model(project, agent);
-        self.launch(project, agent, model.as_deref(), "", pins_json.as_deref())?;
-        self.run_mission = Some(slug.to_string());
-        if let Some(session) = self.live_run_session() {
-            self.set_mission_session(project, slug, Some(session), None)?;
-        }
-        self.refresh_missions(project);
-        Ok(())
     }
 
     /// Write the run bookkeeping (tmux session / opencode session) onto a

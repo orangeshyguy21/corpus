@@ -178,8 +178,11 @@ handle() {
             elif ! docker network inspect "$(config_get arena network)" >/dev/null 2>&1 \
                 || ! docker network inspect "$(config_get arena egress_network)" >/dev/null 2>&1 \
                 || ! docker image inspect corpus-agent:local >/dev/null 2>&1 \
-                || ! docker inspect "$GW_NAME" >/dev/null 2>&1; then
-                notes="arena not up (run: arena.sh up, or call the up method)"
+                || [ "$(docker inspect "$GW_NAME" --format '{{.State.Running}}' 2>/dev/null)" != "true" ]; then
+                # Liveness, not existence: a stopped gateway still passes
+                # plain `docker inspect` but the sandbox cannot reach the
+                # mints through it (the PoC-blocking provisioning gap).
+                notes="arena not up or target gateway stopped (run: arena.sh up, or call the up method)"
             else
                 m1="$(config_get target mint_url)"; m2="$(config_get target mint_url_2)"
                 local info1 info2

@@ -113,6 +113,11 @@ pub struct SourceRevs {
     /// cache degrades to pin + main with the pin leading (a default must
     /// resolve without the network).
     pub revs: Vec<String>,
+    /// Epoch seconds when the rev list was last fetched live
+    /// (`sources/.rev-cache/<name>.json`); None = no cache, the revs are
+    /// pin+main placeholders. The top bar shows a stale-cache hint next
+    /// to a branch rev selected from an aged list.
+    pub refs_fetched: Option<u64>,
 }
 
 impl SourceRevs {
@@ -184,7 +189,13 @@ pub fn plugin_sources(store: &Store, project: &str) -> Result<Vec<SourceRevs>, E
                 revs
             }
         };
-        out.push(SourceRevs { name: repo, pinned, revs });
+        let fetched = crate::srcrev::revs_cache_fetched(&sources_dir, &repo);
+        out.push(SourceRevs {
+            name: repo,
+            pinned,
+            revs,
+            refs_fetched: fetched,
+        });
     }
     Ok(out)
 }
@@ -246,12 +257,30 @@ pub fn prepare_source_pins(
                 "source pin {name}: no repo URL in sources.toml"
             )));
         };
-        // The manifest pin is the audited default: resolve it sha-direct,
-        // no ls-remote needed — the default path must work offline.
-        let sha = if rev == &entry.tag && !entry.sha.is_empty() {
+        // The manifest tag is the audited default: normally resolve it
+        // sha-direct, no ls-remote needed — the default path must work
+        // offline. EXCEPTION: a manifest "tag" that is itself a branch
+        // (`main`/`master`) is MUTABLE — the recorded sha is a
+        // setup-time freeze, not the tip (cdk's sources.toml pins
+        // `main` for the spec), so branch-valued defaults resolve
+        // through the rev cache like any other branch pin. Offline with
+        // no cache at all, the recorded default sha is the graceful
+        // fallback — but ONLY for the manifest's own rev; any other pin
+        // stays a loud error.
+        let branch_default = matches!(entry.tag.as_str(), "main" | "master");
+        let sha = if rev == &entry.tag && !entry.sha.is_empty() && !branch_default {
             entry.sha.clone()
         } else {
-            crate::srcrev::resolve_rev(&sources_dir, name, &entry.repo, rev)?
+            match crate::srcrev::resolve_rev(&sources_dir, name, &entry.repo, rev) {
+                Ok(sha) => sha,
+                Err(err) => {
+                    if rev == &entry.tag && !entry.sha.is_empty() {
+                        entry.sha.clone()
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
         };
         crate::srcrev::ensure_source_tree(&sources_dir, name, &entry.repo, rev, &sha)?;
         resolved.insert(name.clone(), sha);
@@ -295,6 +324,17 @@ fn load_source_entries(path: &Path) -> BTreeMap<String, SourceEntry> {
 mod tests {
     use super::*;
 
+    /// Registry tests mutate the process-global `CORPUS_PLUGINS_DIR`, so
+    /// they must not race the parallel test pool (same pattern as the
+    /// env-mutating launch tests).
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
@@ -332,6 +372,7 @@ mod tests {
 
     #[test]
     fn plugin_sources_reads_config_and_tags() {
+        let _guard = env_lock();
         let root = std::env::temp_dir().join(format!("corpus-plugin-src-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
 
@@ -392,6 +433,70 @@ mod tests {
         pins.clear();
         pins.insert("ghost".to_string(), "main".to_string());
         assert!(prepare_source_pins(&store, "p", &pins).unwrap().is_empty());
+
+        std::env::remove_var("CORPUS_PLUGINS_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A manifest "tag" that is itself a branch (`main`) must NOT freeze
+    /// to the recorded setup-time sha: the pin resolves to the LIVE head
+    /// via the rev cache. Offline with no cache, the recorded default sha
+    /// is the graceful fallback (only for the manifest's own rev).
+    #[test]
+    fn branch_default_pin_resolves_live_head() {
+        let _guard = env_lock();
+        let root = std::env::temp_dir().join(format!("corpus-branchpin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pdir = root.join("plugins").join("cdk-regtest");
+        write(&pdir.join("plugin.toml"), "name = \"cdk-regtest\"\nexec = \"plugin\"\n");
+        write(&pdir.join("config.toml"), "[sources]\nnuts_sha = \"x\"\n");
+        let (remote, tag_sha) = fixture_remote(&root, "v0.2.0");
+        // The live branch head: after the two fixtures commits, main ==
+        // the second commit (== the peeled annotated tag).
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "main"])
+            .current_dir(&remote)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap();
+        assert_eq!(head, tag_sha, "fixture main head == annotated tag commit");
+        // Manifest tag = "main" with a FABRICATED recorded sha.
+        write(
+            &root.join("sources.toml"),
+            &format!(
+                "[sources.nuts]\nrepo = \"{remote}\"\ntag = \"main\"\nsha = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n"
+            ),
+        );
+        std::env::set_var("CORPUS_PLUGINS_DIR", root.join("plugins"));
+        let store = Store::new(root.join("store"));
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+
+        let mut pins = BTreeMap::new();
+        pins.insert("nuts".to_string(), "main".to_string());
+        let resolved = prepare_source_pins(&store, "p", &pins).unwrap();
+        assert_eq!(
+            resolved["nuts"], head,
+            "branch-valued manifest default resolves the live head, not the freeze"
+        );
+        assert!(root.join("sources/nuts").join(&head).join(".git").is_dir());
+
+        // Offline fallback: a manifest-default branch with an unreachable
+        // remote (no cache) degrades to the recorded default sha — a
+        // default must resolve without the network — while a NON-default
+        // branch pin on the same source is a loud error.
+        write(
+            &root.join("sources.toml"),
+            &format!(
+                "[sources.nuts]\nrepo = \"/nonexistent/corpus-nuts-branch\"\ntag = \"main\"\nsha = \"{tag_sha}\"\n"
+            ),
+        );
+        let mut default = BTreeMap::new();
+        default.insert("nuts".to_string(), "main".to_string());
+        let resolved = prepare_source_pins(&store, "p", &default).unwrap();
+        assert_eq!(resolved["nuts"], tag_sha, "offline default degrades to the audited sha");
+        let mut other = BTreeMap::new();
+        other.insert("nuts".to_string(), "push".to_string());
+        assert!(prepare_source_pins(&store, "p", &other).is_err());
 
         std::env::remove_var("CORPUS_PLUGINS_DIR");
         let _ = std::fs::remove_dir_all(&root);

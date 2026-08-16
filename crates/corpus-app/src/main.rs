@@ -237,12 +237,14 @@ impl App {
         }
     }
 
-    /// The per-source `repo: rev` dropdowns (spec §3): flat PANEL fields,
-    /// the `repo: rev` text in MONOSPACE 13px + a caret_down arrow. Options
+    /// The per-source `repo: rev` dropdowns (spec §3): flat PANEL fields in
+    /// the plugin picker's style (see `views::source_dropdown`). Options
     /// come from the selected project's plugin (`source_revs`); the
     /// selection is the PROJECT's — persisted on `project.yaml` and
     /// stamped into missions at creation. Declaration order is preserved
-    /// (`source_revs` is a Vec).
+    /// (`source_revs` is a Vec). A branch rev (`main`) drawn from an
+    /// absent/expired rev cache is amber + tooltipped — it resolves to
+    /// the recorded snapshot, not today's head.
     fn source_dropdowns(&mut self, ui: &mut egui::Ui) {
         let revs = self.state.source_revs.clone();
         let project = self.state.effective_project();
@@ -253,43 +255,23 @@ impl App {
                 .get(&source.name)
                 .cloned()
                 .unwrap_or_else(|| source.default_rev().to_string());
-            theme::combo_field(ui, |ui| {
-                egui::ComboBox::from_id_salt(format!("top_source_{}", source.name))
-                    .icon(theme::combo_caret)
-                    .selected_text(
-                        egui::RichText::new(format!("{}: {}", source.name, selected))
-                            .monospace()
-                            .size(13.0)
-                            .color(theme::TEXT),
-                    )
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        for rev in &source.revs {
-                            if ui
-                                .selectable_label(
-                                    rev == &selected,
-                                    egui::RichText::new(rev.clone()).monospace(),
-                                )
-                                .clicked()
-                            {
-                                // Persist the pick onto the project.
-                                if let Some(project) = &project {
-                                    if let Err(error) = self.state.set_source_pin(
-                                        project,
-                                        &source.name,
-                                        rev,
-                                    ) {
-                                        self.toasts.add(
-                                            egui_toast::Toast::new()
-                                            .kind(egui_toast::ToastKind::Error)
-                                            .text(error.to_string()),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    });
-            });
+            if let Some(rev) = crate::views::source_dropdown::source_dropdown(
+                ui,
+                &format!("top_source_{}", source.name),
+                source,
+                &selected,
+            ) {
+                // Persist the pick onto the project.
+                if let Some(project) = &project {
+                    if let Err(error) = self.state.set_source_pin(project, &source.name, &rev) {
+                        self.toasts.add(
+                            egui_toast::Toast::new()
+                                .kind(egui_toast::ToastKind::Error)
+                                .text(error.to_string()),
+                        );
+                    }
+                }
+            }
         }
         if revs.is_empty() {
             ui.weak("no source pins");
@@ -298,8 +280,11 @@ impl App {
 
     /// The live env status for the selected project's plugin (spec §3): the
     /// plugin name in 13px TEXT beside an 8px filled dot — OK-green when the
-    /// probe is ready, DANGER-red when not. A click forces a re-probe; hover
-    /// shows the probe notes. Rendered as flat text, NOT a pill button.
+    /// probe is ready, DANGER-red when not. The STATUS is inline, not hidden
+    /// in a tooltip: a not-ready env appends a short reason (truncated probe
+    /// notes) so a dead gateway is visible at a glance. A click forces a
+    /// re-probe; hover shows the full probe notes. Rendered as flat text,
+    /// NOT a pill button.
     fn env_dot(&mut self, ui: &mut egui::Ui) {
         let Some(project) = self.state.effective_project() else {
             return;
@@ -310,15 +295,25 @@ impl App {
                 name,
                 "environment ready — click to re-probe".to_string(),
             ),
-            Some((name, false, notes)) => (
-                theme::DANGER,
-                name,
-                if notes.is_empty() {
-                    "environment not ready — click to re-probe".to_string()
-                } else {
-                    format!("not ready — {notes}")
-                },
-            ),
+            Some((name, false, notes)) => {
+                // Short inline reason: the first probe-note clause, capped —
+                // the full notes stay on hover.
+                let short: String = notes.chars().take(48).collect();
+                let short = short.trim_end_matches([' ', ',', ';', '—', '(']).to_string();
+                (
+                    theme::DANGER,
+                    if short.is_empty() {
+                        format!("{name} — not ready")
+                    } else {
+                        format!("{name} — {short}")
+                    },
+                    if notes.is_empty() {
+                        "environment not ready — click to re-probe".to_string()
+                    } else {
+                        format!("not ready — {notes}")
+                    },
+                )
+            }
             None => (
                 theme::TEXT_MUTED,
                 "probe…".to_string(),

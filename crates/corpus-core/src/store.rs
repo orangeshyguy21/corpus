@@ -94,6 +94,39 @@ impl Store {
         self.projects_dir().join(slug)
     }
 
+    /// The project's opencode RUN directory (`store/projects/<p>/var/run/`):
+    /// the working directory missions launch in, so each project owns its
+    /// `.opencode/agent/` set and its opencode session pool (opencode keys
+    /// sessions by cwd) — one project never overwrites another's
+    /// materialized agents.
+    pub fn project_run_dir(&self, slug: &str) -> PathBuf {
+        self.project_dir(slug).join("var").join("run")
+    }
+
+    /// Provision a project's run directory: the real `.opencode/agent/`
+    /// dir, symlinks to the repo-level opencode config (`opencode.json` —
+    /// the MCP server block), `node_modules`/`skills` when present, and
+    /// top-level `store` + `sources` symlinks so cwd-relative prompt
+    /// paths and permission patterns (`store/projects/<p>/corpus/**`,
+    /// `sources/<name>/<sha>`) resolve exactly as they do at repo root.
+    /// Idempotent; safe to call on every launch.
+    pub fn provision_run_dir(&self, slug: &str) -> Result<PathBuf> {
+        let run_dir = self.project_run_dir(slug);
+        let opencode = run_dir.join(".opencode");
+        fs::create_dir_all(opencode.join("agent"))?;
+        let Some(repo_root) = self.root().parent().map(Path::to_path_buf) else {
+            return Ok(run_dir);
+        };
+        let repo_opencode = repo_root.join(".opencode");
+        for name in ["opencode.json", "node_modules", "skills"] {
+            link_if_useful(&repo_opencode.join(name), &opencode.join(name))?;
+        }
+        for name in ["store", "sources"] {
+            link_if_useful(&repo_root.join(name), &run_dir.join(name))?;
+        }
+        Ok(run_dir)
+    }
+
     /// The project-local corpus (the ONLY corpus scope).
     pub fn project_corpus_dir(&self, slug: &str) -> PathBuf {
         self.project_dir(slug).join("corpus")
@@ -687,6 +720,23 @@ impl Store {
         let brief = self.mission_brief(project, slug)?;
         self.write_mission(project, slug, mission, &brief)
     }
+}
+
+/// Symlink `target` to `link` when the target exists and the link does
+/// not — used to wire a project's run dir back into the repo. A real dir
+/// at `link` (e.g. the rendered `.opencode/agent`) is never replaced.
+#[cfg(unix)]
+fn link_if_useful(target: &Path, link: &Path) -> Result<()> {
+    if !target.exists() || link.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn link_if_useful(_target: &Path, _link: &Path) -> Result<()> {
+    Ok(()) // no symlinks — the run dir works without repo-relative paths
 }
 
 /// Create the category directories under a corpus root.

@@ -126,6 +126,42 @@ impl ProjectsView {
         });
         ui.add_space(28.0);
 
+        // --- Sources section: the project's rev pins (the data lives on
+        // project.yaml — `pins` — so this is its home as well as the top
+        // bar's). One dropdown per plugin-declared source, same widget as
+        // the top bar; a pick persists immediately.
+        ui.label(theme::section_heading("Sources"));
+        ui.add_space(12.0);
+        if state.source_revs.is_empty() {
+            ui.label(
+                RichText::new("no sources declared by this plugin")
+                    .size(12.0)
+                    .color(theme::TEXT_FAINT),
+            );
+        } else {
+            let revs = state.source_revs.clone();
+            ui.horizontal_wrapped(|ui| {
+                for source in &revs {
+                    let selected = state
+                        .source_pins
+                        .get(&source.name)
+                        .cloned()
+                        .unwrap_or_else(|| source.default_rev().to_string());
+                    if let Some(rev) = crate::views::source_dropdown::source_dropdown(
+                        ui,
+                        &format!("project_source_{}", source.name),
+                        source,
+                        &selected,
+                    ) {
+                        if let Err(error) = state.set_source_pin(&slug, &source.name, &rev) {
+                            toast(toasts, ToastKind::Error, error.to_string());
+                        }
+                    }
+                }
+            });
+        }
+        ui.add_space(28.0);
+
         // --- Corpus section (spec §5): heading, then the stats row + the
         // inline red Delete (wipe confirm), then the data-driven category
         // visual (proportional strip + legend).

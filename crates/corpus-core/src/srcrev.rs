@@ -25,7 +25,7 @@ use crate::error::Error;
 
 /// Disk-cache TTL for a remote's rev list (24h: tags are append-mostly,
 /// and a stale cache only ever falls back gracefully).
-const REV_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+pub const REV_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// The rev→sha cache file format (`sources/.rev-cache/<name>.json`).
 #[derive(Debug, Serialize, Deserialize)]
@@ -127,6 +127,16 @@ fn cached_refs(sources_dir: &Path, name: &str, repo: &str) -> Option<BTreeMap<St
 /// `sources/.rev-cache/<name>.json` — derived cache beside the fetched trees.
 fn cache_path(sources_dir: &Path, name: &str) -> PathBuf {
     sources_dir.join(".rev-cache").join(format!("{name}.json"))
+}
+
+/// Epoch seconds when a source's rev list was last fetched live (None when
+/// there is no cache). The UI surfaces this so a branch rev (`main`) pulled
+/// from a stale cache is visible to the operator rather than silently
+/// frozen at yesterday's head.
+pub fn revs_cache_fetched(sources_dir: &Path, name: &str) -> Option<u64> {
+    let raw = fs::read_to_string(cache_path(sources_dir, name)).ok()?;
+    let cache: RevCache = serde_json::from_str(&raw).ok()?;
+    Some(cache.fetched)
 }
 
 /// Every selectable rev for a source, ordered with the DEFAULT first:

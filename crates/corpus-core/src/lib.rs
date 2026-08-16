@@ -16,7 +16,7 @@ mod sensitivity;
 mod srcrev;
 mod store;
 
-pub use agents::{AgentConfig, AgentSidecar, CORE_SEEDS, OPENCODE_SCHEMA};
+pub use agents::{AgentConfig, AgentSidecar, CORE_SEEDS, OPENCODE_SCHEMA, SourcePin};
 pub use error::{Error, Result};
 pub use launch::{
     agent_default_model, agent_file_stem, export_session, kill_tmux_session, live_tui_sessions,
@@ -29,7 +29,7 @@ pub use plugin::{
 };
 pub use registry::{discover, plugin_sources, plugin_status, plugins_dir, prepare_source_pins, PluginDir, PluginStatus, SourceRevs};
 pub use sensitivity::Sensitivity;
-pub use srcrev::{ensure_source_tree, resolve_rev, selectable_revs};
+pub use srcrev::{ensure_source_tree, resolve_rev, revs_cache_fetched, selectable_revs, REV_CACHE_TTL_SECS};
 pub use store::{
     checksum, corpus_cost, corpus_stats, fnv1a_hex, project_slug_env, slugify, store_root_env,
     validate_slug, CategoryStat, CorpusStats, CostReport, CostRow,

@@ -25,6 +25,9 @@ pub const ACCENT: Color32 = Color32::from_rgb(0xe5, 0x44, 0x2c);
 pub const OK: Color32 = Color32::from_rgb(0x78, 0xc8, 0x78);
 /// Status: down / error (env dot when a probe fails).
 pub const DANGER: Color32 = Color32::from_rgb(0xe5, 0x44, 0x2c);
+/// Status: warn — pickable but degraded (a branch rev served from a
+/// stale rev cache).
+pub const WARN: Color32 = Color32::from_rgb(0xe0, 0xa8, 0x3c);
 
 // --- type greys ---
 /// Primary light text.

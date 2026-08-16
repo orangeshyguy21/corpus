@@ -15,18 +15,21 @@
 //! rejected by opencode's schema, so the document stays clean); corpus
 //! metadata lives in the `agent.yaml` sidecar, never in the JSON.
 //!
-//! The renderer materializes a project's agents into `.opencode/agent/<name>.md`
-//! — one file per `agent` map entry, frontmatter carrying description/mode/
-//! model/temperature/permission and a body of the prompt with `{file:}` refs
-//! inlined from the agent dir. `.opencode/agent/` is corpus-managed: a launch
-//! first clears the previous generated set, then renders EVERY agent of the
-//! launched project, so the agent list opencode shows is scoped to the
-//! project (and subagent names stay bare so the primary's `task:` permission
-//! keys match verbatim). Every render BINDS the agent to its project:
-//! `store/projects/*` permission patterns are rewritten to the concrete
-//! project, wildcard read-allows gain the corpus boundary, and a Corpus
-//! scope section names the exact corpus dir — agents stay in their own
-//! project's corpus.
+//! The renderer materializes a project's agents into the PROJECT's own
+//! `.opencode/agent/<name>.md` (inside its run directory,
+//! `store/projects/<p>/var/run/` — see `Store::provision_run_dir`) — one
+//! file per `agent` map entry, frontmatter carrying description/mode/
+//! model/temperature/permission and a body of the prompt with `{file:}`
+//! refs inlined from the agent dir. The dir is corpus-managed: a launch
+//! first clears the previous generated set, then renders EVERY agent of
+//! the launched project, so the agent list opencode shows is scoped to
+//! the project (and subagent names stay bare so the primary's `task:`
+//! permission keys match verbatim). Every render BINDS the agent to its
+//! project: `store/projects/*` permission patterns are rewritten to the
+//! concrete project, wildcard read-allows gain the corpus boundary, the
+//! trust red lines (`benchmarks/**`, `plugins/**` read denies) are
+//! injected unconditionally, and a Corpus scope section names the exact
+//! corpus dir — agents stay in their own project's corpus.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -289,24 +292,25 @@ impl Store {
     // Renderer (.opencode/agent/)
     // -----------------------------------------------------------------
 
-    /// The directory materialized agents land in: `.opencode/agent/` next to
-    /// the store root (the repo root).
-    pub fn opencode_agent_dir(&self) -> PathBuf {
-        self.root()
-            .parent()
-            .map(|p| p.join(".opencode").join("agent"))
-            .unwrap_or_else(|| self.root().to_path_buf())
+    /// The directory materialized agents land in: the PROJECT's own
+    /// `.opencode/agent/` inside its run directory (`provision_run_dir`).
+    /// Per-project by construction — one project's launch never rewrites
+    /// another project's agent set.
+    pub fn opencode_agent_dir(&self, project: &str) -> Result<PathBuf> {
+        Ok(self.provision_run_dir(project)?.join(".opencode").join("agent"))
     }
 
-    /// Clear the previously generated agent set in `.opencode/agent/`
-    /// (corpus-managed: the dir is regenerated per launch).
-    pub fn clear_opencode_agents(&self) {
-        let dir = self.opencode_agent_dir();
-        if let Ok(read) = fs::read_dir(&dir) {
-            for entry in read.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    let _ = fs::remove_file(path);
+    /// Clear the previously generated agent set in the project's
+    /// `.opencode/agent/` (corpus-managed: the dir is regenerated per
+    /// launch).
+    pub fn clear_opencode_agents(&self, project: &str) {
+        if let Ok(dir) = self.opencode_agent_dir(project) {
+            if let Ok(read) = fs::read_dir(&dir) {
+                for entry in read.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+                        let _ = fs::remove_file(path);
+                    }
                 }
             }
         }
@@ -316,11 +320,19 @@ impl Store {
     /// names) — after clearing the previous generated set, so the agent
     /// list opencode shows is scoped to this project. Agents render in
     /// slug order; an entry-name collision between two of the project's
-    /// agents resolves to the later slug. Returns the written paths.
-    pub fn render_project_agents(&self, project: &str) -> Result<Vec<PathBuf>> {
+    /// agents resolves to the later slug. `pinned` names the launch's
+    /// source pins (repos the mission pinned, with their rev + resolved
+    /// sha) — rendered as the "Pinned sources" footer; an empty slice
+    /// renders none (the plugin's defaults then apply). Returns the
+    /// written paths.
+    pub fn render_project_agents(
+        &self,
+        project: &str,
+        pinned: &[SourcePin],
+    ) -> Result<Vec<PathBuf>> {
         let agents = self.list_agents(project)?;
-        self.clear_opencode_agents();
-        let out_dir = self.opencode_agent_dir();
+        self.clear_opencode_agents(project);
+        let out_dir = self.opencode_agent_dir(project)?;
         fs::create_dir_all(&out_dir)?;
         let mut written = Vec::new();
         for (slug, agent) in agents {
@@ -334,7 +346,7 @@ impl Store {
                 let cfg = agent_map[name]
                     .as_object()
                     .ok_or_else(|| Error::Store(format!("agent {slug}/{name}: not an object")))?;
-                let body = render_agent_file(cfg, &dir, project)?;
+                let body = render_agent_file(cfg, &dir, project, pinned)?;
                 let dest = out_dir.join(format!("{name}.md"));
                 fs::write(&dest, body)?;
                 written.push(dest);
@@ -347,10 +359,17 @@ impl Store {
     /// ADDITIVE (no clear): used to layer a follow-up agent (the CLI
     /// `--research` pass) onto an already project-scoped set. Launch paths
     /// scope the set with [`Store::render_project_agents`] instead.
+    /// `pinned` renders the Pinned-sources footer (see
+    /// [`Store::render_project_agents`]); pass an empty slice for none.
     /// Returns the written paths.
-    pub fn render_agent(&self, project: &str, slug: &str) -> Result<Vec<PathBuf>> {
+    pub fn render_agent(
+        &self,
+        project: &str,
+        slug: &str,
+        pinned: &[SourcePin],
+    ) -> Result<Vec<PathBuf>> {
         let agent = self.load_agent(project, slug)?;
-        let out_dir = self.opencode_agent_dir();
+        let out_dir = self.opencode_agent_dir(project)?;
         fs::create_dir_all(&out_dir)?;
         let dir = self.project_agent_dir(project, slug);
         let agent_map = agent
@@ -365,7 +384,7 @@ impl Store {
             let cfg = agent_map[name]
                 .as_object()
                 .ok_or_else(|| Error::Store(format!("agent {slug}/{name}: not an object")))?;
-            let body = render_agent_file(cfg, &dir, project)?;
+            let body = render_agent_file(cfg, &dir, project, pinned)?;
             let dest = out_dir.join(format!("{name}.md"));
             fs::write(&dest, body)?;
             written.push(dest);
@@ -374,16 +393,33 @@ impl Store {
     }
 }
 
+/// A mission's source pin as the renderer shows it: the repo name, the rev
+/// label the operator picked, and the RESOLVED sha — the literal tree the
+/// research-zone agents are to read (`sources/<name>/<sha>/`). A launch
+/// with no pins renders no section (the plugin's defaults then apply).
+#[derive(Debug, Clone)]
+pub struct SourcePin {
+    /// Repository name as the plugin declares it (`cdk`, `nuts`).
+    pub name: String,
+    /// The rev label the mission pins (`v0.17.0`, `main`).
+    pub rev: String,
+    /// The commit sha the rev resolved to at launch — the tree under
+    /// `sources/<name>/<sha>/`.
+    pub sha: String,
+}
+
 /// Render one agent-map entry into the opencode agent-markdown body.
 /// The render BINDS the agent to its project: `store/projects/*`
 /// permission patterns are rewritten to the concrete project, a wildcard
 /// read-allow gains the corpus boundary (other projects' corpora denied),
 /// and a Corpus scope section is appended naming the exact corpus dir —
 /// a rendered agent never has to guess which project's corpus is home.
+/// A non-empty `pinned` appends the launch's source pins too.
 fn render_agent_file(
     cfg: &serde_json::Map<String, serde_json::Value>,
     dir: &Path,
     project: &str,
+    pinned: &[SourcePin],
 ) -> Result<String> {
     let mut out = String::with_capacity(256);
     out.push_str("---\n");
@@ -421,6 +457,7 @@ fn render_agent_file(
         out.push_str(&inline_file_refs(dir, prompt)?);
     }
     out.push_str(&corpus_scope_section(project));
+    out.push_str(&pinned_sources_section(pinned));
     Ok(out)
 }
 
@@ -441,10 +478,44 @@ fn corpus_scope_section(project: &str) -> String {
     )
 }
 
+/// The launch-bound source-pin footer: the literal `sources/<name>/<sha>/`
+/// trees THIS run reads. Research-zone agents otherwise derive their
+/// source from `sources.toml` — the DEFAULT pin — so a mission pinned to
+/// another rev must name the trees, or the agent audits the wrong code
+/// and `sources.toml` becomes the only signal the model sees. Empty when
+/// the launch carries no pins.
+fn pinned_sources_section(pinned: &[SourcePin]) -> String {
+    if pinned.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n---\n\n## Pinned sources (bound at launch)\n\n\
+         This run reads these target revisions. Read the LITERAL tree\n\
+         paths below, not `sources.toml` — it records only the DEFAULT\n\
+         pin and may name a different (usually older) tree:\n",
+    );
+    for pin in pinned {
+        out.push_str(&format!(
+            "- `{}` → `{}` at `sources/{}/{}/`\n",
+            pin.name, pin.rev, pin.name, pin.sha
+        ));
+    }
+    out.push_str(
+        "Verify every claim against the named trees; treat anything not\n\
+         traced in them as unverified.\n",
+    );
+    out
+}
+
 /// Bind a permission document to a concrete project at render time:
 /// `store/projects/*` rule keys become `store/projects/<project>`, and a
 /// wildcard read-allow gains the corpus boundary (`store/projects/*`
 /// deny, own project allow — appended last so it wins the evaluation).
+/// The trust red lines are INJECTED, not trusted: every rendered agent
+/// with a read rule map gets `benchmarks/**` and `plugins/**` denies
+/// regardless of what the (hand-editable) agent JSON says — the answer
+/// key and harness internals stay unreadable even if someone edits them
+/// out of a config.
 fn bind_permission_to_project(
     permission: &serde_json::Value,
     project: &str,
@@ -458,6 +529,12 @@ fn bind_permission_to_project(
         let mut value = bind_permission_to_project(value, project);
         if key == "read" {
             if let Value::Object(rules) = &mut value {
+                // Red lines, unconditionally (contamination rule).
+                for red in ["benchmarks/**", "plugins/**"] {
+                    rules
+                        .entry(red.to_string())
+                        .or_insert_with(|| Value::String("deny".to_string()));
+                }
                 let wildcard_allow =
                     rules.get("*").and_then(Value::as_str) == Some("allow");
                 let has_boundary = rules.keys().any(|k| k.starts_with("store/projects/"));
@@ -718,7 +795,7 @@ mod tests {
                 })),
             )
             .unwrap();
-        let written = store.render_project_agents("alpha").unwrap();
+        let written = store.render_project_agents("alpha", &[]).unwrap();
         let text = fs::read_to_string(&written[0]).unwrap();
         // Wildcard store paths bound to the concrete project.
         assert!(text.contains("store/projects/alpha/corpus/**"), "{text}");
@@ -736,6 +813,23 @@ mod tests {
         // The scope section names the project corpus.
         assert!(text.contains("## Corpus scope (bound at launch)"));
         assert!(text.contains("You are bound to project `alpha`"));
+        // No pins -> no Pinned sources section (backend expectations keep
+        // the byte-identical template render).
+        assert!(!text.contains("Pinned sources"), "{text}");
+
+        // A pinned render names the literal tree path the agent must read.
+        let pinned = [SourcePin {
+            name: "cdk".into(),
+            rev: "main".into(),
+            sha: "b2d07815b7cac85b6200b12d813bd5bfda613552".into(),
+        }];
+        let written = store.render_project_agents("alpha", &pinned).unwrap();
+        let text = fs::read_to_string(&written[0]).unwrap();
+        assert!(text.contains("## Pinned sources (bound at launch)"), "{text}");
+        assert!(
+            text.contains("`cdk` → `main` at `sources/cdk/b2d07815b7cac85b6200b12d813bd5bfda613552/`"),
+            "{text}"
+        );
         let _ = fs::remove_dir_all(store.root());
     }
 

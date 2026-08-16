@@ -7,3 +7,4 @@ pub mod json_editor;
 pub mod missions;
 pub mod plugin_picker;
 pub mod projects;
+pub mod source_dropdown;
