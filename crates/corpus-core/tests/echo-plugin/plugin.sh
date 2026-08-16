@@ -26,6 +26,17 @@ handle() {
             jq -nc --argjson id "$id" --arg output "echo-container:${command}${sources}" \
                 '{id:$id, ok:true, result:{output:$output, exit_code:0}}'
             ;;
+        sources)
+            # Mirror the real plugin: params.sources overrides the sha,
+            # else the canned default pin is reported.
+            jq -rnc --argjson id "$id" --argjson p "$params" '
+                ($p.sources // {}) as $over |
+                {id:$id, ok:true, result:[
+                    {name:"cdk", repo:"cashubtc/cdk", tag:"v0.17.0",
+                     sha:($over.cdk // "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                     mount:"/opt/src/cdk"}
+                ]}'
+            ;;
         oracles)
             printf '{"id":%s,"ok":true,"result":[{"name":"001-echo","description":"echo oracle"}]}\n' "$id"
             ;;

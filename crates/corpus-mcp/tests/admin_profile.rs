@@ -248,4 +248,7 @@ fn admin_catalog_carries_no_sandbox_tools() {
     for op in ["project_delete", "agent_delete", "mission_delete", "corpus_wipe"] {
         assert!(names.contains(&op.to_string()), "must carry destructive op {op}");
     }
+    // The model discovery tool (the chat agent resolves exact model ids
+    // through this instead of guessing).
+    assert!(names.contains(&"model_list".to_string()), "must carry model_list");
 }

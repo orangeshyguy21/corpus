@@ -42,7 +42,7 @@ those grants for that option.
 | role | owns | intended tool grant (`available_tools`) |
 |---|---|---|
 | **orchestrator** | intent routing, clarification, confirmation ritual, final summaries | NO admin tools |
-| **agent-builder** | author/edit opencode.json; seed format, validator, trust-domain shapes | `agent_list/get/save/clone/delete`, `corpus_read` |
+| **agent-builder** | author/edit opencode.json; seed format, validator, trust-domain shapes | `agent_list/get/save/clone/delete`, `corpus_read`, `model_list` |
 | **project-manager** | new/clone/rebind/delete/wipe | `project_list/new/clone/delete/rebind`, `corpus_wipe`, `corpus_stats` |
 | **mission-manager** | mission CRUD, budget, pins; agent→mission budget | `mission_list/get/new/delete/set_budget/set_pins`, `agent_list` |
 | **corpus-inspector** | read-only store queries | `corpus_stats/list/read`, `project_list`, `agent_list`, `mission_list` |

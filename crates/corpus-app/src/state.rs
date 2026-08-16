@@ -52,7 +52,9 @@ pub struct AppState {
     /// Which project the env probe aggregation belongs to (the top bar's
     /// live dot — a stale probe is never trusted).
     env_project: Option<String>,
-    /// Missions of `selected_project`, sorted by slug (corpus-core order).
+    /// Missions of `selected_project`, newest-CREATED first (the store
+    /// returns slug order, which reads as random in the sidebar; the app
+    /// layer owns the presentation order, like `projects`).
     pub missions: Vec<(String, Mission)>,
     /// Which project `missions` belongs to; a stale pair is never trusted.
     missions_project: Option<String>,
@@ -100,6 +102,9 @@ pub struct AppState {
     /// Live corpus tmux sessions seen at the last `refresh_live_sessions`
     /// — the re-attach list a relaunched app offers (chunk 7).
     pub live_sessions: Vec<String>,
+    /// When `live_sessions` was last polled (polled on a throttle, never
+    /// per frame — the poll spawns `tmux list-sessions`).
+    live_sessions_polled_at: Option<std::time::Instant>,
 }
 
 /// Who the active (or last-finished) run was.
@@ -154,6 +159,7 @@ impl AppState {
             run_status: None,
             export_path: None,
             live_sessions: Vec::new(),
+            live_sessions_polled_at: None,
         };
         state.refresh();
         state
@@ -178,7 +184,7 @@ impl AppState {
             .map(|(slug, _)| {
                 let tree = ProjectTree {
                     agents: self.store.list_agents(slug).unwrap_or_default(),
-                    missions: self.store.list_missions(slug).unwrap_or_default(),
+                    missions: sort_missions(self.store.list_missions(slug).unwrap_or_default()),
                 };
                 (slug.clone(), tree)
             })
@@ -205,9 +211,10 @@ impl AppState {
         }
     }
 
-    /// Re-list a project's missions (and keep its tree subtree fresh).
+    /// Re-list a project's missions, newest-created first (and keep its
+    /// tree subtree fresh).
     pub fn refresh_missions(&mut self, project: &str) {
-        self.missions = self.store.list_missions(project).unwrap_or_default();
+        self.missions = sort_missions(self.store.list_missions(project).unwrap_or_default());
         self.missions_project = Some(project.to_string());
         if let Some(tree) = self.trees.get_mut(project) {
             tree.missions = self.missions.clone();
@@ -576,6 +583,49 @@ impl AppState {
     /// when the app was relaunched over a surviving run).
     pub fn refresh_live_sessions(&mut self) {
         self.live_sessions = corpus_core::live_tui_sessions();
+        self.live_sessions_polled_at = Some(std::time::Instant::now());
+    }
+
+    /// Poll live sessions on a throttle (2 s): the poll spawns a `tmux
+    /// list-sessions` subprocess, so never per frame — and only when a
+    /// live session can even matter (a run is up, or some mission record
+    /// still holds a session). This keeps the sidebar's activity dots
+    /// fresh without polling an idle app forever.
+    pub fn poll_live_sessions(&mut self) {
+        let relevant = self.run_active()
+            || self
+                .trees
+                .values()
+                .any(|t| t.missions.iter().any(|(_, m)| m.session.is_some()));
+        if !relevant {
+            return;
+        }
+        let due = self
+            .live_sessions_polled_at
+            .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(2));
+        if due {
+            self.refresh_live_sessions();
+        }
+    }
+
+    /// Is `agent` of `project` ACTIVELY RUNNING right now? True when a
+    /// mission of that agent holds a session that is live on the tmux
+    /// server, or the app-owned run is live and belongs to one of its
+    /// missions (the live_sessions poll can lag a launch — the mission
+    /// view applies the same precedence). Drives the sidebar status dot.
+    pub fn agent_running(&self, project: &str, agent: &str) -> bool {
+        let Some(tree) = self.trees.get(project) else {
+            return false;
+        };
+        let app_run = self.live_run_session();
+        tree.missions.iter().any(|(slug, m)| {
+            m.agent == agent
+                && (self.run_active() && self.run_mission.as_deref() == Some(slug.as_str())
+                    || m.session.as_ref().is_some_and(|s| {
+                        self.live_sessions.iter().any(|l| l == s)
+                            || app_run.as_deref() == Some(s.as_str())
+                    }))
+        })
     }
 
     /// The attach argv for a discovered live session (re-attach after an
@@ -744,6 +794,15 @@ impl AppState {
     }
 }
 
+/// Mission list order, newest-CREATED first (slug tiebreak). The store
+/// returns slug order — stable across saves, but the slugs are random
+/// UUIDs so the sidebar looked shuffled; created order matches the
+/// project list (state.rs `refresh`, newest first).
+fn sort_missions(mut missions: Vec<(String, Mission)>) -> Vec<(String, Mission)> {
+    missions.sort_by(|a, b| b.1.created.cmp(&a.1.created).then_with(|| a.0.cmp(&b.0)));
+    missions
+}
+
 /// A fresh RFC-4122-v4-formatted id, generated without new dependencies:
 /// `RandomState` seeds each process with 128 bits of system entropy, and
 /// SipHash-128 over two fixed salts extracts two independent 64-bit
@@ -795,5 +854,31 @@ mod tests {
         let a = new_uuid_id();
         let b = new_uuid_id();
         assert_ne!(a, b);
+    }
+
+    fn mission(created: u64) -> Mission {
+        Mission {
+            agent: "operator".to_string(),
+            pins: std::collections::BTreeMap::new(),
+            budget: None,
+            status: "queued".to_string(),
+            created,
+            name: None,
+            session: None,
+            opencode_session: None,
+        }
+    }
+
+    #[test]
+    fn missions_sort_newest_created_first() {
+        let list = vec![
+            ("b-old".to_string(), mission(100)),
+            ("a-new".to_string(), mission(300)),
+            ("c-mid".to_string(), mission(200)),
+            ("d-tie".to_string(), mission(300)),
+        ];
+        let sorted = sort_missions(list);
+        let order: Vec<&str> = sorted.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(order, ["a-new", "d-tie", "c-mid", "b-old"]);
     }
 }

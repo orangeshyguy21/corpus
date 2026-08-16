@@ -1450,6 +1450,7 @@ dependencies = [
  "icu_normalizer",
  "idna_adapter",
  "image 0.25.10",
+ "pulldown-cmark",
  "rmcp",
  "serde",
  "serde_json",

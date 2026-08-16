@@ -155,6 +155,42 @@ fn attack_save_project_scope() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// target_info must forward the mission's resolved source pins to the
+/// plugin: a mission pinned off the plugin's default rev must see the
+/// mounts the sandbox actually gets (the launch pins), not the plugin's
+/// config defaults. Regression: target_info dropped the pins, so a
+/// pinned mission was told it read code it wasn't reading.
+#[test]
+fn target_info_reports_mission_pins_not_defaults() {
+    let rig = rig("pins");
+    let TestRig { mut ctx, root, .. } = rig;
+    let mut pins = serde_json::Map::new();
+    pins.insert(
+        "cdk".to_string(),
+        serde_json::Value::String("cccccccccccccccccccccccccccccccccccccccc".to_string()),
+    );
+    ctx.source_pins = Some(pins);
+
+    let out = tools::dispatch(&mut ctx, "target_info", &json!({})).expect("target_info");
+    assert!(
+        out.contains("cccccccccccccccccccccccccccccccccccccccc"),
+        "mission pin must appear in sources_in_sandbox: {out}"
+    );
+    assert!(
+        !out.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "the plugin default pin must NOT be reported for a pinned mission: {out}"
+    );
+
+    // No pins -> the plugin's defaults, unchanged.
+    ctx.source_pins = None;
+    let out = tools::dispatch(&mut ctx, "target_info", &json!({})).expect("target_info no pins");
+    assert!(
+        out.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "unpinned run reports the plugin default: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn corpus_promote_is_unknown_tool() {
     let rig = rig("no-promote");

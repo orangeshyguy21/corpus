@@ -289,6 +289,19 @@ pub fn catalog() -> Value {
                 },
                 "required": ["project", "path"]
             }
+        },
+        // --- models ---
+        {
+            "name": "model_list",
+            "description": "Discover the models available to opencode launches: the exact provider/model id strings (with display names) that are valid in an agent config's model field or a launch arg, as reported by `opencode models --verbose`. Use 'filter' to narrow by substring (id or display name) instead of printing the whole catalog, and 'refresh' to bypass the TTL cache when the catalog changed. Always resolve an id through this list before writing it into an agent config — never guess one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filter": {"type": "string", "description": "optional case-insensitive substring matched against id and display name"},
+                    "refresh": {"type": "boolean", "description": "bypass the TTL cache and re-pull opencode's catalog"}
+                },
+                "required": []
+            }
         }
     ])
 }
@@ -319,6 +332,7 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         "corpus_stats" => corpus_stats(ctx, &project(args)?),
         "corpus_list" => corpus_list(ctx, args),
         "corpus_read" => corpus_read(ctx, args),
+        "model_list" => model_list(args),
         other => Err(Error::Args(format!("unknown admin tool: {other}"))),
     }
 }
@@ -722,6 +736,60 @@ fn corpus_read(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let text = std::fs::read_to_string(&canonical)
         .map_err(|e| Error::Args(format!("cannot read {}: {e}", canonical.display())))?;
     Ok(text)
+}
+
+// --- models ---
+
+/// The opencode launch catalog (NOT the benchmark registry and NOT the chat's
+/// ollama set): the exact `provider/model` ids an agent config's model field
+/// accepts. A chat agent resolving "my deepseek model" to a launchable id does
+/// `model_list {"filter": "deepseek"}` — a half-guessed string baked into six
+/// agent JSONs is the failure this exists to prevent.
+fn model_list(args: &Value) -> Result<String> {
+    let filter = args
+        .get("filter")
+        .and_then(Value::as_str)
+        .map(str::to_lowercase);
+    let refresh = args
+        .get("refresh")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let list = corpus_core::model_list(refresh).map_err(|e| {
+        Error::Args(format!("opencode model catalog unavailable: {e}"))
+    })?;
+    let mut lines = Vec::new();
+    let mut total = 0usize;
+    for group in &list.groups {
+        let mut first_in_group = true;
+        for m in &group.models {
+            total += 1;
+            if let Some(f) = &filter {
+                if !m.id.to_lowercase().contains(f) && !m.name.to_lowercase().contains(f) {
+                    continue;
+                }
+            }
+            if first_in_group {
+                if !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                lines.push(format!("== {}", group.label));
+                first_in_group = false;
+            }
+            lines.push(format!("  {}  ({})", m.id, m.name));
+        }
+    }
+    if lines.is_empty() {
+        return Ok(format!(
+            "no model matches {:?} ({} models in the catalog) — widen or drop the filter",
+            filter.unwrap_or_default(),
+            total
+        ));
+    }
+    let header = match &filter {
+        Some(f) => format!("{} of {} models matching {f:?} — ids as in `opencode models --verbose`:", lines.iter().filter(|l| l.starts_with("  ")).count(), total),
+        None => format!("{total} models available — ids as in `opencode models --verbose` (use these exact strings in agent configs):"),
+    };
+    Ok(format!("{header}\n{}", lines.join("\n")))
 }
 
 // --- confirm-token gate ---

@@ -141,7 +141,7 @@ corpus store migrate [--dry-run] [--project <slug>] [--confirm]
                                   # reports only; moves are checksum-verified)
                                   # --confirm also removes legacy template dirs
 # corpus-admin MCP profile: the SAME corpus-mcp binary behind `--admin`
-corpus-mcp --admin                 # stdio MCP server; 20 admin tools only
+corpus-mcp --admin                 # stdio MCP server; 21 admin tools only
 ```
 
 ## corpus-admin MCP profile (dev/decisions.md — chat runtime closeout)
@@ -161,7 +161,8 @@ rebind`, `agent_list/get/new/save/clone/delete` (`agent_new` builds the
 opencode.json from structured fields — prefer it for creation; `agent_save`
 only edits existing agents and runs the core validator, refusing invalid
 documents with the validator's message), `mission_list/
-get/new/delete/set_budget/set_pins`, `corpus_wipe`, `corpus_stats/list/read`.
+get/new/delete/set_budget/set_pins`, `corpus_wipe`, `corpus_stats/list/read`,
+`model_list` (discover opencode model ids for agent configs).
 
 - **Confirm-token gate (server-side, all four destructive ops):**
   `project_delete`, `agent_delete`, `mission_delete`, `corpus_wipe` first

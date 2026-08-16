@@ -149,6 +149,7 @@ pub fn human_tool_name(raw: &str) -> String {
             "corpus_list" => "list corpus entries".into(),
             "corpus_read" => "read corpus entry".into(),
             "corpus_wipe" => "WIPE corpus".into(),
+            "model_list" => "list available models".into(),
             other => other.replace('_', " "),
         }
     }
@@ -448,9 +449,16 @@ impl ChatPanelView {
                             .small(),
                     );
                 }
-                for m in &self.messages {
-                    match m.kind {
-                        BubbleKind::User => self.user_bubble(ui, &m.text, m.queued),
+                let messages = &self.messages;
+                let md = &mut self.md;
+                for (mi, m) in messages.iter().enumerate() {
+                    // Every bubble is namespaced by its index: id-bearing
+                    // widgets inside (egui_commonmark's table Grid among
+                    // them) can then never collide ACROSS bubbles — the
+                    // cross-message clash painted egui's red "🔥 ID clash"
+                    // error text into the log.
+                    ui.push_id(mi, |ui| match m.kind {
+                        BubbleKind::User => user_bubble(ui, &m.text, m.queued),
                         BubbleKind::Assistant => {
                             ui.add_space(8.0);
                             ui.label(
@@ -458,7 +466,21 @@ impl ChatPanelView {
                                     .small()
                                     .color(crate::theme::TEXT_FAINT),
                             );
-                            CommonMarkViewer::new().show(ui, &mut self.md, &m.text);
+                            // Segment markdown: tables are rendered by our
+                            // own renderer (chat/tables.rs); everything else
+                            // goes to egui_commonmark.
+                            for seg in crate::chat::tables::split(&m.text) {
+                                match seg {
+                                    crate::chat::tables::Segment::Markdown(text) => {
+                                        CommonMarkViewer::new().show(ui, md, &text);
+                                    }
+                                    crate::chat::tables::Segment::Table(t) => {
+                                        ui.add_space(4.0);
+                                        crate::chat::tables::show_table(ui, &t);
+                                        ui.add_space(4.0);
+                                    }
+                                }
+                            }
                         }
                         BubbleKind::Thought => {
                             ui.add_space(4.0);
@@ -471,7 +493,7 @@ impl ChatPanelView {
                                     .italics()
                                     .color(crate::theme::TEXT_FAINT),
                             )
-                            .id_salt(format!("thought_{}", m.text.len()))
+                            .id_salt(format!("thought_{mi}"))
                             .default_open(false)
                             .show(ui, |ui| {
                                 ui.label(
@@ -490,7 +512,7 @@ impl ChatPanelView {
                                 .inner_margin(egui::Margin::symmetric(8, 4))
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    self.tool_cards(ui, &m.tools);
+                                    tool_cards(ui, &m.tools);
                                 });
                         }
                         BubbleKind::Error => {
@@ -501,7 +523,7 @@ impl ChatPanelView {
                                     .small(),
                             );
                         }
-                    }
+                    });
                 }
                 // Inline approve/reject cards.
                 self.permission_cards(ui, chat);
@@ -585,31 +607,7 @@ impl ChatPanelView {
     /// log entry is unambiguous about who said it (the "no indication who
     /// sent what" bug). A queued send (mid-turn) is dimmed and tagged.
     fn user_bubble(&self, ui: &mut egui::Ui, text: &str, queued: bool) {
-        ui.add_space(6.0);
-        let max_w = (ui.available_width() * 0.85).max(120.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-            egui::Frame::default()
-                .fill(crate::theme::PANEL)
-                .stroke(egui::Stroke::new(1.0_f32, crate::theme::HAIRLINE))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(10, 6))
-                .show(ui, |ui| {
-                    ui.set_max_width(max_w);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(if queued { "you · queued" } else { "you" })
-                                .small()
-                                .color(crate::theme::TEXT_FAINT),
-                        );
-                        let color = if queued {
-                            crate::theme::TEXT_MUTED
-                        } else {
-                            crate::theme::TEXT
-                        };
-                        ui.label(egui::RichText::new(text).color(color));
-                    });
-                });
-        });
+        user_bubble(ui, text, queued)
     }
 
     /// The chat model picker (the GDK chat's OWN source: `ollama list` via
@@ -653,31 +651,7 @@ impl ChatPanelView {
     }
 
     fn tool_cards(&self, ui: &mut egui::Ui, cards: &[ToolCard]) {
-        for card in cards {
-            // Collapsed by default: the header is the status glyph + the
-            // human tool name; args and result expand on click. (Wall-of-
-            // JSON cards buried the conversation — operator 2026-08-14.)
-            let (glyph, color) = match &card.result {
-                None => ("…", crate::theme::rgb(200, 150, 80)),
-                Some(_) if card.is_error => ("✗", crate::theme::DANGER),
-                Some(_) => ("✓", crate::theme::OK),
-            };
-            egui::CollapsingHeader::new(
-                egui::RichText::new(format!("{glyph} {}", human_tool_name(&card.name)))
-                    .monospace()
-                    .color(color),
-            )
-            .id_salt(format!("tool_{}_{}", card.id, card.name))
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new(&card.name).monospace().small().weak());
-                ui.label(egui::RichText::new(&card.args).monospace().small());
-                if let Some(result) = &card.result {
-                    ui.separator();
-                    ui.label(egui::RichText::new(result).monospace().small());
-                }
-            });
-        }
+        tool_cards(ui, cards)
     }
 
     fn permission_cards(&mut self, ui: &mut egui::Ui, chat: &mut ChatHandle) {        // Take the pending list by value so clicks can mutate chat; a card is
@@ -723,6 +697,66 @@ impl ChatPanelView {
                 self.pending.push(p);
             }
         }
+    }
+}
+
+/// A user message: right-aligned boxed bubble with a "you" tag. A queued send
+/// (mid-turn) is dimmed and tagged. Free function so the message loop can
+/// call it without borrowing `self` (which conflicts with `&mut self.md`).
+fn user_bubble(ui: &mut egui::Ui, text: &str, queued: bool) {
+    ui.add_space(6.0);
+    let max_w = (ui.available_width() * 0.85).max(120.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+        egui::Frame::default()
+            .fill(crate::theme::PANEL)
+            .stroke(egui::Stroke::new(1.0_f32, crate::theme::HAIRLINE))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_max_width(max_w);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(if queued { "you · queued" } else { "you" })
+                            .small()
+                            .color(crate::theme::TEXT_FAINT),
+                    );
+                    let color = if queued {
+                        crate::theme::TEXT_MUTED
+                    } else {
+                        crate::theme::TEXT
+                    };
+                    ui.label(egui::RichText::new(text).color(color));
+                });
+            });
+    });
+}
+
+/// Collapsible tool-call cards. Free function (same reason as `user_bubble`).
+fn tool_cards(ui: &mut egui::Ui, cards: &[ToolCard]) {
+    for card in cards {
+        // Collapsed by default: the header is the status glyph + the
+        // human tool name; args and result expand on click. (Wall-of-
+        // JSON cards buried the conversation — operator 2026-08-14.)
+        let (glyph, color) = match &card.result {
+            None => ("…", crate::theme::rgb(200, 150, 80)),
+            Some(_) if card.is_error => ("✗", crate::theme::DANGER),
+            Some(_) => ("✓", crate::theme::OK),
+        };
+        egui::CollapsingHeader::new(
+            egui::RichText::new(format!("{glyph} {}", human_tool_name(&card.name)))
+                .monospace()
+                .color(color),
+        )
+        .id_salt(format!("tool_{}_{}", card.id, card.name))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(&card.name).monospace().small().weak());
+            ui.label(egui::RichText::new(&card.args).monospace().small());
+            if let Some(result) = &card.result {
+                ui.separator();
+                ui.label(egui::RichText::new(result).monospace().small());
+            }
+        });
     }
 }
 

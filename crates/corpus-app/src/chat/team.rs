@@ -35,6 +35,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "corpus_stats",
     "corpus_list",
     "corpus_read",
+    "model_list",
 ];
 
 /// Mutating-but-not-destructive admin tools: approval-gated FOR NOW (the
@@ -120,6 +121,7 @@ pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "corpus_list",
     "corpus_read",
     "corpus_wipe",
+    "model_list",
 ];
 
 /// A role in the management-chat team.
@@ -150,6 +152,9 @@ impl TeamRole {
                 "agent_new",
                 "agent_save",
                 "agent_clone",
+                // Model discovery: an edited config's model ids must resolve
+                // against the real opencode catalog, never be guessed.
+                "model_list",
             ],
             TeamRole::ProjectManager => &[
                 "project_list",

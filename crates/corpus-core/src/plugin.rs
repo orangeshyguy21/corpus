@@ -338,7 +338,22 @@ impl Plugin {
     /// `sources`: the pinned source corpus mounted read-only into the
     /// sandbox at /opt/src/<name>.
     pub fn sources(&mut self) -> Result<Vec<SourceInfo>, Error> {
-        let value = self.call("sources", None)?;
+        self.sources_with_sources(None)
+    }
+
+    /// `sources` carrying the mission's resolved source pins (`repo ->
+    /// sha`), same contract as [`Self::sandbox_exec_with_sources`]: the
+    /// plugin answers with the mounts the mission's sandbox actually gets,
+    /// not its default pins.
+    pub fn sources_with_sources(
+        &mut self,
+        sources: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<Vec<SourceInfo>, Error> {
+        let mut params = serde_json::json!({});
+        if let Some(sources) = sources {
+            params["sources"] = Value::Object(sources.clone());
+        }
+        let value = self.call("sources", Some(params))?;
         Ok(serde_json::from_value(value)?)
     }
 

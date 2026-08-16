@@ -137,6 +137,21 @@ impl Sidebar {
         let selected = state.effective_project();
         let projects = state.projects.clone();
         let trees = state.trees.clone();
+        // A live agent dot pulses: keep the repaint stream alive only while
+        // something is actually running (50 ms — visible pulse, near-idle
+        // cost; the run view itself animates at a far higher rate anyway).
+        let any_running = selected
+            .as_deref()
+            .and_then(|p| trees.get(p))
+            .is_some_and(|tree| {
+                let project = selected.as_deref().unwrap_or_default();
+                tree.agents
+                    .iter()
+                    .any(|(slug, _)| state.agent_running(project, slug))
+            });
+        if any_running {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
         for (slug, project) in &projects {
             let open = selected.as_deref() == Some(slug.as_str());
             self.project_row(ui, state, toasts, slug, project, open);
@@ -263,8 +278,13 @@ impl Sidebar {
         let on_screen = project_selected && state.current_screen == Screen::Agents;
         for (slug, agent) in &tree.agents {
             let is_sel = on_screen && state.selected_agent.as_deref() == Some(slug.as_str());
+            let running = state.agent_running(project, slug);
             let Row { ui: mut rui, click, .. } = row_ui(ui, is_sel, false, (project, slug));
-            rui.add_space(24.0);
+            // Status dot inside the 24px tree indent: label x is unchanged.
+            rui.add_space(12.0);
+            let (dot_rect, _) =
+                rui.allocate_exact_size(egui::vec2(12.0, ROW_H), egui::Sense::hover());
+            status_dot(&rui, dot_rect, running);
             let label = rui.add(
                 egui::Label::new(RichText::new(slug.clone()).size(13.5).color(theme::TEXT))
                     .sense(egui::Sense::click())
@@ -277,7 +297,8 @@ impl Sidebar {
                 state.selected_agent = Some(slug.clone());
                 state.current_screen = Screen::Agents;
             }
-            click.on_hover_text(format!("{project} · {}", &agent.meta.name));
+            let status = if running { "running" } else { "idle" };
+            click.on_hover_text(format!("{project} · {} · {status}", agent.meta.name));
         }
         if tree.agents.is_empty() {
             row_hint(ui, 24.0, "no agents — press +");
@@ -711,6 +732,26 @@ fn row_ui(ui: &mut Ui, selected: bool, has_kebab: bool, id_seed: impl std::hash:
     // neighbouring row (defect 1c).
     child.set_clip_rect(rect);
     Row { ui: child, rect, click, hovered }
+}
+
+/// An agent row's status dot: idle = a steady faint dot; running (one of
+/// its missions has a live session) = an OK-green dot with a soft pulsing
+/// halo. The pulse is pure paint off the repaint clock — no widget, no
+/// state (the caller requests a 50 ms repaint while any dot is live).
+fn status_dot(ui: &Ui, rect: egui::Rect, running: bool) {
+    let center = rect.center();
+    if running {
+        // Smooth ease-in-out pulse at ~1.4 Hz (two full breaths).
+        let t = ui.ctx().input(|i| i.time) as f32;
+        let pulse = ((t * std::f32::consts::TAU * 1.4).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+        let halo_r = 3.0 + 4.0 * pulse;
+        let core_r = 2.2 + 0.6 * (pulse - 0.5).abs() * -2.0; // slimmer at the extremes
+        let halo = theme::OK.gamma_multiply(0.10 + 0.20 * pulse);
+        ui.painter().circle_filled(center, halo_r, halo);
+        ui.painter().circle_filled(center, core_r, theme::OK);
+    } else {
+        ui.painter().circle_filled(center, 2.2, theme::TEXT_FAINT);
+    }
 }
 
 /// A dim hint row (empty-list / placeholder), matching the row padding.

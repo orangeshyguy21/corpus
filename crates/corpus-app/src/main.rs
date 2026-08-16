@@ -60,10 +60,18 @@ struct App {
     /// Last operator-position context pushed to the chat backend (re-pushed
     /// only on change).
     last_chat_context: String,
-    /// The chat panel's current width (drag-settable, clamped 280..=half). A
-    /// panel width in app state, so the divider is sticky and never persisted
-    /// as pathologically wide by egui's own memory.
+    /// The chat panel's width in app state (280..=half window). The app
+    /// owns panel widths outright — panels render at `exact_width` and a
+    /// custom drag divider moves them; egui's native resize is OFF (its
+    /// PanelState/content feedback loop jittered and fought the drag).
     chat_width: f32,
+    /// The sidebar's width (160..=~45% window), same app-owned mechanics.
+    sidebar_width: f32,
+    /// A live divider drag's press anchor (panel, starting width, starting
+    /// pointer x). Anchored math means the width is RECOMPUTED from the
+    /// anchor each frame — it can't accumulate error, fight content width,
+    /// or drift at the clamps.
+    divider_drag: Option<DividerDrag>,
 }
 
 impl App {
@@ -84,17 +92,46 @@ impl App {
             chat_model: String::new(),
             last_chat_context: String::new(),
             chat_width: 360.0,
+            sidebar_width: 200.0,
+            divider_drag: None,
             state,
         }
     }
 }
 
+/// Which side panel a divider drag is moving.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+enum Divider {
+    Sidebar,
+    Chat,
+}
+
+/// The live drag anchor: where the press started and what width the panel
+/// had then. Recomputed-from per frame — accumulation can never jitter.
+#[derive(Clone, Copy)]
+struct DividerDrag {
+    target: Divider,
+    start_width: f32,
+    start_x: f32,
+}
+
+/// The width an anchored divider drag yields: `start_width` plus the
+/// pointer displacement in the panel's widening direction, clamped. Pure
+/// so the drag contract is unit-tested (drags must track the pointer
+/// exactly and stop dead at the clamps — never fight, never drift).
+fn dragged_width(target: Divider, drag: DividerDrag, pointer_x: f32, min: f32, max: f32) -> f32 {
+    let dx = pointer_x - drag.start_x;
+    let delta = match target {
+        Divider::Sidebar => dx,   // a left panel widens as you pull right
+        Divider::Chat => -dx,     // a right panel widens as you pull left
+    };
+    (drag.start_width + delta).clamp(min, max)
+}
+
 impl eframe::App for App {
-    /// Don't persist egui's GUI memory (window positions AND **panel widths**)
-    /// to disk. Persisted `PanelState` was restoring the chat panel's once-dragged
-    /// full width on every launch, so it "slid across the whole window" and
-    /// resisted being dragged back. We reset to a sane default each start; any
-    /// signed layout resets first frame.
+    /// Don't persist egui's GUI memory (window positions) to disk. Panel
+    /// widths are app-owned now (see `chat_width`), so egui memory has
+    /// nothing pathological left to restore.
     fn persist_egui_memory(&self) -> bool {
         false
     }
@@ -103,6 +140,10 @@ impl eframe::App for App {
         // Keep the selected project's scoped caches loaded (only hits disk
         // when the selection changed).
         self.state.ensure_selection();
+        // Keep the sidebar's agent status dots honest: poll tmux on a
+        // throttle when a live session can exist (never per frame).
+        self.state.poll_live_sessions();
+        self.clamp_panel_widths(ctx);
         // Screen-change hooks.
         if self.state.current_screen != self.last_screen {
             self.last_screen = self.state.current_screen;
@@ -117,10 +158,12 @@ impl eframe::App for App {
             }
         }
         self.top_bar(ctx);
-        self.sidebar_panel(ctx);
-        if self.state.chat_open {
-            self.chat_panel(ctx);
-        }
+        let sidebar_rect = self.sidebar_panel(ctx);
+        let chat_rect = if self.state.chat_open {
+            Some(self.chat_panel(ctx))
+        } else {
+            None
+        };
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(theme::BG))
             .show(ctx, |ui| {
@@ -144,6 +187,17 @@ impl eframe::App for App {
                 }
             }
         });
+
+        // Drag dividers LAST: the grab zone paints/interacts over the edge
+        // band, so it must come after the panels whose borders it straddles.
+        if let Some(w) = self.drag_divider(ctx, Divider::Sidebar, sidebar_rect) {
+            self.sidebar_width = w;
+        }
+        if let Some(rect) = chat_rect {
+            if let Some(w) = self.drag_divider(ctx, Divider::Chat, rect) {
+                self.chat_width = w;
+            }
+        }
 
         // Toast overlay (top-right of the whole window).
         self.toasts.show(ctx);
@@ -353,12 +407,13 @@ impl App {
     /// (Projects / Agents / Missions) with `+` create flows, the selected
     /// project's dots-three-vertical menu, and the bottom corpus summary.
     /// Rendered by the `sidebar` module; this wrapper only owns the panel
-    /// chrome.
-    fn sidebar_panel(&mut self, ctx: &egui::Context) {
+    /// chrome. The width is APP-OWNED (`exact_width`): egui's native
+    /// resize is off — the drag divider is the only mover (native resize
+    /// fed its content width back into PanelState — the jitter source).
+    fn sidebar_panel(&mut self, ctx: &egui::Context) -> egui::Rect {
         egui::SidePanel::left("sidebar_nav")
-            .resizable(true)
-            .default_width(200.0)
-            .min_width(160.0)
+            .resizable(false)
+            .exact_width(self.sidebar_width)
             .frame(
                 egui::Frame::default()
                     .fill(theme::BG)
@@ -366,7 +421,9 @@ impl App {
             )
             .show(ctx, |ui| {
                 self.sidebar.show(ui, &mut self.state, &mut self.toasts);
-            });
+            })
+            .response
+            .rect
     }
 
     /// The management chat panel (dev/decisions.md chunk 3, native egui):
@@ -376,20 +433,17 @@ impl App {
     /// driven by corpus-core's `ollama_models()` (the GDK chat talks to
     /// Ollama DIRECTLY, never opencode's catalog); it lives in
     /// `chat::panel::ChatPanelView`.
-    fn chat_panel(&mut self, ctx: &egui::Context) {
-        // Width policy: default ~360px, min 280px. The max clamp keeps the panel
-        // from ever being forced wider than half the window. `show` returns the
-        // panel's actual width, which we clamp and feed back as the default so
-        // dragging STICKS (and stays clamped) across frames. Disk-persistence of
-        // panel width is off (persist_egui_memory=false) so a once-dragged-wide
-        // panel cannot be restored on the next launch.
-        let half = ctx.screen_rect().width() * 0.5;
-        let max = half.max(360.0);
-        let inner = egui::SidePanel::right("chat_panel_v2")
-            .resizable(true)
-            .default_width(self.chat_width)
-            .min_width(280.0)
-            .max_width(max)
+    ///
+    /// Width policy: default 360, min 280, max half the window — but
+    /// APP-OWNED. The panel renders at `exact_width` and the custom drag
+    /// divider is the only mover. egui's native resize (its persisted
+    /// PanelState + content-width feedback) was the jitter / "slides
+    /// across the window" / "doesn't hold" bug history; it's off, and the
+    /// divider's anchored math can't accumulate error (see `drag_divider`).
+    fn chat_panel(&mut self, ctx: &egui::Context) -> egui::Rect {
+        egui::SidePanel::right("chat_panel_v2")
+            .resizable(false)
+            .exact_width(self.chat_width.max(280.0))
             .frame(
                 egui::Frame::default()
                     .fill(theme::BG)
@@ -436,9 +490,9 @@ impl App {
                     self.last_chat_context = ctx;
                 }
                 self.chat_panel.show(ui, &mut self.chat);
-            });
-        // Persist the (clamped) dragged width so the divider sticks.
-        self.chat_width = inner.response.rect.width().clamp(280.0, max);
+            })
+            .response
+            .rect
     }
 
     /// The role + model the current chat backend was launched with; a change
@@ -469,6 +523,96 @@ impl App {
         self.chat_role = role;
         self.chat_model = model.clone();
         self.chat = chat::ChatHandle::start_scoped(&project, &model, role);
+    }
+
+    /// Keep the app-owned panel widths inside their live bounds (the
+    /// window can have resized since a drag set them).
+    fn clamp_panel_widths(&mut self, ctx: &egui::Context) {
+        let half = ctx.screen_rect().width() * 0.5;
+        self.sidebar_width = self.sidebar_width.clamp(160.0, (half * 0.9).max(220.0));
+        self.chat_width = self.chat_width.clamp(280.0, half.max(360.0));
+    }
+
+    /// The drag handle for one panel edge: a 9px strip centered on the
+    /// panel edge (the 1px hairline plus 4px of grab on each side). Its
+    /// drag is ANCHORED: at press we remember the width + pointer x, and
+    /// each frame's width derives from THAT anchor and the live pointer —
+    /// never from the previous frame's width. That's what kills the
+    /// jitter/drift of the native egui resize (which integrated from a
+    /// content-union PanelState rect that fed back on itself). While the
+    /// drag is live we take over the cursor so the strip reads as one
+    /// held thing even when the pointer strays off the 9px band.
+    fn drag_divider(
+        &mut self,
+        ctx: &egui::Context,
+        panel: Divider,
+        panel_rect: egui::Rect,
+    ) -> Option<f32> {
+        let (min, max) = match panel {
+            Divider::Sidebar => (160.0, (ctx.screen_rect().width() * 0.45).max(220.0)),
+            Divider::Chat => (280.0, (ctx.screen_rect().width() * 0.5).max(360.0)),
+        };
+        let current = match panel {
+            Divider::Sidebar => self.sidebar_width,
+            Divider::Chat => self.chat_width,
+        };
+        let edge_x = match panel {
+            Divider::Sidebar => panel_rect.max.x,
+            Divider::Chat => panel_rect.min.x,
+        };
+        let draw = egui::Rect::from_center_size(
+            egui::pos2(edge_x, panel_rect.center().y),
+            egui::vec2(1.0, panel_rect.height()),
+        );
+        let grab = draw.expand2(egui::vec2(4.0, 0.0));
+        // A throwaway background-layer Ui just for the handle: painting a
+        // REAL widget (not reusing a panel's ui) means its Sense hit-test
+        // and its cursor are independent of any widget the panels laid
+        // out near the edge.
+        let mut ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new(("divider", panel)),
+            egui::UiBuilder::new()
+                .max_rect(ctx.screen_rect())
+                .layer_id(egui::LayerId::background()),
+        );
+        let r = ui.allocate_rect(grab, egui::Sense::drag());
+        // The strip stays "held" look+grabbed while THIS panel's drag is
+        // live, even if the pointer strays off the 9px band.
+        let held = matches!(self.divider_drag, Some(d) if d.target == panel);
+        if r.drag_started() {
+            if let Some(p) = r.interact_pointer_pos() {
+                self.divider_drag = Some(DividerDrag {
+                    target: panel,
+                    start_width: current,
+                    start_x: p.x,
+                });
+            }
+        }
+        if !ctx.input(|i| i.pointer.primary_down()) {
+            self.divider_drag = None;
+        }
+        if held || r.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        let stroke = if r.dragged() {
+            egui::Stroke::new(1.0_f32, theme::TEXT)
+        } else if r.hovered() || held {
+            egui::Stroke::new(1.0_f32, theme::TEXT_MUTED)
+        } else {
+            egui::Stroke::new(1.0_f32, theme::HAIRLINE)
+        };
+        ui.painter().vline(edge_x, panel_rect.y_range(), stroke);
+        // Only the drag updates the width — the panel never snaps on
+        // hover or release.
+        if r.dragged() {
+            if let (Some(d), Some(p)) = (self.divider_drag, r.interact_pointer_pos()) {
+                if d.target == panel {
+                    return Some(dragged_width(panel, d, p.x, min, max));
+                }
+            }
+        }
+        None
     }
 
     /// The operator-position context juiced into chat turns: where the
@@ -520,6 +664,34 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drag(width: f32, x: f32) -> DividerDrag {
+        DividerDrag { target: Divider::Sidebar, start_width: width, start_x: x }
+    }
+
+    #[test]
+    fn anchored_drag_tracks_the_pointer_and_clamps_at_both_ends() {
+        let d = drag(200.0, 100.0);
+        let chat = drag(300.0, 100.0);
+        // Sidebar (left panel): pull right = widen.
+        assert_eq!(dragged_width(Divider::Sidebar, d, 130.0, 160.0, 480.0), 230.0);
+        // Chat (right panel): pull LEFT = widen (opposite sign).
+        assert_eq!(dragged_width(Divider::Chat, chat, 70.0, 280.0, 520.0), 330.0);
+        // Clamps hold while the pointer keeps travelling past them —
+        // anchored (not integrated), so a long overrun never "sticks".
+        assert_eq!(dragged_width(Divider::Sidebar, d, 5000.0, 160.0, 480.0), 480.0);
+        assert_eq!(dragged_width(Divider::Chat, chat, -5000.0, 280.0, 520.0), 520.0);
+        assert_eq!(dragged_width(Divider::Sidebar, d, -5000.0, 160.0, 480.0), 160.0);
+        // ...and releasing the clamp returns the width to the pointer with
+        // no accumulated error (the jitter-killer).
+        assert_eq!(dragged_width(Divider::Sidebar, d, 110.0, 160.0, 480.0), 210.0);
+        assert_eq!(dragged_width(Divider::Chat, chat, 110.0, 280.0, 520.0), 290.0);
+    }
 }
 
 /// Decode `assets/logo-icon.png` into the RGBA [`egui::IconData`] eframe

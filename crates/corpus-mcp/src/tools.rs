@@ -278,7 +278,8 @@ fn require_u64(args: &Value, key: &str) -> Result<u64> {
 fn target_info(ctx: &mut Ctx) -> Result<String> {
     let targets = resilient(ctx, |p| p.targets())?;
     let tools = resilient(ctx, |p| p.tools())?;
-    let sources = resilient(ctx, |p| p.sources())?;
+    let pins = ctx.source_pins.clone();
+    let sources = resilient(ctx, |p| p.sources_with_sources(pins.as_ref()))?;
     Ok(serde_json::to_string_pretty(&json!({
         "targets": targets,
         "scope": "ONLY these URLs may be attacked; the sandbox cannot reach anything else",

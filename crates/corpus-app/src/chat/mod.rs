@@ -22,6 +22,10 @@
 //! term (project-scoped id + transcript path) — never goose's own session name.
 
 pub mod panel;
+// GFM table splitting + rendering for assistant bubbles (2026-08-16:
+// egui_commonmark 0.20's own tables are borderless striped Grids whose ids
+// clash across messages, painting "🔥 ID clash" errors into the log).
+pub mod tables;
 
 mod embedded;
 pub mod team;
