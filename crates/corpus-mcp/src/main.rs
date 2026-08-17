@@ -111,7 +111,9 @@ fn handle_call(ctx: &mut Ctx, id: Value, request: &Value, admin: bool) -> Value 
             "id": id,
             "result": { "content": [{ "type": "text", "text": text }] }
         }),
-        Err(Error::Args(message)) => json!({
+        // `Refused` renders exactly like the `Args` refusals it replaced —
+        // its `gate` is for the refusal log and never reaches the wire.
+        Err(Error::Args(message)) | Err(Error::Refused { message, .. }) => json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": {

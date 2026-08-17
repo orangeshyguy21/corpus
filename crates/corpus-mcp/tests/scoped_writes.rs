@@ -195,7 +195,7 @@ fn target_info_reports_mission_pins_not_defaults() {
     let out = tools::dispatch(&mut ctx, "target_info", &json!({})).expect("target_info");
     assert!(
         out.contains("cccccccccccccccccccccccccccccccccccccccc"),
-        "mission pin must appear in sources_in_sandbox: {out}"
+        "mission pin must appear in the reported sources: {out}"
     );
     assert!(
         !out.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -209,6 +209,55 @@ fn target_info_reports_mission_pins_not_defaults() {
         out.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         "unpinned run reports the plugin default: {out}"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The namespace split that cost a run. The pinned trees exist in two
+/// places — `sources/<name>/<sha>` in the run cwd, and `/opt/src/<name>`
+/// inside the container — and each is reachable only by its own tool.
+/// `target_info` used to report the SANDBOX path to every role and assert
+/// "you have no host filesystem", which is false for all of them and
+/// useless to a researcher, whose two tools do not include `sandbox_exec`.
+/// One agent believed it, spent a run being denied by opencode for reading
+/// a path absent from the machine, and concluded the harness was lying to
+/// it rather than that it held the wrong path. It was right.
+#[test]
+fn source_paths_are_reported_per_role_not_per_sandbox() {
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let TestRig { mut ctx, root, .. } = rig("source-paths");
+
+    // A researcher cannot enter the sandbox, so the mount is not a path it
+    // can act on and naming it is the whole bug.
+    ctx.role = Ok(corpus_core::AgentRole::Researcher);
+    let out = tools::dispatch(&mut ctx, "target_info", &json!({})).expect("target_info");
+    assert!(
+        out.contains(&format!("sources/cdk/{SHA}")),
+        "a researcher must be told the path it can actually read: {out}"
+    );
+    assert!(
+        !out.contains("/opt/src"),
+        "the sandbox mount is unreachable for this role and must not be named: {out}"
+    );
+    assert!(
+        !out.contains("no host filesystem"),
+        "its working directory IS a host directory: {out}"
+    );
+
+    // A tester or super holds `sandbox_exec`, so BOTH are true — and each
+    // is labelled with the tool it belongs to rather than left to be
+    // guessed at.
+    for role in [corpus_core::AgentRole::Tester, corpus_core::AgentRole::Super] {
+        ctx.role = Ok(role);
+        let out = tools::dispatch(&mut ctx, "target_info", &json!({})).expect("target_info");
+        assert!(
+            out.contains(&format!("sources/cdk/{SHA}")),
+            "{role:?} reads on the host too: {out}"
+        );
+        assert!(
+            out.contains("path_inside_sandbox_exec") && out.contains("/opt/src/cdk"),
+            "{role:?} can enter the sandbox, where the mount is the right path: {out}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 

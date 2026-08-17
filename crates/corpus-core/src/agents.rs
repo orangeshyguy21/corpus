@@ -58,9 +58,16 @@ use crate::store::{now_epoch, validate_slug, Store};
 /// TRUST BOUNDARY: this is enforceable only for agents WITHOUT a host
 /// shell. An agent holding `bash: allow` can re-exec corpus-mcp with a
 /// forged identity, or edit the sidecar through the `store` symlink that
-/// `provision_run_dir` creates. `role_grants_shell` refuses that pairing
-/// so the contradiction is caught at save time rather than believed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+/// `provision_run_dir` creates. `bind_permission` force-denies `bash` for
+/// any role that [`AgentRole::shell_would_defeat_gate`] flags, so a stored
+/// grant cannot survive into the rendered artifact.
+///
+/// Deliberately NOT `Ord`. The three roles below form a chain
+/// (researcher ⊆ tester ⊆ super) over the corpus-tool sets, and a derived
+/// ordering encoded that chain as declaration position — which quietly
+/// stops being true the moment a role's grants live in a different
+/// namespace. [`AgentRole::cap_under`] spells the relation out instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentRole {
     /// Reads and curates; never executes. The contamination-sensitive
@@ -74,6 +81,18 @@ pub enum AgentRole {
     Tester,
     /// Everything: research and penetration both.
     Super,
+    /// Manages the PROJECT rather than the target: creates and edits the
+    /// project's other agents, sets their roles, writes mission records,
+    /// curates the corpus. Holds ZERO sandbox tools and no open internet —
+    /// its whole grant set lives in a different namespace
+    /// ([`AgentRole::admin_tools`]), which is why it is incomparable to the
+    /// three above rather than above or below them.
+    ///
+    /// Declared LAST on purpose: [`AgentRole::ALL`] feeds `infer_role`'s
+    /// first-match search, and a role granting no corpus tools satisfies an
+    /// empty requirement — placed earlier it would relabel every legacy
+    /// agent the moment anyone ran `migrate-roles`.
+    Curator,
 }
 
 /// The sandbox tool catalog, as the permission-block keys spell them
@@ -95,15 +114,56 @@ pub const CORPUS_TOOLS: [&str; 8] = [
 /// Everything else is execution or publication.
 const RESEARCHER_TOOLS: [&str; 2] = ["corpus_target_info", "corpus_technique_save"];
 
+/// The project-management tool catalog, as MCP names (the rendered
+/// permission keys are `corpus_` + these, because the run config names the
+/// server `corpus`).
+///
+/// A SEPARATE namespace from [`CORPUS_TOOLS`], not a superset of it: these
+/// mutate the project's own configuration rather than acting on a target,
+/// so no role holds both. The list is the `corpus-mcp --admin` catalog
+/// minus everything a project-scoped server cannot honestly serve:
+///
+/// - `project_list/new/clone/delete/rebind` and `agent_copy` name a project
+///   by a key other than `project`, so scope injection cannot reach them;
+/// - `corpus_wipe` destroys research output wholesale — an operator act.
+pub const CURATOR_TOOLS: [&str; 23] = [
+    "agent_list",
+    "agent_get",
+    "agent_new",
+    "agent_save",
+    "agent_clone",
+    "agent_set",
+    "agent_set_role",
+    "agent_set_permission",
+    "agent_subagent_add",
+    "agent_subagent_remove",
+    "agent_delete",
+    "mission_list",
+    "mission_get",
+    "mission_new",
+    "mission_delete",
+    "mission_set_budget",
+    "mission_set_pins",
+    "corpus_stats",
+    "corpus_list",
+    "corpus_read",
+    "entry_delete",
+    "entry_move",
+    "model_list",
+];
+
 impl AgentRole {
     /// Parse a role name (config, CLI flag, sidecar).
+    ///
+    /// Derived from [`AgentRole::as_str`], which is exhaustive, rather than
+    /// written as its own `match` with a `_ => None` arm. That arm meant a
+    /// new variant compiled fine and was then silently unparseable at every
+    /// entry point — `--role`, the MCP schemas, the sidecar — with nothing
+    /// but one round-trip assertion standing between that and a role nobody
+    /// could actually select.
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "researcher" => Some(Self::Researcher),
-            "tester" => Some(Self::Tester),
-            "super" => Some(Self::Super),
-            _ => None,
-        }
+        let key = raw.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|role| role.as_str() == key)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -111,11 +171,24 @@ impl AgentRole {
             Self::Researcher => "researcher",
             Self::Tester => "tester",
             Self::Super => "super",
+            Self::Curator => "curator",
         }
     }
 
+    /// The role names, for a usage line: `researcher|tester|super`. Derived
+    /// so a new variant reaches every CLI help string and error message
+    /// without ten separate edits.
+    pub fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(|role| role.as_str())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
     /// Every role, for UI pickers and exhaustiveness tests.
-    pub const ALL: [Self; 3] = [Self::Researcher, Self::Tester, Self::Super];
+    pub const ALL: [Self; 4] =
+        [Self::Researcher, Self::Tester, Self::Super, Self::Curator];
 
     /// The starting prompt for a new agent of this role.
     ///
@@ -134,6 +207,7 @@ impl AgentRole {
             Self::Researcher => include_str!("prompts/researcher.md"),
             Self::Tester => include_str!("prompts/tester.md"),
             Self::Super => include_str!("prompts/super.md"),
+            Self::Curator => include_str!("prompts/curator.md"),
         }
     }
 
@@ -150,6 +224,10 @@ impl AgentRole {
             }
             Self::Super => {
                 "Research and penetration both: the open internet and the sandbox in one agent."
+            }
+            Self::Curator => {
+                "Manages this project: its agents, their roles, its missions and its corpus. \
+                 Runs no missions itself."
             }
         }
     }
@@ -168,6 +246,10 @@ impl AgentRole {
                  No open internet, so an execution turn cannot pull in untrusted text."
             }
             Self::Super => "everything: research and penetration both.",
+            Self::Curator => {
+                "manages the project's agents, missions and corpus through the corpus server. \
+                 No sandbox, no open internet \u{2014} it builds the team rather than joining it."
+            }
         }
     }
 
@@ -182,6 +264,19 @@ impl AgentRole {
             // opencode-enforced (see `grants_web`). The server-enforced
             // boundary is researcher-vs-rest.
             Self::Tester | Self::Super => &CORPUS_TOOLS,
+            // Not a narrower research role \u{2014} a different job. Its grants
+            // are in `admin_tools`.
+            Self::Curator => &[],
+        }
+    }
+
+    /// The project-management tools this role may call. Kept apart from
+    /// [`AgentRole::tools`] because the two catalogs are disjoint: one acts
+    /// on the target, the other on the project's own configuration.
+    pub fn admin_tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Curator => &CURATOR_TOOLS,
+            Self::Researcher | Self::Tester | Self::Super => &[],
         }
     }
 
@@ -208,6 +303,45 @@ impl AgentRole {
     /// forge the identity the server trusts.
     pub fn shell_would_defeat_gate(self) -> bool {
         self.tools().len() < CORPUS_TOOLS.len()
+    }
+
+    /// The role a SUBAGENT entry may render under, given the ceiling the
+    /// server will enforce for the whole session — the primary's, because
+    /// corpus-mcp resolves exactly one role per session from
+    /// `CORPUS_OPENCODE_AGENT`, and that names the primary.
+    ///
+    /// Deliberately not a `min` over a derived ordering. Researcher ⊆
+    /// Tester ⊆ Super holds over the corpus-tool sets, so it is written out
+    /// here as three arms; the moment a role's grants live in a different
+    /// namespace, "which is smaller" stops having an answer and a derived
+    /// `Ord` would return whichever variant happened to be declared first —
+    /// a number, not a decision.
+    pub fn cap_under(self, primary: Self) -> Self {
+        match (primary, self) {
+            (a, b) if a == b => a,
+            // The two incomparable cases come FIRST — the chain arms below
+            // are catch-alls over `sub`, and would otherwise answer
+            // (super, curator) with "curator", handing a research session a
+            // subagent advertising management tools.
+            //
+            // A curator's session is curated end to end: the server resolves
+            // ONE role per session and takes it from the primary, so a
+            // subagent rendered as a researcher would carry
+            // `corpus_target_info: allow` into a session whose server
+            // refuses that tool.
+            (Self::Curator, _) => Self::Curator,
+            // The mirror image. The two grant sets do not intersect, so
+            // there is nothing to inherit and it collapses to the safest
+            // role rather than to the parent's.
+            (_, Self::Curator) => Self::Researcher,
+            // Super carries every ceiling, so a subagent keeps its own.
+            (Self::Super, sub) => sub,
+            // A tester's session cannot serve a wider ceiling than its own.
+            (Self::Tester, Self::Super) => Self::Tester,
+            (Self::Tester, sub) => sub,
+            // The narrowest primary caps everything to itself.
+            (Self::Researcher, _) => Self::Researcher,
+        }
     }
 }
 
@@ -272,6 +406,19 @@ pub struct AgentSidecar {
     /// enforced by opencode, never by the server.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub subagent_roles: std::collections::BTreeMap<String, AgentRole>,
+    /// When this agent was last changed, and by whom
+    /// (`curator:<slug>` / `operator`).
+    ///
+    /// `None` means NEVER RECORDED — a sidecar written before provenance
+    /// existed — and is deliberately distinguishable from an explicit
+    /// `modified_by: operator`, the same way `role: None` is
+    /// distinguishable from an explicit researcher. An agent that a curator
+    /// built should be readable as such from its own sidecar, without
+    /// consulting the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_by: Option<String>,
 }
 
 impl AgentSidecar {
@@ -359,7 +506,7 @@ impl Store {
         // `DEFAULT_AGENT_NAME` placeholder; keeping it out of here means a
         // core-created agent renders under its slug, not a shared placeholder
         // handle, and the render/role tests stay independent of UI defaults.
-        write_sidecar(&dir, slug, None, role, Default::default())?;
+        write_sidecar(&dir, slug, None, role, Default::default(), self.actor())?;
         Ok(())
     }
 
@@ -491,7 +638,7 @@ impl Store {
         });
         validate_agent_doc(&doc, &dir).map_err(|e| Error::Store(format!("agent {slug}: {e}")))?;
         fs::write(dir.join("opencode.json"), serde_json::to_string_pretty(&doc)?)?;
-        write_sidecar(&dir, slug, from, role, Default::default())?;
+        write_sidecar(&dir, slug, from, role, Default::default(), self.actor())?;
         Ok(())
     }
 
@@ -543,7 +690,14 @@ impl Store {
         // — and silently downgrading would break "copy this agent" in a way
         // that only shows up as a refused tool mid-mission.
         let src_meta = read_sidecar(&source, from);
-        write_sidecar(&dest, to, Some(from), src_meta.role(), src_meta.subagent_roles)?;
+        write_sidecar(
+            &dest,
+            to,
+            Some(from),
+            src_meta.role(),
+            src_meta.subagent_roles,
+            self.actor(),
+        )?;
         Ok(())
     }
 
@@ -760,7 +914,7 @@ impl Store {
         )?;
         let mut meta = read_sidecar(&dir, slug);
         if meta.subagent_roles.remove(name).is_some() {
-            fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&meta)?)?;
+            self.stamp_and_write_sidecar(&dir, &mut meta)?;
         }
         Ok(())
     }
@@ -823,6 +977,7 @@ impl Store {
             Some(&format!("{from_project}/{from}")),
             src_meta.role(),
             src_meta.subagent_roles,
+            self.actor(),
         )?;
         Ok(())
     }
@@ -843,7 +998,7 @@ impl Store {
         } else {
             name.to_string()
         };
-        fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&meta)?)?;
+        self.stamp_and_write_sidecar(&dir, &mut meta)?;
         Ok(())
     }
 
@@ -856,7 +1011,7 @@ impl Store {
         }
         let mut meta = read_sidecar(&dir, slug);
         meta.role = Some(role);
-        fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&meta)?)?;
+        self.stamp_and_write_sidecar(&dir, &mut meta)?;
         Ok(())
     }
 
@@ -883,8 +1038,24 @@ impl Store {
         }
         let dir = self.project_agent_dir(project, slug);
         let mut meta = read_sidecar(&dir, slug);
+        // A curator and a research role cannot share a session. The server
+        // resolves ONE role per run, from the primary, so the pairing would
+        // render an entry advertising tools its own session refuses.
+        // `cap_under` already collapses it at render time; refusing here
+        // means the operator finds out now instead of wondering why a
+        // subagent lost its grants at launch.
+        let primary = meta.role();
+        if (primary == AgentRole::Curator) != (role == AgentRole::Curator) {
+            return Err(Error::Store(format!(
+                "agent {project}/{slug} is a {} and cannot hold a {} subagent — one role is \
+                 enforced per session, taken from the primary, so this would render as {}",
+                primary.as_str(),
+                role.as_str(),
+                role.cap_under(primary).as_str()
+            )));
+        }
         meta.subagent_roles.insert(subagent.to_string(), role);
-        fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&meta)?)?;
+        self.stamp_and_write_sidecar(&dir, &mut meta)?;
         Ok(())
     }
 
@@ -1012,19 +1183,17 @@ impl Store {
     /// Render EVERY agent of the project into `.opencode/agent/*.md` (bare
     /// names) — after clearing the previous generated set, so the agent
     /// list opencode shows is scoped to this project. Agents render in
-    /// slug order. `pinned` names the launch's source pins (repos the
-    /// mission pinned, with their rev + resolved sha) — rendered as the
-    /// "Pinned sources" footer; an empty slice renders none (the plugin's
-    /// defaults then apply). Returns the written paths.
+    /// slug order. Returns the written paths.
+    ///
+    /// Takes no source pins: they are a property of the RUN and reach the
+    /// agent through `target_info`, so this render is a pure function of
+    /// the project and produces identical bytes on every launch. That is
+    /// what makes re-rendering safe while another mission is live.
     ///
     /// Validation runs BEFORE the clear, so a refused render leaves the
     /// previously rendered set on disk rather than half-scoping the
     /// project.
-    pub fn render_project_agents(
-        &self,
-        project: &str,
-        pinned: &[SourcePin],
-    ) -> Result<Vec<PathBuf>> {
+    pub fn render_project_agents(&self, project: &str) -> Result<Vec<PathBuf>> {
         let agents = self.list_agents(project)?;
         let claimed = claim_entries(&agents, project)?;
         check_delegation_closure(&agents, &claimed, project)?;
@@ -1048,7 +1217,6 @@ impl Store {
                     .ok_or_else(|| Error::Store(format!("agent {slug}/{name}: not an object")))?;
                 let ctx = RenderCtx {
                     project,
-                    pinned,
                     role: entry_role(&agent.meta, name, slug),
                     known_entries: &known,
                     roots: roots.clone(),
@@ -1068,15 +1236,8 @@ impl Store {
     /// ADDITIVE (no clear): used to layer a follow-up agent (the CLI
     /// `--research` pass) onto an already project-scoped set. Launch paths
     /// scope the set with [`Store::render_project_agents`] instead.
-    /// `pinned` renders the Pinned-sources footer (see
-    /// [`Store::render_project_agents`]); pass an empty slice for none.
     /// Returns the written paths.
-    pub fn render_agent(
-        &self,
-        project: &str,
-        slug: &str,
-        pinned: &[SourcePin],
-    ) -> Result<Vec<PathBuf>> {
+    pub fn render_agent(&self, project: &str, slug: &str) -> Result<Vec<PathBuf>> {
         let agent = self.load_agent(project, slug)?;
         // Delegation is checked against the WHOLE project: this path layers
         // one agent onto an already project-scoped set, so the set it joins
@@ -1104,7 +1265,6 @@ impl Store {
                 .ok_or_else(|| Error::Store(format!("agent {slug}/{name}: not an object")))?;
             let ctx = RenderCtx {
                 project,
-                pinned,
                 role: entry_role(&agent.meta, name, slug),
                 known_entries: &known,
                 roots: roots.clone(),
@@ -1280,7 +1440,7 @@ fn entry_role(meta: &AgentSidecar, entry: &str, slug: &str) -> AgentRole {
         return meta.role();
     }
     match meta.subagent_roles.get(entry) {
-        Some(sub) => (*sub).min(meta.role()),
+        Some(sub) => sub.cap_under(meta.role()),
         None => meta.role(),
     }
 }
@@ -1304,8 +1464,6 @@ pub struct SourcePin {
 struct RenderCtx<'a> {
     /// The project the rendered agent is bound to.
     project: &'a str,
-    /// The launch's source pins; empty renders no footer.
-    pinned: &'a [SourcePin],
     /// This entry's capability ceiling.
     role: AgentRole,
     /// Every entry name the project declares — the delegation universe.
@@ -1337,15 +1495,15 @@ fn render_agent_file(
     out.push_str("---\n");
     let description = cfg.get("description").and_then(|v| v.as_str()).unwrap_or("");
     out.push_str("description: ");
-    out.push_str(description);
+    out.push_str(&yaml_scalar(description));
     out.push('\n');
     let mode = cfg.get("mode").and_then(|v| v.as_str()).unwrap_or("primary");
     out.push_str("mode: ");
-    out.push_str(mode);
+    out.push_str(&yaml_scalar(mode));
     out.push('\n');
     if let Some(model) = cfg.get("model").and_then(|v| v.as_str()).filter(|m| !m.is_empty()) {
         out.push_str("model: ");
-        out.push_str(model);
+        out.push_str(&yaml_scalar(model));
         out.push('\n');
     }
     if let Some(temperature) = cfg.get("temperature").and_then(|v| v.as_f64()) {
@@ -1371,7 +1529,7 @@ fn render_agent_file(
         out.push_str(&inline_file_refs(dir, prompt)?);
     }
     out.push_str(&corpus_scope_section(ctx.project));
-    out.push_str(&pinned_sources_section(ctx.pinned));
+    out.push_str(pinned_sources_section(ctx.role));
     Ok(out)
 }
 
@@ -1392,266 +1550,436 @@ fn corpus_scope_section(project: &str) -> String {
     )
 }
 
-/// The launch-bound source-pin footer: the literal `sources/<name>/<sha>/`
-/// trees THIS run reads. Research-zone agents otherwise derive their
-/// source from `sources.toml` — the DEFAULT pin — so a mission pinned to
-/// another rev must name the trees, or the agent audits the wrong code
-/// and `sources.toml` becomes the only signal the model sees. Empty when
-/// the launch carries no pins.
-fn pinned_sources_section(pinned: &[SourcePin]) -> String {
-    if pinned.is_empty() {
-        return String::new();
+/// The source-pin instruction. CONSTANT, and that is the point.
+///
+/// This footer used to name the literal `sources/<name>/<sha>/` trees of
+/// whichever launch rendered last — a per-RUN fact written into a file the
+/// whole project shares. Two consequences, both bad: launching a second
+/// mission rewrote the trees under a live one, and keeping them apart
+/// meant a run directory per mission, duplicating opencode's
+/// `node_modules` with it.
+///
+/// The pins already travel per-run as `CORPUS_SOURCE_PINS`, which
+/// `start_tui` sets on the tmux session and `target_info` reports as an
+/// exact `sources/<name>/<sha>` path per pin. So the FILE states the rule
+/// and the TOOL states the facts — which is the same split
+/// `write_run_opencode_config` already draws between project config and
+/// run identity.
+///
+/// Rendered only for a role that can actually call `target_info`; a
+/// curator manages the project and reads no source.
+fn pinned_sources_section(role: AgentRole) -> &'static str {
+    if !role.allows("target_info") {
+        return "";
     }
-    let mut out = String::from(
-        "\n---\n\n## Pinned sources (bound at launch)\n\n\
-         This run reads these target revisions. Read the LITERAL tree\n\
-         paths below, not `sources.toml` — it records only the DEFAULT\n\
-         pin and may name a different (usually older) tree:\n",
-    );
-    for pin in pinned {
-        out.push_str(&format!(
-            "- `{}` → `{}` at `sources/{}/{}/`\n",
-            pin.name, pin.rev, pin.name, pin.sha
-        ));
+    "\n---\n\n## Pinned sources\n\n\
+     Call `target_info` before you read any source. It names the exact\n\
+     `sources/<name>/<sha>/` trees THIS run is pinned to — read those\n\
+     literal paths. Do NOT derive source paths from `sources.toml`: it\n\
+     records only the DEFAULT pin and may name a different (usually older)\n\
+     tree. Verify every claim against the pinned trees; treat anything not\n\
+     traced in them as unverified.\n"
+}
+
+/// One permission decision. Ordered by tightness, so a merge that takes
+/// the MAXIMUM moves a ceiling in the only direction a stored document is
+/// allowed to move it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Action {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl Action {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
     }
-    out.push_str(
-        "Verify every claim against the named trees; treat anything not\n\
-         traced in them as unverified.\n",
-    );
-    out
+
+    /// Read a stored value. `None` if it is not a string at all; anything
+    /// that IS a string but not one of opencode's three words reads as
+    /// `Deny` — a permission we cannot interpret is not one we can honour.
+    /// The predecessor copied such a string into the artifact verbatim and
+    /// left opencode to decide what `"maybe"` meant.
+    fn parse(value: &serde_json::Value) -> Option<Self> {
+        match value.as_str()? {
+            "allow" => Some(Self::Allow),
+            "ask" => Some(Self::Ask),
+            _ => Some(Self::Deny),
+        }
+    }
+}
+
+/// A glob rule family (`read`/`edit`/`write`/`task`): pattern -> action.
+///
+/// Sorted, because `canonical_json` sorts the block before it is written
+/// and opencode evaluates last-match-wins over that order — so a narrow
+/// rule only beats the broad one it refines when it sorts AFTER it. Every
+/// pattern injected below extends the prefix of the rule it must beat,
+/// which is what makes that hold.
+type Rules = BTreeMap<String, Action>;
+
+fn rules<const N: usize>(entries: [(&str, Action); N]) -> Rules {
+    entries
+        .into_iter()
+        .map(|(pattern, action)| (pattern.to_string(), action))
+        .collect()
+}
+
+/// The rendered permission block as a VALUE: computed once from the role
+/// and the stored document, then serialized.
+///
+/// The predecessor derived the same block by mutating a single string-keyed
+/// JSON map through nine stages. Every failure that design actually shipped
+/// was a rule that silently did not land, and each was invisible in the
+/// same way — nothing was wrong with the stage, the stage simply had
+/// nowhere to write:
+///
+/// - a scalar `read: "allow"` is not a map, so the red lines injected into
+///   `read` went into a value that discarded them;
+/// - agents built from a role carry no permission block at all, so entries
+///   whose rules were only ever DEFAULTED rendered with no path rules;
+/// - `bash` was defaulted where it meant to be forced, so a stored
+///   `"bash": "allow"` survived every render — against a module doc that
+///   had claimed the opposite since roles landed.
+///
+/// A field cannot be absent. That is the whole reason this is a struct:
+/// the compiler now asks the question each of those bugs answered wrongly.
+struct Policy {
+    read: Rules,
+    edit: Rules,
+    write: Rules,
+    /// Delegation, confined to entries the project actually declares.
+    /// `render_project_agents` already refuses a dangling name outright;
+    /// this keeps the ARTIFACT safe on any path that renders without it.
+    task: Rules,
+    bash: Action,
+    webfetch: Action,
+    websearch: Action,
+    /// Reaching outside the run dir at all. The run cwd exposes exactly
+    /// one project by construction; this is the switch deciding whether
+    /// that construction can be stepped around.
+    external_directory: Action,
+    /// The `corpus_*` switches: 8 research tools and 23 management ones,
+    /// every one written explicitly so the artifact never leans on
+    /// omission-means-allow. Three come out `corpus_corpus_*` because the
+    /// run config names the MCP server `corpus`.
+    tools: BTreeMap<String, Action>,
+    /// Keys this type does not model — opencode's own `glob`, `grep`,
+    /// `list`, and whatever a later version adds. Carried through
+    /// unchanged: the render binds and tightens, and silently dropping a
+    /// setting it fails to recognize is neither.
+    passthrough: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Bind a permission document to a concrete project AND a role at render
 /// time. The rendered artifact — not the stored JSON — is what opencode
 /// obeys, so deriving here means role and document can never contradict in
 /// the dangerous direction, however the stored block was edited.
-///
-/// Applied, in order:
-/// - `store/projects/*` rule keys become `store/projects/<project>`.
-/// - Scalar `read`/`edit`/`write` values are normalized to rule maps FIRST,
-///   so the red lines below always land (a scalar `read: "allow"` used to
-///   skip them entirely).
-/// - Trust red lines, INJECTED not trusted: `benchmarks/**` and
-///   `plugins/**` read denies, plus `store/projects/*/agents/**` edit and
-///   write denies — the agent tree holds the sidecars this whole gate
-///   trusts, and `provision_run_dir` symlinks `store` into the run cwd.
-/// - A wildcard read-allow gains the corpus boundary (own project allow,
-///   everything else deny — appended last so it wins evaluation).
-/// - `task` is always written: absent delegation becomes `{"*": "deny"}`,
-///   and an allow naming an entry the project does not declare is
-///   force-denied. Omission would otherwise inherit opencode's default and
-///   let a dangling name resolve against config discovered outside the run
-///   dir — the leak that sent one project's scout at another's corpus.
-/// - The 8 `corpus_*` keys are force-written from the ROLE with a
-///   deny-wins merge: a stored `deny` survives (hand-tightening works), a
-///   stored `allow` beyond the role becomes `deny`.
 fn bind_permission(permission: &serde_json::Value, ctx: &RenderCtx<'_>) -> serde_json::Value {
-    use serde_json::{Map, Value};
-    let role = ctx.role;
-    // The path-rule keys ALWAYS exist before binding. The red lines and the
-    // corpus boundary are injected INTO `read`/`edit`/`write`, so an entry
-    // that never mentioned them used to render with no path rules at all —
-    // no contamination denies, no project boundary. Agents built from a
-    // role carry no permission block by design, which made that the normal
-    // case rather than the exotic one.
-    let mut base = match permission {
-        Value::Object(map) => map.clone(),
-        _ => Map::new(),
-    };
-    for (key, default) in default_path_rules(ctx.project) {
-        base.entry(key).or_insert(default);
-    }
-    let mut out = match bind_paths(&Value::Object(base), ctx.project, &ctx.roots) {
-        Value::Object(map) => map,
-        _ => Map::new(),
-    };
+    Policy::build(permission, ctx).into_json()
+}
 
-    // Web access is opencode-enforced; the role decides whether to offer
-    // it. Written either way — a rendered file must never depend on
-    // opencode's default for a capability the role has an opinion about.
-    let web = if role.grants_web() { "allow" } else { "deny" };
-    for key in ["webfetch", "websearch"] {
-        let tightened = out.get(key).and_then(Value::as_str) == Some("deny");
-        let action = if tightened { "deny" } else { web };
-        out.insert(key.to_string(), Value::String(action.to_string()));
-    }
-
-    // Reaching outside the run dir at all. The run cwd exposes exactly one
-    // project by construction, so this is the switch that decides whether
-    // that construction can be stepped around; only the unrestricted role
-    // may, and only if its config already said so.
-    if !matches!(role, AgentRole::Super) {
-        out.insert(
-            "external_directory".to_string(),
-            Value::String("deny".to_string()),
-        );
-    }
-
-    // Delegation, normalized the way the corpus tools are below: written
-    // explicitly, and confined to entries this project actually declares.
-    // `render_project_agents` already refuses a dangling name outright;
-    // this keeps the ARTIFACT safe for any path that renders without that
-    // check.
-    let mut task = match out.remove("task") {
-        Some(Value::Object(map)) => map,
-        Some(Value::String(action)) => {
-            let mut rules = Map::new();
-            rules.insert("*".to_string(), Value::String(action));
-            rules
-        }
-        _ => Map::new(),
-    };
-    task.entry("*".to_string())
-        .or_insert_with(|| Value::String("deny".to_string()));
-    for (name, action) in task.iter_mut() {
-        if name != "*" && !ctx.known_entries.contains(name.as_str()) {
-            *action = Value::String("deny".to_string());
-        }
-    }
-    out.insert("task".to_string(), Value::Object(task));
-
-    // Deny-wins merge of the corpus tool ceiling. Every one of the 8 keys
-    // is written explicitly, so the rendered file never relies on
-    // omission-means-allow.
-    for tool in CORPUS_TOOLS {
-        let stored = out.get(tool).and_then(Value::as_str);
-        let action = match role.allows(tool) {
-            // Outside the ceiling: denied regardless of what was stored.
-            false => "deny",
-            // Inside it: a stored `deny`/`ask` tightens and is kept.
-            true => stored.unwrap_or("allow"),
+impl Policy {
+    fn build(permission: &serde_json::Value, ctx: &RenderCtx<'_>) -> Self {
+        let role = ctx.role;
+        // The project rewrite runs ONCE, over the stored document only.
+        // Everything injected below is written with the concrete project
+        // already in it — except two deliberate `store/projects/*`
+        // wildcards, which mean all projects and must survive as such.
+        let mut stored = match bind_project(permission, ctx.project) {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
         };
-        out.insert(tool.to_string(), Value::String(action.to_string()));
-    }
-    Value::Object(out)
-}
 
-/// The path rules every rendered entry starts from when it says nothing
-/// itself: read the world (the red lines and the project boundary then
-/// carve it down), and write nothing outside your own corpus. A host shell
-/// stays denied — for the restricted roles it would let an agent forge the
-/// identity the server's gate trusts, and for the rest it is simply not how
-/// work reaches the sandbox.
-fn default_path_rules(project: &str) -> Vec<(String, serde_json::Value)> {
-    let corpus = format!("store/projects/{project}/corpus/**");
-    let write = serde_json::json!({ "*": "deny", corpus: "allow" });
-    vec![
-        ("read".to_string(), serde_json::json!({ "*": "allow" })),
-        ("edit".to_string(), write.clone()),
-        ("write".to_string(), write),
-        ("bash".to_string(), serde_json::Value::String("deny".to_string())),
-    ]
-}
+        let corpus = format!("store/projects/{}/corpus/**", ctx.project);
+        let runs = format!("store/projects/{}/corpus/runs/**", ctx.project);
+        // `runs/` sits inside the corpus but is not an agent's to change:
+        // those transcripts are what technique cards cite by name, what the
+        // cost report counts, and the only provenance a mission leaves.
+        let mutable_default = || {
+            rules([
+                ("*", Action::Deny),
+                (corpus.as_str(), Action::Allow),
+                (runs.as_str(), Action::Deny),
+            ])
+        };
+        let mut read = take_rules(&mut stored, "read")
+            .unwrap_or_else(|| rules([("*", Action::Allow)]));
+        let mut edit = take_rules(&mut stored, "edit").unwrap_or_else(mutable_default);
+        let mut write = take_rules(&mut stored, "write").unwrap_or_else(mutable_default);
+        seal_readable(&mut read, ctx);
+        seal_mutable(&mut edit, ctx);
+        seal_mutable(&mut write, ctx);
 
-/// Rewrite project wildcards, normalize path-rule scalars to maps, and
-/// inject the trust red lines. Split from the role merge so the recursion
-/// stays simple.
-fn bind_paths(
-    permission: &serde_json::Value,
-    project: &str,
-    roots: &DataRoots,
-) -> serde_json::Value {
-    use serde_json::{Map, Value};
-    let Value::Object(map) = permission else {
-        return permission.clone();
-    };
-    let mut out = Map::new();
-    for (key, value) in map {
-        let mut value = bind_paths(value, project, roots);
-        // Path-rule keys carry red lines; a bare scalar becomes `{"*": v}`
-        // so the injection below has somewhere to land.
-        if matches!(key.as_str(), "read" | "edit" | "write") {
-            if let Value::String(action) = &value {
-                let mut rules = Map::new();
-                rules.insert("*".to_string(), Value::String(action.clone()));
-                value = Value::Object(rules);
+        let mut task = take_rules(&mut stored, "task").unwrap_or_default();
+        // Omission would inherit opencode's default and let a dangling name
+        // resolve against config discovered outside the run dir — the leak
+        // that sent one project's scout at another's corpus.
+        task.entry("*".to_string()).or_insert(Action::Deny);
+        for (name, action) in task.iter_mut() {
+            if name != "*" && !ctx.known_entries.contains(name.as_str()) {
+                *action = Action::Deny;
             }
         }
-        if let Value::Object(rules) = &mut value {
-            if key == "read" {
-                // Contamination rule: the answer key and harness internals
-                // stay unreadable even if edited out of a config.
-                for red in ["benchmarks/**", "plugins/**"] {
-                    rules
-                        .entry(red.to_string())
-                        .or_insert_with(|| Value::String("deny".to_string()));
-                }
-                let wildcard_allow = rules.get("*").and_then(Value::as_str) == Some("allow");
-                let has_boundary = rules.keys().any(|k| k.starts_with("store/projects/"));
-                if wildcard_allow && !has_boundary {
-                    // Relative: what the run cwd exposes. Narrowed to the
-                    // corpus and mission records — the project's `agents/`
-                    // holds the sidecars this gate trusts, and `var/` its
-                    // chat scope, neither of which is research material.
-                    rules.insert(
-                        "store/projects/*".to_string(),
-                        Value::String("deny".to_string()),
-                    );
-                    for allowed in ["corpus", "missions"] {
-                        rules.insert(
-                            format!("store/projects/{project}/{allowed}/**"),
-                            Value::String("allow".to_string()),
-                        );
-                    }
-                }
-                // ABSOLUTE: the relative patterns above describe the run
-                // cwd, and say nothing about `/Users/…/.corpus/store/...`.
-                // The run dir links only one project, so an absolute path
-                // is the one way left to name another project's corpus.
-                inject_data_boundary(rules, project, roots, "corpus");
-            }
-            if matches!(key.as_str(), "edit" | "write") {
-                // The agent tree holds the role sidecars this gate trusts,
-                // and the run cwd links the project — no agent writes there.
-                rules.insert(
-                    "store/projects/*/agents/**".to_string(),
-                    Value::String("deny".to_string()),
-                );
-                inject_data_boundary(rules, project, roots, "corpus");
-            }
+
+        let mut tools = BTreeMap::new();
+        for tool in CORPUS_TOOLS {
+            let stored = take_action(&mut stored, tool);
+            tools.insert(tool.to_string(), ceiling(role.allows(tool), stored));
         }
-        let key = key.replace("store/projects/*", &format!("store/projects/{project}"));
-        out.insert(key, value);
+        let granted = role.admin_tools();
+        for tool in CURATOR_TOOLS {
+            let key = format!("corpus_{tool}");
+            let stored = take_action(&mut stored, &key);
+            tools.insert(key, ceiling(granted.contains(&tool), stored));
+        }
+
+        // Web is opencode-enforced; the role decides whether to offer it.
+        // Written either way — a rendered file must never depend on
+        // opencode's default for a capability the role has an opinion on.
+        let offered = match role.grants_web() {
+            true => Action::Allow,
+            false => Action::Deny,
+        };
+        let web = |stored: Option<Action>| match stored {
+            Some(Action::Deny) => Action::Deny,
+            _ => offered,
+        };
+        let webfetch = web(take_action(&mut stored, "webfetch"));
+        let websearch = web(take_action(&mut stored, "websearch"));
+
+        // A host shell defeats the whole gate for any role the server
+        // restricts: it re-execs corpus-mcp with a forged
+        // `CORPUS_OPENCODE_AGENT`, or edits the sidecar through the `store`
+        // link the run dir provides.
+        let stored_bash = take_action(&mut stored, "bash");
+        let bash = match role.shell_would_defeat_gate() {
+            true => Action::Deny,
+            false => stored_bash.unwrap_or(Action::Deny),
+        };
+
+        // Written for EVERY role, `super` included. The exemption that used
+        // to skip the key for `super` was meant to let the unrestricted
+        // role step outside — but an absent key hands the decision to
+        // opencode's default, which denies. So the exemption delivered
+        // nothing except an artifact that did not say what it meant.
+        let _ = take_action(&mut stored, "external_directory");
+        let external_directory = Action::Deny;
+
+        Self {
+            read,
+            edit,
+            write,
+            task,
+            bash,
+            webfetch,
+            websearch,
+            external_directory,
+            tools,
+            passthrough: stored,
+        }
     }
-    Value::Object(out)
+
+    fn into_json(self) -> serde_json::Value {
+        let mut out = self.passthrough;
+        for (key, family) in [
+            ("read", self.read),
+            ("edit", self.edit),
+            ("write", self.write),
+            ("task", self.task),
+        ] {
+            let rules = family
+                .into_iter()
+                .map(|(pattern, action)| (pattern, scalar(action)))
+                .collect();
+            out.insert(key.to_string(), serde_json::Value::Object(rules));
+        }
+        for (key, action) in [
+            ("bash", self.bash),
+            ("webfetch", self.webfetch),
+            ("websearch", self.websearch),
+            ("external_directory", self.external_directory),
+        ] {
+            out.insert(key.to_string(), scalar(action));
+        }
+        for (tool, action) in self.tools {
+            out.insert(tool, scalar(action));
+        }
+        serde_json::Value::Object(out)
+    }
 }
 
-/// Deny the data root outright, then re-allow exactly one subdirectory of
-/// exactly one project — by ABSOLUTE path.
+fn scalar(action: Action) -> serde_json::Value {
+    serde_json::Value::String(action.as_str().to_string())
+}
+
+/// The ceiling merge. Outside the role's grant a tool is denied whatever
+/// the document said; inside it, a stored `deny`/`ask` TIGHTENS and is
+/// kept, so hand-tightening an agent works and hand-widening one does not.
+fn ceiling(granted: bool, stored: Option<Action>) -> Action {
+    match granted {
+        false => Action::Deny,
+        true => stored.unwrap_or(Action::Allow),
+    }
+}
+
+/// Pull a rule family out of the stored document, normalizing a bare
+/// scalar to `{"*": scalar}` so the red lines have somewhere to land.
+fn take_rules(stored: &mut serde_json::Map<String, serde_json::Value>, key: &str) -> Option<Rules> {
+    let value = stored.remove(key)?;
+    let mut out = Rules::new();
+    match &value {
+        serde_json::Value::Object(map) => {
+            for (pattern, action) in map {
+                if let Some(action) = Action::parse(action) {
+                    out.insert(pattern.clone(), action);
+                }
+            }
+        }
+        other => {
+            if let Some(action) = Action::parse(other) {
+                out.insert("*".to_string(), action);
+            }
+        }
+    }
+    Some(out)
+}
+
+fn take_action(
+    stored: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<Action> {
+    Action::parse(&stored.remove(key)?)
+}
+
+/// Emit a string as a YAML scalar that survives a round trip.
 ///
-/// Ordering matters and is not incidental: `canonical_json` sorts keys
-/// lexicographically before the block is written, and opencode evaluates
-/// last-match-wins, so the narrow allow must sort AFTER the broad deny.
-/// `<data>/**` < `<data>/store/projects/<p>/corpus/**` holds because the
-/// allow extends the deny's prefix — every allow emitted here must keep
-/// that property.
-fn inject_data_boundary(
-    rules: &mut serde_json::Map<String, serde_json::Value>,
-    project: &str,
-    roots: &DataRoots,
-    subdir: &str,
-) {
-    let deny = || serde_json::Value::String("deny".to_string());
+/// The frontmatter used to interpolate these raw, so any description
+/// containing `": "` produced a file whose frontmatter does not parse —
+/// and opencode reads the permission block out of that frontmatter, so the
+/// whole role gate on the opencode side went with it. The `super` role's
+/// own description tripped this, silently, for every agent rendered under
+/// it. Quoting is delegated to serde_yaml rather than hand-rolled: a value
+/// that needs no quotes still renders bare, so the artifacts of every
+/// colon-free description are byte-identical to before.
+fn yaml_scalar(value: &str) -> String {
+    serde_yaml::to_string(value)
+        .map(|s| s.trim_end().to_string())
+        .unwrap_or_else(|_| format!("{value:?}"))
+}
+
+/// Rewrite `store/projects/*` to the concrete project in every key, at
+/// every depth of the stored document.
+///
+/// Applied to the STORED document only. The wildcards this render injects
+/// itself (`store/projects/*` in `read`, `store/projects/*/agents/**` in
+/// `edit`/`write`) mean every project and must stay wildcards — which is
+/// why binding runs first and injection second, rather than the two being
+/// interleaved as they were when one function did both.
+fn bind_project(value: &serde_json::Value, project: &str) -> serde_json::Value {
+    let serde_json::Value::Object(map) = value else {
+        return value.clone();
+    };
+    let bound = format!("store/projects/{project}");
+    serde_json::Value::Object(
+        map.iter()
+            .map(|(key, value)| {
+                (
+                    key.replace("store/projects/*", &bound),
+                    bind_project(value, project),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The red lines on READING, injected rather than trusted.
+fn seal_readable(rules: &mut Rules, ctx: &RenderCtx<'_>) {
+    // Contamination rule: the answer key and harness internals stay
+    // unreadable even if edited out of a config.
+    for red in ["benchmarks/**", "plugins/**"] {
+        rules.entry(red.to_string()).or_insert(Action::Deny);
+    }
+    // The project boundary, RELATIVE — what the run cwd exposes. Narrowed
+    // to the corpus and mission records: the project's `agents/` holds the
+    // sidecars this gate trusts and `var/` its chat scope, neither of which
+    // is research material. Only applied to a document that opened
+    // everything and drew no boundary of its own.
+    let opens_everything = rules.get("*") == Some(&Action::Allow);
+    let has_boundary = rules.keys().any(|k| k.starts_with("store/projects/"));
+    if opens_everything && !has_boundary {
+        rules.insert("store/projects/*".to_string(), Action::Deny);
+        for allowed in ["corpus", "missions"] {
+            rules.insert(
+                format!("store/projects/{}/{allowed}/**", ctx.project),
+                Action::Allow,
+            );
+        }
+    }
+    seal_data_roots(rules, ctx, false);
+}
+
+/// The red lines on WRITING. The agent tree holds the role sidecars this
+/// gate trusts, and the run cwd links the project — no agent writes there.
+fn seal_mutable(rules: &mut Rules, ctx: &RenderCtx<'_>) {
+    rules.insert("store/projects/*/agents/**".to_string(), Action::Deny);
+    seal_data_roots(rules, ctx, true);
+}
+
+/// Deny the data roots by ABSOLUTE path, then re-allow exactly one
+/// project's corpus.
+///
+/// The relative patterns above describe the run cwd and say nothing about
+/// `/Users/…/.corpus/store/...`; the run dir links only one project, so an
+/// absolute path is the one route left to name another's corpus.
+///
+/// Ordering matters and is not incidental: the block is sorted before it is
+/// written and opencode evaluates last-match-wins, so the narrow allow must
+/// sort AFTER the broad deny. `<data>/**` < `<data>/store/projects/<p>/…`
+/// holds because the allow extends the deny's prefix — every allow emitted
+/// here must keep that property.
+fn seal_data_roots(rules: &mut Rules, ctx: &RenderCtx<'_>, mutating: bool) {
+    let roots = &ctx.roots;
     if !roots.data.is_empty() {
-        // Management-chat transcripts: the operator's notes, ranging over
-        // every project. Denied by name rather than by denying the whole
-        // data root — the agent's own run dir lives under that root too,
-        // and a blanket deny would take its cwd (and the `sources` link)
-        // with it if opencode resolves paths before matching.
-        rules.insert(
-            format!("{}/var/chat/**", roots.data.trim_end_matches('/')),
-            deny(),
-        );
+        let data = roots.data.trim_end_matches('/');
+        // Denied by name rather than by denying the whole data root: the
+        // agent's own run dir lives under that root too, and a blanket deny
+        // would take its cwd (and the `sources` link) with it if opencode
+        // resolves paths before matching.
+        //
+        // `chat` is the operator's notes across every project. `audit` and
+        // `refusals` are the records OF this agent — deny-by-default
+        // already covers them for writes, but a subject editing its own
+        // entry is the one failure those logs cannot tolerate, so it is
+        // stated rather than inferred. Reading them is denied too: between
+        // them they are a map of every gate and the exact wording that
+        // trips it.
+        for log in ["audit", "chat", "refusals"] {
+            rules.insert(format!("{data}/var/{log}/**"), Action::Deny);
+        }
     }
     if roots.store.is_empty() {
         return;
     }
     let store = roots.store.trim_end_matches('/');
-    rules.insert(format!("{store}/**"), deny());
+    rules.insert(format!("{store}/**"), Action::Deny);
     rules.insert(
-        format!("{store}/projects/{project}/{subdir}/**"),
-        serde_json::Value::String("allow".to_string()),
+        format!("{store}/projects/{}/corpus/**", ctx.project),
+        Action::Allow,
     );
+    // The absolute half of the `runs/` rule. Reading a transcript is fine —
+    // an agent may want its own — but changing one is not.
+    if mutating {
+        rules.insert(
+            format!("{store}/projects/{}/corpus/runs/**", ctx.project),
+            Action::Deny,
+        );
+    }
 }
 
 /// The absolute roots a render denies by path. Held as strings because
@@ -1852,6 +2180,7 @@ fn write_sidecar(
     cloned_from: Option<&str>,
     role: AgentRole,
     subagent_roles: std::collections::BTreeMap<String, AgentRole>,
+    actor: &str,
 ) -> Result<()> {
     let sidecar = AgentSidecar {
         name: name.to_string(),
@@ -1861,9 +2190,25 @@ fn write_sidecar(
         // role, not an inherited absence.
         role: Some(role),
         subagent_roles,
+        modified: Some(now_epoch()),
+        modified_by: Some(actor.to_string()),
     };
     fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&sidecar)?)?;
     Ok(())
+}
+
+impl Store {
+    /// Write a sidecar back, stamping who changed it and when. EVERY
+    /// in-place sidecar rewrite goes through here, so a future mutator
+    /// cannot forget provenance by writing the file itself — which is the
+    /// failure mode that made "the operator can audit it" untrue for the
+    /// whole life of the role system.
+    fn stamp_and_write_sidecar(&self, dir: &Path, meta: &mut AgentSidecar) -> Result<()> {
+        meta.modified = Some(now_epoch());
+        meta.modified_by = Some(self.actor().to_string());
+        fs::write(dir.join("agent.yaml"), serde_yaml::to_string(meta)?)?;
+        Ok(())
+    }
 }
 
 /// Read the sidecar, falling back to the SAFEST role when it is missing or
@@ -1881,6 +2226,8 @@ fn read_sidecar(dir: &Path, slug: &str) -> AgentSidecar {
             // the safest role via `role()` and migration can still see it.
             role: None,
             subagent_roles: std::collections::BTreeMap::new(),
+            modified: None,
+            modified_by: None,
         })
 }
 
@@ -1988,7 +2335,7 @@ mod tests {
             )
             .unwrap();
         // ...but the sidecar says researcher (the role it was created with).
-        let text = fs::read_to_string(&store.render_project_agents("alpha", &[]).unwrap()[0])
+        let text = fs::read_to_string(&store.render_project_agents("alpha").unwrap()[0])
             .unwrap();
         let perm = rendered_permission(&text);
         assert_eq!(perm["corpus_target_info"].as_str(), Some("allow"));
@@ -2027,7 +2374,7 @@ mod tests {
                 })),
             )
             .unwrap();
-        let text = fs::read_to_string(&store.render_project_agents("alpha", &[]).unwrap()[0])
+        let text = fs::read_to_string(&store.render_project_agents("alpha").unwrap()[0])
             .unwrap();
         let perm = rendered_permission(&text);
         for tool in CORPUS_TOOLS {
@@ -2059,7 +2406,7 @@ mod tests {
                 })),
             )
             .unwrap();
-        let text = fs::read_to_string(&store.render_project_agents("alpha", &[]).unwrap()[0])
+        let text = fs::read_to_string(&store.render_project_agents("alpha").unwrap()[0])
             .unwrap();
         let perm = rendered_permission(&text);
         assert_eq!(perm["read"]["benchmarks/**"].as_str(), Some("deny"), "{text}");
@@ -2109,6 +2456,8 @@ mod tests {
             cloned_from: None,
             role: Some(AgentRole::Researcher),
             subagent_roles: Default::default(),
+            modified: None,
+            modified_by: None,
         };
         meta.subagent_roles.insert("scout".into(), AgentRole::Super);
         assert_eq!(
@@ -2125,6 +2474,276 @@ mod tests {
             "a narrower subagent stays narrow"
         );
         assert_eq!(entry_role(&meta, "discover", "discover"), AgentRole::Super);
+    }
+
+    /// The subagent cap, as a table rather than as a consequence of
+    /// declaration order. It used to be `min` over a derived `Ord`, so the
+    /// answer for any pair was decided by where the variants happened to sit
+    /// in the enum body; this pins the relation the roles actually have, so
+    /// that adding a role that is NOT part of the chain shows up here as a
+    /// diff to read rather than as a number that silently changed.
+    #[test]
+    fn cap_under_reproduces_the_research_chain() {
+        use AgentRole::{Researcher, Super, Tester};
+        let table = [
+            // (primary, subagent, capped)
+            (Researcher, Researcher, Researcher),
+            (Researcher, Tester, Researcher),
+            (Researcher, Super, Researcher),
+            (Tester, Researcher, Researcher),
+            (Tester, Tester, Tester),
+            (Tester, Super, Tester),
+            (Super, Researcher, Researcher),
+            (Super, Tester, Tester),
+            (Super, Super, Super),
+        ];
+        for (primary, sub, want) in table {
+            assert_eq!(
+                sub.cap_under(primary),
+                want,
+                "{:?} under {:?}",
+                sub.as_str(),
+                primary.as_str()
+            );
+        }
+        // The property the table encodes: a subagent never renders wider
+        // than the session its parent's role bought.
+        for primary in AgentRole::ALL {
+            for sub in AgentRole::ALL {
+                let capped = sub.cap_under(primary);
+                for tool in capped.tools() {
+                    assert!(
+                        primary.allows(tool),
+                        "{} under {} kept {tool}, which the primary cannot call",
+                        sub.as_str(),
+                        primary.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The curator sits outside the research chain, and `cap_under` has to
+    /// say so in both directions. The dangerous case is a curator subagent
+    /// under a SUPER primary: the chain arms are catch-alls over the
+    /// subagent, so an arm ordering that let `(Super, Curator)` fall through
+    /// would hand a research session a subagent advertising management
+    /// tools its own server refuses.
+    #[test]
+    fn curator_is_incomparable_to_the_research_roles() {
+        use AgentRole::{Curator, Researcher, Super, Tester};
+        assert_eq!(Curator.cap_under(Curator), Curator);
+        // A curator primary curates its whole session.
+        for sub in [Researcher, Tester, Super] {
+            assert_eq!(
+                sub.cap_under(Curator),
+                Curator,
+                "{} under a curator",
+                sub.as_str()
+            );
+        }
+        // A curator subagent collapses to the safest role under ANY research
+        // primary — including super, which carries every research ceiling
+        // and still has nothing to lend a curator.
+        for primary in [Researcher, Tester, Super] {
+            assert_eq!(
+                Curator.cap_under(primary),
+                Researcher,
+                "a curator under {}",
+                primary.as_str()
+            );
+        }
+        // The invariant the whole table exists to protect, restated over the
+        // management namespace this time.
+        for primary in AgentRole::ALL {
+            for sub in AgentRole::ALL {
+                for tool in sub.cap_under(primary).admin_tools() {
+                    assert!(
+                        primary.admin_tools().contains(tool),
+                        "{} under {} kept {tool}, which the primary cannot call",
+                        sub.as_str(),
+                        primary.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A role granting no corpus tools satisfies an empty requirement, so
+    /// placing it early in `ALL` would make `infer_role`'s first-match
+    /// search relabel every legacy agent the next time anyone ran
+    /// `migrate-roles`. Position is the guard; this test is what notices if
+    /// someone tidies the enum.
+    #[test]
+    fn a_new_role_cannot_relabel_legacy_agents() {
+        assert_eq!(AgentRole::ALL[0], AgentRole::Researcher, "safest first");
+        assert_eq!(
+            AgentRole::ALL.last().copied(),
+            Some(AgentRole::Curator),
+            "a zero-corpus-tool role must sort last or it matches everything"
+        );
+        // An agent with no permission block at all, and one that grants
+        // nothing: neither is a curator, whatever the tool arithmetic says.
+        for doc in [
+            serde_json::json!({}),
+            serde_json::json!({ "permission": { "bash": "deny" } }),
+        ] {
+            let cfg = doc.as_object().unwrap().clone();
+            assert_ne!(
+                infer_role(&cfg),
+                AgentRole::Curator,
+                "inference must never invent a curator: {doc}"
+            );
+        }
+    }
+
+    /// The module doc has promised since the roles landed that a shell and a
+    /// restricted role cannot coexist. It was never enforced: `bash: deny`
+    /// was only a DEFAULT, so a stored allow rode straight through the
+    /// render — and a shell re-execs corpus-mcp with a forged identity.
+    #[test]
+    fn a_stored_bash_allow_cannot_survive_a_restricted_role() {
+        let store = tmp_store("bash-hole");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        for (slug, role) in [
+            ("res", AgentRole::Researcher),
+            ("cur", AgentRole::Curator),
+            ("sup", AgentRole::Super),
+        ] {
+            store.create_agent_with_role("alpha", slug, role).unwrap();
+            store
+                .save_agent(
+                    "alpha",
+                    slug,
+                    &doc(serde_json::json!({
+                        slug: { "mode": "primary", "permission": { "bash": "allow" } },
+                    })),
+                )
+                .unwrap();
+        }
+        store.render_project_agents("alpha").unwrap();
+        let read = |slug: &str| {
+            fs::read_to_string(store.opencode_agent_dir("alpha").join(format!("{slug}.md"))).unwrap()
+        };
+        for slug in ["res", "cur"] {
+            assert_eq!(
+                rendered_permission(&read(slug))["bash"].as_str(),
+                Some("deny"),
+                "{slug}: a server-restricted role cannot hold a shell"
+            );
+        }
+        // Super holds every corpus tool, so a shell forges nothing it did
+        // not already have — its stored grant is honoured.
+        assert_eq!(
+            rendered_permission(&read("sup"))["bash"].as_str(),
+            Some("allow"),
+            "the unrestricted role keeps what it asked for"
+        );
+    }
+
+    /// The management namespace is written for every role, denied wherever
+    /// it is not granted — the same discipline the corpus tools get, so the
+    /// artifact never depends on opencode's default for a tool the role has
+    /// an opinion about.
+    #[test]
+    fn render_denies_the_admin_namespace_outside_the_curator() {
+        let store = tmp_store("admin-ns");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("alpha", "res", AgentRole::Researcher)
+            .unwrap();
+        store
+            .create_agent_with_role("alpha", "cur", AgentRole::Curator)
+            .unwrap();
+        store.render_project_agents("alpha").unwrap();
+        let read = |slug: &str| {
+            rendered_permission(
+                &fs::read_to_string(store.opencode_agent_dir("alpha").join(format!("{slug}.md")))
+                    .unwrap(),
+            )
+        };
+        let (res, cur) = (read("res"), read("cur"));
+        for tool in CURATOR_TOOLS {
+            let key = format!("corpus_{tool}");
+            assert_eq!(res[&key].as_str(), Some("deny"), "researcher: {key}");
+            assert_eq!(cur[&key].as_str(), Some("allow"), "curator: {key}");
+        }
+        // And the reverse: a curator holds no sandbox tools at all.
+        for tool in CORPUS_TOOLS {
+            assert_eq!(cur[tool].as_str(), Some("deny"), "curator: {tool}");
+        }
+        assert_eq!(cur["webfetch"].as_str(), Some("deny"));
+        assert_eq!(cur["bash"].as_str(), Some("deny"));
+    }
+
+    /// One role is enforced per session, taken from the primary — so a
+    /// curator and a research subagent cannot share one. Refused at set
+    /// time, where the operator can see it, rather than silently collapsed
+    /// at render time.
+    #[test]
+    fn a_curator_cannot_hold_a_research_subagent() {
+        let store = tmp_store("mixed-subs");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("alpha", "cur", AgentRole::Curator)
+            .unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "cur",
+                &doc(serde_json::json!({
+                    "cur": { "mode": "primary" },
+                    "cur-helper": { "mode": "subagent", "description": "d" },
+                })),
+            )
+            .unwrap();
+        let error = store
+            .set_subagent_role("alpha", "cur", "cur-helper", AgentRole::Tester)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("curator"), "{error}");
+        assert!(error.contains("tester"), "{error}");
+        // A curator subagent under a curator is fine.
+        store
+            .set_subagent_role("alpha", "cur", "cur-helper", AgentRole::Curator)
+            .unwrap();
+
+        // And the mirror: a research primary refuses a curator subagent.
+        store
+            .create_agent_with_role("alpha", "res", AgentRole::Researcher)
+            .unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "res",
+                &doc(serde_json::json!({
+                    "res": { "mode": "primary" },
+                    "res-scout": { "mode": "subagent", "description": "d" },
+                })),
+            )
+            .unwrap();
+        assert!(store
+            .set_subagent_role("alpha", "res", "res-scout", AgentRole::Curator)
+            .is_err());
+    }
+
+    /// Every role name survives a round trip. This is the ONLY thing that
+    /// catches a variant missing from `parse` — which is why `parse` is now
+    /// derived from `as_str` rather than written as a second match.
+    #[test]
+    fn every_role_name_round_trips() {
+        for role in AgentRole::ALL {
+            assert_eq!(AgentRole::parse(role.as_str()), Some(role));
+            assert_eq!(AgentRole::parse(&role.as_str().to_uppercase()), Some(role));
+            assert_eq!(AgentRole::parse(&format!("  {}  ", role.as_str())), Some(role));
+            assert!(
+                AgentRole::names().contains(role.as_str()),
+                "{} is missing from the usage line",
+                role.as_str()
+            );
+        }
+        assert_eq!(AgentRole::parse("root"), None);
+        assert_eq!(AgentRole::parse(""), None);
     }
 
     /// Cloning preserves subagents (it used to drop them) and carries the
@@ -2419,7 +3038,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let error = store.render_project_agents("alpha", &[]).unwrap_err().to_string();
+        let error = store.render_project_agents("alpha").unwrap_err().to_string();
         assert!(error.contains("shared-scout"), "{error}");
         assert!(error.contains("rename one"), "{error}");
     }
@@ -2447,7 +3066,7 @@ mod tests {
                 })),
             )
             .unwrap();
-        let error = store.render_project_agents("alpha", &[]).unwrap_err().to_string();
+        let error = store.render_project_agents("alpha").unwrap_err().to_string();
         assert!(error.contains("discover-scout"), "{error}");
         assert!(error.contains("alpha"), "names the project: {error}");
         assert!(error.contains("closed"), "{error}");
@@ -2487,7 +3106,7 @@ mod tests {
             )
             .unwrap();
         store.check_project_delegation("alpha").unwrap();
-        let written = store.render_project_agents("alpha", &[]).unwrap();
+        let written = store.render_project_agents("alpha").unwrap();
         assert_eq!(written.len(), 3);
         let one = fs::read_to_string(store.opencode_agent_dir("alpha").join("one.md")).unwrap();
         assert_eq!(
@@ -2549,7 +3168,7 @@ mod tests {
                 })),
             )
             .unwrap();
-        store.render_project_agents("alpha", &[]).unwrap();
+        store.render_project_agents("alpha").unwrap();
         let text = fs::read_to_string(store.opencode_agent_dir("alpha").join("a.md")).unwrap();
         let read = &rendered_permission(&text)["read"];
 
@@ -2595,7 +3214,7 @@ mod tests {
                 &doc(serde_json::json!({ "a": { "mode": "primary" } })),
             )
             .unwrap();
-        store.render_project_agents("alpha", &[]).unwrap();
+        store.render_project_agents("alpha").unwrap();
         let text = fs::read_to_string(store.opencode_agent_dir("alpha").join("a.md")).unwrap();
         assert_eq!(rendered_permission(&text)["task"]["*"].as_str(), Some("deny"));
 
@@ -2604,7 +3223,6 @@ mod tests {
         let known = BTreeSet::new();
         let ctx = RenderCtx {
             project: "alpha",
-            pinned: &[],
             role: AgentRole::Researcher,
             known_entries: &known,
             roots: DataRoots::default(),
@@ -2638,7 +3256,7 @@ mod tests {
                 })),
             )
             .unwrap();
-        let written = store.render_project_agents("alpha", &[]).unwrap();
+        let written = store.render_project_agents("alpha").unwrap();
         let text = fs::read_to_string(&written[0]).unwrap();
         // Wildcard store paths bound to the concrete project.
         assert!(text.contains("store/projects/alpha/corpus/**"), "{text}");
@@ -2661,22 +3279,48 @@ mod tests {
         // The scope section names the project corpus.
         assert!(text.contains("## Corpus scope (bound at launch)"));
         assert!(text.contains("You are bound to project `alpha`"));
-        // No pins -> no Pinned sources section (backend expectations keep
-        // the byte-identical template render).
-        assert!(!text.contains("Pinned sources"), "{text}");
-
-        // A pinned render names the literal tree path the agent must read.
-        let pinned = [SourcePin {
-            name: "cdk".into(),
-            rev: "main".into(),
-            sha: "b2d07815b7cac85b6200b12d813bd5bfda613552".into(),
-        }];
-        let written = store.render_project_agents("alpha", &pinned).unwrap();
-        let text = fs::read_to_string(&written[0]).unwrap();
-        assert!(text.contains("## Pinned sources (bound at launch)"), "{text}");
+        // The pin section points at the TOOL and names no revision: the
+        // render is a pure function of the project, so a second mission's
+        // launch cannot rewrite the trees under a live one.
+        assert!(text.contains("## Pinned sources"), "{text}");
+        assert!(text.contains("Call `target_info` before you read any source"), "{text}");
         assert!(
-            text.contains("`cdk` → `main` at `sources/cdk/b2d07815b7cac85b6200b12d813bd5bfda613552/`"),
-            "{text}"
+            !text.contains("sources/cdk/"),
+            "a literal tree path is a per-RUN fact and must not reach a per-project file: {text}"
+        );
+
+        // A curator manages the project and reads no source, so it holds no
+        // `target_info` and gets no pin section at all.
+        store
+            .create_agent_with_role("alpha", "keeper", AgentRole::Curator)
+            .unwrap();
+        store.render_project_agents("alpha").unwrap();
+        let keeper =
+            fs::read_to_string(store.opencode_agent_dir("alpha").join("keeper.md")).unwrap();
+        assert!(!keeper.contains("Pinned sources"), "{keeper}");
+
+        // THE property that lets two missions run at once: the render is a
+        // pure function of the project, so a second mission's launch
+        // rewrites the first's agent files with identical bytes. When the
+        // pins lived in here, launching B changed the tree paths under a
+        // live A — the same class of bug as telling an agent to read a
+        // path that does not exist.
+        let first: Vec<String> = store
+            .render_project_agents("alpha")
+            .unwrap()
+            .iter()
+            .map(|p| fs::read_to_string(p).unwrap())
+            .collect();
+        let second: Vec<String> = store
+            .render_project_agents("alpha")
+            .unwrap()
+            .iter()
+            .map(|p| fs::read_to_string(p).unwrap())
+            .collect();
+        assert_eq!(
+            first, second,
+            "a re-render must be byte-identical, or launching one mission \
+             disturbs another that is already live"
         );
         let _ = fs::remove_dir_all(store.root());
     }

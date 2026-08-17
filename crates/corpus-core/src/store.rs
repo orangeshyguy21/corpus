@@ -93,15 +93,35 @@ pub fn project_slug_env() -> std::result::Result<String, String> {
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    /// Who this process acts AS, stamped onto everything it changes.
+    /// `None` reads as `operator`. Ambient rather than a parameter on six
+    /// mutating methods: the answer is a property of the process, and
+    /// threading it through every signature would mean every future
+    /// mutator has to remember to carry it.
+    actor: Option<String>,
 }
 
 impl Store {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, actor: None }
     }
 
     pub fn from_env() -> Self {
         Self::new(store_root_env())
+    }
+
+    /// Act as someone in particular — the MCP server sets this from the
+    /// identity it already resolved for the role gate, so a curator's edits
+    /// carry its name.
+    pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
+        self.actor = Some(actor.into());
+        self
+    }
+
+    /// Who is acting. `operator` when nobody said otherwise: a human at the
+    /// CLI or in the management chat.
+    pub fn actor(&self) -> &str {
+        self.actor.as_deref().unwrap_or("operator")
     }
 
     pub fn root(&self) -> &Path {
@@ -925,6 +945,176 @@ impl Store {
         Ok(project)
     }
 
+    /// Resolve a caller-supplied RELATIVE path to an absolute one inside a
+    /// project's corpus, or refuse.
+    ///
+    /// The shared guard for reading, moving and deleting corpus entries.
+    /// Textual checks come first because they are cheap and unambiguous;
+    /// `canonicalize` comes last because it is the only one that catches a
+    /// SYMLINK planted inside the corpus — and the corpus is precisely
+    /// where an agent is allowed to write with its own file tools, so that
+    /// is not a theoretical concern.
+    ///
+    /// [`EntryAccess`] decides how strict it is: reading reaches anything
+    /// inside the corpus, changing one refuses `runs/` and whole
+    /// categories, and a destination need not exist yet.
+    pub fn resolve_corpus_entry(
+        &self,
+        project: &str,
+        rel: &str,
+        access: EntryAccess,
+    ) -> Result<PathBuf> {
+        let rel = rel.trim();
+        if rel.is_empty() {
+            return Err(Error::Store("path is empty".into()));
+        }
+        let path = Path::new(rel);
+        if path.is_absolute() {
+            return Err(Error::Store(format!(
+                "path must be relative to the project corpus: {rel}"
+            )));
+        }
+        let mut components = Vec::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::Normal(part) => components.push(part),
+                // `..` is the obvious escape, but a stray `/` or a Windows
+                // prefix would also re-root the join.
+                other => {
+                    return Err(Error::Store(format!(
+                        "path component {other:?} is not allowed inside a corpus: {rel}"
+                    )))
+                }
+            }
+        }
+        let category = components
+            .first()
+            .and_then(|c| c.to_str())
+            .ok_or_else(|| Error::Store(format!("path names no category: {rel}")))?;
+        if !CATEGORIES.contains(&category) {
+            return Err(Error::Store(format!(
+                "{category:?} is not a corpus category (one of {})",
+                CATEGORIES.join(", ")
+            )));
+        }
+        if category == RUNS && access.is_mutation() {
+            return Err(Error::Store(format!(
+                "{RUNS}/ holds the mission transcripts: technique cards cite them by name, the \
+                 cost report counts them, and they are what an operator reads to audit a run. \
+                 They can be read, never changed: {rel}"
+            )));
+        }
+        if components.len() == 1 && access.is_mutation() {
+            return Err(Error::Store(format!(
+                "{rel} is a whole category, not an entry — removing one wholesale is a corpus \
+                 wipe under another name"
+            )));
+        }
+        // The root must canonicalize: comparing a canonical path against a
+        // non-canonical root refuses legal paths whenever the store sits
+        // behind a symlink, which it does whenever a run dir is involved.
+        let root = self.project_corpus_dir(project).canonicalize().map_err(|e| {
+            Error::Store(format!(
+                "project {project} has no corpus directory ({e}) — create the project first"
+            ))
+        })?;
+        let joined = root.join(path);
+        let resolved = match access != EntryAccess::Destination {
+            true => joined
+                .canonicalize()
+                .map_err(|e| Error::Store(format!("{rel}: {e}")))?,
+            false => {
+                // The destination need not exist, and neither need its
+                // parents: moving into `hypotheses/2026/` should create the
+                // year. Canonicalize the deepest ancestor that DOES exist,
+                // prove that is inside the corpus, then re-join the rest.
+                // Every remaining component was checked to be `Normal`
+                // above, so nothing in the tail can climb back out.
+                let mut existing = joined.clone();
+                let mut tail: Vec<std::ffi::OsString> = Vec::new();
+                while !existing.exists() {
+                    let name = existing
+                        .file_name()
+                        .ok_or_else(|| Error::Store(format!("{rel} names no file")))?
+                        .to_os_string();
+                    tail.push(name);
+                    existing = existing
+                        .parent()
+                        .ok_or_else(|| Error::Store(format!("{rel} has no parent")))?
+                        .to_path_buf();
+                }
+                let mut resolved = existing
+                    .canonicalize()
+                    .map_err(|e| Error::Store(format!("{rel}: {e}")))?;
+                for part in tail.iter().rev() {
+                    resolved.push(part);
+                }
+                resolved
+            }
+        };
+        if !resolved.starts_with(&root) {
+            return Err(Error::Store(format!(
+                "{rel} resolves outside the project corpus — a link inside a corpus does not \
+                 widen it"
+            )));
+        }
+        Ok(resolved)
+    }
+
+    /// Delete ONE entry from a project's corpus, returning the bytes freed.
+    /// A directory needs `recursive`: attacks are stored as directories, so
+    /// without it a one-word slip takes a whole artifact.
+    pub fn delete_corpus_entry(&self, project: &str, rel: &str, recursive: bool) -> Result<u64> {
+        let path = self.resolve_corpus_entry(project, rel, EntryAccess::Mutate)?;
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.is_dir() {
+            if !recursive {
+                return Err(Error::Store(format!(
+                    "{rel} is a directory — pass recursive to remove it and everything under it"
+                )));
+            }
+            let bytes = dir_bytes(&path);
+            fs::remove_dir_all(&path)?;
+            return Ok(bytes);
+        }
+        let bytes = meta.len();
+        fs::remove_file(&path)?;
+        Ok(bytes)
+    }
+
+    /// Move or rename ONE entry within a project's corpus. Both ends stay
+    /// inside the same corpus; an existing destination is refused unless
+    /// `overwrite`.
+    pub fn move_corpus_entry(
+        &self,
+        project: &str,
+        from: &str,
+        to: &str,
+        overwrite: bool,
+    ) -> Result<()> {
+        let src = self.resolve_corpus_entry(project, from, EntryAccess::Mutate)?;
+        let dst = self.resolve_corpus_entry(project, to, EntryAccess::Destination)?;
+        if src == dst {
+            return Ok(());
+        }
+        if dst.symlink_metadata().is_ok() {
+            if !overwrite {
+                return Err(Error::Store(format!(
+                    "{to} already exists — pass overwrite to replace it"
+                )));
+            }
+            match dst.is_dir() {
+                true => fs::remove_dir_all(&dst)?,
+                false => fs::remove_file(&dst)?,
+            }
+        }
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&src, &dst)?;
+        Ok(())
+    }
+
     // --- missions ---
 
     /// Create (or overwrite) a mission record at
@@ -1051,6 +1241,44 @@ fn relink(_target: &Path, _link: &Path) -> Result<()> {
     Err(Error::Store(
         "run directories need symlinks; this platform has none".into(),
     ))
+}
+
+/// What a caller intends to do with a corpus entry. Reading is permitted
+/// anywhere inside the corpus — a run transcript is legitimate material,
+/// and reading one changes nothing — while changing one is refused for
+/// `runs/` (cards cite those by name) and for a bare category (that is a
+/// corpus wipe wearing a different name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryAccess {
+    /// Read an existing entry.
+    Read,
+    /// Change or remove an existing entry.
+    Mutate,
+    /// A move destination, which need not exist yet.
+    Destination,
+}
+
+impl EntryAccess {
+    fn is_mutation(self) -> bool {
+        matches!(self, Self::Mutate | Self::Destination)
+    }
+}
+
+/// Total bytes under a directory, best-effort (an unreadable entry counts
+/// as zero rather than failing a delete that is about to remove it anyway).
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return total;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match path.is_dir() {
+            true => total += dir_bytes(&path),
+            false => total += entry.metadata().map(|m| m.len()).unwrap_or(0),
+        }
+    }
+    total
 }
 
 /// Create the category directories under a corpus root.

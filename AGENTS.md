@@ -66,6 +66,8 @@ dev/                 everything uncommitted & machine-local: architecture,
     project.yaml  corpus/  agents/  missions/
   var/run/<slug>/                 the opencode run cwd, per project
   var/chat/<slug>/                goose management-chat scope
+  var/audit/<slug>.jsonl          curator acts (`corpus audit`)
+  var/refusals/<slug>.jsonl       calls the server turned away (`corpus refusals`)
   app.yaml                        app prefs
 ```
 
@@ -78,6 +80,16 @@ A run dir is provisioned per launch and exposes EXACTLY one project:
   .opencode/opencode.json                    generated; carries CORPUS_PROJECT
   .opencode/agent/*.md                       rendered from the project's agents
 ```
+
+The run dir is per PROJECT and shared by every mission in it, so everything
+in it must be a project-level fact. Per-RUN identity — `CORPUS_OPENCODE_AGENT`,
+`CORPUS_RUN_LOG`, `CORPUS_SOURCE_PINS` — travels as environment on the tmux
+session instead, and reaches the agent through `target_info`. That split is
+what lets several missions run at once: `render_project_agents` takes no
+launch state, so a second mission's launch rewrites the first's agent files
+with identical bytes. The renderer used to bake each launch's literal
+`sources/<name>/<sha>/` trees into those files, which meant launching one
+mission silently repointed a live one at another mission's revisions.
 
 That is the project boundary. The permission globs in a rendered agent are
 the second line of defence, not the only one: another project's corpus is
@@ -168,7 +180,9 @@ corpus project list|new|clone|delete|rebind|wipe <slug>
 corpus agent list|new|clone|delete <project> ...   # new takes --role
 corpus mission list|new|delete <project> ...
 # corpus-admin MCP profile: the SAME corpus-mcp binary behind `--admin`
-corpus-mcp --admin                 # stdio MCP server; 21 admin tools only
+corpus-mcp --admin                 # stdio MCP server; the 30 admin tools only
+corpus audit <project> [--tail N]  # who changed this project (curator acts)
+corpus refusals <project> [--tail N] [--gate G]  # what the server turned away
 ```
 
 ## corpus-admin MCP profile (dev/decisions.md — chat runtime closeout)
@@ -177,11 +191,20 @@ corpus-mcp --admin                 # stdio MCP server; 21 admin tools only
 host-side operator tooling, thin over corpus-core, for natural-language
 store administration via the GDK/goose chat. It sits OUTSIDE the research
 trust domains (no sandbox, no oracles, no targets) and never runs missions
-— it prepares them. The sandbox-facing profile (operator/researcher
-agents) never enables it; the chat session config always does
-(`corpus-mcp --admin`). The tool group lives in
-`crates/corpus-mcp/src/admin.rs`; `main.rs` gates `tools/list` + `tools/call`
-on the flag and the admin profile advertises NO sandbox/finding tools.
+— it prepares them. It is UNSCOPED: 21 of its tools take a `project`
+argument, so it reaches every project. That is why it is the operator's
+profile and not an agent's. The tool group lives in
+`crates/corpus-mcp/src/admin.rs`; `main.rs` gates `tools/list` +
+`tools/call` on the flag and the admin profile advertises NO
+sandbox/finding tools.
+
+The same tools reach an IN-PROJECT agent through a different door: the
+`curator` role. There the ROLE decides the catalog (not an argv flag), and
+`tools::dispatch` injects the project from the proven `CORPUS_PROJECT`
+scope before any handler reads it — so a curator cannot name another
+project, and the seven tools that identify a project by some other key
+(`project_*`, `agent_copy`) are simply not in its grant set. Neither is
+`corpus_wipe`. See "The curator role" below.
 
 Admin tools (all thin over corpus-core): `project_list/new/clone/delete/
 rebind`, `agent_list/get/new/save/clone/delete` (`agent_new` builds the
@@ -336,6 +359,7 @@ the `corpus_sandbox_exec` MCP tool (see Trust domains below).
 |---|---|---|---|
 | **Execution sandbox** | the `tester` ROLE, via `corpus_sandbox_exec` | DENIED by default | benchmarks/, plugins/, oracle implementations, findings of the current mission |
 | **Research zone** | the `researcher` ROLE (reads only) | open internet (webfetch/search) | executes nothing; read-denied on benchmarks/** |
+| **Project management** | the `curator` ROLE, via the scoped admin tools | NO egress, NO sandbox | manages its OWN project's agents, missions and corpus; cannot name another project; every act recorded |
 | **Model inference** | host-side only, local by default | the model endpoint sits on the host | the sandbox has no model access |
 | **Corpus store** | write via MCP tools (`finding_write`, `attack_save`, `technique_save`), gated per artifact | — | — |
 
@@ -346,6 +370,96 @@ the ceiling), and in the rendered `.opencode/agent/*.md` by opencode
 permissions DERIVED from the role at render time. The stored config can
 only tighten, never widen. A tester's channel into the world is the MCP
 tool catalog; a researcher can never execute.
+
+The rendered block is computed as a typed `Policy` value (agents.rs) and
+serialized once, rather than assembled by mutating a JSON map. Every
+failure that design shipped was a rule that silently did not land because
+the stage meaning to write it had nowhere to write — a scalar `read:
+"allow"` is not a map, so the red lines injected into `read` went nowhere;
+`bash` was defaulted where it meant to be forced, so a stored `allow`
+survived every render. A struct field cannot be absent, which is the point.
+`tests/roles.rs` holds a byte fixture per role plus both halves of the
+merge (a stored block may tighten; it may not widen).
+
+## The curator role
+
+An agent that manages its own project rather than the target: it creates
+and edits the project's other agents, sets their roles, writes mission
+records, and curates the corpus. It holds ZERO sandbox tools and no open
+internet — an agent that can rewrite every other agent's config is the last
+one that should be reading attacker-controlled text.
+
+- **Scoped by construction.** `tools::dispatch` routes the management tools
+  through `curator_dispatch`, which overwrites `args["project"]` from the
+  proven scope before dispatching. The 17 sites in `admin.rs` that read
+  `project` therefore all see the same unforgeable value, and the scoped
+  catalog strips `project` from every advertised schema — a tool that
+  quietly ignores an argument it asked for is worse than one that never
+  asked.
+- **Not comparable to the research roles.** `AgentRole` is deliberately NOT
+  `Ord`; `cap_under` spells the relation out. A subagent under a curator IS
+  a curator (one role is enforced per session, taken from the primary), and
+  a curator subagent under a research primary collapses to researcher —
+  refused at set time by `set_subagent_role` rather than silently collapsed
+  at render time.
+- **It may set roles, including its own.** That is deliberate, and the
+  audit log is what makes it survivable.
+- **Every act is recorded.** `~/.corpus/var/audit/<project>.jsonl`, append
+  only: intent before the call, outcome after, actor on every line. A
+  failure to record REFUSES the call — an act this role cannot account for
+  does not happen. The log lives outside the project subtree, so the agent
+  it describes can neither edit it (`write` is deny-by-default with only
+  its own corpus re-allowed) nor reach it with `entry_delete` (rooted at
+  `corpus/`, category-gated). Read it with `corpus audit <project>`; no
+  agent has a tool for it, because the subject of a log should not be its
+  reader.
+- **`runs/` is nobody's to change.** Technique cards cite those transcripts
+  by name, `corpus_cost` counts them, and they are the provenance an
+  operator audits. Denied to `entry_delete`/`entry_move` AND write-denied
+  in every rendered permission block, since the corpus is the one place an
+  agent may write with opencode's own file tools.
+- **It cannot launch.** `mission_new` writes a record; running it stays an
+  operator act.
+
+## Debugging a run: the refusal log
+
+`~/.corpus/var/refusals/<project>.jsonl`, written by `corpus-mcp` at the
+one door every tool call passes through (`tools::dispatch`). Every `Err`
+that reaches a caller leaves a line — tool, args, actor, the role in force,
+the message verbatim, the `run_log` basename that places it in the
+transcript, and the **gate** that refused: `identity`, `role`, `scope`,
+`probe`, `args`, `unknown`, `harness`. Read it with
+`corpus refusals <project> [--gate G]`.
+
+Read it BEFORE the transcript. The raw run capture is a PTY dump of a TUI —
+megabytes of ANSI redraw in which the only account of a refusal is the
+model's own prose about it. This is the same facts as values.
+
+- **Empty is a finding.** No refusals for a run that misbehaved means the
+  corpus server never turned it away, which narrows the hunt to opencode's
+  permission block or to a tool description pointing somewhere the agent
+  cannot reach. That is exactly the `/opt/src` namespace split: the mount
+  path in `target_info` is the SANDBOX's, reachable only through
+  `sandbox_exec`, while a host-launched agent has the same trees under
+  `sources/<name>/<sha>` in its run cwd. An agent that believes the former
+  gets denied by opencode, and corpus records nothing, because corpus did
+  nothing.
+- **`unknown` is not a permissions problem.** It is the only gate meaning
+  the server had no opinion at all.
+- **Best-effort, unlike the audit log.** `refusal::record` returns `()` and
+  has no fallible public write path: `audit` REFUSES an act it cannot
+  record, because a curator is trusted on the strength of the record; a
+  diagnostic that could change an outcome would be an observer altering
+  what it observes.
+- **Out of reach of its subject, like the audit log.** It lives outside the
+  project subtree and is read+write denied by path in every rendered
+  permission block — readable, it is a map of every gate and the exact
+  wording that trips it. `corpus refusals` is operator-only; no agent has a
+  tool for it.
+- Calls refused before a project could be resolved land in `_unscoped` —
+  the most diagnostic records there are, so they are never dropped for want
+  of a filename. The slug is sanitized into one path component, since a
+  malformed `CORPUS_PROJECT` is itself a refusal worth logging.
 
 ## Plugin protocol
 

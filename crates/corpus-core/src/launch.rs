@@ -31,6 +31,7 @@
 //! scripted missions): the piped spawn behind the same handle. It is
 //! also the no-tmux fallback for the app (attach greys).
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -172,7 +173,7 @@ impl RunSession {
     ///
     /// Throttled to one lookup a second — each call is an `opencode
     /// session list` subprocess, and the app asks on its poll beat.
-    pub fn opencode_session_id(&mut self) -> Option<String> {
+    pub fn opencode_session_id(&mut self, claimed: &BTreeSet<String>) -> Option<String> {
         let Backend::Tui { tui_session_id, launched_at_ms, repo, discovery, .. } =
             &mut self.backend
         else {
@@ -185,7 +186,7 @@ impl RunSession {
             return None;
         }
         *discovery = std::time::Instant::now();
-        let found = find_opencode_session(repo.as_path(), *launched_at_ms).ok()?;
+        let found = find_opencode_session(repo.as_path(), *launched_at_ms, claimed).ok()?;
         *tui_session_id = Some(found.clone());
         Some(found)
     }
@@ -288,6 +289,10 @@ impl RunSession {
             env.push((SOURCE_PINS_ENV, pins));
         }
         write_tui_script(&script, &env, prompt, resume)?;
+        // Stamped BEFORE the spawn: session discovery keys off "created
+        // after this moment", and a stamp taken afterwards could in
+        // principle sit past the session opencode went on to create.
+        let launched_at_ms = now_millis();
         let mut command = Command::new(&tmux);
         command.args(["new-session", "-d", "-s", &session]);
         command.arg("-c").arg(&repo);
@@ -330,7 +335,7 @@ impl RunSession {
                 // A resume already knows its session; a fresh spawn
                 // discovers one once opencode has created it.
                 tui_session_id: resume.map(str::to_string),
-                launched_at_ms: now_millis(),
+                launched_at_ms,
                 stopped: false,
                 exported: false,
                 export_json,
@@ -518,7 +523,7 @@ impl RunSession {
         let id = match tui_session_id.clone() {
             Some(id) => id,
             None => {
-                let found = find_opencode_session(repo.as_path(), *launched_at_ms)?;
+                let found = find_opencode_session(repo.as_path(), *launched_at_ms, &BTreeSet::new())?;
                 *tui_session_id = Some(found.clone());
                 found
             }
@@ -674,7 +679,11 @@ fn shell_quote(value: &str) -> String {
 /// Find the newest opencode session opened in `cwd` since `launched_at`
 /// (ms) — our TUI's session id. The TUI command has no `--title`, so
 /// the record is located by project dir + launch window instead.
-fn find_opencode_session(cwd: &Path, launched_at_ms: u64) -> Result<String> {
+fn find_opencode_session(
+    cwd: &Path,
+    launched_at_ms: u64,
+    claimed: &BTreeSet<String>,
+) -> Result<String> {
     let opencode = resolve_opencode()?;
     let output = Command::new(&opencode)
         .args(["session", "list", "--format", "json", "-n", "50"])
@@ -689,7 +698,6 @@ fn find_opencode_session(cwd: &Path, launched_at_ms: u64) -> Result<String> {
     let list: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| Error::Store(format!("opencode session list gave bad JSON: {e}")))?;
     let dir = cwd.to_string_lossy();
-    let window = launched_at_ms.saturating_sub(5_000);
     let mut best: Option<(u64, String)> = None;
     for entry in list.as_array().unwrap_or(&Vec::new()) {
         let in_dir = entry
@@ -706,10 +714,17 @@ fn find_opencode_session(cwd: &Path, launched_at_ms: u64) -> Result<String> {
         ) else {
             continue;
         };
-        if created < window || created > launched_at_ms + 60_000 {
+        // Sessions this run cannot own: created before it started, or
+        // already bound to another mission. Both matter now that runs
+        // overlap — they share one cwd, so the listing shows every
+        // concurrent mission's conversation.
+        if created < launched_at_ms || claimed.contains(id) {
             continue;
         }
-        if best.as_ref().map(|(c, _)| created > *c).unwrap_or(true) {
+        // OLDEST, not newest. The first session to appear after a launch
+        // is that launch's own; picking the newest handed a slow-booting
+        // run the conversation of a mission started after it.
+        if best.as_ref().map(|(c, _)| created < *c).unwrap_or(true) {
             best = Some((created, id.to_string()));
         }
     }
@@ -802,18 +817,47 @@ pub fn live_tui_sessions() -> Vec<String> {
         .collect()
 }
 
+/// The opencode conversation a LIVE tmux session is hosting, discovered
+/// without a `RunSession` handle.
+///
+/// Needed because a handle is not the same thing as a live run. A run this
+/// process re-attached to after a restart never had one, and a run
+/// displaced by a later launch stops having one — yet both are still up,
+/// and a mission holding neither a handle nor a conversation id is an
+/// orphan: live in tmux, but impossible to export or resume.
+///
+/// The launch stamp comes from the session name, which `start_tui` builds
+/// from the same instant it records as `launched_at_ms`.
+pub fn session_conversation(
+    store: &Store,
+    project: &str,
+    session: &str,
+    claimed: &BTreeSet<String>,
+) -> Option<String> {
+    let ts = session_stamp(session)?;
+    let cwd = store.project_run_dir(project);
+    find_opencode_session(&cwd, ts.saturating_mul(1000), claimed).ok()
+}
+
+/// The launch stamp in `corpus-<agent>-<ts>`. `<agent>` may itself contain
+/// `-`, so the stamp splits off the TAIL.
+fn session_stamp(session: &str) -> Option<u64> {
+    let stem = session.strip_prefix("corpus-")?;
+    let (agent, ts) = stem.rsplit_once('-')?;
+    if agent.is_empty() {
+        return None;
+    }
+    ts.parse::<u64>().ok()
+}
+
 /// The raw capture a TUI session appends to, derived from the session
 /// name: `start_tui` builds both from the same launch stamp, so
 /// `corpus-<agent>-<ts>` pairs with `runs/<ts>-<agent>.raw`. Lets the app
 /// find the log of a run it does NOT own (re-attached after a relaunch)
 /// without a handle. None when the name isn't ours or carries no stamp.
 pub fn session_raw_log(store: &Store, project: &str, session: &str) -> Option<PathBuf> {
-    // `<agent>` may itself contain `-`, so split the STAMP off the tail.
-    let stem = session.strip_prefix("corpus-")?;
-    let (agent, ts) = stem.rsplit_once('-')?;
-    if agent.is_empty() || ts.parse::<u64>().is_err() {
-        return None;
-    }
+    let ts = session_stamp(session)?;
+    let (agent, _) = session.strip_prefix("corpus-")?.rsplit_once('-')?;
     Some(
         store
             .project_corpus_dir(project)
@@ -1476,7 +1520,7 @@ mod tests {
         store
             .create_agent_with_role("p", "operator", AgentRole::Tester)
             .unwrap();
-        let written = store.render_agent("p", "operator", &[]).unwrap();
+        let written = store.render_agent("p", "operator").unwrap();
         assert!(!written.is_empty());
         let dest = &written[0];
         assert!(dest.ends_with("operator.md"), "{dest:?}");

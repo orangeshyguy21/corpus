@@ -1,0 +1,451 @@
+//! The curator route: project-management tools served to an in-project
+//! agent, scoped to the project the server already proved.
+//!
+//! The property under test throughout is that the project is NOT the
+//! caller's to choose. The `--admin` profile resolves it from a tool
+//! argument at 17 separate sites; this route overwrites that argument from
+//! `CORPUS_PROJECT` before any of them run, so naming another project is
+//! not refused so much as impossible.
+
+use std::path::PathBuf;
+
+use corpus_core::{AgentRole, Scope, Store};
+use corpus_mcp::tools::{self, Ctx};
+use serde_json::{json, Value};
+
+fn echo_plugin() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../corpus-core/tests/echo-plugin")
+}
+
+struct Rig {
+    ctx: Ctx,
+    store: Store,
+    root: PathBuf,
+}
+
+/// Two projects, so "it used the scope" and "it used the argument" give
+/// different answers. `alpha` is the scope; `beta` is what a caller might
+/// try to name.
+fn rig(tag: &str, role: AgentRole) -> Rig {
+    let world = std::env::temp_dir().join(format!("corpus-curator-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&world);
+    // Mirrors what `Ctx::from_env` does from the run identity: everything
+    // this process changes carries the name of the agent that changed it.
+    let store = Store::new(world.join("store")).with_actor("curator:keeper");
+    for slug in ["alpha", "beta"] {
+        store.create_project(slug, slug, "echo-plugin").expect("project");
+    }
+    store
+        .create_agent_with_role("alpha", "keeper", role)
+        .expect("agent");
+    store
+        .create_agent_with_role("beta", "untouched", AgentRole::Researcher)
+        .expect("agent");
+    let ctx = Ctx::for_test(
+        corpus_core::Plugin::spawn(&echo_plugin()).expect("spawn echo plugin"),
+        store.clone(),
+        Scope::new("alpha"),
+        role,
+    );
+    Rig { ctx, store, root: world }
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn names(catalog: &Value) -> Vec<String> {
+    catalog
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The advertised catalog and the routing table are built from separate
+/// lists; a tool in one and not the other is either unroutable or invisible.
+#[test]
+fn the_admin_catalog_matches_its_routing_table() {
+    let mut advertised = names(&corpus_mcp::admin::catalog());
+    advertised.sort();
+    let mut declared: Vec<String> = corpus_mcp::admin::ADMIN_TOOLS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    declared.sort();
+    assert_eq!(advertised, declared);
+}
+
+/// The catalog a curator advertises is exactly its grant set — no project
+/// CRUD (a scoped server cannot honestly serve a tool whose subject is
+/// another project), no corpus_wipe, and none of the sandbox tools.
+#[test]
+fn a_curator_advertises_exactly_its_grant_set() {
+    let catalog = tools::catalog_for(&Ok(AgentRole::Curator));
+    let mut got = names(&catalog);
+    got.sort();
+    let mut want: Vec<String> = corpus_core::CURATOR_TOOLS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    want.sort();
+    assert_eq!(got, want);
+
+    for forbidden in [
+        "project_new",
+        "project_delete",
+        "project_clone",
+        "project_rebind",
+        "agent_copy",
+        "corpus_wipe",
+        "sandbox_exec",
+        "oracle_run",
+        "faucet",
+        "finding_write",
+        "target_info",
+    ] {
+        assert!(
+            !got.contains(&forbidden.to_string()),
+            "a curator must not advertise {forbidden}"
+        );
+    }
+}
+
+/// The research roles see none of it, and a curator sees no sandbox tool.
+/// The two catalogs are disjoint by construction.
+#[test]
+fn the_two_catalogs_do_not_overlap() {
+    for role in [AgentRole::Researcher, AgentRole::Tester, AgentRole::Super] {
+        let got = names(&tools::catalog_for(&Ok(role)));
+        for admin in corpus_core::CURATOR_TOOLS {
+            assert!(
+                !got.contains(&admin.to_string()),
+                "{} must not advertise {admin}",
+                role.as_str()
+            );
+        }
+        assert!(!got.is_empty(), "{} still has its own tools", role.as_str());
+    }
+}
+
+/// A scoped server must not ask for something it will overwrite. Leaving
+/// `project` in the schema would invite a model to supply one and then have
+/// it silently replaced — worse than never asking.
+#[test]
+fn curator_schemas_never_advertise_a_project() {
+    let catalog = tools::catalog_for(&Ok(AgentRole::Curator));
+    for tool in catalog.as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let schema = &tool["inputSchema"];
+        assert!(
+            schema["properties"].get("project").is_none(),
+            "{name} advertises a project property"
+        );
+        if let Some(required) = schema["required"].as_array() {
+            assert!(
+                !required.iter().any(|k| k.as_str() == Some("project")),
+                "{name} requires a project"
+            );
+        }
+    }
+}
+
+/// The heart of it: a curator scoped to `alpha` that explicitly names
+/// `beta` gets alpha's answer, and beta is never touched.
+#[test]
+fn a_curator_cannot_reach_another_project() {
+    let mut rig = rig("cross", AgentRole::Curator);
+
+    let listed = tools::dispatch(&mut rig.ctx, "agent_list", &json!({ "project": "beta" }))
+        .expect("agent_list answers");
+    assert!(
+        listed.contains("keeper"),
+        "the SCOPE decides, not the argument: {listed}"
+    );
+    assert!(
+        !listed.contains("untouched"),
+        "beta's agents must not be reachable: {listed}"
+    );
+
+    // And a mutation aimed at beta lands in alpha or not at all — never in
+    // beta.
+    let _ = tools::dispatch(
+        &mut rig.ctx,
+        "agent_new",
+        &json!({
+            "project": "beta",
+            "agent": "planted",
+            "description": "d",
+            "prompt": "p",
+        }),
+    );
+    assert!(
+        !rig.store.project_agent_dir("beta", "planted").exists(),
+        "nothing may be created in another project"
+    );
+    assert!(
+        rig.store.project_agent_dir("alpha", "planted").exists(),
+        "the write landed in the scoped project"
+    );
+    assert!(
+        rig.store.load_agent("beta", "untouched").is_ok(),
+        "beta's own agent survives"
+    );
+}
+
+/// A research role reaching for a management tool is told it is a
+/// permissions problem, not a typo — otherwise a model hunts for a spelling
+/// that does not exist.
+#[test]
+fn research_roles_are_refused_management_tools_by_role() {
+    for role in [AgentRole::Researcher, AgentRole::Tester, AgentRole::Super] {
+        let mut rig = rig(&format!("deny-{}", role.as_str()), role);
+        let error = tools::dispatch(&mut rig.ctx, "agent_new", &json!({}))
+            .expect_err("must refuse")
+            .to_string();
+        assert!(error.contains(role.as_str()), "{error}");
+        assert!(
+            !error.contains("unknown"),
+            "a refusal must not read as a typo: {error}"
+        );
+        assert!(
+            !error.contains("(allowed: )"),
+            "the empty-grants message must be gone: {error}"
+        );
+    }
+}
+
+/// A curator reaching for a sandbox tool gets a message that names what it
+/// DOES hold, rather than an empty parenthesis.
+#[test]
+fn a_curator_refused_a_sandbox_tool_is_told_what_it_holds() {
+    let mut rig = rig("no-sandbox", AgentRole::Curator);
+    let error = tools::dispatch(&mut rig.ctx, "sandbox_exec", &json!({ "command": "id" }))
+        .expect_err("must refuse")
+        .to_string();
+    assert!(error.contains("curator"), "{error}");
+    assert!(error.contains("project-management"), "{error}");
+    assert!(!error.contains("(allowed: )"), "{error}");
+}
+
+/// A curator's work is store-side, so a red probe — a dead mint, an absent
+/// plugin — must not stop it from repairing the project. The route runs
+/// ahead of the probe gate for exactly this case.
+#[test]
+fn a_curator_works_while_the_probe_is_red() {
+    let mut rig = rig("probe-red", AgentRole::Curator);
+    rig.ctx.probe_ready = false;
+    rig.ctx.probe_notes = "mints down".to_string();
+    let listed = tools::dispatch(&mut rig.ctx, "agent_list", &json!({}))
+        .expect("management tools survive an unhealthy arena");
+    assert!(listed.contains("keeper"), "{listed}");
+}
+
+/// No proven scope, no management tools — the same fail-closed rule the
+/// write tools follow.
+#[test]
+fn an_unresolved_scope_refuses_every_management_tool() {
+    let mut rig = rig("no-scope", AgentRole::Curator);
+    rig.ctx.scope = Err("CORPUS_PROJECT is unset — every launch path sets it".to_string());
+    for tool in ["agent_list", "agent_new", "mission_list", "corpus_stats"] {
+        let error = tools::dispatch(&mut rig.ctx, tool, &json!({}))
+            .expect_err("must refuse")
+            .to_string();
+        assert!(error.contains("CORPUS_PROJECT"), "{tool}: {error}");
+    }
+}
+
+/// The whole case for this role is that its acts are visible afterwards.
+/// Every mutation leaves an intent line and an outcome line; reads leave
+/// none, so the log stays a record of acts rather than of curiosity.
+#[test]
+fn every_mutation_is_recorded_and_reads_are_not() {
+    let mut rig = rig("audit", AgentRole::Curator);
+
+    for tool in ["agent_list", "mission_list", "corpus_stats"] {
+        tools::dispatch(&mut rig.ctx, tool, &json!({})).expect("reads work");
+    }
+    assert!(
+        corpus_core::audit::tail(&rig.store, "alpha", 100).unwrap().is_empty(),
+        "looking is not an act"
+    );
+
+    tools::dispatch(
+        &mut rig.ctx,
+        "agent_new",
+        &json!({ "agent": "built", "description": "d", "prompt": "p" }),
+    )
+    .expect("create");
+    tools::dispatch(
+        &mut rig.ctx,
+        "agent_set_role",
+        &json!({ "agent": "built", "role": "tester" }),
+    )
+    .expect("set role");
+
+    let log = corpus_core::audit::tail(&rig.store, "alpha", 100).unwrap();
+    assert_eq!(log.len(), 4, "an intent and an outcome each: {log:?}");
+    for record in &log {
+        assert!(
+            record.actor.starts_with("curator:"),
+            "every line names its actor: {record:?}"
+        );
+    }
+    assert_eq!(log[0].op, "agent_new");
+    assert_eq!(log[0].outcome, corpus_core::audit::Outcome::Intent);
+    assert_eq!(log[0].target, "agents/built");
+    assert_eq!(log[1].outcome, corpus_core::audit::Outcome::Ok);
+    assert_eq!(log[2].op, "agent_set_role");
+    assert!(log[2].detail.contains("tester"), "{:?}", log[2]);
+
+    // A refusal is recorded too — an attempt is an act.
+    let _ = tools::dispatch(
+        &mut rig.ctx,
+        "agent_delete",
+        &json!({ "agent": "ghost", "confirm_token": "bogus" }),
+    );
+    let log = corpus_core::audit::tail(&rig.store, "alpha", 100).unwrap();
+    assert_eq!(
+        log.last().unwrap().outcome,
+        corpus_core::audit::Outcome::Refused,
+        "{:?}",
+        log.last()
+    );
+
+    // And the agent it built carries the same provenance in its sidecar,
+    // so an operator can see who made it without reading the log.
+    let built = rig.store.load_agent("alpha", "built").unwrap();
+    assert!(
+        built.meta.modified_by.as_deref().unwrap_or("").starts_with("curator:"),
+        "{:?}",
+        built.meta
+    );
+}
+
+/// A dry-run must look at what it is about to destroy. Minting a token for
+/// a target nobody loaded spends a turn and then fails on the SECOND call,
+/// with an error about the target rather than about the typo — and says
+/// nothing about what the deletion would cost.
+#[test]
+fn destructive_dry_runs_verify_and_price_their_target() {
+    let mut rig = rig("dryrun", AgentRole::Curator);
+
+    // A typo fails NOW, on the call that made it.
+    let error = tools::dispatch(&mut rig.ctx, "agent_delete", &json!({ "agent": "kepeer" }))
+        .expect_err("a nonexistent agent is not a dry run")
+        .to_string();
+    assert!(error.contains("kepeer"), "{error}");
+
+    // A real target is priced: role, subagents, and what its removal breaks.
+    tools::dispatch(
+        &mut rig.ctx,
+        "agent_subagent_add",
+        &json!({
+            "agent": "keeper",
+            "name": "keeper-scout",
+            "description": "d",
+            "prompt": "p",
+        }),
+    )
+    .expect("add a subagent");
+    let dry = tools::dispatch(&mut rig.ctx, "agent_delete", &json!({ "agent": "keeper" }))
+        .expect("dry run");
+    assert!(dry.contains("DRY RUN"), "{dry}");
+    assert!(dry.contains("curator"), "names the role: {dry}");
+    assert!(dry.contains("1 subagent"), "counts what goes with it: {dry}");
+    assert!(dry.contains("confirm_token"), "{dry}");
+
+    // Missions likewise.
+    tools::dispatch(
+        &mut rig.ctx,
+        "mission_new",
+        &json!({ "slug": "m1", "agent": "keeper", "brief": "b" }),
+    )
+    .expect("mission");
+    let dry = tools::dispatch(&mut rig.ctx, "mission_delete", &json!({ "mission": "m1" }))
+        .expect("dry run");
+    assert!(dry.contains("keeper"), "names the agent: {dry}");
+    assert!(dry.contains("queued"), "names the status: {dry}");
+    assert!(
+        tools::dispatch(&mut rig.ctx, "mission_delete", &json!({ "mission": "ghost" })).is_err(),
+        "a mission that does not exist is not a dry run"
+    );
+}
+
+/// If an act cannot be recorded, it does not happen. An unwritable log
+/// costs the role its powers, not its accountability.
+#[test]
+fn an_unrecordable_act_is_refused() {
+    let mut rig = rig("audit-blocked", AgentRole::Curator);
+    // Occupy the audit directory's path with a file, so the append cannot
+    // create it.
+    let audit_dir = rig.store.var_dir().join("audit");
+    std::fs::create_dir_all(audit_dir.parent().unwrap()).unwrap();
+    std::fs::write(&audit_dir, "not a directory\n").unwrap();
+
+    let error = tools::dispatch(
+        &mut rig.ctx,
+        "agent_new",
+        &json!({ "agent": "unrecorded", "description": "d", "prompt": "p" }),
+    )
+    .expect_err("must refuse")
+    .to_string();
+    assert!(error.contains("cannot be recorded"), "{error}");
+    assert!(
+        !rig.store.project_agent_dir("alpha", "unrecorded").exists(),
+        "the act must not have happened"
+    );
+
+    // Reads still work — they were never going to be recorded.
+    tools::dispatch(&mut rig.ctx, "agent_list", &json!({})).expect("reads are unaffected");
+}
+
+/// An edit that leaves the agent set open under delegation makes the NEXT
+/// launch refuse to render the whole project. The curator learns about it
+/// on the call that caused it, not a day later.
+#[test]
+fn a_dangling_delegation_is_reported_on_the_call_that_caused_it() {
+    let mut rig = rig("delegation", AgentRole::Curator);
+    // A primary that delegates to a scout, and the scout it names.
+    let doc = json!({
+        "$schema": "https://opencode.ai/config.json",
+        "agent": {
+            "keeper": {
+                "mode": "primary",
+                "permission": { "task": { "*": "deny", "keeper-scout": "allow" } },
+            },
+            "keeper-scout": { "mode": "subagent", "description": "d" },
+        }
+    });
+    let saved = tools::dispatch(
+        &mut rig.ctx,
+        "agent_save",
+        &json!({ "agent": "keeper", "document": doc }),
+    )
+    .expect("a closed set saves cleanly");
+    assert!(!saved.contains("[warning]"), "{saved}");
+
+    // Now drop the scout entry but keep the rule that names it.
+    let broken = json!({
+        "$schema": "https://opencode.ai/config.json",
+        "agent": {
+            "keeper": {
+                "mode": "primary",
+                "permission": { "task": { "*": "deny", "keeper-scout": "allow" } },
+            },
+        }
+    });
+    let out = tools::dispatch(
+        &mut rig.ctx,
+        "agent_save",
+        &json!({ "agent": "keeper", "document": broken }),
+    )
+    .expect("the write still lands");
+    assert!(out.contains("[warning]"), "{out}");
+    assert!(out.contains("keeper-scout"), "{out}");
+    assert!(out.contains("next launch"), "{out}");
+}

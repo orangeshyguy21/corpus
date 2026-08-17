@@ -649,7 +649,10 @@ Use Markdown formatting for all responses.
             ));
         }
         s.push_str(
-            "Give the specialist a complete, self-contained brief (it sees none of this conversation), then report its result back. Destructive operations (corpus_wipe, project_delete, agent_delete, mission_delete) are impossible for every specialist by construction — if the operator asks for one, tell them to switch the chat role to operator.",
+            &format!(
+                "Give the specialist a complete, self-contained brief (it sees none of this conversation), then report its result back. Destructive operations ({}) are impossible for every specialist by construction — if the operator asks for one, tell them to switch the chat role to operator.",
+                crate::chat::team::DESTRUCTIVE_TOOLS.join(", ")
+            ),
         );
         s
     }
