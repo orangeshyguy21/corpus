@@ -6,13 +6,13 @@
 //! Business logic (validation, store plumbing) lives here or in corpus-core,
 //! never in a view.
 
-use std::collections::{BTreeMap, hash_map::RandomState};
+use std::collections::{BTreeMap, BTreeSet, hash_map::RandomState};
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 
 use corpus_core::{
     AgentConfig, CorpusStats, CostReport, Error, Mission, PluginStatus, Project, RunLine,
-    RunSession, SourcePin, SourceRevs, Store,
+    RunSession, SourceRevs, Store,
 };
 
 use crate::nav::Screen;
@@ -681,7 +681,6 @@ impl AppState {
         agent: &str,
         model: Option<&str>,
         mission: &str,
-        pinned: &[SourcePin],
         source_pins_json: Option<&str>,
     ) -> Result<(), Error> {
         if self.run.is_some() {
@@ -692,7 +691,7 @@ impl AppState {
         // Fail loudly on an unknown agent, then materialize the WHOLE
         // project: the agent list opencode shows is project-scoped.
         self.store.load_agent(project, agent)?;
-        self.store.render_project_agents(project, pinned)?;
+        self.store.render_project_agents(project)?;
         let session = RunSession::spawn(project, agent, model, mission, source_pins_json)?;
         self.adopt_run(session);
         Ok(())
@@ -785,6 +784,13 @@ impl AppState {
             .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(2));
         if due {
             self.refresh_live_sessions();
+            // On the tmux listing's beat, not the faster one: the sweep
+            // shells out per pending mission, and it needs the listing it
+            // just refreshed to know which sessions are live. A no-op once
+            // every live mission has its conversation recorded.
+            if let Some(project) = self.effective_project() {
+                self.sweep_conversations(&project);
+            }
         }
         // Activity is a `stat` per live session — no subprocess, so it
         // polls faster: the dot should catch a turn starting, not lag it
@@ -906,10 +912,10 @@ impl AppState {
     /// REPLACED (transcript exported when possible, torn down either way)
     /// so a new mission always lands on a fresh opencode session.
     pub fn launch_mission(&mut self, project: &str, agent: &str, slug: &str) -> Result<(), Error> {
-        let (_record, pinned, pins_json) = self.prepare_launch(project, slug)?;
-        self.teardown_active_run(project, slug);
+        let (_record, pins_json) = self.prepare_launch(project, slug)?;
+        self.background_active_run();
         let model = self.agent_default_model(project, agent);
-        self.launch(project, agent, model.as_deref(), "", &pinned, pins_json.as_deref())?;
+        self.launch(project, agent, model.as_deref(), "", pins_json.as_deref())?;
         self.run_mission = Some(slug.to_string());
         if let Some(session) = self.live_run_session() {
             self.set_tmux_session(project, slug, Some(session))?;
@@ -926,15 +932,15 @@ impl AppState {
     /// died is steerable again with its history intact. Same one-run-at-a-
     /// time rule as `launch_mission`: a live run is replaced.
     pub fn resume_mission(&mut self, project: &str, slug: &str) -> Result<(), Error> {
-        let (record, pinned, pins_json) = self.prepare_launch(project, slug)?;
+        let (record, pins_json) = self.prepare_launch(project, slug)?;
         let id = record.opencode_session.clone().ok_or_else(|| {
             Error::Store("no opencode session recorded for this mission — nothing to resume".into())
         })?;
-        self.teardown_active_run(project, slug);
+        self.background_active_run();
         // Same materialization as a launch: the resumed conversation runs
         // against this project's agent set.
         self.store.load_agent(project, &record.agent)?;
-        self.store.render_project_agents(project, &pinned)?;
+        self.store.render_project_agents(project)?;
         let model = self.agent_default_model(project, &record.agent);
         let run = corpus_core::RunSession::resume(
             project,
@@ -959,7 +965,7 @@ impl AppState {
         &self,
         project: &str,
         slug: &str,
-    ) -> Result<(Mission, Vec<SourcePin>, Option<String>), Error> {
+    ) -> Result<(Mission, Option<String>), Error> {
         let mission_record = self.store.load_mission(project, slug)?;
         let prepared = corpus_core::prepare_source_pins(&self.store, project, &mission_record.pins)?;
         let pins_json = if prepared.is_empty() {
@@ -967,45 +973,69 @@ impl AppState {
         } else {
             Some(serde_json::to_string(&prepared)?)
         };
-        // The renderer's pin list: the mission's rev labels + the resolved
-        // shas, so the materialized agents read the named trees.
-        let pinned: Vec<SourcePin> = mission_record
-            .pins
-            .iter()
-            .filter_map(|(name, rev)| {
-                let sha = prepared.get(name)?.clone();
-                Some(SourcePin {
-                    name: name.clone(),
-                    rev: rev.clone(),
-                    sha,
-                })
-            })
-            .collect();
-        Ok((mission_record, pinned, pins_json))
+        Ok((mission_record, pins_json))
     }
 
-    /// One active run at a time: stop the live run (best-effort
-    /// transcript export first), and clear the dead tmux session
-    /// off whichever mission held it so re-attach never aims at a corpse.
-    fn teardown_active_run(&mut self, project: &str, incoming_slug: &str) {
+    /// Start a new run WITHOUT stopping the live one.
+    ///
+    /// This used to tear the previous run down. Its guard tested handle
+    /// OWNERSHIP rather than reality, so one action behaved two ways: a run
+    /// this process launched was killed, while a run it had merely
+    /// re-attached to after a restart survived untouched — which is why
+    /// restarting the app appeared to "restore" a clobbered session. A run
+    /// now ends only when the operator stops it.
+    ///
+    /// The outgoing run keeps its tmux binding, but `adopt_run` is about to
+    /// drop its `RunSession`, and nothing polls for a conversation id once
+    /// the handle is gone. So the id is claimed here, while the handle still
+    /// exists. `sweep_conversations` is the backstop for a run displaced
+    /// before opencode had created its session at all.
+    fn background_active_run(&mut self) {
         if !self.run_active() {
             return;
         }
-        let replaced = self.live_run_session();
-        self.stop_run();
-        if let Some(replaced) = replaced {
-            let holder = self
-                .missions
-                .iter()
-                .find(|(s, m)| {
-                    s.as_str() != incoming_slug && m.session.as_deref() == Some(replaced.as_str())
-                })
-                .map(|(s, _)| s.clone());
-            if let Some(holder) = holder {
-                // Only the dead tmux session goes; the displaced mission
-                // keeps its opencode id so it can be resumed later.
-                let _ = self.set_tmux_session(project, &holder, None);
+        self.capture_opencode_session();
+    }
+
+    /// Ids already bound to other missions.
+    ///
+    /// Concurrent runs share one run dir, so `opencode session list` shows
+    /// every live mission's conversation. Excluding what is already claimed
+    /// is what stops a slow-booting run from adopting a neighbour's.
+    fn claimed_conversations(&self, except: &str) -> BTreeSet<String> {
+        self.missions
+            .iter()
+            .filter(|(slug, _)| slug.as_str() != except)
+            .filter_map(|(_, m)| m.opencode_session.clone())
+            .collect()
+    }
+
+    /// Fill in the conversation id of any mission that is LIVE in tmux but
+    /// has none recorded — the runs no handle covers: displaced by a later
+    /// launch, or re-attached after a restart. Without this they stay
+    /// orphans, attachable but neither exportable nor resumable.
+    pub fn sweep_conversations(&mut self, project: &str) {
+        let pending: Vec<(String, String)> = self
+            .missions
+            .iter()
+            .filter(|(_, m)| m.opencode_session.is_none())
+            .filter_map(|(slug, m)| Some((slug.clone(), m.session.clone()?)))
+            .filter(|(_, session)| self.live_sessions.iter().any(|l| l == session))
+            .collect();
+        let mut changed = false;
+        for (slug, session) in pending {
+            let claimed = self.claimed_conversations(&slug);
+            let Some(id) =
+                corpus_core::session_conversation(&self.store, project, &session, &claimed)
+            else {
+                continue;
+            };
+            if self.set_opencode_session(project, &slug, Some(id)).is_ok() {
+                changed = true;
             }
+        }
+        if changed {
+            self.refresh_missions(project);
         }
     }
 
@@ -1060,7 +1090,12 @@ impl AppState {
         if known.is_some() {
             return;
         }
-        let Some(id) = self.run.as_mut().and_then(|run| run.opencode_session_id()) else {
+        let claimed = self.claimed_conversations(&slug);
+        let Some(id) = self
+            .run
+            .as_mut()
+            .and_then(|run| run.opencode_session_id(&claimed))
+        else {
             return;
         };
         if self.set_opencode_session(&project, &slug, Some(id)).is_ok() {

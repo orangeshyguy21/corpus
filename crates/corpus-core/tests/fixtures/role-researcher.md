@@ -113,3 +113,14 @@ permissions and strictly off-limits: reading them pollutes the
 project boundary. Any path in this prompt that names a corpus
 category without the `store/projects/p/` prefix means
 the one inside YOUR project corpus.
+
+---
+
+## Pinned sources
+
+Call `target_info` before you read any source. It names the exact
+`sources/<name>/<sha>/` trees THIS run is pinned to — read those
+literal paths. Do NOT derive source paths from `sources.toml`: it
+records only the DEFAULT pin and may name a different (usually older)
+tree. Verify every claim against the pinned trees; treat anything not
+traced in them as unverified.

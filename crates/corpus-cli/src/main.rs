@@ -166,7 +166,7 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
 
     // Materialize the project's agents (clear + render to .opencode/agent/):
     // the agent list opencode shows is scoped to the project.
-    let written = store.render_project_agents(&scope.project, &[])
+    let written = store.render_project_agents(&scope.project)
         .map_err(|e| e.to_string())?;
     for path in &written {
         println!("materialized {}", path.display());
@@ -210,7 +210,7 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         drop(log);
         // Materialize the researcher agent for the follow-up.
-        let _ = store.render_agent(&scope.project, "researcher", &[])
+        let _ = store.render_agent(&scope.project, "researcher")
             .map_err(|e| e.to_string())?;
         let mut session = corpus_core::RunSession::spawn_headless_append(
             &scope.project,

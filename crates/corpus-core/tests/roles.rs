@@ -31,7 +31,7 @@ fn tmp_store(tag: &str) -> Store {
 fn render_role(store: &Store, project: &str, role: AgentRole) -> String {
     let slug = role.as_str();
     store.create_agent_with_role(project, slug, role).unwrap();
-    store.render_project_agents(project, &[]).unwrap();
+    store.render_project_agents(project).unwrap();
     fs::read_to_string(store.opencode_agent_dir(project).join(format!("{slug}.md"))).unwrap()
 }
 
@@ -152,7 +152,7 @@ fn roles_bind_their_trust_domains() {
     store
         .create_agent_with_role("p", "tester", AgentRole::Tester)
         .unwrap();
-    store.render_project_agents("p", &[]).unwrap();
+    store.render_project_agents("p").unwrap();
     let read_render = |slug: &str| {
         fs::read_to_string(store.opencode_agent_dir("p").join(format!("{slug}.md"))).unwrap()
     };
@@ -237,7 +237,7 @@ fn a_stored_block_cannot_widen_what_the_role_denies() {
             }),
         )
         .unwrap();
-    store.render_project_agents("p", &[]).unwrap();
+    store.render_project_agents("p").unwrap();
     let rendered =
         fs::read_to_string(store.opencode_agent_dir("p").join("researcher.md")).unwrap();
     let perms = perm(&rendered);
@@ -285,7 +285,7 @@ fn a_stored_block_cannot_widen_what_the_role_denies() {
             &serde_json::json!({"task": {"*": "allow", "nonexistent": "allow"}}),
         )
         .unwrap();
-    let refused = store.render_project_agents("p", &[]).unwrap_err().to_string();
+    let refused = store.render_project_agents("p").unwrap_err().to_string();
     assert!(
         refused.contains("nonexistent") && refused.contains("closed under delegation"),
         "a dangling delegation must refuse the render: {refused}"
@@ -318,7 +318,7 @@ fn a_stored_block_may_tighten_within_the_role() {
             }),
         )
         .unwrap();
-    store.render_project_agents("p", &[]).unwrap();
+    store.render_project_agents("p").unwrap();
     let rendered = fs::read_to_string(store.opencode_agent_dir("p").join("tester.md")).unwrap();
     let perms = perm(&rendered);
 

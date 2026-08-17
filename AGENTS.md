@@ -81,6 +81,16 @@ A run dir is provisioned per launch and exposes EXACTLY one project:
   .opencode/agent/*.md                       rendered from the project's agents
 ```
 
+The run dir is per PROJECT and shared by every mission in it, so everything
+in it must be a project-level fact. Per-RUN identity — `CORPUS_OPENCODE_AGENT`,
+`CORPUS_RUN_LOG`, `CORPUS_SOURCE_PINS` — travels as environment on the tmux
+session instead, and reaches the agent through `target_info`. That split is
+what lets several missions run at once: `render_project_agents` takes no
+launch state, so a second mission's launch rewrites the first's agent files
+with identical bytes. The renderer used to bake each launch's literal
+`sources/<name>/<sha>/` trees into those files, which meant launching one
+mission silently repointed a live one at another mission's revisions.
+
 That is the project boundary. The permission globs in a rendered agent are
 the second line of defence, not the only one: another project's corpus is
 absent from the namespace rather than deny-listed, and `benchmarks/` (the

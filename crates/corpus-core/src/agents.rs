@@ -1183,19 +1183,17 @@ impl Store {
     /// Render EVERY agent of the project into `.opencode/agent/*.md` (bare
     /// names) — after clearing the previous generated set, so the agent
     /// list opencode shows is scoped to this project. Agents render in
-    /// slug order. `pinned` names the launch's source pins (repos the
-    /// mission pinned, with their rev + resolved sha) — rendered as the
-    /// "Pinned sources" footer; an empty slice renders none (the plugin's
-    /// defaults then apply). Returns the written paths.
+    /// slug order. Returns the written paths.
+    ///
+    /// Takes no source pins: they are a property of the RUN and reach the
+    /// agent through `target_info`, so this render is a pure function of
+    /// the project and produces identical bytes on every launch. That is
+    /// what makes re-rendering safe while another mission is live.
     ///
     /// Validation runs BEFORE the clear, so a refused render leaves the
     /// previously rendered set on disk rather than half-scoping the
     /// project.
-    pub fn render_project_agents(
-        &self,
-        project: &str,
-        pinned: &[SourcePin],
-    ) -> Result<Vec<PathBuf>> {
+    pub fn render_project_agents(&self, project: &str) -> Result<Vec<PathBuf>> {
         let agents = self.list_agents(project)?;
         let claimed = claim_entries(&agents, project)?;
         check_delegation_closure(&agents, &claimed, project)?;
@@ -1219,7 +1217,6 @@ impl Store {
                     .ok_or_else(|| Error::Store(format!("agent {slug}/{name}: not an object")))?;
                 let ctx = RenderCtx {
                     project,
-                    pinned,
                     role: entry_role(&agent.meta, name, slug),
                     known_entries: &known,
                     roots: roots.clone(),
@@ -1239,15 +1236,8 @@ impl Store {
     /// ADDITIVE (no clear): used to layer a follow-up agent (the CLI
     /// `--research` pass) onto an already project-scoped set. Launch paths
     /// scope the set with [`Store::render_project_agents`] instead.
-    /// `pinned` renders the Pinned-sources footer (see
-    /// [`Store::render_project_agents`]); pass an empty slice for none.
     /// Returns the written paths.
-    pub fn render_agent(
-        &self,
-        project: &str,
-        slug: &str,
-        pinned: &[SourcePin],
-    ) -> Result<Vec<PathBuf>> {
+    pub fn render_agent(&self, project: &str, slug: &str) -> Result<Vec<PathBuf>> {
         let agent = self.load_agent(project, slug)?;
         // Delegation is checked against the WHOLE project: this path layers
         // one agent onto an already project-scoped set, so the set it joins
@@ -1275,7 +1265,6 @@ impl Store {
                 .ok_or_else(|| Error::Store(format!("agent {slug}/{name}: not an object")))?;
             let ctx = RenderCtx {
                 project,
-                pinned,
                 role: entry_role(&agent.meta, name, slug),
                 known_entries: &known,
                 roots: roots.clone(),
@@ -1475,8 +1464,6 @@ pub struct SourcePin {
 struct RenderCtx<'a> {
     /// The project the rendered agent is bound to.
     project: &'a str,
-    /// The launch's source pins; empty renders no footer.
-    pinned: &'a [SourcePin],
     /// This entry's capability ceiling.
     role: AgentRole,
     /// Every entry name the project declares — the delegation universe.
@@ -1542,7 +1529,7 @@ fn render_agent_file(
         out.push_str(&inline_file_refs(dir, prompt)?);
     }
     out.push_str(&corpus_scope_section(ctx.project));
-    out.push_str(&pinned_sources_section(ctx.pinned));
+    out.push_str(pinned_sources_section(ctx.role));
     Ok(out)
 }
 
@@ -1563,33 +1550,35 @@ fn corpus_scope_section(project: &str) -> String {
     )
 }
 
-/// The launch-bound source-pin footer: the literal `sources/<name>/<sha>/`
-/// trees THIS run reads. Research-zone agents otherwise derive their
-/// source from `sources.toml` — the DEFAULT pin — so a mission pinned to
-/// another rev must name the trees, or the agent audits the wrong code
-/// and `sources.toml` becomes the only signal the model sees. Empty when
-/// the launch carries no pins.
-fn pinned_sources_section(pinned: &[SourcePin]) -> String {
-    if pinned.is_empty() {
-        return String::new();
+/// The source-pin instruction. CONSTANT, and that is the point.
+///
+/// This footer used to name the literal `sources/<name>/<sha>/` trees of
+/// whichever launch rendered last — a per-RUN fact written into a file the
+/// whole project shares. Two consequences, both bad: launching a second
+/// mission rewrote the trees under a live one, and keeping them apart
+/// meant a run directory per mission, duplicating opencode's
+/// `node_modules` with it.
+///
+/// The pins already travel per-run as `CORPUS_SOURCE_PINS`, which
+/// `start_tui` sets on the tmux session and `target_info` reports as an
+/// exact `sources/<name>/<sha>` path per pin. So the FILE states the rule
+/// and the TOOL states the facts — which is the same split
+/// `write_run_opencode_config` already draws between project config and
+/// run identity.
+///
+/// Rendered only for a role that can actually call `target_info`; a
+/// curator manages the project and reads no source.
+fn pinned_sources_section(role: AgentRole) -> &'static str {
+    if !role.allows("target_info") {
+        return "";
     }
-    let mut out = String::from(
-        "\n---\n\n## Pinned sources (bound at launch)\n\n\
-         This run reads these target revisions. Read the LITERAL tree\n\
-         paths below, not `sources.toml` — it records only the DEFAULT\n\
-         pin and may name a different (usually older) tree:\n",
-    );
-    for pin in pinned {
-        out.push_str(&format!(
-            "- `{}` → `{}` at `sources/{}/{}/`\n",
-            pin.name, pin.rev, pin.name, pin.sha
-        ));
-    }
-    out.push_str(
-        "Verify every claim against the named trees; treat anything not\n\
-         traced in them as unverified.\n",
-    );
-    out
+    "\n---\n\n## Pinned sources\n\n\
+     Call `target_info` before you read any source. It names the exact\n\
+     `sources/<name>/<sha>/` trees THIS run is pinned to — read those\n\
+     literal paths. Do NOT derive source paths from `sources.toml`: it\n\
+     records only the DEFAULT pin and may name a different (usually older)\n\
+     tree. Verify every claim against the pinned trees; treat anything not\n\
+     traced in them as unverified.\n"
 }
 
 /// One permission decision. Ordered by tightness, so a merge that takes
@@ -2346,7 +2335,7 @@ mod tests {
             )
             .unwrap();
         // ...but the sidecar says researcher (the role it was created with).
-        let text = fs::read_to_string(&store.render_project_agents("alpha", &[]).unwrap()[0])
+        let text = fs::read_to_string(&store.render_project_agents("alpha").unwrap()[0])
             .unwrap();
         let perm = rendered_permission(&text);
         assert_eq!(perm["corpus_target_info"].as_str(), Some("allow"));
@@ -2385,7 +2374,7 @@ mod tests {
                 })),
             )
             .unwrap();
-        let text = fs::read_to_string(&store.render_project_agents("alpha", &[]).unwrap()[0])
+        let text = fs::read_to_string(&store.render_project_agents("alpha").unwrap()[0])
             .unwrap();
         let perm = rendered_permission(&text);
         for tool in CORPUS_TOOLS {
@@ -2417,7 +2406,7 @@ mod tests {
                 })),
             )
             .unwrap();
-        let text = fs::read_to_string(&store.render_project_agents("alpha", &[]).unwrap()[0])
+        let text = fs::read_to_string(&store.render_project_agents("alpha").unwrap()[0])
             .unwrap();
         let perm = rendered_permission(&text);
         assert_eq!(perm["read"]["benchmarks/**"].as_str(), Some("deny"), "{text}");
@@ -2632,7 +2621,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        store.render_project_agents("alpha", &[]).unwrap();
+        store.render_project_agents("alpha").unwrap();
         let read = |slug: &str| {
             fs::read_to_string(store.opencode_agent_dir("alpha").join(format!("{slug}.md"))).unwrap()
         };
@@ -2666,7 +2655,7 @@ mod tests {
         store
             .create_agent_with_role("alpha", "cur", AgentRole::Curator)
             .unwrap();
-        store.render_project_agents("alpha", &[]).unwrap();
+        store.render_project_agents("alpha").unwrap();
         let read = |slug: &str| {
             rendered_permission(
                 &fs::read_to_string(store.opencode_agent_dir("alpha").join(format!("{slug}.md")))
@@ -3049,7 +3038,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let error = store.render_project_agents("alpha", &[]).unwrap_err().to_string();
+        let error = store.render_project_agents("alpha").unwrap_err().to_string();
         assert!(error.contains("shared-scout"), "{error}");
         assert!(error.contains("rename one"), "{error}");
     }
@@ -3077,7 +3066,7 @@ mod tests {
                 })),
             )
             .unwrap();
-        let error = store.render_project_agents("alpha", &[]).unwrap_err().to_string();
+        let error = store.render_project_agents("alpha").unwrap_err().to_string();
         assert!(error.contains("discover-scout"), "{error}");
         assert!(error.contains("alpha"), "names the project: {error}");
         assert!(error.contains("closed"), "{error}");
@@ -3117,7 +3106,7 @@ mod tests {
             )
             .unwrap();
         store.check_project_delegation("alpha").unwrap();
-        let written = store.render_project_agents("alpha", &[]).unwrap();
+        let written = store.render_project_agents("alpha").unwrap();
         assert_eq!(written.len(), 3);
         let one = fs::read_to_string(store.opencode_agent_dir("alpha").join("one.md")).unwrap();
         assert_eq!(
@@ -3179,7 +3168,7 @@ mod tests {
                 })),
             )
             .unwrap();
-        store.render_project_agents("alpha", &[]).unwrap();
+        store.render_project_agents("alpha").unwrap();
         let text = fs::read_to_string(store.opencode_agent_dir("alpha").join("a.md")).unwrap();
         let read = &rendered_permission(&text)["read"];
 
@@ -3225,7 +3214,7 @@ mod tests {
                 &doc(serde_json::json!({ "a": { "mode": "primary" } })),
             )
             .unwrap();
-        store.render_project_agents("alpha", &[]).unwrap();
+        store.render_project_agents("alpha").unwrap();
         let text = fs::read_to_string(store.opencode_agent_dir("alpha").join("a.md")).unwrap();
         assert_eq!(rendered_permission(&text)["task"]["*"].as_str(), Some("deny"));
 
@@ -3234,7 +3223,6 @@ mod tests {
         let known = BTreeSet::new();
         let ctx = RenderCtx {
             project: "alpha",
-            pinned: &[],
             role: AgentRole::Researcher,
             known_entries: &known,
             roots: DataRoots::default(),
@@ -3268,7 +3256,7 @@ mod tests {
                 })),
             )
             .unwrap();
-        let written = store.render_project_agents("alpha", &[]).unwrap();
+        let written = store.render_project_agents("alpha").unwrap();
         let text = fs::read_to_string(&written[0]).unwrap();
         // Wildcard store paths bound to the concrete project.
         assert!(text.contains("store/projects/alpha/corpus/**"), "{text}");
@@ -3291,22 +3279,48 @@ mod tests {
         // The scope section names the project corpus.
         assert!(text.contains("## Corpus scope (bound at launch)"));
         assert!(text.contains("You are bound to project `alpha`"));
-        // No pins -> no Pinned sources section (backend expectations keep
-        // the byte-identical template render).
-        assert!(!text.contains("Pinned sources"), "{text}");
-
-        // A pinned render names the literal tree path the agent must read.
-        let pinned = [SourcePin {
-            name: "cdk".into(),
-            rev: "main".into(),
-            sha: "b2d07815b7cac85b6200b12d813bd5bfda613552".into(),
-        }];
-        let written = store.render_project_agents("alpha", &pinned).unwrap();
-        let text = fs::read_to_string(&written[0]).unwrap();
-        assert!(text.contains("## Pinned sources (bound at launch)"), "{text}");
+        // The pin section points at the TOOL and names no revision: the
+        // render is a pure function of the project, so a second mission's
+        // launch cannot rewrite the trees under a live one.
+        assert!(text.contains("## Pinned sources"), "{text}");
+        assert!(text.contains("Call `target_info` before you read any source"), "{text}");
         assert!(
-            text.contains("`cdk` → `main` at `sources/cdk/b2d07815b7cac85b6200b12d813bd5bfda613552/`"),
-            "{text}"
+            !text.contains("sources/cdk/"),
+            "a literal tree path is a per-RUN fact and must not reach a per-project file: {text}"
+        );
+
+        // A curator manages the project and reads no source, so it holds no
+        // `target_info` and gets no pin section at all.
+        store
+            .create_agent_with_role("alpha", "keeper", AgentRole::Curator)
+            .unwrap();
+        store.render_project_agents("alpha").unwrap();
+        let keeper =
+            fs::read_to_string(store.opencode_agent_dir("alpha").join("keeper.md")).unwrap();
+        assert!(!keeper.contains("Pinned sources"), "{keeper}");
+
+        // THE property that lets two missions run at once: the render is a
+        // pure function of the project, so a second mission's launch
+        // rewrites the first's agent files with identical bytes. When the
+        // pins lived in here, launching B changed the tree paths under a
+        // live A — the same class of bug as telling an agent to read a
+        // path that does not exist.
+        let first: Vec<String> = store
+            .render_project_agents("alpha")
+            .unwrap()
+            .iter()
+            .map(|p| fs::read_to_string(p).unwrap())
+            .collect();
+        let second: Vec<String> = store
+            .render_project_agents("alpha")
+            .unwrap()
+            .iter()
+            .map(|p| fs::read_to_string(p).unwrap())
+            .collect();
+        assert_eq!(
+            first, second,
+            "a re-render must be byte-identical, or launching one mission \
+             disturbs another that is already live"
         );
         let _ = fs::remove_dir_all(store.root());
     }

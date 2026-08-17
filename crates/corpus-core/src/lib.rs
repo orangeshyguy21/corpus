@@ -23,7 +23,8 @@ pub use agents::{AgentConfig, AgentSidecar, DEFAULT_AGENT_NAME, OPENCODE_SCHEMA,
 pub use error::{Error, Result};
 pub use launch::{
     agent_default_model, agent_file_stem, export_session, kill_tmux_session, live_tui_sessions,
-    opencode_agent_handle, run_idle_secs, session_raw_log, tui_attach_command, RunLine, RunSession,
+    opencode_agent_handle, run_idle_secs, session_conversation, session_raw_log, tui_attach_command,
+    RunLine, RunSession,
 };
 pub use models::{model_list, ollama_models, ModelEntry, ModelList, ModelOption, ModelProviderGroup, ModelRegistry};
 pub use paths::{
