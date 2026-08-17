@@ -57,6 +57,9 @@ struct App {
     /// The model the current chat backend was launched with; a picker change
     /// restarts the session (the old code kept the old model silently).
     chat_model: String,
+    /// The model last written to `store/app.yaml` — the guard that keeps the
+    /// persistence check an in-memory comparison instead of a per-frame read.
+    chat_model_saved: String,
     /// Last operator-position context pushed to the chat backend (re-pushed
     /// only on change).
     last_chat_context: String,
@@ -79,7 +82,17 @@ impl App {
         theme::apply(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let state = AppState::from_env();
+        // Restore the remembered chat model (store/app.yaml). Only the
+        // PICKER is restored, not a session: the backend starts on the first
+        // frame the chat panel actually renders, so a launch with the panel
+        // closed still spawns nothing. A model that ollama no longer has
+        // fails visibly on that first start rather than being silently
+        // dropped here — checking would mean probing ollama during boot.
+        let remembered = state.prefs().chat_model;
+        let mut chat_panel = chat::panel::ChatPanelView::default();
+        chat_panel.set_model(&remembered);
         Self {
+            chat_model_saved: remembered,
             last_screen: state.current_screen,
             sidebar: Sidebar::default(),
             projects: projects::ProjectsView::default(),
@@ -87,7 +100,7 @@ impl App {
             missions: missions::MissionsView::default(),
             toasts: egui_toast::Toasts::new(),
             chat: chat::ChatHandle::idle(""),
-            chat_panel: chat::panel::ChatPanelView::default(),
+            chat_panel,
             chat_role: chat::team::TeamRole::Operator,
             chat_model: String::new(),
             last_chat_context: String::new(),
@@ -493,6 +506,16 @@ impl App {
                     self.last_chat_context = ctx;
                 }
                 self.chat_panel.show(ui, &mut self.chat);
+                // Persist a picker change (store/app.yaml). Guarded by the
+                // in-memory copy so the steady state is a comparison, not a
+                // file read every frame. Saved on the PICK, not on session
+                // start: a model chosen with no project selected (nothing to
+                // scope a session to) must still come back next launch.
+                let picked = self.chat_panel.model();
+                if picked != self.chat_model_saved {
+                    self.chat_model_saved = picked.to_string();
+                    self.state.remember_chat_model(picked);
+                }
             })
             .response
             .rect

@@ -40,6 +40,10 @@ pub struct ProjectsView {
     show_clone: bool,
     clone_name: String,
     clone_corpus: bool,
+    /// The Rename dialog + its edit buffer (the project's display label; the
+    /// slug never moves).
+    show_rename: bool,
+    rename_name: String,
     /// Schedule a fresh plugin probe aggregation next frame (probe state
     /// is fetched on demand, not continuously).
     needs_probe: bool,
@@ -54,6 +58,8 @@ impl Default for ProjectsView {
             show_clone: false,
             clone_name: String::new(),
             clone_corpus: false,
+            show_rename: false,
+            rename_name: String::new(),
             needs_probe: false,
         }
     }
@@ -109,6 +115,10 @@ impl ProjectsView {
                     self.clone_name.clear();
                     self.clone_corpus = false;
                     self.show_clone = true;
+                }
+                if theme::house_button(ui, "Rename").clicked() {
+                    self.rename_name = name.clone();
+                    self.show_rename = true;
                 }
                 ui.label(
                     RichText::new(format!("created: {}", fmt_epoch(project.created)))
@@ -269,6 +279,7 @@ impl ProjectsView {
         });
 
         self.clone_window(ui, state, toasts, &slug);
+        self.rename_window(ui, state, toasts, &slug);
         self.wipe_confirm_window(ui, state, toasts, &slug);
     }
 
@@ -351,6 +362,53 @@ impl ProjectsView {
                 });
             });
         self.confirm_wipe = open && !wiped && !cancel;
+    }
+
+    /// The Rename dialog: the project's display LABEL only. The slug is the
+    /// project's identity — its directory name and the key agents, missions,
+    /// run dirs and pins are filed under — so a rename never moves it.
+    fn rename_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
+        if !self.show_rename {
+            return;
+        }
+        let mut open = self.show_rename;
+        let mut renamed = false;
+        egui::Window::new("Rename project")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
+            .show(ui.ctx(), |ui| {
+                ui.label("Display name");
+                let entry = ui.text_edit_singleline(&mut self.rename_name);
+                ui.label(
+                    RichText::new(format!("id stays `{slug}`"))
+                        .size(12.0)
+                        .color(theme::TEXT_FAINT),
+                );
+                ui.add_space(8.0);
+                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let named = !self.rename_name.trim().is_empty();
+                let clicked = ui
+                    .add_enabled_ui(named, |ui| theme::house_button(ui, "Rename"))
+                    .inner
+                    .clicked();
+                if clicked || (submit && named) {
+                    match state.rename_project(slug, &self.rename_name) {
+                        Ok(project) => {
+                            toast(
+                                toasts,
+                                ToastKind::Success,
+                                format!("renamed project to {}", project.name),
+                            );
+                            state.refresh();
+                            renamed = true;
+                        }
+                        Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
+                    }
+                }
+            });
+        self.show_rename = open && !renamed;
     }
 
     /// The Clone dialog: display name (defaults to the source's) + the

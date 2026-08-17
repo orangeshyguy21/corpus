@@ -45,9 +45,15 @@ pub struct Sidebar {
     clone_corpus: bool,
     /// The mission being renamed (Mission menu -> Rename…) — the project
     /// rides along: tree rows can belong to a non-selected project.
-    rename_project: Option<String>,
+    rename_mission_project: Option<String>,
     rename_mission: Option<String>,
     rename_name: String,
+    /// The project being renamed (Project kebab -> Rename…) and its edit
+    /// buffer. Separate from the mission rename's state: both modals can be
+    /// open at once, and one shared buffer would let them overwrite each
+    /// other's text.
+    rename_project: Option<String>,
+    rename_project_name: String,
     /// The project the new-agent modal targets (the `+` on a project's
     /// agents group sets it).
     new_agent_project: String,
@@ -68,9 +74,11 @@ impl Default for Sidebar {
             show_clone: false,
             clone_name: String::new(),
             clone_corpus: false,
-            rename_project: None,
+            rename_mission_project: None,
             rename_mission: None,
             rename_name: String::new(),
+            rename_project: None,
+            rename_project_name: String::new(),
             new_agent_project: String::new(),
             needs_probe: false,
         }
@@ -110,6 +118,7 @@ impl Sidebar {
         self.create_project_window(ui, state, toasts);
         self.new_agent_window(ui, state, toasts);
         self.rename_window(ui, state, toasts);
+        self.rename_project_window(ui, state, toasts);
         self.clone_window(ui, state, toasts);
     }
 
@@ -219,6 +228,11 @@ impl Sidebar {
                         ))
                         .frame(false),
                         |ui| {
+                            if ui.button("Rename…").clicked() {
+                                self.rename_project = Some(slug.to_string());
+                                self.rename_project_name = name.clone();
+                                ui.close_menu();
+                            }
                             if ui.button("Clone…").clicked() {
                                 self.prep_clone(slug.to_string());
                                 ui.close_menu();
@@ -486,7 +500,7 @@ impl Sidebar {
                     ui.close_menu();
                 }
                 if ui.button("Rename…").clicked() {
-                    self.rename_project = Some(project.to_string());
+                    self.rename_mission_project = Some(project.to_string());
                     self.rename_mission = Some(slug.to_string());
                     self.rename_name = name.to_string();
                     ui.close_menu();
@@ -500,12 +514,69 @@ impl Sidebar {
         .response
     }
 
+    /// The project Rename… modal: sets the project's display LABEL. The slug
+    /// is its identity — directory name, and the key every agent, mission,
+    /// run dir, pin and chat session is filed under — so it never moves.
+    fn rename_project_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
+        let Some(slug) = self.rename_project.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut done = false;
+        egui::Window::new("Rename project")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -120.0))
+            .show(ui.ctx(), |ui| {
+                ui.label("Display name");
+                let entry = ui.text_edit_singleline(&mut self.rename_project_name);
+                ui.label(
+                    egui::RichText::new(format!("id stays `{slug}`"))
+                        .small()
+                        .color(theme::TEXT_FAINT),
+                );
+                ui.add_space(8.0);
+                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let named = !self.rename_project_name.trim().is_empty();
+                let clicked = ui
+                    .add_enabled_ui(named, |ui| theme::house_button(ui, "Rename"))
+                    .inner
+                    .clicked();
+                if (clicked || (submit && named))
+                    && match state.rename_project(&slug, &self.rename_project_name) {
+                        Ok(project) => {
+                            toast(
+                                toasts,
+                                ToastKind::Success,
+                                format!("renamed project to {}", project.name),
+                            );
+                            true
+                        }
+                        Err(error) => {
+                            toast(toasts, ToastKind::Error, error.to_string());
+                            false
+                        }
+                    }
+                {
+                    // The sidebar rows, the chat header and the project view
+                    // all read the label off the store — one refresh repaints
+                    // every one of them.
+                    state.refresh();
+                    done = true;
+                }
+            });
+        if !open || done {
+            self.rename_project = None;
+        }
+    }
+
     /// The Rename… modal: sets the record's display name (keeps the slug).
     fn rename_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
         let Some(slug) = self.rename_mission.clone() else {
             return;
         };
-        let Some(project) = self.rename_project.clone() else {
+        let Some(project) = self.rename_mission_project.clone() else {
             self.rename_mission = None;
             return;
         };

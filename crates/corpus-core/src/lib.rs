@@ -33,7 +33,7 @@ pub use sensitivity::Sensitivity;
 pub use srcrev::{ensure_source_tree, resolve_rev, revs_cache_fetched, selectable_revs, REV_CACHE_TTL_SECS};
 pub use store::{
     checksum, corpus_cost, corpus_stats, fnv1a_hex, mission_logs, project_slug_env, slugify,
-    store_root_env, validate_slug, CategoryStat, CorpusStats, CostReport, CostRow,
+    store_root_env, validate_slug, AppPrefs, CategoryStat, CorpusStats, CostReport, CostRow,
     MigrationReport, MigrateOptions, Mission, MissionLog, Project, Scope, Store, CATEGORIES,
     AGENT_ENV, DEFAULT_PROJECT_SLUG, PROJECT_ENV, RUN_LOG_ENV, RUNS, SOURCE_PINS_ENV, STORE_ENV,
 };

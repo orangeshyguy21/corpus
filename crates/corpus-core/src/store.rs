@@ -230,6 +230,48 @@ impl Project {
     }
 }
 
+/// The app's remembered UI choices (`store/app.yaml`) — the operator's
+/// settings, not corpus data. Kept beside the store it describes (and so
+/// scoped by `CORPUS_STORE` like everything else) rather than in egui's
+/// memory blob, which the app deliberately does not persist.
+///
+/// Every field is optional-by-default: an older file, a hand-edit, or a
+/// field added later must never make the app fail to start.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppPrefs {
+    /// The model last chosen in the chat panel's picker. Restored on launch
+    /// so the chat comes back where it was left; empty = never chosen, and
+    /// the panel stays idle until one is picked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub chat_model: String,
+}
+
+impl Store {
+    fn prefs_path(&self) -> PathBuf {
+        self.root().join("app.yaml")
+    }
+
+    /// Read the remembered UI choices. NEVER fails: a missing, unreadable or
+    /// malformed file yields defaults, because losing a preference must not
+    /// keep the app from opening.
+    pub fn load_prefs(&self) -> AppPrefs {
+        fs::read_to_string(self.prefs_path())
+            .ok()
+            .and_then(|raw| serde_yaml::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist the remembered UI choices.
+    pub fn save_prefs(&self, prefs: &AppPrefs) -> Result<()> {
+        let path = self.prefs_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, serde_yaml::to_string(prefs)?)?;
+        Ok(())
+    }
+}
+
 /// The result of a corpus walk: file count + total bytes under
 /// `store/projects/<p>/corpus/` (every file in every category, attack
 /// directories included), broken down per category for the project
@@ -710,6 +752,21 @@ impl Store {
         Ok(project)
     }
 
+    /// Rename a project's DISPLAY name. The slug is the project's identity —
+    /// it names the directory and is what agents, missions, run dirs, pins
+    /// and chat sessions are keyed by — so a rename touches the label only,
+    /// never the path.
+    pub fn rename_project(&self, slug: &str, name: &str) -> Result<Project> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::Store("project name must not be empty".into()));
+        }
+        let mut project = Project::load(self, slug)?;
+        project.name = name.to_string();
+        project.save(self, slug)?;
+        Ok(project)
+    }
+
     /// Rebind a project's environment plugin (the one mutable binding a
     /// project carries).
     pub fn rebind_project(&self, slug: &str, plugin: &str) -> Result<Project> {
@@ -1148,6 +1205,46 @@ mod tests {
         // delete
         store.delete_project("cdk-b").unwrap();
         assert!(Project::load(&store, "cdk-b").is_err());
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn app_prefs_round_trip_and_never_fail_the_launch() {
+        let store = tmp_store("prefs");
+        // Nothing on disk yet: defaults, no error — a first launch has no
+        // remembered model and the panel simply stays idle.
+        assert_eq!(store.load_prefs().chat_model, "");
+        store
+            .save_prefs(&AppPrefs { chat_model: "qwen3.8:27b-mlx".into() })
+            .unwrap();
+        assert_eq!(store.load_prefs().chat_model, "qwen3.8:27b-mlx");
+        // An unknown field (a newer app's file) still loads.
+        write(&store.root().join("app.yaml"), "chat_model: m\nfuture_thing: 3\n");
+        assert_eq!(store.load_prefs().chat_model, "m");
+        // Garbage degrades to defaults rather than refusing to open.
+        write(&store.root().join("app.yaml"), "\t not: [yaml");
+        assert_eq!(store.load_prefs().chat_model, "");
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn rename_project_moves_the_label_not_the_slug() {
+        let store = tmp_store("rename-proj");
+        seed_sample(&store);
+        store.create_project("cdk-a", "CDK team A", "cdk-regtest").unwrap();
+        store.create_agent_from_seed("cdk-a", "hunter", "researcher").unwrap();
+        let renamed = store.rename_project("cdk-a", "  Local Runner  ").unwrap();
+        assert_eq!(renamed.name, "Local Runner", "the name is trimmed");
+        // The slug — and therefore every path filed under it — is untouched.
+        assert!(store.project_dir("cdk-a").is_dir());
+        assert!(store.project_agent_dir("cdk-a", "hunter").join("opencode.json").is_file());
+        let reloaded = Project::load(&store, "cdk-a").unwrap();
+        assert_eq!(reloaded.name, "Local Runner");
+        assert_eq!(reloaded.plugin, "cdk-regtest", "rename touches nothing else");
+        // An empty (or whitespace) name is refused rather than blanking the
+        // label — the sidebar would fall back to showing the raw slug.
+        assert!(store.rename_project("cdk-a", "   ").is_err());
+        assert!(store.rename_project("no-such-project", "X").is_err());
         let _ = fs::remove_dir_all(store.root());
     }
 

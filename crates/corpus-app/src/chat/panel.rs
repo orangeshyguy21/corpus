@@ -52,6 +52,15 @@ pub struct ChatPanelView {
     /// The display name of the chat's project (slug fallback) — the header
     /// names things, never bare UUIDs.
     project_label: String,
+    /// LAST FRAME's measured composer height. The footer used to be a fixed
+    /// 88px reservation, so the moment the input grew past one row the box
+    /// (and the status line under it) fell off the bottom of the panel — the
+    /// "text cut off" bug. Measuring it instead means the message log always
+    /// yields exactly the space the composer actually takes.
+    footer_h: f32,
+    /// Whether the input had keyboard focus last frame — drives the
+    /// composer's focus ring.
+    input_focused: bool,
 }
 
 struct Rendered {
@@ -125,6 +134,8 @@ impl Default for ChatPanelView {
             usage: (0, 0),
             role: crate::chat::team::TeamRole::Operator,
             project_label: String::new(),
+            footer_h: 108.0,
+            input_focused: false,
         }
     }
 }
@@ -431,16 +442,18 @@ impl ChatPanelView {
         }
     }
 
-    /// The footer status line: backend PHASE only (connecting / ready /
-    /// failed). Turn activity lives in the log (`live_activity`).
+    /// The backend PHASE (connecting / ready / failed) as the model picker's
+    /// dot colour and tooltip wording. Turn activity lives in the log
+    /// (`live_activity`), and a failure's detail is already an error bubble
+    /// there — this line names the phase, it doesn't explain it.
     fn status(&self, chat: &dyn Chat) -> (String, egui::Color32) {
         match chat.phase() {
-            ChatPhase::Idle => ("no backend — pick a model below".into(), crate::theme::TEXT_FAINT),
+            ChatPhase::Idle => ("no backend — pick a model".into(), crate::theme::TEXT_FAINT),
             ChatPhase::Connecting => ("connecting…".into(), crate::theme::rgb(200, 150, 80)),
             ChatPhase::Ready => ("ready".into(), crate::theme::OK),
             ChatPhase::Finished => (
                 match &self.last_error {
-                    Some(e) => format!("failed: {e}"),
+                    Some(_) => "failed — see log".into(),
                     None => "session ended".into(),
                 },
                 crate::theme::DANGER,
@@ -450,23 +463,26 @@ impl ChatPanelView {
 
     /// Render the panel; returns nothing, mutates chat/self.
     pub fn show(&mut self, ui: &mut egui::Ui, chat: &mut ChatHandle) {
+        let project = if self.project_label.is_empty() {
+            chat.project()
+        } else {
+            self.project_label.clone()
+        };
+        // The role picker is allocated FIRST (right-to-left), then the title
+        // group fills what's left. Laid out title-first, the truncating
+        // project label claims the whole row and squeezes the picker off the
+        // panel's edge.
         ui.horizontal(|ui| {
-            ui.heading("Chat");
-            let label = if self.project_label.is_empty() {
-                chat.project()
-            } else {
-                self.project_label.clone()
-            };
-            ui.weak(&format!("— {label}"));
-            // The role selector (default Operator: full catalog, destructive
-            // ops gated by inline Approve/Reject). A change restarts the
-            // session (main.rs ensure_chat_started compares the role).
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // The role selector (default Operator: full catalog,
+                // destructive ops gated by inline Approve/Reject). A change
+                // restarts the session (main.rs ensure_chat_started compares
+                // the role).
                 crate::theme::combo_field(ui, |ui| {
                     egui::ComboBox::from_id_salt("chat_role")
                         .icon(crate::theme::combo_caret)
                         .selected_text(
-                            egui::RichText::new(format!("role: {}", self.role.label())).small(),
+                            egui::RichText::new(self.role.label().to_string()).small(),
                         )
                         .show_ui(ui, |ui| {
                             for r in crate::chat::team::ALL_ROLES {
@@ -481,16 +497,30 @@ impl ChatPanelView {
                             }
                         });
                 });
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(crate::theme::section_heading("Chat"));
+                    // Truncated, never wrapped.
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("· {project}"))
+                                .small()
+                                .color(crate::theme::TEXT_FAINT),
+                        )
+                        .truncate(),
+                    );
+                });
             });
         });
-        ui.separator();
+        ui.add_space(2.0);
+        crate::theme::hairline(ui);
+        ui.add_space(6.0);
 
-        // Message scroll with explicit height reservation, then the footer
-        // (model picker + input row + status line) below it. (NOT bottom_up
-        // layout — it inverts the ScrollArea's content stacking: the "new
-        // message stacks on top" bug.)
-        let footer_h = 88.0; // picker row + input row + status line + separator
-        let scroll_h = (ui.available_height() - footer_h).max(0.0);
+        // Message scroll with explicit height reservation, then the composer
+        // below it. (NOT bottom_up layout — it inverts the ScrollArea's
+        // content stacking: the "new message stacks on top" bug.) The
+        // reservation is LAST FRAME's measured composer height, so a grown
+        // input steals space from the log instead of falling off the panel.
+        let scroll_h = (ui.available_height() - self.footer_h - 8.0).max(60.0);
         // Scrollable message area. Horizontal shrink is ON so a wide
         // markdown line can never force the panel wider than its clamp.
         egui::ScrollArea::vertical()
@@ -498,18 +528,8 @@ impl ChatPanelView {
             .auto_shrink([true, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                if self.model.is_empty() {
-                    ui.label(
-                        egui::RichText::new("no model selected — choose a chat model below to start")
-                            .color(crate::theme::rgb(200, 120, 60))
-                            .small(),
-                    );
-                } else if self.messages.is_empty() {
-                    ui.label(
-                        egui::RichText::new("no messages yet — say hello below")
-                            .color(crate::theme::TEXT_FAINT)
-                            .small(),
-                    );
+                if self.messages.is_empty() {
+                    self.empty_state(ui, scroll_h);
                 }
                 let messages = &self.messages;
                 let md = &mut self.md;
@@ -573,12 +593,12 @@ impl ChatPanelView {
                             });
                         }
                         BubbleKind::Tool => {
-                            ui.add_space(4.0);
+                            ui.add_space(6.0);
                             egui::Frame::default()
                                 .fill(crate::theme::EDITOR_BG)
                                 .stroke(egui::Stroke::new(1.0_f32, crate::theme::HAIRLINE))
-                                .corner_radius(egui::CornerRadius::same(2))
-                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .inner_margin(egui::Margin::symmetric(8, 6))
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     tool_cards(ui, &m.tools);
@@ -614,66 +634,107 @@ impl ChatPanelView {
                     ui.label(egui::RichText::new(text).small().italics().color(color));
                 }
             });
-        ui.separator();
 
-        // The model picker lives with the input (operator decision), not up
-        // in the header. Driven by corpus-core's `ollama_models()` — the
-        // GDK chat talks to the Ollama server DIRECTLY, so it lists what
-        // Ollama has pulled, never opencode's catalog. Never an ambient
-        // default: with no model selected, SEND stays gated.
-        self.model_picker(ui);
+        // The composer card: model picker, input, send/stop and the status
+        // line, all inside ONE bordered surface pinned to the bottom of the
+        // panel. Measured every frame so the log above reserves exactly the
+        // height it needs (see `footer_h`).
+        ui.add_space(6.0);
+        let measured = ui
+            .scope(|ui| {
+                self.composer(ui, chat);
+            })
+            .response
+            .rect
+            .height();
+        if (measured - self.footer_h).abs() > 0.5 {
+            self.footer_h = measured;
+            // Re-lay out immediately: the log's reservation is now stale by
+            // exactly this delta, and a static panel wouldn't repaint on its
+            // own.
+            ui.ctx().request_repaint();
+        }
+    }
 
-        // Input row: an auto-growing multiline box (grows with content up to
-        // a cap, then scrolls) beside ONE button that transforms — `send`
-        // while idle, a red `stop` while a turn is live. Enter sends,
-        // Shift+Enter inserts a newline; Esc stops a live turn.
-        self.input_row(ui, chat);
-
-        // Status line: backend phase + cumulative usage. The stop affordance
-        // now lives in the transforming button above, not here.
-        let (text, color) = self.status(chat);
-        ui.horizontal(|ui| {
-            ui.colored_label(color, egui::RichText::new(text).small());
-            if self.usage != (0, 0) {
-                ui.label(
-                    egui::RichText::new(format!("· ↑{} ↓{} tokens", self.usage.0, self.usage.1))
-                        .small()
-                        .color(crate::theme::TEXT_FAINT),
-                );
-            }
+    /// The empty log: a quiet, vertically-centred invitation rather than a
+    /// lone grey line stranded at the top of a tall black rectangle.
+    fn empty_state(&self, ui: &mut egui::Ui, h: f32) {
+        ui.add_space((h * 0.34).max(12.0));
+        ui.vertical_centered(|ui| {
+            let (title, sub) = if self.model.is_empty() {
+                ("choose a model to begin", "the picker sits below, in the composer")
+            } else {
+                ("no messages yet", "ask for a project, an agent, a mission…")
+            };
+            ui.label(
+                crate::theme::icon_text(
+                    egui_phosphor::regular::CHATS_CIRCLE,
+                    26.0,
+                    crate::theme::HAIRLINE,
+                ),
+            );
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(title).color(crate::theme::TEXT_MUTED));
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(sub).small().color(crate::theme::TEXT_FAINT));
         });
     }
 
-    /// The composer: the auto-growing input + the transforming send/stop
-    /// button, plus the keyboard contract (Enter send, Shift+Enter newline,
-    /// Esc stop).
-    fn input_row(&mut self, ui: &mut egui::Ui, chat: &mut dyn Chat) {
+    /// The composer: ONE bordered card — the auto-growing input on top, then
+    /// a rail carrying the model picker, the session's token usage and the
+    /// transforming send/stop button — plus the keyboard contract (Enter
+    /// send, Shift+Enter newline, Esc stop).
+    ///
+    /// It is a card, not three loose rows, because the old stack (picker row
+    /// / input+button row / status row) had no shared edge: the input's own
+    /// frame, the button and the status text all floated at different insets
+    /// and the whole thing overflowed the panel once the box grew.
+    ///
+    /// The backend phase has no widget of its own: it is the dot INSIDE the
+    /// picker (grey = no model, amber = connecting, green = ready, red =
+    /// failed), which is the control the operator acts on when it isn't
+    /// green. The wording lives in its tooltip and, for a live turn, in the
+    /// log's activity line.
+    fn composer(&mut self, ui: &mut egui::Ui, chat: &mut dyn Chat) {
         let is_live = chat.phase() == ChatPhase::Ready && !matches!(self.activity, Activity::Idle);
         // Esc is a global stop while a turn runs, wherever focus is.
         if is_live && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             chat.stop();
         }
-        ui.horizontal_top(|ui| {
-            let btn_w = 58.0;
-            let text_w = (ui.available_width() - btn_w - 8.0).max(20.0);
 
-            // The box grows with its content: 1 row minimum, capped so a
-            // long paste scrolls instead of eating the log. Its width is
-            // reserved explicitly so the button always keeps its slot.
+        let mut card = egui::Frame::default()
+            .fill(crate::theme::EDITOR_BG)
+            .stroke(egui::Stroke::new(1.0_f32, crate::theme::HAIRLINE))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(8, 8))
+            .begin(ui);
+
+        {
+            let ui = &mut card.content_ui;
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 6.0;
+
+            // The box grows with its content: 1 row minimum, capped so a long
+            // paste scrolls instead of eating the log. Frameless — the card
+            // IS its frame — and full width, so a wrapped line is never
+            // clipped by a button sitting beside it.
+            let text_w = ui.available_width();
             let editor = egui::TextEdit::multiline(&mut self.input)
-                .hint_text("message…")
+                .hint_text(
+                    egui::RichText::new("message the corpus…").color(crate::theme::TEXT_FAINT),
+                )
                 .desired_width(text_w)
                 .desired_rows(1)
+                .frame(false)
+                .margin(egui::Margin::symmetric(2, 2))
                 .id_salt("chat_input");
-            let response = ui
-                .allocate_ui(egui::vec2(text_w, 0.0), |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(160.0)
-                        .id_salt("chat_input_scroll")
-                        .show(ui, |ui| ui.add_enabled(!self.model.is_empty(), editor))
-                        .inner
-                })
+            let response = egui::ScrollArea::vertical()
+                .max_height(150.0)
+                .auto_shrink([false, true])
+                .id_salt("chat_input_scroll")
+                .show(ui, |ui| ui.add_enabled(!self.model.is_empty(), editor))
                 .inner;
+            self.input_focused = response.has_focus();
 
             // Enter submits; Shift+Enter is a newline (left for the editor).
             // The editor has already inserted the '\n' for a plain Enter, so
@@ -684,15 +745,41 @@ impl ChatPanelView {
                 self.input.pop();
             }
 
+            crate::theme::hairline(ui);
+
+            // Bottom rail: the status-bearing model picker fills the left,
+            // usage and the one transforming button sit hard right. Same
+            // allocation order as the header — the button and usage take
+            // their slots first, and the picker sizes itself to what's left
+            // (a picker laid out first would claim the row and push the
+            // button off the card).
             let can_send = self.can_send(chat);
-            let clicked = if is_live {
-                ui.add(egui::Button::new(
-                    egui::RichText::new("stop").color(crate::theme::DANGER),
-                ))
-                .clicked()
-            } else {
-                ui.add_enabled(can_send, egui::Button::new("send")).clicked()
-            };
+            let mut clicked = false;
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    clicked = if is_live {
+                        crate::theme::destructive_button(ui, "stop").clicked()
+                    } else {
+                        ui.add_enabled_ui(can_send, |ui| crate::theme::house_button(ui, "send"))
+                            .inner
+                            .clicked()
+                    };
+                    if self.usage != (0, 0) {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "↑{} ↓{}",
+                                compact_tokens(self.usage.0),
+                                compact_tokens(self.usage.1)
+                            ))
+                            .small()
+                            .color(crate::theme::TEXT_FAINT),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        self.model_picker(ui, chat);
+                    });
+                });
+            });
 
             if is_live {
                 if clicked {
@@ -701,7 +788,14 @@ impl ChatPanelView {
             } else if clicked || (plain_enter && can_send) {
                 self.submit(chat);
             }
-        });
+        }
+
+        // A focus ring on the card, painted after its content so the ring
+        // reflects THIS frame's focus.
+        if self.input_focused {
+            card.frame.stroke = egui::Stroke::new(1.0_f32, crate::theme::TEXT_FAINT);
+        }
+        card.end(ui);
     }
 
     /// Send the current input as a new turn and clear the box.
@@ -732,24 +826,42 @@ impl ChatPanelView {
     }
 
     /// The chat model picker (the GDK chat's OWN source: `ollama list` via
-    /// corpus-core, never opencode's catalog). Lives in the footer beside
-    /// the input row.
-    fn model_picker(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("model").small().color(crate::theme::TEXT_MUTED));
-            let current = self.model.clone();
-            crate::theme::combo_field(ui, |ui| {
-                egui::ComboBox::from_id_salt("chat_model")
-                    .icon(crate::theme::combo_caret)
-                    .selected_text(
-                        egui::RichText::new(if current.is_empty() {
-                            "choose…".to_string()
-                        } else {
-                            current.clone()
-                        })
-                        .small(),
-                    )
-                    .show_ui(ui, |ui| {
+    /// corpus-core, never opencode's catalog), in the composer's bottom rail.
+    ///
+    /// It carries the backend status as a coloured dot in its own field: the
+    /// phase is a property OF the chosen model's session, and the picker is
+    /// what the operator reaches for when the dot isn't green, so a separate
+    /// status line was both a duplicate and a widget nobody could act on. The
+    /// phase wording moves to the field's tooltip.
+    fn model_picker(&mut self, ui: &mut egui::Ui, chat: &dyn Chat) {
+        let current = self.model.clone();
+        let (phase, dot) = self.status(chat);
+        // The field takes what the rail's right-hand controls left it. The
+        // label is elided to fit rather than allowed to widen the button:
+        // ComboBox sizes to its text, so a long `hf.co/…` id would shove the
+        // send button off the card.
+        let field_w = (ui.available_width() - 2.0).max(90.0);
+        let text_color = if current.is_empty() {
+            crate::theme::TEXT_FAINT
+        } else {
+            crate::theme::TEXT
+        };
+        let label = if current.is_empty() {
+            "choose a model…"
+        } else {
+            &current
+        };
+        // ComboBox sizes to its text (`width` is only a minimum), so the
+        // label is fitted to the slot BEFORE it can widen the button and
+        // shove the send button off the card. Budget = the field minus its
+        // own furniture: two 8px margins, the caret icon and its spacing.
+        let selected = fit_picker_label(ui, label, text_color, field_w - 36.0);
+        crate::theme::combo_field(ui, |ui| {
+            let combo = egui::ComboBox::from_id_salt("chat_model")
+                .icon(crate::theme::combo_caret)
+                .width(field_w)
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
                         if let Ok(list) = corpus_core::ollama_models() {
                             for g in &list.groups {
                                 if !g.label.is_empty() {
@@ -767,7 +879,23 @@ impl ChatPanelView {
                             ui.label("ollama not available — a model is required");
                         }
                     });
-            });
+            // The status light, painted into the gap the label reserved for
+            // it. A painted dot (the app's idiom — sidebar rows and the env
+            // dot are the same shape) rather than a glyph: phosphor's DOT
+            // renders at punctuation size and read as a stray period.
+            let rect = combo.response.rect;
+            ui.painter().circle_filled(
+                egui::pos2(rect.left() + DOT_INSET, rect.center().y),
+                3.5,
+                dot,
+            );
+            // The full id is never truncated away: it's the first line of the
+            // tooltip, with the phase under it.
+            if !current.is_empty() {
+                combo.response.on_hover_text(format!("{current}\n{phase}"))
+            } else {
+                combo.response.on_hover_text(phase)
+            }
         });
     }
 
@@ -775,22 +903,39 @@ impl ChatPanelView {
         tool_cards(ui, cards)
     }
 
-    fn permission_cards(&mut self, ui: &mut egui::Ui, chat: &mut ChatHandle) {        // Take the pending list by value so clicks can mutate chat; a card is
+    fn permission_cards(&mut self, ui: &mut egui::Ui, chat: &mut ChatHandle) {
+        // Take the pending list by value so clicks can mutate chat; a card is
         // re-added ONLY if the operator didn't resolve it this frame (the old
         // unconditional re-add made every card immortal — the "stale
         // approve/reject" bug).
         let pending = std::mem::take(&mut self.pending);
         for p in pending {
             let mut resolved = false;
-            ui.add_space(6.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "⛨ approval needed › {}",
-                        human_tool_name(&p.tool)
-                    ))
-                    .strong(),
-                );
+            ui.add_space(8.0);
+            egui::Frame::default()
+                .fill(crate::theme::PANEL)
+                .stroke(egui::Stroke::new(1.0_f32, crate::theme::ACCENT))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(crate::theme::icon_text(
+                        egui_phosphor::regular::SHIELD_WARNING,
+                        14.0,
+                        crate::theme::ACCENT,
+                    ));
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "approval needed · {}",
+                                human_tool_name(&p.tool)
+                            ))
+                            .color(crate::theme::TEXT),
+                        )
+                        .truncate(),
+                    );
+                });
                 if !p.summary.is_empty() {
                     ui.label(egui::RichText::new(&p.summary).monospace().small());
                 }
@@ -803,12 +948,13 @@ impl ChatPanelView {
                         .small()
                         .color(crate::theme::TEXT_MUTED),
                 );
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Approve").clicked() {
+                    if crate::theme::house_button(ui, "approve").clicked() {
                         chat.approve(&p.id);
                         resolved = true;
                     }
-                    if ui.button("Reject").clicked() {
+                    if crate::theme::destructive_button(ui, "reject").clicked() {
                         chat.reject(&p.id);
                         resolved = true;
                     }
@@ -818,6 +964,85 @@ impl ChatPanelView {
                 self.pending.push(p);
             }
         }
+    }
+}
+
+/// Where the picker's status dot is painted, measured from the field's left
+/// edge — the button's 8px inner margin plus half the gap the label leaves
+/// in front of itself.
+const DOT_INSET: f32 = 15.0;
+
+/// The picker's selected line: the model id, indented past the status dot's
+/// gap and elided to the widest form that fits `budget` px. The line is
+/// MEASURED (real galley width) rather than estimated from an average
+/// character width, which is what let a long `hf.co/…` id creep over the
+/// token counts beside it. Binary search: ~6 layouts, not one per character.
+fn fit_picker_label(
+    ui: &egui::Ui,
+    model: &str,
+    text_color: egui::Color32,
+    budget: f32,
+) -> egui::text::LayoutJob {
+    let job = |label: &str| {
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            label,
+            DOT_INSET,
+            egui::TextFormat {
+                font_id: crate::theme::font(12.0),
+                color: text_color,
+                valign: egui::Align::Center,
+                ..Default::default()
+            },
+        );
+        job
+    };
+    let fits = |j: &egui::text::LayoutJob| {
+        ui.fonts(|f| f.layout_job(j.clone())).size().x <= budget
+    };
+    let full = job(model);
+    if fits(&full) {
+        return full;
+    }
+    // Largest character count that still fits (never below 4 — an id elided
+    // past that says nothing, and the tooltip carries the full one anyway).
+    let (mut lo, mut hi) = (4_usize, model.chars().count());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(&job(&elide_middle(model, mid))) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    job(&elide_middle(model, lo))
+}
+
+/// Elide a model id in the MIDDLE — `hf.co/unsloth/Qwen3-30B:Q4_K_M` keeps
+/// both the family and the quant tag, which is what tells two pulled models
+/// apart. Head/tail truncation drops exactly the half that disambiguates.
+fn elide_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max || max < 4 {
+        return s.to_string();
+    }
+    let keep = max - 1; // the ellipsis costs one
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    format!(
+        "{}…{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
+}
+
+/// Token counts for the composer's status rail: `1234` → `1.2k`, so the
+/// cumulative usage can never grow wide enough to shove the send button.
+fn compact_tokens(n: i64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        n if n >= 1_000 => format!("{:.1}k", n as f64 / 1_000.0),
+        n => n.to_string(),
     }
 }
 
@@ -858,23 +1083,39 @@ fn tool_cards(ui: &mut egui::Ui, cards: &[ToolCard]) {
         // Collapsed by default: the header is the status glyph + the
         // human tool name; args and result expand on click. (Wall-of-
         // JSON cards buried the conversation — operator 2026-08-14.)
+        // The glyph comes from the phosphor family via a LayoutJob: the old
+        // "✓ / ✗ / …" literals aren't in Inter-Light and rendered as tofu
+        // boxes.
         let (glyph, color) = match &card.result {
-            None => ("…", crate::theme::rgb(200, 150, 80)),
-            Some(_) if card.is_error => ("✗", crate::theme::DANGER),
-            Some(_) => ("✓", crate::theme::OK),
+            None => (
+                egui_phosphor::regular::CIRCLE_DASHED,
+                crate::theme::rgb(200, 150, 80),
+            ),
+            Some(_) if card.is_error => (egui_phosphor::regular::X_CIRCLE, crate::theme::DANGER),
+            Some(_) => (egui_phosphor::regular::CHECK_CIRCLE, crate::theme::OK),
         };
-        egui::CollapsingHeader::new(
-            egui::RichText::new(format!("{glyph} {}", human_tool_name(&card.name)))
-                .monospace()
-                .color(color),
-        )
+        egui::CollapsingHeader::new(crate::theme::icon_label(
+            glyph,
+            13.0,
+            color,
+            &human_tool_name(&card.name),
+            crate::theme::mono(12.5),
+            color,
+        ))
         .id_salt(format!("tool_{}_{}", card.id, card.name))
         .default_open(false)
         .show(ui, |ui| {
             ui.label(egui::RichText::new(&card.name).monospace().small().weak());
-            ui.label(egui::RichText::new(&card.args).monospace().small());
+            ui.label(
+                egui::RichText::new(&card.args)
+                    .monospace()
+                    .small()
+                    .color(crate::theme::TEXT_MUTED),
+            );
             if let Some(result) = &card.result {
-                ui.separator();
+                ui.add_space(4.0);
+                crate::theme::hairline(ui);
+                ui.add_space(4.0);
                 ui.label(egui::RichText::new(result).monospace().small());
             }
         });
@@ -883,7 +1124,29 @@ fn tool_cards(ui: &mut egui::Ui, cards: &[ToolCard]) {
 
 #[cfg(test)]
 mod tests {
-    use super::human_tool_name;
+    use super::{compact_tokens, elide_middle, human_tool_name};
+
+    #[test]
+    fn model_ids_elide_in_the_middle_keeping_family_and_tag() {
+        // Short enough to fit: untouched.
+        assert_eq!(elide_middle("qwen3:8b", 20), "qwen3:8b");
+        // Both ends survive — the quant tag is what tells two pulls apart.
+        let long = "hf.co/unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M";
+        let short = elide_middle(long, 20);
+        assert_eq!(short.chars().count(), 20);
+        assert!(short.starts_with("hf.co/"), "family head kept: {short}");
+        assert!(short.ends_with("Q4_K_M"), "quant tail kept: {short}");
+        // Multi-byte ids are cut on char boundaries, never mid-codepoint.
+        assert_eq!(elide_middle("ααααααααββββββββ", 5).chars().count(), 5);
+    }
+
+    #[test]
+    fn usage_counts_compact_so_they_cannot_widen_the_rail() {
+        assert_eq!(compact_tokens(0), "0");
+        assert_eq!(compact_tokens(999), "999");
+        assert_eq!(compact_tokens(18_432), "18.4k");
+        assert_eq!(compact_tokens(2_500_000), "2.5M");
+    }
 
     #[test]
     fn human_tool_names_cover_the_catalog_and_roles() {

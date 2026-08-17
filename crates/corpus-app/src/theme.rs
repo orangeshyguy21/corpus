@@ -144,6 +144,7 @@ pub fn icon_button(ui: &mut Ui, icon: &str, size: f32) -> egui::Response {
             &mut style.visuals.widgets.active,
         ] {
             ws.bg_fill = Color32::TRANSPARENT;
+            ws.weak_bg_fill = Color32::TRANSPARENT;
             ws.bg_stroke = egui::Stroke::NONE;
         }
         style.visuals.widgets.inactive.fg_stroke.color = TEXT_MUTED;
@@ -191,6 +192,44 @@ pub fn flat_field_frame() -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(8, 4))
 }
 
+/// A phosphor glyph followed by text in ONE laid-out line — needed wherever
+/// a widget takes a single `WidgetText` (a CollapsingHeader title or a
+/// ComboBox's selected text, say) but the glyph must resolve from the
+/// phosphor family. A plain RichText can only carry one family, so the icon
+/// rendered as tofu; the two colours let a status glyph read differently
+/// from its label.
+pub fn icon_label(
+    icon: &str,
+    icon_size: f32,
+    icon_color: Color32,
+    text: &str,
+    font: FontId,
+    text_color: Color32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        icon,
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::new(icon_size, egui::FontFamily::Name("phosphor".into())),
+            color: icon_color,
+            valign: egui::Align::Center,
+            ..Default::default()
+        },
+    );
+    job.append(
+        text,
+        4.0,
+        egui::TextFormat {
+            font_id: font,
+            color: text_color,
+            valign: egui::Align::Center,
+            ..Default::default()
+        },
+    );
+    job
+}
+
 /// A full-width 1px HAIRLINE hairline rule.
 pub fn hairline(ui: &mut Ui) {
     let (rect, _) =
@@ -214,6 +253,7 @@ pub fn combo_field<R>(ui: &mut Ui, inner: impl FnOnce(&mut Ui) -> R) -> R {
             &mut style.visuals.widgets.active,
         ] {
             ws.bg_fill = PANEL;
+            ws.weak_bg_fill = PANEL; // the ComboBox's button paints THIS one
             ws.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
             ws.corner_radius = egui::CornerRadius::same(2);
             ws.fg_stroke.color = TEXT;
@@ -264,9 +304,18 @@ fn override_button_visuals(style: &mut egui::Style, resting: Color32, kind: Butt
         ws.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
         ws.corner_radius = radius;
     }
-    style.visuals.widgets.inactive.bg_fill = resting;
-    style.visuals.widgets.hovered.bg_fill = hover_fill;
-    style.visuals.widgets.active.bg_fill = hover_fill;
+    // A Button paints `weak_bg_fill`, NOT `bg_fill` (that one is for
+    // checkbox/slider tracks). Setting only `bg_fill` left every house and
+    // destructive button on egui's default grey — the destructive red never
+    // showed up. Both are set, always.
+    for (ws, fill) in [
+        (&mut style.visuals.widgets.inactive, resting),
+        (&mut style.visuals.widgets.hovered, hover_fill),
+        (&mut style.visuals.widgets.active, hover_fill),
+    ] {
+        ws.bg_fill = fill;
+        ws.weak_bg_fill = fill;
+    }
 }
 
 /// Apply the visual language to the egui context. Call once at startup.
@@ -304,17 +353,25 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.noninteractive.bg_fill = BG;
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT_MUTED);
-    // Widget surfaces are one step lighter than the canvas.
+    // Widget surfaces are one step lighter than the canvas. `weak_bg_fill` is
+    // what a Button/ComboBox actually paints, so it tracks `bg_fill` here —
+    // set alone, `bg_fill` left every plain button on egui's default grey.
     visuals.widgets.inactive.bg_fill = PANEL;
+    visuals.widgets.inactive.weak_bg_fill = PANEL;
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x22, 0x23, 0x2a);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x22, 0x23, 0x2a);
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
     visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(2);
     visuals.widgets.active.bg_fill = Color32::from_rgb(0x26, 0x27, 0x30);
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0x26, 0x27, 0x30);
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(2);
     visuals.selection.bg_fill = ACCENT;
+    // Inline `code` in chat markdown: a dark chip, not egui's light grey
+    // block (which glared against the near-black log).
+    visuals.code_bg_color = PANEL;
     visuals.override_text_color = Some(TEXT);
     ctx.set_visuals(visuals);
 

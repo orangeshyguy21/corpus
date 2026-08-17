@@ -486,6 +486,31 @@ impl AppState {
         self.store.delete_project(slug)
     }
 
+    /// The app's remembered UI choices (`store/app.yaml`). Read on demand —
+    /// it is a tiny file and the app touches it at launch and on a picker
+    /// change, never per frame.
+    pub fn prefs(&self) -> corpus_core::AppPrefs {
+        self.store.load_prefs()
+    }
+
+    /// Remember the chat model the operator picked, so the next launch comes
+    /// back on it. A write failure is deliberately swallowed: a read-only
+    /// store must degrade to "this session only", not toast on every pick.
+    pub fn remember_chat_model(&self, model: &str) {
+        let mut prefs = self.store.load_prefs();
+        if prefs.chat_model == model {
+            return;
+        }
+        prefs.chat_model = model.to_string();
+        let _ = self.store.save_prefs(&prefs);
+    }
+
+    /// Rename a project's display label (the slug — its identity in every
+    /// path — is untouched).
+    pub fn rename_project(&self, slug: &str, name: &str) -> Result<Project, Error> {
+        self.store.rename_project(slug, name)
+    }
+
     /// Change a project's environment plugin binding.
     pub fn rebind_project(&self, slug: &str, plugin: &str) -> Result<Project, Error> {
         self.store.rebind_project(slug, plugin)
