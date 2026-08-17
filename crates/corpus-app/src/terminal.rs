@@ -16,6 +16,10 @@
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use alacritty_terminal::term::TermMode;
+/// egui_term does not re-export its SelectionType (its `backend` module is
+/// private), but it IS a public alias of alacritty's — and this crate pins
+/// the same alacritty_terminal version as egui_term, so the types match.
+use alacritty_terminal::selection::SelectionType;
 use egui_term::{
     BackendCommand, BackendSettings, ColorPalette, FontSettings, PtyEvent, TerminalBackend,
     TerminalFont, TerminalTheme, TerminalView,
@@ -32,6 +36,12 @@ pub struct TerminalPane {
     attached: Option<String>,
     /// Click-to-focus state; released by a click outside the pane.
     focused: bool,
+    /// A Shift-drag selection is in progress: while true, primary-button
+    /// press/move/release events are stripped from the frame BEFORE the
+    /// egui_term view clones them (its press handler would forward them to
+    /// the PTY as mouse reports, starting tmux's own copy-mode selection
+    /// instead of a copyable local one — the mouse-mode copy bug).
+    shift_selecting: bool,
     /// Font matched to the app theme, resolved on first show.
     font: Option<TerminalFont>,
     /// Colors matched to the app theme (panel fill + readable fg).
@@ -49,6 +59,7 @@ impl Default for TerminalPane {
             pty_rx,
             attached: None,
             focused: false,
+            shift_selecting: false,
             font: None,
             theme: pane_theme(),
             next_id: 1,
@@ -86,6 +97,7 @@ impl TerminalPane {
         self.backend = None; // Drop shuts the event loop; the PTY close detaches the client
         self.attached = None;
         self.focused = false;
+        self.shift_selecting = false;
     }
 
     /// Spawn the embedded PTY running the attach argv. The child is
@@ -133,11 +145,19 @@ impl TerminalPane {
         let Some(backend) = self.backend.as_mut() else {
             return;
         };
+        // The pane is the panel's only child: the available rect IS the
+        // view rect (TerminalView allocates `ui.available_size()` at the
+        // current cursor).
+        let rect = ui.available_rect_before_wrap();
+        let mut selecting = self.shift_selecting;
+        Self::shift_select_pass(&mut selecting, ui.ctx(), rect, backend);
+        self.shift_selecting = selecting;
         let view = TerminalView::new(ui, backend)
             .set_theme(self.theme.clone())
             .set_font(font)
             .set_focus(self.focused);
         let response = ui.add(view);
+        Self::copy_pass(ui.ctx(), rect, self.focused, backend);
         // Scrollback: forward the wheel as SGR mouse reports when the
         // attached program requested mouse mode (corpus tmux sessions get
         // `set-option mouse on` at launch). egui_term's own wheel handler
@@ -200,6 +220,97 @@ impl TerminalPane {
         });
         if clicked_outside {
             self.focused = false;
+        }
+    }
+
+    /// Shift-drag local selection (the mouse-mode bypass). egui_term's press
+    /// handler forwards EVERY left click to the PTY once the attached
+    /// program enabled mouse reporting — and our tmux sessions always have
+    /// `mouse on` — so a drag could never start the local, copyable
+    /// selection (its SelectStart lives in the branch the mouse-report
+    /// branch shadows). Standard terminals bypass mouse reporting with
+    /// Shift; we do the same at the wrapper level: a Shift+press starts
+    /// the selection, the primary-button events are stripped from the
+    /// frame's event list BEFORE the view clones them (tmux never sees
+    /// the drag, so it does not enter copy mode), and the drag drives
+    /// SelectUpdate on the backend directly. Ends on button release.
+    fn shift_select_pass(
+        selecting: &mut bool,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        backend: &mut TerminalBackend,
+    ) {
+        let (shift_press, released, latest) = ctx.input(|i| {
+            let press = i.events.iter().find_map(|e| match e {
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                    pos,
+                } if modifiers.shift && rect.contains(*pos) => Some(*pos),
+                _ => None,
+            });
+            (
+                press,
+                i.pointer.button_released(egui::PointerButton::Primary),
+                i.pointer.latest_pos(),
+            )
+        });
+        if let Some(pos) = shift_press {
+            *selecting = true;
+            backend.process_command(BackendCommand::SelectStart(
+                SelectionType::Simple,
+                pos.x - rect.left(),
+                pos.y - rect.top(),
+            ));
+        }
+        if !*selecting {
+            return;
+        }
+        // Swallow the drag from the view: leave PointerMoved and the
+        // primary press/release in the event list and the view forwards
+        // them as SGR reports (its own selection is tied to state the
+        // stripped press never set).
+        ctx.input_mut(|i| {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        ..
+                    } | egui::Event::PointerMoved(_)
+                )
+            });
+        });
+        if let Some(pos) = latest {
+            backend.process_command(BackendCommand::SelectUpdate(
+                pos.x - rect.left(),
+                pos.y - rect.top(),
+            ));
+        }
+        if released {
+            *selecting = false;
+        }
+    }
+
+    /// Copy the local selection to the OS clipboard on Cmd+C (egui Copy
+    /// event). Pane-level, not the view's: the view only handles Copy
+    /// while focused, and a Shift-drag select never grabbed focus. Gated
+    /// on focus-or-hover so a Cmd+C aimed at another pane is untouched;
+    /// the string the view would copy is the same one, so a focused pane
+    /// just copies twice.
+    fn copy_pass(ctx: &egui::Context, rect: egui::Rect, focused: bool, backend: &TerminalBackend) {
+        let copy_here = ctx.input(|i| {
+            let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+            let over = i.pointer.latest_pos().is_some_and(|pos| rect.contains(pos));
+            copy && (focused || over)
+        });
+        if !copy_here {
+            return;
+        }
+        let content = backend.selectable_content();
+        if !content.is_empty() {
+            ctx.copy_text(content);
         }
     }
 

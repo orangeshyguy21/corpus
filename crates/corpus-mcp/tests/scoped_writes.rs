@@ -21,41 +21,30 @@ struct TestRig {
     root: PathBuf,
 }
 
-fn seed_core(store: &Store) {
-    let dir = store.seed_agents_dir();
-    for slug in ["operator", "researcher"] {
-        let d = dir.join(slug);
-        let _ = std::fs::create_dir_all(&d);
-        std::fs::write(
-            d.join("opencode.json"),
-            format!(
-                "{{\"$schema\":\"https://opencode.ai/config.json\",\"agent\":{{\"{slug}\":{{\"description\":\"{slug}\",\"mode\":\"primary\",\"prompt\":\"You are {slug}.\\n\"}}}}}}"
-            ),
-        )
-        .unwrap();
-    }
-}
-
 fn rig(tag: &str) -> TestRig {
     let root = std::env::temp_dir().join(format!("corpus-mcp-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let store = Store::new(root.clone());
-    seed_core(&store);
     store
         .create_project("proj", "Proj", "echo-plugin")
         .expect("create project");
-    let ctx = Ctx {
-        plugin: corpus_core::Plugin::spawn(&echo_plugin()).expect("spawn echo plugin"),
-        store: store.clone(),
-        scope: Scope::new("proj"),
-        faucet_spent_sats: 0,
-        faucet_budget_sats: 1_000_000,
-        probe_ready: true,
-        probe_notes: String::new(),
-        last_probe: std::time::Instant::now(),
-        admin: false,
-        pending_confirms: std::collections::HashMap::new(),
-    };
+    // Projects no longer arrive with agents — they are created from a role.
+    for (slug, role) in [
+        ("operator", corpus_core::AgentRole::Tester),
+        ("researcher", corpus_core::AgentRole::Researcher),
+    ] {
+        store
+            .create_agent_with_role("proj", slug, role)
+            .expect("create agent");
+    }
+    // Super: these tests exercise the WRITE tools, so the role gate must
+    // not be what refuses them. Role-gating itself is tested separately.
+    let ctx = Ctx::for_test(
+        corpus_core::Plugin::spawn(&echo_plugin()).expect("spawn echo plugin"),
+        store.clone(),
+        Scope::new("proj"),
+        corpus_core::AgentRole::Super,
+    );
     TestRig { ctx, store, root }
 }
 
@@ -123,6 +112,39 @@ fn roundtrip_project_scoped_writes_and_wipe() {
     .expect_err("missing run_log must be refused");
     assert!(err.to_string().contains("run_log must name an existing file"));
 
+    // run_log defaults to CORPUS_RUN_LOG (ctx.run_log) when omitted.
+    ctx.run_log = Some("1700000000-op-run.log".to_string());
+    let out = tools::dispatch(
+        &mut ctx,
+        "technique_save",
+        &json!({
+            "name": "default-log-card",
+            "status": "analyzed-only",
+            "body": "omitted run_log -> defaults to ctx.run_log"
+        }),
+    )
+    .expect("technique_save with default run_log");
+    assert!(out.contains("technique card saved"), "{out}");
+    let card = std::fs::read_to_string(
+        proj_corpus(&store).join("techniques/default-log-card.md"),
+    )
+    .unwrap();
+    assert!(card.contains("run_log: 1700000000-op-run.log"), "{card}");
+
+    // run_log omitted AND no ctx.run_log -> helpful error.
+    ctx.run_log = None;
+    let err = tools::dispatch(
+        &mut ctx,
+        "technique_save",
+        &json!({
+            "name": "no-log-card",
+            "status": "analyzed-only",
+            "body": "x"
+        }),
+    )
+    .expect_err("no run_log and no CORPUS_RUN_LOG must be refused");
+    assert!(err.to_string().contains("run_log not provided"));
+
     // Wipe the project corpus: generation bumps, corpus gone, agents survive.
     let p = store.wipe_project_corpus("proj").expect("wipe");
     assert_eq!(p.corpus_generation, 1);
@@ -152,6 +174,117 @@ fn attack_save_project_scope() {
     assert!(attack_text.contains("sensitivity: internal"));
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// target_info must forward the mission's resolved source pins to the
+/// plugin: a mission pinned off the plugin's default rev must see the
+/// mounts the sandbox actually gets (the launch pins), not the plugin's
+/// config defaults. Regression: target_info dropped the pins, so a
+/// pinned mission was told it read code it wasn't reading.
+#[test]
+fn target_info_reports_mission_pins_not_defaults() {
+    let rig = rig("pins");
+    let TestRig { mut ctx, root, .. } = rig;
+    let mut pins = serde_json::Map::new();
+    pins.insert(
+        "cdk".to_string(),
+        serde_json::Value::String("cccccccccccccccccccccccccccccccccccccccc".to_string()),
+    );
+    ctx.source_pins = Some(pins);
+
+    let out = tools::dispatch(&mut ctx, "target_info", &json!({})).expect("target_info");
+    assert!(
+        out.contains("cccccccccccccccccccccccccccccccccccccccc"),
+        "mission pin must appear in sources_in_sandbox: {out}"
+    );
+    assert!(
+        !out.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "the plugin default pin must NOT be reported for a pinned mission: {out}"
+    );
+
+    // No pins -> the plugin's defaults, unchanged.
+    ctx.source_pins = None;
+    let out = tools::dispatch(&mut ctx, "target_info", &json!({})).expect("target_info no pins");
+    assert!(
+        out.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "unpinned run reports the plugin default: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// THE role gate: a researcher is refused the execution and publication
+/// tools by the SERVER, whatever any permission block says — the server
+/// never reads that block. This is the property the whole role system
+/// exists to provide.
+#[test]
+fn researcher_role_is_refused_execution_and_publication_tools() {
+    let TestRig { mut ctx, root, .. } = rig("role-researcher");
+    ctx.role = Ok(corpus_core::AgentRole::Researcher);
+
+    for (tool, args) in [
+        ("sandbox_exec", json!({"command": "echo hi"})),
+        ("oracle_run", json!({"name": "double-spend"})),
+        ("faucet", json!({"op": "balance"})),
+        ("wallet_fund", json!({"work_dir": "/tmp/w", "amount_sat": 10})),
+        ("attack_save", json!({"name": "a", "description": "d", "script": "s"})),
+        (
+            "finding_write",
+            json!({"title": "t", "severity": "high", "detail": "d"}),
+        ),
+    ] {
+        let err = tools::dispatch(&mut ctx, tool, &args)
+            .expect_err("a researcher must be refused {tool}");
+        let msg = err.to_string();
+        assert!(msg.contains("researcher"), "{tool}: {msg}");
+        assert!(msg.contains(tool), "{tool}: {msg}");
+    }
+
+    // ...and still gets the two tools its role does grant.
+    tools::dispatch(&mut ctx, "target_info", &json!({}))
+        .expect("a researcher reads its target");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An unresolved identity denies EVERYTHING (fail closed): a gate that is
+/// bypassed by unsetting an environment variable is not a gate.
+#[test]
+fn unresolved_role_denies_every_tool() {
+    let TestRig { mut ctx, root, .. } = rig("role-unresolved");
+    ctx.role = Err("CORPUS_OPENCODE_AGENT is unset".to_string());
+    for tool in ["target_info", "technique_save", "sandbox_exec", "finding_write"] {
+        let err = tools::dispatch(&mut ctx, tool, &json!({}))
+            .expect_err("an unresolved role denies everything");
+        assert!(err.to_string().contains("no resolved agent role"), "{tool}: {err}");
+    }
+    // And it advertises nothing, so the agent isn't invited to try.
+    let catalog = tools::catalog_for(&ctx.role);
+    assert_eq!(catalog.as_array().map(|a| a.len()), Some(0), "{catalog}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The advertised catalog matches what the role can actually call, so a
+/// low-trust agent never sees attack-relevant tool descriptions.
+#[test]
+fn advertised_catalog_matches_the_role() {
+    let names = |role| -> Vec<String> {
+        tools::catalog_for(&Ok(role))
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .collect()
+    };
+    let researcher = names(corpus_core::AgentRole::Researcher);
+    assert!(researcher.contains(&"target_info".to_string()), "{researcher:?}");
+    assert!(researcher.contains(&"technique_save".to_string()), "{researcher:?}");
+    for hidden in ["sandbox_exec", "faucet", "finding_write", "attack_save"] {
+        assert!(
+            !researcher.contains(&hidden.to_string()),
+            "a researcher must not be shown {hidden}: {researcher:?}"
+        );
+    }
+    let sup = names(corpus_core::AgentRole::Super);
+    assert_eq!(sup.len(), corpus_core::CORPUS_TOOLS.len(), "{sup:?}");
 }
 
 #[test]

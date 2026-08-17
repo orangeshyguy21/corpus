@@ -54,13 +54,27 @@ struct App {
     /// The team role the current chat backend was launched as
     /// (dev/decisions.md chunk 3); a change restarts the scoped session.
     chat_role: chat::team::TeamRole,
+    /// The model the current chat backend was launched with; a picker change
+    /// restarts the session (the old code kept the old model silently).
+    chat_model: String,
+    /// The model last written to `store/app.yaml` — the guard that keeps the
+    /// persistence check an in-memory comparison instead of a per-frame read.
+    chat_model_saved: String,
     /// Last operator-position context pushed to the chat backend (re-pushed
     /// only on change).
     last_chat_context: String,
-    /// The chat panel's current width (drag-settable, clamped 280..=half). A
-    /// panel width in app state, so the divider is sticky and never persisted
-    /// as pathologically wide by egui's own memory.
+    /// The chat panel's width in app state (280..=half window). The app
+    /// owns panel widths outright — panels render at `exact_width` and a
+    /// custom drag divider moves them; egui's native resize is OFF (its
+    /// PanelState/content feedback loop jittered and fought the drag).
     chat_width: f32,
+    /// The sidebar's width (160..=~45% window), same app-owned mechanics.
+    sidebar_width: f32,
+    /// A live divider drag's press anchor (panel, starting width, starting
+    /// pointer x). Anchored math means the width is RECOMPUTED from the
+    /// anchor each frame — it can't accumulate error, fight content width,
+    /// or drift at the clamps.
+    divider_drag: Option<DividerDrag>,
 }
 
 impl App {
@@ -68,7 +82,17 @@ impl App {
         theme::apply(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let state = AppState::from_env();
+        // Restore the remembered chat model (store/app.yaml). Only the
+        // PICKER is restored, not a session: the backend starts on the first
+        // frame the chat panel actually renders, so a launch with the panel
+        // closed still spawns nothing. A model that ollama no longer has
+        // fails visibly on that first start rather than being silently
+        // dropped here — checking would mean probing ollama during boot.
+        let remembered = state.prefs().chat_model;
+        let mut chat_panel = chat::panel::ChatPanelView::default();
+        chat_panel.set_model(&remembered);
         Self {
+            chat_model_saved: remembered,
             last_screen: state.current_screen,
             sidebar: Sidebar::default(),
             projects: projects::ProjectsView::default(),
@@ -76,21 +100,51 @@ impl App {
             missions: missions::MissionsView::default(),
             toasts: egui_toast::Toasts::new(),
             chat: chat::ChatHandle::idle(""),
-            chat_panel: chat::panel::ChatPanelView::default(),
-            chat_role: chat::team::TeamRole::Orchestrator,
+            chat_panel,
+            chat_role: chat::team::TeamRole::Operator,
+            chat_model: String::new(),
             last_chat_context: String::new(),
             chat_width: 360.0,
+            sidebar_width: 200.0,
+            divider_drag: None,
             state,
         }
     }
 }
 
+/// Which side panel a divider drag is moving.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+enum Divider {
+    Sidebar,
+    Chat,
+}
+
+/// The live drag anchor: where the press started and what width the panel
+/// had then. Recomputed-from per frame — accumulation can never jitter.
+#[derive(Clone, Copy)]
+struct DividerDrag {
+    target: Divider,
+    start_width: f32,
+    start_x: f32,
+}
+
+/// The width an anchored divider drag yields: `start_width` plus the
+/// pointer displacement in the panel's widening direction, clamped. Pure
+/// so the drag contract is unit-tested (drags must track the pointer
+/// exactly and stop dead at the clamps — never fight, never drift).
+fn dragged_width(target: Divider, drag: DividerDrag, pointer_x: f32, min: f32, max: f32) -> f32 {
+    let dx = pointer_x - drag.start_x;
+    let delta = match target {
+        Divider::Sidebar => dx,   // a left panel widens as you pull right
+        Divider::Chat => -dx,     // a right panel widens as you pull left
+    };
+    (drag.start_width + delta).clamp(min, max)
+}
+
 impl eframe::App for App {
-    /// Don't persist egui's GUI memory (window positions AND **panel widths**)
-    /// to disk. Persisted `PanelState` was restoring the chat panel's once-dragged
-    /// full width on every launch, so it "slid across the whole window" and
-    /// resisted being dragged back. We reset to a sane default each start; any
-    /// signed layout resets first frame.
+    /// Don't persist egui's GUI memory (window positions) to disk. Panel
+    /// widths are app-owned now (see `chat_width`), so egui memory has
+    /// nothing pathological left to restore.
     fn persist_egui_memory(&self) -> bool {
         false
     }
@@ -99,6 +153,13 @@ impl eframe::App for App {
         // Keep the selected project's scoped caches loaded (only hits disk
         // when the selection changed).
         self.state.ensure_selection();
+        // Keep the sidebar's agent status dots honest: poll tmux on a
+        // throttle when a live session can exist (never per frame).
+        self.state.poll_live_sessions();
+        // Keep the sidebar's corpus summary current as missions write
+        // (throttled re-walk — replaces the old manual refresh button).
+        self.state.poll_corpus_stats();
+        self.clamp_panel_widths(ctx);
         // Screen-change hooks.
         if self.state.current_screen != self.last_screen {
             self.last_screen = self.state.current_screen;
@@ -113,10 +174,12 @@ impl eframe::App for App {
             }
         }
         self.top_bar(ctx);
-        self.sidebar_panel(ctx);
-        if self.state.chat_open {
-            self.chat_panel(ctx);
-        }
+        let sidebar_rect = self.sidebar_panel(ctx);
+        let chat_rect = if self.state.chat_open {
+            Some(self.chat_panel(ctx))
+        } else {
+            None
+        };
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(theme::BG))
             .show(ctx, |ui| {
@@ -141,6 +204,17 @@ impl eframe::App for App {
             }
         });
 
+        // Drag dividers LAST: the grab zone paints/interacts over the edge
+        // band, so it must come after the panels whose borders it straddles.
+        if let Some(w) = self.drag_divider(ctx, Divider::Sidebar, sidebar_rect) {
+            self.sidebar_width = w;
+        }
+        if let Some(rect) = chat_rect {
+            if let Some(w) = self.drag_divider(ctx, Divider::Chat, rect) {
+                self.chat_width = w;
+            }
+        }
+
         // Toast overlay (top-right of the whole window).
         self.toasts.show(ctx);
 
@@ -162,20 +236,21 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let total_w = ui.available_width();
                     // LEFT: the wordmark, height 20px, aspect maintained
                     // (source 1072×325 -> ~66px wide).
                     ui.add(
                         egui::Image::new(egui::include_image!("../assets/logo.png"))
                             .fit_to_exact_size(egui::vec2(66.0, 20.0)),
                     );
-                    // Roughly centre the source dropdowns between the logo
-                    // and the right zone.
+                    ui.add_space(theme::SPACING);
+                    self.breadcrumb(ui);
+                    // Roughly centre the source dropdowns in the space
+                    // left between the breadcrumb and the right zone.
+                    let remaining = ui.available_width();
                     let dropdown_count = self.state.source_revs.len().max(1);
                     let dropdown_w = (dropdown_count as f32) * 150.0;
                     let right_zone = 200.0;
-                    let logo_w = 66.0 + theme::SPACING;
-                    let spacer = ((total_w - logo_w - dropdown_w - right_zone) / 2.0).max(0.0);
+                    let spacer = ((remaining - dropdown_w - right_zone) / 2.0).max(0.0);
                     ui.add_space(spacer);
                     self.source_dropdowns(ui);
                     // Right zone (right_to_left places rightmost first): the
@@ -194,46 +269,79 @@ impl App {
             });
     }
 
-    /// The per-source `repo: rev` dropdowns (spec §3): flat PANEL fields,
-    /// the `repo: rev` text in MONOSPACE 13px + a caret_down arrow. Options
-    /// come from the selected project's plugin (`source_revs`), the
-    /// selection lives in `source_pins` (stamped into missions at
-    /// creation). Declaration order is preserved (`source_revs` is a Vec).
+    /// The nav breadcrumb: `project > agent > mission` from the current
+    /// selections; each segment jumps to its screen. Faint, mono, compact.
+    fn breadcrumb(&mut self, ui: &mut egui::Ui) {
+        let project = self.state.effective_project().map(|slug| {
+            self.state
+                .projects
+                .iter()
+                .find(|(s, _)| s == &slug)
+                .map(|(_, p)| if p.name.is_empty() { slug.clone() } else { p.name.clone() })
+                .unwrap_or(slug)
+        });
+        let segments: [(Option<String>, Screen); 3] = [
+            (project, Screen::Projects),
+            (self.state.selected_agent.clone(), Screen::Agents),
+            (self.state.selected_mission.clone(), Screen::Missions),
+        ];
+        let mut first = true;
+        for (label, screen) in segments {
+            let Some(label) = label else { continue };
+            if !first {
+                ui.label(egui::RichText::new("›").size(12.0).color(theme::TEXT_FAINT));
+            }
+            first = false;
+            let active = self.state.current_screen == screen;
+            let color = if active { theme::TEXT } else { theme::TEXT_FAINT };
+            let response = ui.add(
+                egui::Label::new(egui::RichText::new(label).size(12.0).monospace().color(color))
+                    .sense(egui::Sense::click()),
+            );
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if response.clicked() {
+                self.state.current_screen = screen;
+            }
+        }
+    }
+
+    /// The per-source `repo: rev` dropdowns (spec §3): flat PANEL fields in
+    /// the plugin picker's style (see `views::source_dropdown`). Options
+    /// come from the selected project's plugin (`source_revs`); the
+    /// selection is the PROJECT's — persisted on `project.yaml` and
+    /// stamped into missions at creation. Declaration order is preserved
+    /// (`source_revs` is a Vec). A branch rev (`main`) drawn from an
+    /// absent/expired rev cache is amber + tooltipped — it resolves to
+    /// the recorded snapshot, not today's head.
     fn source_dropdowns(&mut self, ui: &mut egui::Ui) {
         let revs = self.state.source_revs.clone();
+        let project = self.state.effective_project();
         for source in &revs {
             let selected = self
                 .state
                 .source_pins
                 .get(&source.name)
                 .cloned()
-                .unwrap_or_else(|| source.pinned.clone());
-            theme::combo_field(ui, |ui| {
-                egui::ComboBox::from_id_salt(format!("top_source_{}", source.name))
-                    .icon(theme::combo_caret)
-                    .selected_text(
-                        egui::RichText::new(format!("{}: {}", source.name, selected))
-                            .monospace()
-                            .size(13.0)
-                            .color(theme::TEXT),
-                    )
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        for rev in &source.revs {
-                            if ui
-                                .selectable_label(
-                                    rev == &selected,
-                                    egui::RichText::new(rev.clone()).monospace(),
-                                )
-                                .clicked()
-                            {
-                                self.state
-                                    .source_pins
-                                    .insert(source.name.clone(), rev.clone());
-                            }
-                        }
-                    });
-            });
+                .unwrap_or_else(|| source.default_rev().to_string());
+            if let Some(rev) = crate::views::source_dropdown::source_dropdown(
+                ui,
+                &format!("top_source_{}", source.name),
+                source,
+                &selected,
+            ) {
+                // Persist the pick onto the project.
+                if let Some(project) = &project {
+                    if let Err(error) = self.state.set_source_pin(project, &source.name, &rev) {
+                        self.toasts.add(
+                            egui_toast::Toast::new()
+                                .kind(egui_toast::ToastKind::Error)
+                                .text(error.to_string()),
+                        );
+                    }
+                }
+            }
         }
         if revs.is_empty() {
             ui.weak("no source pins");
@@ -242,8 +350,11 @@ impl App {
 
     /// The live env status for the selected project's plugin (spec §3): the
     /// plugin name in 13px TEXT beside an 8px filled dot — OK-green when the
-    /// probe is ready, DANGER-red when not. A click forces a re-probe; hover
-    /// shows the probe notes. Rendered as flat text, NOT a pill button.
+    /// probe is ready, DANGER-red when not. The STATUS is inline, not hidden
+    /// in a tooltip: a not-ready env appends a short reason (truncated probe
+    /// notes) so a dead gateway is visible at a glance. A click forces a
+    /// re-probe; hover shows the full probe notes. Rendered as flat text,
+    /// NOT a pill button.
     fn env_dot(&mut self, ui: &mut egui::Ui) {
         let Some(project) = self.state.effective_project() else {
             return;
@@ -254,15 +365,25 @@ impl App {
                 name,
                 "environment ready — click to re-probe".to_string(),
             ),
-            Some((name, false, notes)) => (
-                theme::DANGER,
-                name,
-                if notes.is_empty() {
-                    "environment not ready — click to re-probe".to_string()
-                } else {
-                    format!("not ready — {notes}")
-                },
-            ),
+            Some((name, false, notes)) => {
+                // Short inline reason: the first probe-note clause, capped —
+                // the full notes stay on hover.
+                let short: String = notes.chars().take(48).collect();
+                let short = short.trim_end_matches([' ', ',', ';', '—', '(']).to_string();
+                (
+                    theme::DANGER,
+                    if short.is_empty() {
+                        format!("{name} — not ready")
+                    } else {
+                        format!("{name} — {short}")
+                    },
+                    if notes.is_empty() {
+                        "environment not ready — click to re-probe".to_string()
+                    } else {
+                        format!("not ready — {notes}")
+                    },
+                )
+            }
             None => (
                 theme::TEXT_MUTED,
                 "probe…".to_string(),
@@ -302,12 +423,13 @@ impl App {
     /// (Projects / Agents / Missions) with `+` create flows, the selected
     /// project's dots-three-vertical menu, and the bottom corpus summary.
     /// Rendered by the `sidebar` module; this wrapper only owns the panel
-    /// chrome.
-    fn sidebar_panel(&mut self, ctx: &egui::Context) {
+    /// chrome. The width is APP-OWNED (`exact_width`): egui's native
+    /// resize is off — the drag divider is the only mover (native resize
+    /// fed its content width back into PanelState — the jitter source).
+    fn sidebar_panel(&mut self, ctx: &egui::Context) -> egui::Rect {
         egui::SidePanel::left("sidebar_nav")
-            .resizable(true)
-            .default_width(200.0)
-            .min_width(160.0)
+            .resizable(false)
+            .exact_width(self.sidebar_width)
             .frame(
                 egui::Frame::default()
                     .fill(theme::BG)
@@ -315,36 +437,66 @@ impl App {
             )
             .show(ctx, |ui| {
                 self.sidebar.show(ui, &mut self.state, &mut self.toasts);
-            });
+            })
+            .response
+            .rect
     }
 
     /// The management chat panel (dev/decisions.md chunk 3, native egui):
-    /// a model picker (reused from the app's model layer; Ollama group
-    /// default), a streaming markdown message view, tool-call cards, and the
-    /// confirm-token ritual as inline Approve/Reject.
-    fn chat_panel(&mut self, ctx: &egui::Context) {
-        // Width policy: default ~360px, min 280px. The max clamp keeps the panel
-        // from ever being forced wider than half the window. `show` returns the
-        // panel's actual width, which we clamp and feed back as the default so
-        // dragging STICKS (and stays clamped) across frames. Disk-persistence of
-        // panel width is off (persist_egui_memory=false) so a once-dragged-wide
-        // panel cannot be restored on the next launch.
-        let half = ctx.screen_rect().width() * 0.5;
-        let max = half.max(360.0);
-        let inner = egui::SidePanel::right("chat_panel_v2")
-            .resizable(true)
-            .default_width(self.chat_width)
-            .min_width(280.0)
-            .max_width(max)
+    /// attributed message bubbles (you / corpus / tool cards), a
+    /// chronological activity tail in the log, and the footer row — model
+    /// picker by the input, then the input + phase status. The picker is
+    /// driven by corpus-core's `ollama_models()` (the GDK chat talks to
+    /// Ollama DIRECTLY, never opencode's catalog); it lives in
+    /// `chat::panel::ChatPanelView`.
+    ///
+    /// Width policy: default 360, min 280, max half the window — but
+    /// APP-OWNED. The panel renders at `exact_width` and the custom drag
+    /// divider is the only mover. egui's native resize (its persisted
+    /// PanelState + content-width feedback) was the jitter / "slides
+    /// across the window" / "doesn't hold" bug history; it's off, and the
+    /// divider's anchored math can't accumulate error (see `drag_divider`).
+    fn chat_panel(&mut self, ctx: &egui::Context) -> egui::Rect {
+        egui::SidePanel::right("chat_panel_v2")
+            .resizable(false)
+            .exact_width(self.chat_width.max(280.0))
             .frame(
                 egui::Frame::default()
                     .fill(theme::BG)
                     .inner_margin(egui::Margin::symmetric(12, 12)),
             )
             .show(ctx, |ui| {
-                self.chat_model_picker(ui);
-                // Drain backend events into the view, then render.
-                self.chat_panel.absorb(&self.chat);
+                // Drain backend events into the view, then render. The model
+                // picker is the panel's own footer widget (by the input).
+                let events = self.chat_panel.absorb(&self.chat);
+                // The chat mutated the store (a write tool succeeded):
+                // re-read projects/agents/missions so the sidebar lists the
+                // thing the chat just made.
+                let mut corpus_touched = false;
+                for ev in &events {
+                    if let chat::ChatEvent::StoreMutated { area } = ev {
+                        corpus_touched |= *area == "corpus";
+                        self.state.refresh();
+                    }
+                }
+                if corpus_touched {
+                    if let Some(p) = self.state.effective_project() {
+                        self.state.refresh_corpus_stats(&p);
+                    }
+                }
+                // The header names the project, never a bare UUID.
+                let label = self
+                    .state
+                    .effective_project()
+                    .and_then(|slug| {
+                        self.state
+                            .projects
+                            .iter()
+                            .find(|(s, _)| s == &slug)
+                            .map(|(_, p)| p.name.clone())
+                    })
+                    .unwrap_or_default();
+                self.chat_panel.set_project_label(&label);
                 self.ensure_chat_started();
                 // Juice the session with the operator's current position
                 // (re-pushed only when it changes).
@@ -354,45 +506,23 @@ impl App {
                     self.last_chat_context = ctx;
                 }
                 self.chat_panel.show(ui, &mut self.chat);
-            });
-        // Persist the (clamped) dragged width so the divider sticks.
-        self.chat_width = inner.response.rect.width().clamp(280.0, max);
+                // Persist a picker change (store/app.yaml). Guarded by the
+                // in-memory copy so the steady state is a comparison, not a
+                // file read every frame. Saved on the PICK, not on session
+                // start: a model chosen with no project selected (nothing to
+                // scope a session to) must still come back next launch.
+                let picked = self.chat_panel.model();
+                if picked != self.chat_model_saved {
+                    self.chat_model_saved = picked.to_string();
+                    self.state.remember_chat_model(picked);
+                }
+            })
+            .response
+            .rect
     }
 
-    /// The chat model picker: driven by corpus-core's `ollama_models()` — the
-    /// GDK chat talks to the Ollama server DIRECTLY, so it lists what Ollama
-    /// has pulled, never opencode's catalog (missions/agents keep `model_list`).
-    /// The selected value is the bare model name (the provider is pinned to
-    /// ollama in the chat backend's GOOSE_MODEL). Never an ambient default;
-    /// with no model selected the panel refuses to start.
-    fn chat_model_picker(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("model");
-            let current = self.chat_panel.model().to_string();
-            egui::ComboBox::from_id_salt("chat_model")
-                .selected_text(if current.is_empty() { "choose…".to_string() } else { current.clone() })
-                .show_ui(ui, |ui| {
-                    if let Ok(list) = corpus_core::ollama_models() {
-                        for g in &list.groups {
-                            if !g.label.is_empty() {
-                                ui.label(egui::RichText::new(&g.label).weak().small());
-                            }
-                            for m in &g.models {
-                                let label = if m.name.is_empty() { m.model.clone() } else { m.name.clone() };
-                                if ui.selectable_label(current == m.model, &label).clicked() {
-                                    self.chat_panel.set_model(&m.model);
-                                }
-                            }
-                        }
-                    } else {
-                        ui.label("ollama not available — a model is required");
-                    }
-                });
-        });
-    }
-
-    /// The chat is ALWAYS the Orchestrator — the operator never picks a
-    /// role; delegation to scoped specialists is the orchestrator's job.
+    /// The role + model the current chat backend was launched with; a change
+    /// in either (or a Finished backend) restarts the scoped session.
     fn ensure_chat_started(&mut self) {
         if self.chat_panel.model().is_empty() {
             return; // no model -> panel stays idle (refuses to start)
@@ -401,15 +531,114 @@ impl App {
             return;
         };
         let model = self.chat_panel.model().to_string();
-        let role = chat::team::TeamRole::Orchestrator;
+        let role = self.chat_panel.role();
+        // Live = same project + role + model AND a backend that isn't dead.
+        // (The old check treated ChatPhase::Finished as live — a failed
+        // backend was never restarted — and ignored the model entirely, so
+        // a picker change silently kept the old model.)
         let live = self.chat.project() == project
             && self.chat_role == role
-            && self.chat.phase() != chat::ChatPhase::Idle;
+            && self.chat_model == model
+            && matches!(
+                self.chat.phase(),
+                chat::ChatPhase::Connecting | chat::ChatPhase::Ready
+            );
         if live {
             return;
         }
         self.chat_role = role;
+        self.chat_model = model.clone();
         self.chat = chat::ChatHandle::start_scoped(&project, &model, role);
+    }
+
+    /// Keep the app-owned panel widths inside their live bounds (the
+    /// window can have resized since a drag set them).
+    fn clamp_panel_widths(&mut self, ctx: &egui::Context) {
+        let half = ctx.screen_rect().width() * 0.5;
+        self.sidebar_width = self.sidebar_width.clamp(160.0, (half * 0.9).max(220.0));
+        self.chat_width = self.chat_width.clamp(280.0, half.max(360.0));
+    }
+
+    /// The drag handle for one panel edge: a 9px strip centered on the
+    /// panel edge (the 1px hairline plus 4px of grab on each side). Its
+    /// drag is ANCHORED: at press we remember the width + pointer x, and
+    /// each frame's width derives from THAT anchor and the live pointer —
+    /// never from the previous frame's width. That's what kills the
+    /// jitter/drift of the native egui resize (which integrated from a
+    /// content-union PanelState rect that fed back on itself). While the
+    /// drag is live we take over the cursor so the strip reads as one
+    /// held thing even when the pointer strays off the 9px band.
+    fn drag_divider(
+        &mut self,
+        ctx: &egui::Context,
+        panel: Divider,
+        panel_rect: egui::Rect,
+    ) -> Option<f32> {
+        let (min, max) = match panel {
+            Divider::Sidebar => (160.0, (ctx.screen_rect().width() * 0.45).max(220.0)),
+            Divider::Chat => (280.0, (ctx.screen_rect().width() * 0.5).max(360.0)),
+        };
+        let current = match panel {
+            Divider::Sidebar => self.sidebar_width,
+            Divider::Chat => self.chat_width,
+        };
+        let edge_x = match panel {
+            Divider::Sidebar => panel_rect.max.x,
+            Divider::Chat => panel_rect.min.x,
+        };
+        let draw = egui::Rect::from_center_size(
+            egui::pos2(edge_x, panel_rect.center().y),
+            egui::vec2(1.0, panel_rect.height()),
+        );
+        let grab = draw.expand2(egui::vec2(4.0, 0.0));
+        // A throwaway background-layer Ui just for the handle: painting a
+        // REAL widget (not reusing a panel's ui) means its Sense hit-test
+        // and its cursor are independent of any widget the panels laid
+        // out near the edge.
+        let mut ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new(("divider", panel)),
+            egui::UiBuilder::new()
+                .max_rect(ctx.screen_rect())
+                .layer_id(egui::LayerId::background()),
+        );
+        let r = ui.allocate_rect(grab, egui::Sense::drag());
+        // The strip stays "held" look+grabbed while THIS panel's drag is
+        // live, even if the pointer strays off the 9px band.
+        let held = matches!(self.divider_drag, Some(d) if d.target == panel);
+        if r.drag_started() {
+            if let Some(p) = r.interact_pointer_pos() {
+                self.divider_drag = Some(DividerDrag {
+                    target: panel,
+                    start_width: current,
+                    start_x: p.x,
+                });
+            }
+        }
+        if !ctx.input(|i| i.pointer.primary_down()) {
+            self.divider_drag = None;
+        }
+        if held || r.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        let stroke = if r.dragged() {
+            egui::Stroke::new(1.0_f32, theme::TEXT)
+        } else if r.hovered() || held {
+            egui::Stroke::new(1.0_f32, theme::TEXT_MUTED)
+        } else {
+            egui::Stroke::new(1.0_f32, theme::HAIRLINE)
+        };
+        ui.painter().vline(edge_x, panel_rect.y_range(), stroke);
+        // Only the drag updates the width — the panel never snaps on
+        // hover or release.
+        if r.dragged() {
+            if let (Some(d), Some(p)) = (self.divider_drag, r.interact_pointer_pos()) {
+                if d.target == panel {
+                    return Some(dragged_width(panel, d, p.x, min, max));
+                }
+            }
+        }
+        None
     }
 
     /// The operator-position context juiced into chat turns: where the
@@ -439,6 +668,10 @@ fn padded<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 fn main() -> eframe::Result {
+    // Process-wide goose env (stream timeout, input limit, telemetry) —
+    // ONCE, before any goose call can lock Config::global(). No-op values
+    // when the operator already set them.
+    chat::init_goose_env();
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 900.0])
         .with_title("corpus-app");
@@ -457,6 +690,34 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drag(width: f32, x: f32) -> DividerDrag {
+        DividerDrag { target: Divider::Sidebar, start_width: width, start_x: x }
+    }
+
+    #[test]
+    fn anchored_drag_tracks_the_pointer_and_clamps_at_both_ends() {
+        let d = drag(200.0, 100.0);
+        let chat = drag(300.0, 100.0);
+        // Sidebar (left panel): pull right = widen.
+        assert_eq!(dragged_width(Divider::Sidebar, d, 130.0, 160.0, 480.0), 230.0);
+        // Chat (right panel): pull LEFT = widen (opposite sign).
+        assert_eq!(dragged_width(Divider::Chat, chat, 70.0, 280.0, 520.0), 330.0);
+        // Clamps hold while the pointer keeps travelling past them —
+        // anchored (not integrated), so a long overrun never "sticks".
+        assert_eq!(dragged_width(Divider::Sidebar, d, 5000.0, 160.0, 480.0), 480.0);
+        assert_eq!(dragged_width(Divider::Chat, chat, -5000.0, 280.0, 520.0), 520.0);
+        assert_eq!(dragged_width(Divider::Sidebar, d, -5000.0, 160.0, 480.0), 160.0);
+        // ...and releasing the clamp returns the width to the pointer with
+        // no accumulated error (the jitter-killer).
+        assert_eq!(dragged_width(Divider::Sidebar, d, 110.0, 160.0, 480.0), 210.0);
+        assert_eq!(dragged_width(Divider::Chat, chat, 110.0, 280.0, 520.0), 290.0);
+    }
 }
 
 /// Decode `assets/logo-icon.png` into the RGBA [`egui::IconData`] eframe

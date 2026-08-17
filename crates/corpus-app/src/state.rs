@@ -11,11 +11,33 @@ use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 
 use corpus_core::{
-    AgentConfig, CorpusStats, Error, Mission, PluginStatus, Project, RunLine, RunSession,
-    SourceRevs, Store,
+    AgentConfig, CorpusStats, CostReport, Error, Mission, PluginStatus, Project, RunLine,
+    RunSession, SourcePin, SourceRevs, Store,
 };
 
 use crate::nav::Screen;
+
+/// How recently a run's TUI must have painted for the agent to count as
+/// WORKING. opencode animates while a turn is in flight (spinner, token
+/// stream, tool output), so a live-but-quiet capture for this long means
+/// the turn is over and it's waiting on the operator. Long enough to ride
+/// out a slow frame, short enough that the dot settles as soon as the
+/// answer lands.
+const WORKING_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+/// How often the raw captures are re-stat'd. Cheap next to the tmux
+/// listing (no subprocess), so it runs on the faster beat.
+const ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How often the corpus is re-walked to keep the sidebar summary current.
+/// Slower than the activity beat — the count moving a second or two after
+/// a write lands is fine, and this touches every corpus file's metadata.
+const CORPUS_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One project's subtree in the sidebar tree: its agents and missions.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectTree {
+    pub agents: Vec<(String, AgentConfig)>,
+    pub missions: Vec<(String, Mission)>,
+}
 
 /// App-wide state: the corpus-core store handle plus the data the
 /// screens render. Owned by `App`, passed by reference to the views.
@@ -45,20 +67,35 @@ pub struct AppState {
     /// Which project the env probe aggregation belongs to (the top bar's
     /// live dot — a stale probe is never trusted).
     env_project: Option<String>,
-    /// Missions of `selected_project`, sorted by slug (corpus-core order).
+    /// Missions of `selected_project`, newest-CREATED first (the store
+    /// returns slug order, which reads as random in the sidebar; the app
+    /// layer owns the presentation order, like `projects`).
     pub missions: Vec<(String, Mission)>,
     /// Which project `missions` belongs to; a stale pair is never trusted.
     missions_project: Option<String>,
-    /// The last computed corpus summary (files/bytes) for
-    /// `corpus_stats_project` — refreshed on selection change + manually.
+    /// The last computed corpus summary (files/bytes per category) and
+    /// cost report for `corpus_stats_project` — refreshed on selection
+    /// change + manually.
     corpus_stats: Option<CorpusStats>,
+    corpus_cost: Option<CostReport>,
+    /// The project's mission transcripts (`corpus/runs/`), newest first —
+    /// refreshed on the same beat as `corpus_stats`.
+    mission_logs: Vec<corpus_core::MissionLog>,
     corpus_stats_project: Option<String>,
+    /// When the corpus was last auto-re-walked (the sidebar summary keeps
+    /// itself current on a throttle — no manual refresh). Independent of
+    /// selection-change refreshes, which are immediate.
+    corpus_polled_at: Option<std::time::Instant>,
     /// Discovered plugins with live probe results, refreshed on demand
     /// (`refresh_plugins`) — never per-frame: probing spawns processes
     /// on the host.
     plugins: Vec<PluginStatus>,
     /// Agents of `agents_project`, sorted by slug (corpus-core order).
     pub agents: Vec<(String, AgentConfig)>,
+    /// The sidebar tree: every project's agents + missions, keyed by
+    /// project slug — rebuilt with `refresh`/`refresh_agents`/
+    /// `refresh_missions` (the CRUD paths), never per frame.
+    pub trees: BTreeMap<String, ProjectTree>,
     /// Which project `agents` belongs to; a stale pair is never trusted.
     pub agents_project: Option<String>,
     /// The agent the Agents screen edits (sidebar click sets it; the view
@@ -75,15 +112,58 @@ pub struct AppState {
     run: Option<RunSession>,
     /// Identity of the active (or last-finished) run.
     pub run_meta: Option<RunMeta>,
+    /// The mission the active run belongs to (None = not a mission run) —
+    /// the mission view never shows another mission's output.
+    pub run_mission: Option<String>,
     /// Transcript lines drained so far (the run view renders these).
     pub run_lines: Vec<RunLine>,
     /// None = still running; Some = final state (set once, at exit).
     pub run_status: Option<RunStatus>,
-    /// The exported transcript path for a dismissed run.
+    /// The durable transcript path of the last stopped run.
     pub export_path: Option<String>,
     /// Live corpus tmux sessions seen at the last `refresh_live_sessions`
     /// — the re-attach list a relaunched app offers (chunk 7).
     pub live_sessions: Vec<String>,
+    /// When `live_sessions` was last polled (polled on a throttle, never
+    /// per frame — the poll spawns `tmux list-sessions`).
+    live_sessions_polled_at: Option<std::time::Instant>,
+    /// Per tmux session, the moment its TUI last painted anything —
+    /// derived from the run's raw capture mtime and aged forward between
+    /// polls, so it stays honest without re-statting every frame. This is
+    /// what separates a WORKING agent from one parked at its prompt.
+    session_activity: BTreeMap<String, std::time::Instant>,
+    /// When `session_activity` was last refreshed (a `stat` per live
+    /// session — cheap, so polled faster than the tmux listing).
+    session_activity_polled_at: Option<std::time::Instant>,
+}
+
+/// What a mission's row is showing: nothing live, a live session parked
+/// at its prompt, or an agent actually producing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionActivity {
+    /// No live run and no live session — the mission is not up.
+    Idle,
+    /// The opencode session is live but quiet: the turn is finished and
+    /// it is waiting on the operator (or on a reply). Not work.
+    Waiting,
+    /// The agent is producing right now — streaming, spinning, running
+    /// tools. The only state that earns the pulse.
+    Working,
+}
+
+/// The status dot's decision, given whether the session is up and when
+/// its TUI last painted. Split out from `AppState` so the rule itself is
+/// testable: a LIVE session is only `Working` when something was painted
+/// inside `WORKING_WINDOW` — no capture reading is not evidence of work,
+/// which is precisely the case that used to pulse forever.
+fn activity_for(live: bool, last_paint: Option<std::time::Instant>) -> MissionActivity {
+    if !live {
+        return MissionActivity::Idle;
+    }
+    match last_paint {
+        Some(painted) if painted.elapsed() < WORKING_WINDOW => MissionActivity::Working,
+        _ => MissionActivity::Waiting,
+    }
 }
 
 /// Who the active (or last-finished) run was.
@@ -98,13 +178,11 @@ pub struct RunMeta {
 /// The final state of a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
-    /// Exited on its own with this code (piped headless only — a TUI
-    /// run never exits by itself).
+    /// Exited on its own with this code (piped headless, or a TUI run
+    /// whose tmux session ended — the operator quit opencode).
     Exited(i32),
-    /// Torn down by the operator (best-effort transcript export first).
-    Aborted,
-    /// Gracefully closed by the operator: transcript exported first.
-    Dismissed,
+    /// Stopped by the operator (best-effort transcript export first).
+    Stopped,
 }
 
 impl AppState {
@@ -123,8 +201,12 @@ impl AppState {
             env_project: None,
             missions: Vec::new(),
             missions_project: None,
+            trees: BTreeMap::new(),
             corpus_stats: None,
+            mission_logs: Vec::new(),
+            corpus_cost: None,
             corpus_stats_project: None,
+            corpus_polled_at: None,
             plugins: Vec::new(),
             agents: Vec::new(),
             agents_project: None,
@@ -133,18 +215,43 @@ impl AppState {
             pending_launch: None,
             run: None,
             run_meta: None,
+            run_mission: None,
             run_lines: Vec::new(),
             run_status: None,
             export_path: None,
             live_sessions: Vec::new(),
+            live_sessions_polled_at: None,
+            session_activity: BTreeMap::new(),
+            session_activity_polled_at: None,
         };
         state.refresh();
         state
     }
 
-    /// Re-list the projects from the store.
+    /// Re-list the projects from the store (and rebuild the sidebar tree).
+    /// Newest-created first — the tree's default-open project is the most
+    /// recent (the selection fallback takes `projects.first()`).
     pub fn refresh(&mut self) {
         self.projects = self.store.list_projects().unwrap_or_default();
+        self.projects.sort_by(|a, b| b.1.created.cmp(&a.1.created));
+        self.refresh_trees();
+    }
+
+    /// Rebuild the sidebar tree: every project's agents + missions. One
+    /// dir scan per project — called from the refresh paths, never per
+    /// frame.
+    pub fn refresh_trees(&mut self) {
+        self.trees = self
+            .projects
+            .iter()
+            .map(|(slug, _)| {
+                let tree = ProjectTree {
+                    agents: self.store.list_agents(slug).unwrap_or_default(),
+                    missions: sort_missions(self.store.list_missions(slug).unwrap_or_default()),
+                };
+                (slug.clone(), tree)
+            })
+            .collect();
     }
 
     /// Re-probe the discovered plugins (host-side aggregation; the app
@@ -158,22 +265,34 @@ impl AppState {
         &self.plugins
     }
 
-    /// Re-list a project's agents.
+    /// Re-list a project's agents (and keep its tree subtree fresh).
     pub fn refresh_agents(&mut self, project: &str) {
         self.agents = self.store.list_agents(project).unwrap_or_default();
         self.agents_project = Some(project.to_string());
+        if let Some(tree) = self.trees.get_mut(project) {
+            tree.agents = self.agents.clone();
+        }
     }
 
-    /// Re-list a project's missions.
+    /// Re-list a project's missions, newest-created first (and keep its
+    /// tree subtree fresh).
     pub fn refresh_missions(&mut self, project: &str) {
-        self.missions = self.store.list_missions(project).unwrap_or_default();
+        self.missions = sort_missions(self.store.list_missions(project).unwrap_or_default());
         self.missions_project = Some(project.to_string());
+        if let Some(tree) = self.trees.get_mut(project) {
+            tree.missions = self.missions.clone();
+        }
     }
 
-    /// Re-walk a project's corpus (files/bytes) for the sidebar summary.
+    /// Re-walk a project's corpus (files/bytes per category, the mission
+    /// transcripts, and the token/cost aggregation over run exports) for
+    /// the sidebar summary and the project view.
     pub fn refresh_corpus_stats(&mut self, project: &str) {
         self.corpus_stats = corpus_core::corpus_stats(&self.store, project).ok();
+        self.mission_logs = corpus_core::mission_logs(&self.store, project).unwrap_or_default();
+        self.corpus_cost = corpus_core::corpus_cost(&self.store, project).ok();
         self.corpus_stats_project = Some(project.to_string());
+        self.corpus_polled_at = Some(std::time::Instant::now());
     }
 
     /// The sidebar's selected project — held by slug, falling back to the
@@ -197,22 +316,46 @@ impl AppState {
         self.refresh_env(slug);
     }
 
-    /// Load the source-rev dropdowns for the project's plugin, defaulting
-    /// `source_pins` to each repo's pinned rev. When the plugin/sources
-    /// can't be found the current pins are left untouched (the placeholder
-    /// defaults hold) rather than cleared.
+    /// Load the source-rev dropdowns for the project's plugin (the plugin
+    /// defines the revs AVAILABLE), seeding the selection from the
+    /// PROJECT's stored pins (the project owns the pick) with any unset
+    /// source at its default rev. When the plugin/sources can't be found
+    /// the current pins are left untouched (the placeholder defaults
+    /// hold) rather than cleared.
     pub fn refresh_source_revs(&mut self, project: &str) {
         let revs = corpus_core::plugin_sources(&self.store, project).unwrap_or_default();
         if !revs.is_empty() {
-            // Re-derive the pins from the plugin's pins: changing the
-            // project changes what pins are meaningful.
+            let stored: BTreeMap<String, String> = self
+                .projects
+                .iter()
+                .find(|(s, _)| s == project)
+                .map(|(_, p)| p.pins.clone())
+                .unwrap_or_default();
             self.source_pins = revs
                 .iter()
-                .map(|source| (source.name.clone(), source.pinned.clone()))
+                .map(|source| {
+                    let rev = stored
+                        .get(&source.name)
+                        .filter(|rev| source.revs.contains(rev))
+                        .cloned()
+                        .unwrap_or_else(|| source.default_rev().to_string());
+                    (source.name.clone(), rev)
+                })
                 .collect();
         }
         self.source_revs = revs;
         self.source_revs_project = Some(project.to_string());
+    }
+
+    /// The top-bar dropdown changed: update the in-memory selection and
+    /// persist the pick onto the project (missions stamp it at creation).
+    pub fn set_source_pin(&mut self, project: &str, repo: &str, rev: &str) -> Result<(), Error> {
+        self.source_pins.insert(repo.to_string(), rev.to_string());
+        let updated = self.store.set_project_pins(project, self.source_pins.clone())?;
+        if let Some((_, spec)) = self.projects.iter_mut().find(|(s, _)| s == project) {
+            *spec = updated;
+        }
+        Ok(())
     }
 
     /// The current env-status aggregation for a project's plugin, as a
@@ -247,6 +390,7 @@ impl AppState {
             self.agents.clear();
             self.missions.clear();
             self.corpus_stats = None;
+            self.mission_logs.clear();
             self.agents_project = None;
             self.missions_project = None;
             self.corpus_stats_project = None;
@@ -284,8 +428,19 @@ impl AppState {
 
     /// The sidebar's corpus summary for the selected project (None = not
     /// computed yet, or no project).
-    pub fn corpus_stats(&self) -> Option<CorpusStats> {
-        self.corpus_stats
+    pub fn corpus_stats(&self) -> Option<&CorpusStats> {
+        self.corpus_stats.as_ref()
+    }
+
+    /// The project view's mission logs for the selected project, newest
+    /// first (empty = none written yet, or no project).
+    pub fn mission_logs(&self) -> &[corpus_core::MissionLog] {
+        &self.mission_logs
+    }
+
+    /// The project view's cost report for the selected project.
+    pub fn corpus_cost(&self) -> Option<&CostReport> {
+        self.corpus_cost.as_ref()
     }
 
     /// Create a project. The human gives the display name; the machine
@@ -293,26 +448,67 @@ impl AppState {
     /// kebab-case slug, so it slots straight into the store layout
     /// (`store/projects/<id>/`), CLI scopes, and `CORPUS_PROJECT`.
     pub fn create_project(&self, name: &str, plugin: &str) -> Result<(String, Project), Error> {
-        let id = new_uuid_id();
-        self.store.create_project(&id, name, plugin).map(|p| (id, p))
+        // Human names mint human slugs ("Dep Scans" → "dep-scans"); only a
+        // name with no alphanumerics falls back to the opaque id. (UUID
+        // slugs made every chat/tool reference unreadable — 2026-08-14.)
+        let slug = {
+            let s = corpus_core::slugify(name);
+            if s.is_empty() { new_uuid_id() } else { s }
+        };
+        self.store.create_project(&slug, name, plugin).map(|p| (slug, p))
     }
 
-    /// Clone a project with a fresh auto-generated id; the copied name
-    /// falls back to the source's when none is given.
+    /// Clone a project; the copied name falls back to the source's when
+    /// none is given. The slug derives from the name (kebab), else an id.
     pub fn clone_project(
         &self,
         from: &str,
         name: Option<&str>,
         with_corpus: bool,
     ) -> Result<(String, Project), Error> {
-        let id = new_uuid_id();
+        let slug = name
+            .map(corpus_core::slugify)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("{from}-copy"));
+        // A taken slug gets a numeric suffix rather than an opaque id.
+        let slug = (2..)
+            .map(|n| {
+                if n == 2 { slug.clone() } else { format!("{slug}-{n}") }
+            })
+            .find(|s| !self.store.project_dir(s).exists())
+            .unwrap_or_else(new_uuid_id);
         self.store
-            .clone_project(from, &id, name, with_corpus)
-            .map(|p| (id, p))
+            .clone_project(from, &slug, name, with_corpus)
+            .map(|p| (slug, p))
     }
 
     pub fn delete_project(&self, slug: &str) -> Result<(), Error> {
         self.store.delete_project(slug)
+    }
+
+    /// The app's remembered UI choices (`store/app.yaml`). Read on demand —
+    /// it is a tiny file and the app touches it at launch and on a picker
+    /// change, never per frame.
+    pub fn prefs(&self) -> corpus_core::AppPrefs {
+        self.store.load_prefs()
+    }
+
+    /// Remember the chat model the operator picked, so the next launch comes
+    /// back on it. A write failure is deliberately swallowed: a read-only
+    /// store must degrade to "this session only", not toast on every pick.
+    pub fn remember_chat_model(&self, model: &str) {
+        let mut prefs = self.store.load_prefs();
+        if prefs.chat_model == model {
+            return;
+        }
+        prefs.chat_model = model.to_string();
+        let _ = self.store.save_prefs(&prefs);
+    }
+
+    /// Rename a project's display label (the slug — its identity in every
+    /// path — is untouched).
+    pub fn rename_project(&self, slug: &str, name: &str) -> Result<Project, Error> {
+        self.store.rename_project(slug, name)
     }
 
     /// Change a project's environment plugin binding.
@@ -339,6 +535,79 @@ impl AppState {
         self.store.save_agent(project, slug, doc)
     }
 
+    // --- granular agent edits (the Forms tab) -------------------------
+    // Each is a read-modify-validate-write in corpus-core, so the form
+    // sends one value instead of rewriting the whole document.
+
+    /// Set one field of an agent entry (`None` = the primary).
+    pub fn set_agent_field(
+        &self,
+        project: &str,
+        slug: &str,
+        entry: Option<&str>,
+        field: &str,
+        value: serde_json::Value,
+    ) -> Result<(), Error> {
+        self.store.set_agent_field(project, slug, entry, field, value)
+    }
+
+    /// Rename an agent's display label (the slug — its identity in every
+    /// path — is untouched).
+    pub fn set_agent_name(&self, project: &str, slug: &str, name: &str) -> Result<(), Error> {
+        self.store.set_agent_name(project, slug, name)
+    }
+
+    /// Set the agent's (or a subagent's) role — the server-enforced ceiling.
+    pub fn set_agent_role(
+        &self,
+        project: &str,
+        slug: &str,
+        entry: Option<&str>,
+        role: corpus_core::AgentRole,
+    ) -> Result<(), Error> {
+        match entry {
+            Some(sub) => self.store.set_subagent_role(project, slug, sub, role),
+            None => self.store.set_agent_role(project, slug, role),
+        }
+    }
+
+    /// Merge a permission patch into an entry.
+    pub fn patch_agent_permission(
+        &self,
+        project: &str,
+        slug: &str,
+        entry: Option<&str>,
+        patch: &serde_json::Value,
+    ) -> Result<(), Error> {
+        self.store.patch_agent_permission(project, slug, entry, patch)
+    }
+
+    pub fn add_subagent(
+        &self,
+        project: &str,
+        slug: &str,
+        name: &str,
+        description: &str,
+        prompt: &str,
+        model: Option<&str>,
+        role: Option<corpus_core::AgentRole>,
+    ) -> Result<(), Error> {
+        self.store
+            .add_subagent(project, slug, name, description, prompt, model, role)
+    }
+
+    pub fn remove_subagent(&self, project: &str, slug: &str, name: &str) -> Result<(), Error> {
+        self.store.remove_subagent(project, slug, name)
+    }
+
+    /// opencode's launchable model ids — the catalog an AGENT config must
+    /// resolve against. Deliberately NOT `ollama_models()`, which is the
+    /// chat's own (locally-pulled) list and would offer ids a mission
+    /// cannot launch with. TTL-cached in corpus-core; `refresh` re-pulls.
+    pub fn opencode_models(&self, refresh: bool) -> Option<corpus_core::ModelList> {
+        corpus_core::model_list(refresh).ok()
+    }
+
     /// Clone an agent.
     pub fn clone_agent(&self, project: &str, from: &str) -> Result<(), Error> {
         let id = new_uuid_id();
@@ -350,17 +619,19 @@ impl AppState {
         self.store.delete_agent(project, slug)
     }
 
-    /// Clone a core seed into the project as a new (auto-id'd) agent —
-    /// the sidebar's "+ agent → clone-from-seed" flow. `seed` is a
-    /// core-seed name (`operator` / `researcher`), or `blank` for the
-    /// empty config.
-    pub fn create_agent_from_seed(&self, project: &str, seed: &str) -> Result<String, Error> {
+    /// Create a new (auto-id'd) agent from a ROLE — the sidebar's
+    /// "+ agent" flow. Roles replaced the seed set: the role already
+    /// decides the capability ceiling the renderer writes, so a seed
+    /// document was only ever contributing a starting prompt, which now
+    /// ships compiled into corpus-core.
+    pub fn create_agent_with_role(&self, project: &str, role: corpus_core::AgentRole) -> Result<String, Error> {
         let id = new_uuid_id();
-        if seed == "blank" {
-            self.store.create_blank_agent(project, &id)?;
-        } else {
-            self.store.create_agent_from_seed(project, &id, seed)?;
-        }
+        self.store.create_agent_with_role(project, &id, role)?;
+        // Stamp the human placeholder name so the Forms tab and the sidebar
+        // show an editable label (and opencode a friendly handle), not the
+        // opaque id. Best-effort: a naming failure must not undo a created
+        // agent.
+        let _ = self.store.set_agent_name(project, &id, corpus_core::DEFAULT_AGENT_NAME);
         Ok(id)
     }
 
@@ -398,27 +669,46 @@ impl AppState {
     }
 
     /// Materialize the agent and spawn the mission on the project
-    /// scope. One active run at a time.
+    /// scope. One active run at a time. `pinned` is the launch's source
+    /// pins (rev + resolved sha), rendered into the materialized agent
+    /// files so research-zone agents read the right `sources/<name>/<sha>/`
+    /// tree; empty for a launch with none. `source_pins_json` is the
+    /// resolved `repo -> sha` map exported to the run (None = the
+    /// plugin's default pins).
     pub fn launch(
         &mut self,
         project: &str,
         agent: &str,
         model: Option<&str>,
         mission: &str,
+        pinned: &[SourcePin],
+        source_pins_json: Option<&str>,
     ) -> Result<(), Error> {
         if self.run.is_some() {
             return Err(Error::Store(
-                "a run is already active — abort or wait for it first".into(),
+                "a run is already active — stop it or wait for it first".into(),
             ));
         }
-        self.store.render_agent(project, agent)?;
-        let session = RunSession::spawn(project, agent, model, mission)?;
+        // Fail loudly on an unknown agent, then materialize the WHOLE
+        // project: the agent list opencode shows is project-scoped.
+        self.store.load_agent(project, agent)?;
+        self.store.render_project_agents(project, pinned)?;
+        let session = RunSession::spawn(project, agent, model, mission, source_pins_json)?;
+        self.adopt_run(session);
+        Ok(())
+    }
+
+    /// Take ownership of a freshly spawned run and reset the per-run
+    /// bookkeeping (attach argv, drained lines, terminal status). Shared
+    /// by `launch` and `resume_mission` so a resumed run is wired exactly
+    /// like a fresh one.
+    fn adopt_run(&mut self, session: RunSession) {
         let pty_attach = session.pty_attach_command();
         self.run = Some(session);
         self.run_meta = Some(RunMeta { pty_attach });
+        self.run_mission = None;
         self.run_lines.clear();
         self.run_status = None;
-        Ok(())
     }
 
     /// Drain any new transcript lines; mark the run finished the moment
@@ -431,9 +721,9 @@ impl AppState {
             self.run_lines.push(line);
         }
         if let Some(status) = session.try_exit() {
-            // An operator abort already recorded its terminal state;
+            // An operator stop already recorded its terminal state;
             // everything else surfaces as its exit code.
-            if self.run_status != Some(RunStatus::Aborted) {
+            if self.run_status != Some(RunStatus::Stopped) {
                 self.run_status = Some(RunStatus::Exited(status.code().unwrap_or(1)));
             }
             return;
@@ -441,33 +731,15 @@ impl AppState {
         self.run = Some(session);
     }
 
-    /// Operator-initiated tear-down: best-effort transcript export,
-    /// then kill the whole session tree. The run is immediately over.
-    pub fn abort_run(&mut self) {
-        if let Some(mut session) = self.run.take() {
-            session.abort();
-        }
-        self.run_status = Some(RunStatus::Aborted);
-    }
-
-    /// Graceful close: export the transcript of record (a TUI run's
-    /// `<epoch>-<agent>.json`), then close the run. On export failure
-    /// the run stays live so the operator can abort instead.
-    pub fn dismiss_run(&mut self) -> Result<(), Error> {
-        let Some(mut session) = self.run.take() else {
-            return Err(Error::Store("no run to dismiss".into()));
-        };
-        match session.dismiss() {
-            Ok(export) => {
-                self.export_path = Some(export.display().to_string());
-                self.run_status = Some(RunStatus::Dismissed);
-                Ok(())
-            }
-            Err(error) => {
-                self.run = Some(session);
-                Err(error)
-            }
-        }
+    /// Operator-initiated stop: best-effort transcript-of-record export,
+    /// then kill the run. Returns the durable transcript path (the
+    /// exported JSON when it lands, else the raw/.log fallback).
+    pub fn stop_run(&mut self) -> Option<PathBuf> {
+        let mut session = self.run.take()?;
+        let path = session.stop();
+        self.export_path = Some(path.display().to_string());
+        self.run_status = Some(RunStatus::Stopped);
+        Some(path)
     }
 
     /// The embedded-PTY attach argv of the LIVE run (chunk 7): Some for
@@ -491,6 +763,126 @@ impl AppState {
     /// when the app was relaunched over a surviving run).
     pub fn refresh_live_sessions(&mut self) {
         self.live_sessions = corpus_core::live_tui_sessions();
+        self.live_sessions_polled_at = Some(std::time::Instant::now());
+    }
+
+    /// Poll live sessions on a throttle (2 s): the poll spawns a `tmux
+    /// list-sessions` subprocess, so never per frame — and only when a
+    /// live session can even matter (a run is up, or some mission record
+    /// still holds a session). This keeps the sidebar's activity dots
+    /// fresh without polling an idle app forever.
+    pub fn poll_live_sessions(&mut self) {
+        let relevant = self.run_active()
+            || self
+                .trees
+                .values()
+                .any(|t| t.missions.iter().any(|(_, m)| m.session.is_some()));
+        if !relevant {
+            return;
+        }
+        let due = self
+            .live_sessions_polled_at
+            .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(2));
+        if due {
+            self.refresh_live_sessions();
+        }
+        // Activity is a `stat` per live session — no subprocess, so it
+        // polls faster: the dot should catch a turn starting, not lag it
+        // by the tmux listing's throttle.
+        let activity_due = self
+            .session_activity_polled_at
+            .is_none_or(|t| t.elapsed() > ACTIVITY_POLL);
+        if activity_due {
+            self.refresh_session_activity();
+            // Same beat: catch the live run's opencode session id as soon
+            // as the TUI has created it (self-throttled, and a no-op once
+            // the mission record has one).
+            self.capture_opencode_session();
+        }
+    }
+
+    /// Keep the sidebar's corpus summary current on its own, so new
+    /// findings/attacks a running mission writes just appear — no manual
+    /// refresh. The walk is a cheap `read_dir` + `stat` pass (bounded by
+    /// file COUNT, not size), so a throttle this tight is comfortable.
+    /// Selection-change refreshes still happen immediately elsewhere;
+    /// this only fills the gaps between them.
+    pub fn poll_corpus_stats(&mut self) {
+        let Some(project) = self.effective_project() else {
+            return;
+        };
+        let due = self
+            .corpus_polled_at
+            .is_none_or(|t| t.elapsed() > CORPUS_POLL);
+        if due {
+            self.refresh_corpus_stats(&project);
+        }
+    }
+
+    /// Re-stat the raw capture of every mission session we know of, and
+    /// record WHEN it last grew as an `Instant`. Storing the instant (not
+    /// the age) means the reading keeps aging correctly between polls, so
+    /// a 500 ms poll still gives a dot that goes still the moment output
+    /// stops.
+    fn refresh_session_activity(&mut self) {
+        self.session_activity_polled_at = Some(std::time::Instant::now());
+        let sessions: Vec<(String, String)> = self
+            .trees
+            .iter()
+            .flat_map(|(project, tree)| {
+                tree.missions.iter().filter_map(move |(_, mission)| {
+                    mission.session.clone().map(|s| (project.clone(), s))
+                })
+            })
+            .collect();
+        self.session_activity.clear();
+        for (project, session) in sessions {
+            let Some(log) = corpus_core::session_raw_log(&self.store, &project, &session) else {
+                continue;
+            };
+            let Some(idle) = corpus_core::run_idle_secs(&log) else {
+                continue;
+            };
+            let last_paint = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(idle))
+                .unwrap_or_else(std::time::Instant::now);
+            self.session_activity.insert(session, last_paint);
+        }
+    }
+
+    /// What the mission's status dot should say: `Idle` (nothing up),
+    /// `Waiting` (session live, agent quiet), or `Working` (producing
+    /// right now).
+    ///
+    /// A run is UP when the app-owned run is live and belongs to this
+    /// mission (run_status set = exited/stopped = down), or when the
+    /// mission's recorded tmux session is alive on the server — which
+    /// covers a relaunched app and sessions the app never owned.
+    ///
+    /// The busy signal is the run's raw capture: everything the TUI
+    /// paints flows through `tmux pipe-pane` into it, and a TUI waiting
+    /// at its prompt paints nothing — so a capture that grew within
+    /// `WORKING_WINDOW` means the agent is mid-turn. A piped headless run
+    /// has no TUI to watch and is one-shot by nature: while it is up, it
+    /// IS working.
+    pub fn mission_activity(&self, project: &str, slug: &str) -> MissionActivity {
+        let owned = self.run_active()
+            && self.run_status.is_none()
+            && self.run_mission.as_deref() == Some(slug);
+        let session = self
+            .trees
+            .get(project)
+            .and_then(|tree| tree.missions.iter().find(|(s, _)| s == slug))
+            .and_then(|(_, mission)| mission.session.clone());
+        let Some(session) = session else {
+            // No tmux session: the only thing that can be up is an
+            // app-owned piped run, which is busy for its whole life.
+            return if owned { MissionActivity::Working } else { MissionActivity::Idle };
+        };
+        let live = self.live_sessions.iter().any(|l| l == &session)
+            || self.live_run_session().as_deref() == Some(session.as_str())
+            || owned;
+        activity_for(live, self.session_activity.get(&session).copied())
     }
 
     /// The attach argv for a discovered live session (re-attach after an
@@ -502,7 +894,7 @@ impl AppState {
     // --- mission bookkeeping (run attach + sidebar ops) ---
 
     /// The tmux session of the app-owned live run, if any.
-    fn live_run_session(&self) -> Option<String> {
+    pub(crate) fn live_run_session(&self) -> Option<String> {
         self.live_pty_attach()
             .and_then(|argv| AppState::pty_attach_session(&argv))
     }
@@ -510,30 +902,170 @@ impl AppState {
     /// Launch a mission's run: a BARE opencode TUI (empty prompt — the
     /// operator types the mission into opencode's own input), then persist
     /// the spawned tmux session on the mission record so a relaunched app
-    /// re-attaches by selection.
+    /// re-attaches by selection. One active run at a time: a live run is
+    /// REPLACED (transcript exported when possible, torn down either way)
+    /// so a new mission always lands on a fresh opencode session.
     pub fn launch_mission(&mut self, project: &str, agent: &str, slug: &str) -> Result<(), Error> {
+        let (_record, pinned, pins_json) = self.prepare_launch(project, slug)?;
+        self.teardown_active_run(project, slug);
         let model = self.agent_default_model(project, agent);
-        self.launch(project, agent, model.as_deref(), "")?;
+        self.launch(project, agent, model.as_deref(), "", &pinned, pins_json.as_deref())?;
+        self.run_mission = Some(slug.to_string());
         if let Some(session) = self.live_run_session() {
-            self.set_mission_session(project, slug, Some(session), None)?;
+            self.set_tmux_session(project, slug, Some(session))?;
+        }
+        // A fresh launch is a NEW conversation: drop any id from a
+        // previous run so discovery records the right one.
+        self.set_opencode_session(project, slug, None)?;
+        self.refresh_missions(project);
+        Ok(())
+    }
+
+    /// Re-open a mission's recorded opencode conversation in a fresh TUI
+    /// (`opencode --session <id>`), so an old mission whose tmux session
+    /// died is steerable again with its history intact. Same one-run-at-a-
+    /// time rule as `launch_mission`: a live run is replaced.
+    pub fn resume_mission(&mut self, project: &str, slug: &str) -> Result<(), Error> {
+        let (record, pinned, pins_json) = self.prepare_launch(project, slug)?;
+        let id = record.opencode_session.clone().ok_or_else(|| {
+            Error::Store("no opencode session recorded for this mission — nothing to resume".into())
+        })?;
+        self.teardown_active_run(project, slug);
+        // Same materialization as a launch: the resumed conversation runs
+        // against this project's agent set.
+        self.store.load_agent(project, &record.agent)?;
+        self.store.render_project_agents(project, &pinned)?;
+        let model = self.agent_default_model(project, &record.agent);
+        let run = corpus_core::RunSession::resume(
+            project,
+            &record.agent,
+            model.as_deref(),
+            &id,
+            pins_json.as_deref(),
+        )?;
+        self.adopt_run(run);
+        self.run_mission = Some(slug.to_string());
+        if let Some(session) = self.live_run_session() {
+            self.set_tmux_session(project, slug, Some(session))?;
         }
         self.refresh_missions(project);
         Ok(())
     }
 
-    /// Write the run bookkeeping (tmux session / opencode session) onto a
-    /// mission record, preserving its brief.
-    fn set_mission_session(
+    /// The shared launch preamble: load the mission, resolve its rev
+    /// pins to shas + fetch trees (loud failure here must never tear
+    /// down a working run — that happens only after this returns).
+    fn prepare_launch(
+        &self,
+        project: &str,
+        slug: &str,
+    ) -> Result<(Mission, Vec<SourcePin>, Option<String>), Error> {
+        let mission_record = self.store.load_mission(project, slug)?;
+        let prepared = corpus_core::prepare_source_pins(&self.store, project, &mission_record.pins)?;
+        let pins_json = if prepared.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&prepared)?)
+        };
+        // The renderer's pin list: the mission's rev labels + the resolved
+        // shas, so the materialized agents read the named trees.
+        let pinned: Vec<SourcePin> = mission_record
+            .pins
+            .iter()
+            .filter_map(|(name, rev)| {
+                let sha = prepared.get(name)?.clone();
+                Some(SourcePin {
+                    name: name.clone(),
+                    rev: rev.clone(),
+                    sha,
+                })
+            })
+            .collect();
+        Ok((mission_record, pinned, pins_json))
+    }
+
+    /// One active run at a time: stop the live run (best-effort
+    /// transcript export first), and clear the dead tmux session
+    /// off whichever mission held it so re-attach never aims at a corpse.
+    fn teardown_active_run(&mut self, project: &str, incoming_slug: &str) {
+        if !self.run_active() {
+            return;
+        }
+        let replaced = self.live_run_session();
+        self.stop_run();
+        if let Some(replaced) = replaced {
+            let holder = self
+                .missions
+                .iter()
+                .find(|(s, m)| {
+                    s.as_str() != incoming_slug && m.session.as_deref() == Some(replaced.as_str())
+                })
+                .map(|(s, _)| s.clone());
+            if let Some(holder) = holder {
+                // Only the dead tmux session goes; the displaced mission
+                // keeps its opencode id so it can be resumed later.
+                let _ = self.set_tmux_session(project, &holder, None);
+            }
+        }
+    }
+
+    /// Point a mission at a tmux session (or clear a dead one). The
+    /// opencode session is left alone: the tmux session is where the run
+    /// is ATTACHED, while the opencode session is what the mission IS —
+    /// it outlives every attach and is what `resume_mission` re-opens.
+    fn set_tmux_session(
         &mut self,
         project: &str,
         slug: &str,
         session: Option<String>,
-        opencode_session: Option<String>,
     ) -> Result<(), Error> {
         let mut mission = self.store.load_mission(project, slug)?;
         mission.session = session;
-        mission.opencode_session = opencode_session;
         self.store.update_mission(project, slug, &mission)
+    }
+
+    /// Record (or clear) the opencode conversation a mission owns. A
+    /// fresh launch clears it — opencode starts a new conversation, so
+    /// the old id would resume the WRONG one — and discovery fills it
+    /// back in once the TUI has created its session.
+    fn set_opencode_session(
+        &mut self,
+        project: &str,
+        slug: &str,
+        id: Option<String>,
+    ) -> Result<(), Error> {
+        let mut mission = self.store.load_mission(project, slug)?;
+        mission.opencode_session = id;
+        self.store.update_mission(project, slug, &mission)
+    }
+
+    /// Catch the opencode session id of the live run and persist it on
+    /// its mission. Called on the poll beat: the id doesn't exist at
+    /// launch (the TUI has to boot first), and without it a mission can
+    /// be neither exported after an app restart nor resumed. Cheap once
+    /// it lands — the lookup stops the moment the record has an id.
+    fn capture_opencode_session(&mut self) {
+        let (Some(project), Some(slug)) = (self.effective_project(), self.run_mission.clone())
+        else {
+            return;
+        };
+        if !self.run_active() || self.run_status.is_some() {
+            return;
+        }
+        let known = self
+            .store
+            .load_mission(&project, &slug)
+            .ok()
+            .and_then(|m| m.opencode_session);
+        if known.is_some() {
+            return;
+        }
+        let Some(id) = self.run.as_mut().and_then(|run| run.opencode_session_id()) else {
+            return;
+        };
+        if self.set_opencode_session(&project, &slug, Some(id)).is_ok() {
+            self.refresh_missions(&project);
+        }
     }
 
     /// Rename a mission (its display label) while keeping the slug.
@@ -548,48 +1080,37 @@ impl AppState {
         self.store.update_mission(project, slug, &mission)
     }
 
-    /// Abort a mission's run: `tmux kill-session` on its recorded session
-    /// (works whether the app owns the run or it survived an app relaunch).
-    pub fn abort_mission(&mut self, project: &str, slug: &str) -> Result<(), Error> {
+    /// Stop a mission's run: best-effort transcript-of-record export,
+    /// then kill — whether the app owns the run or it survived an app
+    /// relaunch. Clears the dead tmux session and returns the durable
+    /// transcript path when known. The opencode session id STAYS on the
+    /// record: stopping ends the attach, not the conversation, and that
+    /// id is what `resume_mission` re-opens.
+    pub fn stop_mission(&mut self, project: &str, slug: &str) -> Result<String, Error> {
         let mission = self.store.load_mission(project, slug)?;
         let session = mission.session.as_deref().ok_or_else(|| {
-            Error::Store("no live session on this mission — nothing to abort".into())
+            Error::Store("no live session on this mission — nothing to stop".into())
         })?;
-        if self.live_run_session().as_deref() == Some(session) {
-            self.abort_run();
+        let path = if self.live_run_session().as_deref() == Some(session) {
+            self.stop_run().map(|p| p.display().to_string())
         } else {
+            // A run that outlived the app: export via the recorded
+            // opencode session when we have one (best-effort — the raw
+            // capture is the durable fallback), then kill the tmux session.
+            let exported = mission
+                .opencode_session
+                .as_deref()
+                .and_then(|id| corpus_core::export_session(project, &mission.agent, id).ok())
+                .map(|p| p.display().to_string());
             corpus_core::kill_tmux_session(session);
-        }
-        self.refresh_live_sessions();
-        Ok(())
-    }
-
-    /// Dismiss a mission: export the transcript of record to the project
-    /// corpus `runs/`, kill the run, and clear its bookkeeping. Uses the
-    /// stored opencode session for re-attached runs; the app-owned run
-    /// exports through its own handle.
-    pub fn dismiss_mission(&mut self, project: &str, slug: &str) -> Result<(), Error> {
-        let mission = self.store.load_mission(project, slug)?;
-        let session = mission.session.as_deref();
-        let is_owned = session.is_some()
-            && self.live_run_session().as_deref() == session;
-        let path = if is_owned {
-            self.dismiss_run()?;
-            self.export_path.clone().unwrap_or_default()
-        } else {
-            let opencode_id = mission.opencode_session.as_deref().ok_or_else(|| {
-                Error::Store("no opencode session recorded — cannot export".into())
-            })?;
-            let path = corpus_core::export_session(project, &mission.agent, opencode_id)?;
-            if let Some(sref) = session {
-                corpus_core::kill_tmux_session(sref);
-            }
-            path.display().to_string()
+            exported
         };
-        self.export_path = Some(path);
-        self.set_mission_session(project, slug, None, None)?;
+        if let Some(path) = &path {
+            self.export_path = Some(path.clone());
+        }
+        self.set_tmux_session(project, slug, None)?;
         self.refresh_live_sessions();
-        Ok(())
+        Ok(path.unwrap_or_default())
     }
 
     /// The model the launch dialog pre-fills: the registry's curated
@@ -610,6 +1131,29 @@ impl AppState {
         corpus_core::launch::agent_default_model(&self.store, project, agent)
             .or_else(|| self.suggested_model())
     }
+}
+
+/// The label to show for an agent: its display name, never the opaque
+/// slug (a UUID). Agents predating names — or created before the default
+/// placeholder — carry a sidecar `name` equal to their slug; those fall
+/// back to a friendly placeholder so a raw id never surfaces in the UI.
+/// The slug stays available in hover tooltips and the JSON tab for anyone
+/// who needs the identity.
+pub fn agent_label(name: &str, slug: &str) -> String {
+    if name.is_empty() || name == slug {
+        "unnamed agent".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Mission list order, newest-CREATED first (slug tiebreak). The store
+/// returns slug order — stable across saves, but the slugs are random
+/// UUIDs so the sidebar looked shuffled; created order matches the
+/// project list (state.rs `refresh`, newest first).
+fn sort_missions(mut missions: Vec<(String, Mission)>) -> Vec<(String, Mission)> {
+    missions.sort_by(|a, b| b.1.created.cmp(&a.1.created).then_with(|| a.0.cmp(&b.0)));
+    missions
 }
 
 /// A fresh RFC-4122-v4-formatted id, generated without new dependencies:
@@ -663,5 +1207,47 @@ mod tests {
         let a = new_uuid_id();
         let b = new_uuid_id();
         assert_ne!(a, b);
+    }
+
+    fn mission(created: u64) -> Mission {
+        Mission {
+            agent: "operator".to_string(),
+            pins: std::collections::BTreeMap::new(),
+            budget: None,
+            status: "queued".to_string(),
+            created,
+            name: None,
+            session: None,
+            opencode_session: None,
+        }
+    }
+
+    #[test]
+    fn only_a_painting_session_counts_as_working() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        // Nothing up: the session state below is irrelevant.
+        assert_eq!(activity_for(false, Some(now)), MissionActivity::Idle);
+        // Live and painting right now — the pulse is earned.
+        assert_eq!(activity_for(true, Some(now)), MissionActivity::Working);
+        // Live but quiet past the window: an opencode TUI parked at its
+        // prompt. This is the case that used to pulse forever.
+        let stale = now - (WORKING_WINDOW + Duration::from_secs(1));
+        assert_eq!(activity_for(true, Some(stale)), MissionActivity::Waiting);
+        // Live with no capture to read: absence of evidence, not work.
+        assert_eq!(activity_for(true, None), MissionActivity::Waiting);
+    }
+
+    #[test]
+    fn missions_sort_newest_created_first() {
+        let list = vec![
+            ("b-old".to_string(), mission(100)),
+            ("a-new".to_string(), mission(300)),
+            ("c-mid".to_string(), mission(200)),
+            ("d-tie".to_string(), mission(300)),
+        ];
+        let sorted = sort_missions(list);
+        let order: Vec<&str> = sorted.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(order, ["a-new", "d-tie", "c-mid", "b-old"]);
     }
 }

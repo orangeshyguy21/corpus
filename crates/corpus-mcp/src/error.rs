@@ -17,6 +17,12 @@ pub enum Error {
     #[error("invalid arguments: {0}")]
     Args(String),
 
+    /// No usable project scope: the server could not establish which
+    /// project's corpus it serves, so every scoped tool refuses rather
+    /// than guessing one.
+    #[error("scope error: {0}")]
+    Scope(String),
+
     /// A plugin or plugin protocol error.
     #[error("plugin error: {0}")]
     Plugin(#[from] corpus_core::Error),

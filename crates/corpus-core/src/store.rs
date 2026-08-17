@@ -33,29 +33,60 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::frontmatter;
 
-/// Project the flat store migrates into, and the unscoped default.
-pub const DEFAULT_PROJECT_SLUG: &str = "default";
-
-/// Environment variables overriding the default scope.
-pub const STORE_ENV: &str = "CORPUS_STORE";
+/// Environment variables overriding the default scope. The store root is
+/// resolved in [`crate::paths`], which owns every root the app has.
+pub use crate::paths::STORE_ENV;
 pub const PROJECT_ENV: &str = "CORPUS_PROJECT";
+/// The launched mission's resolved source pins (`{"<repo>": "<sha>"}`
+/// JSON) — corpus-mcp forwards these to the plugin so the sandbox mounts
+/// the revs the mission recorded, not config.toml's defaults.
+pub const SOURCE_PINS_ENV: &str = "CORPUS_SOURCE_PINS";
+
+/// The basename of the current run's transcript file in the project
+/// corpus `runs/` (e.g. `1786891368-verify.raw`). Set by the launcher
+/// so `technique_save`/`finding_write` can cite it without the agent
+/// guessing — the sandbox has no host FS and cannot enumerate `runs/`.
+pub const RUN_LOG_ENV: &str = "CORPUS_RUN_LOG";
+
+/// The slug of the agent this run was launched as — the run's IDENTITY.
+/// Exported by BOTH launch paths into the opencode process, which
+/// corpus-mcp inherits: the server resolves the agent's role from it and
+/// gates its tool catalog accordingly. Without it the server cannot tell
+/// a researcher from an operator and can only fail closed.
+pub const AGENT_ENV: &str = "CORPUS_OPENCODE_AGENT";
+
+/// The opencode `--agent` handle for the run: the launched agent's
+/// project-unique, name-derived identifier (see `agents::primary_handles`).
+/// SEPARATE from [`AGENT_ENV`] on purpose — opencode shows this (so the
+/// operator sees a name, not the opaque dir slug), while the server still
+/// resolves the role from [`AGENT_ENV`] (the dir slug, the agent's true
+/// identity). For an unnamed agent the two coincide (both the slug).
+pub const HANDLE_ENV: &str = "CORPUS_OPENCODE_HANDLE";
 
 /// The corpus category layout.
 pub const CATEGORIES: [&str; 5] = ["hypotheses", "techniques", "findings", "attacks", "runs"];
 
-/// Resolve the store root: `CORPUS_STORE`, else `~/Sites/corpus/store`.
+/// The mission-log category: a corpus dir like any other on disk, but
+/// summarized on its own (see `CorpusStats`) — run transcripts dwarf the
+/// knowledge categories and would swamp any shared byte breakdown.
+pub const RUNS: &str = "runs";
+
+/// Resolve the store root: `CORPUS_STORE`, else `~/.corpus/store`.
 pub fn store_root_env() -> PathBuf {
-    std::env::var(STORE_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(format!("{home}/Sites/corpus/store"))
-        })
+    crate::paths::store_root()
 }
 
-/// The current project scope: `CORPUS_PROJECT` else `default`.
-pub fn project_slug_env() -> String {
-    std::env::var(PROJECT_ENV).unwrap_or_else(|_| DEFAULT_PROJECT_SLUG.to_string())
+/// The current project scope, or why there isn't one. There is NO default:
+/// a silently-defaulted project resolves every read and write against the
+/// wrong subtree and looks like it worked.
+pub fn project_slug_env() -> std::result::Result<String, String> {
+    let slug = std::env::var(PROJECT_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{PROJECT_ENV} is unset — every launch path sets it"))?;
+    validate_slug(&slug).map_err(|e| format!("{PROJECT_ENV}={slug:?}: {e}"))?;
+    Ok(slug)
 }
 
 /// The store: path plumbing over the scoped layout.
@@ -77,17 +108,140 @@ impl Store {
         &self.root
     }
 
-    /// The core seed-agent set (read-only, versioned with the app).
-    pub fn seed_agents_dir(&self) -> PathBuf {
-        self.root.join("templates").join("agents")
-    }
-
     pub fn projects_dir(&self) -> PathBuf {
         self.root.join("projects")
     }
 
     pub fn project_dir(&self, slug: &str) -> PathBuf {
         self.projects_dir().join(slug)
+    }
+
+    /// The project's opencode RUN directory (`<var>/run/<slug>/`): the
+    /// working directory missions launch in, so each project owns its
+    /// `.opencode/agent/` set and its opencode session pool (opencode keys
+    /// sessions by cwd) — one project never overwrites another's
+    /// materialized agents.
+    ///
+    /// A SIBLING of the store, never inside the project it serves: the run
+    /// dir links the project's own subtree into itself, and a run dir
+    /// nested in that subtree would make the link a cycle.
+    pub fn project_run_dir(&self, slug: &str) -> PathBuf {
+        self.var_dir().join("run").join(slug)
+    }
+
+    /// This store's mutable side-tree (`<store parent>/var`): run dirs and
+    /// chat scopes. Derived from THIS store rather than the environment —
+    /// a `Store` built over a temp dir must keep its runs in that temp dir,
+    /// not wherever `CORPUS_STORE` happens to point in this process.
+    pub fn var_dir(&self) -> PathBuf {
+        self.root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.root.clone())
+            .join("var")
+    }
+
+    /// This store's goose management-chat scope for a project. Outside the
+    /// project subtree on purpose: chat transcripts range over every
+    /// project, and a launched agent can read its own project tree.
+    pub fn project_chat_dir(&self, slug: &str) -> PathBuf {
+        self.var_dir().join("chat").join(slug)
+    }
+
+    /// Provision a project's run directory — the whole boundary, expressed
+    /// as a directory:
+    ///
+    /// ```text
+    /// <var>/run/<slug>/
+    ///   store/projects/<slug> -> <store>/projects/<slug>   ONLY this project
+    ///   sources               -> <resources>/sources
+    ///   .opencode/
+    ///     opencode.json         generated (carries CORPUS_PROJECT)
+    ///     skills              -> <resources>/.opencode/skills
+    ///     agent/*.md            the rendered set
+    /// ```
+    ///
+    /// The single-project link is the point. Every rendered permission
+    /// pattern is cwd-relative (`store/projects/<slug>/corpus/**`,
+    /// `sources/<name>/<sha>`), so they all resolve exactly as before —
+    /// but no other project is reachable to deny in the first place, and
+    /// `benchmarks/`, `plugins/` and the repo's own `.opencode/` are not
+    /// present at all rather than being deny-listed.
+    ///
+    /// Idempotent; safe to call on every launch.
+    pub fn provision_run_dir(&self, slug: &str) -> Result<PathBuf> {
+        // A run dir is a project's, so the project must exist.
+        let project = Project::load(self, slug)?;
+        let run_dir = self.project_run_dir(slug);
+        let opencode = run_dir.join(".opencode");
+        fs::create_dir_all(opencode.join("agent"))?;
+        fs::create_dir_all(run_dir.join("store").join("projects"))?;
+
+        relink(
+            &self.project_dir(slug),
+            &run_dir.join("store").join("projects").join(slug),
+        )?;
+
+        // Pinned source trees: REQUIRED. A run without them reads nothing
+        // and quietly falls back to whatever the prompt says about
+        // sources.toml, auditing a tree nobody chose. The directory itself
+        // is a fetch cache (`srcrev` fills it), so create it rather than
+        // refusing a machine that simply hasn't fetched yet — but the
+        // RESOURCE ROOT must resolve, because not knowing where sources go
+        // is a different problem from not having fetched them.
+        let resources = crate::paths::resource_root()?;
+        let sources = resources.join("sources");
+        fs::create_dir_all(&sources)?;
+        relink(&sources, &run_dir.join("sources"))?;
+        // Skills are optional — not every install ships them.
+        let skills = resources.join(".opencode").join("skills");
+        if skills.exists() {
+            relink(&skills, &opencode.join("skills"))?;
+        }
+        // NOT node_modules: opencode creates its own in the run dir at
+        // runtime, and a symlink placed first would win and then rot.
+
+        self.write_run_opencode_config(slug, &project, &opencode)?;
+        Ok(run_dir)
+    }
+
+    /// Write the run dir's own `opencode.json`. A REAL file, regenerated on
+    /// every provision, never a symlink to a shared one: it carries
+    /// `CORPUS_PROJECT`, so the project scope survives every path into the
+    /// MCP server — a hand-run `opencode`, a fresh tmux pane, a server
+    /// respawn. The shared repo-level config had no project in it at all,
+    /// which is why the scope depended on inherited environment and
+    /// silently fell back to a default when that was lost.
+    ///
+    /// Per-RUN identity (`CORPUS_OPENCODE_AGENT`, `CORPUS_RUN_LOG`,
+    /// `CORPUS_SOURCE_PINS`) deliberately stays out: it is not a property
+    /// of the project. A server started outside a launch therefore gets a
+    /// correctly scoped store with NO agent identity, so its role fails to
+    /// resolve and every tool refuses — the right answer.
+    fn write_run_opencode_config(&self, slug: &str, project: &Project, opencode: &Path) -> Result<()> {
+        let mcp_bin = crate::paths::corpus_mcp_bin()?;
+        let plugins = crate::registry::plugins_dir();
+        let config = serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "mcp": {
+                "corpus": {
+                    "type": "local",
+                    "enabled": true,
+                    "timeout": 180000,
+                    "command": [mcp_bin.to_string_lossy()],
+                    "environment": {
+                        STORE_ENV: self.root().to_string_lossy(),
+                        PROJECT_ENV: slug,
+                        crate::registry::PLUGINS_DIR_ENV: plugins.to_string_lossy(),
+                        "CORPUS_PLUGIN_DIR": plugins.join(&project.plugin).to_string_lossy(),
+                    }
+                }
+            }
+        });
+        let body = serde_json::to_string_pretty(&config)
+            .map_err(|e| Error::Store(format!("run config: {e}")))?;
+        fs::write(opencode.join("opencode.json"), body + "\n")?;
+        Ok(())
     }
 
     /// The project-local corpus (the ONLY corpus scope).
@@ -120,8 +274,21 @@ impl Scope {
         Self { project: project.into() }
     }
 
-    pub fn from_env() -> Self {
-        Self::new(project_slug_env())
+    /// Resolve the scope from the environment, or refuse. The project must
+    /// be named AND exist: a wrong-but-plausible slug would otherwise
+    /// materialize a brand-new corpus tree on first write and report
+    /// success (see `Store::create_project` for the only sanctioned way a
+    /// project comes into being).
+    pub fn from_env_strict(store: &Store) -> std::result::Result<Self, String> {
+        let slug = project_slug_env()?;
+        if !store.project_dir(&slug).join("project.yaml").is_file() {
+            return Err(format!(
+                "{PROJECT_ENV}={slug:?} names no project in {} — projects are created deliberately, \
+                 never by a write landing in them",
+                store.root().display()
+            ));
+        }
+        Ok(Self::new(slug))
     }
 
     /// The project corpus directory this scope writes to.
@@ -149,6 +316,12 @@ pub struct Project {
     /// Bumped on every corpus wipe so old run logs stay attributable.
     #[serde(default)]
     pub corpus_generation: u64,
+    /// The project's chosen source revs (`repo -> rev`, edited in the top
+    /// bar): the revs available come from the plugin, the SELECTION is the
+    /// project's. Missions stamp these at creation. Empty = every source
+    /// at its default rev.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pins: BTreeMap<String, String>,
 }
 
 impl Project {
@@ -169,11 +342,87 @@ impl Project {
     }
 }
 
+/// The app's remembered UI choices (`store/app.yaml`) — the operator's
+/// settings, not corpus data. Kept beside the store it describes (and so
+/// scoped by `CORPUS_STORE` like everything else) rather than in egui's
+/// memory blob, which the app deliberately does not persist.
+///
+/// Every field is optional-by-default: an older file, a hand-edit, or a
+/// field added later must never make the app fail to start.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppPrefs {
+    /// The model last chosen in the chat panel's picker. Restored on launch
+    /// so the chat comes back where it was left; empty = never chosen, and
+    /// the panel stays idle until one is picked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub chat_model: String,
+}
+
+impl Store {
+    fn prefs_path(&self) -> PathBuf {
+        self.root().join("app.yaml")
+    }
+
+    /// Read the remembered UI choices. NEVER fails: a missing, unreadable or
+    /// malformed file yields defaults, because losing a preference must not
+    /// keep the app from opening.
+    pub fn load_prefs(&self) -> AppPrefs {
+        fs::read_to_string(self.prefs_path())
+            .ok()
+            .and_then(|raw| serde_yaml::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist the remembered UI choices.
+    pub fn save_prefs(&self, prefs: &AppPrefs) -> Result<()> {
+        let path = self.prefs_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, serde_yaml::to_string(prefs)?)?;
+        Ok(())
+    }
+}
+
 /// The result of a corpus walk: file count + total bytes under
 /// `store/projects/<p>/corpus/` (every file in every category, attack
-/// directories included).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// directories included), broken down per category for the project
+/// view's corpus visual.
+///
+/// `runs/` is kept OUT of `categories` and reported separately as
+/// `logs`: mission transcripts run orders of magnitude larger than the
+/// knowledge categories, so folding them in would leave every other
+/// category an invisible sliver of the strip. `files`/`bytes` stay the
+/// grand totals (knowledge + logs); use `knowledge_files`/
+/// `knowledge_bytes` for the corpus-only summary.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CorpusStats {
+    pub files: u64,
+    pub bytes: u64,
+    /// Per-category file/byte totals, in CATEGORIES order minus `runs`,
+    /// plus an `other` bucket for files outside a category dir. Empty
+    /// categories are not reported.
+    pub categories: Vec<CategoryStat>,
+    /// The `runs/` bucket — mission logs. Zeroed when there are none.
+    pub logs: CategoryStat,
+}
+
+impl CorpusStats {
+    /// Files excluding mission logs (the Corpus section's count).
+    pub fn knowledge_files(&self) -> u64 {
+        self.files.saturating_sub(self.logs.files)
+    }
+
+    /// Bytes excluding mission logs (the Corpus section's size).
+    pub fn knowledge_bytes(&self) -> u64 {
+        self.bytes.saturating_sub(self.logs.bytes)
+    }
+}
+
+/// One corpus category's share of the summary.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CategoryStat {
+    pub name: String,
     pub files: u64,
     pub bytes: u64,
 }
@@ -182,27 +431,216 @@ pub struct CorpusStats {
 /// (one `read_dir` pass) — the UI calls it on selection change and manual
 /// refresh, never per-frame. Mirrors `find store/projects/<p>/corpus -type f`
 /// plus the byte total: only regular files count, directories (including
-/// attack dirs) are descended into.
+/// attack dirs) are descended into; each file is attributed to its
+/// top-level category dir.
 pub fn corpus_stats(store: &Store, project: &str) -> Result<CorpusStats> {
     let root = store.project_corpus_dir(project);
     let mut stats = CorpusStats::default();
-    if !root.is_dir() {
-        return Ok(stats);
-    }
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if let Ok(meta) = fs::metadata(&path) {
-                stats.files += 1;
-                stats.bytes += meta.len();
+    let mut by_name: std::collections::BTreeMap<String, CategoryStat> = CATEGORIES
+        .iter()
+        .map(|c| {
+            (
+                c.to_string(),
+                CategoryStat { name: c.to_string(), files: 0, bytes: 0 },
+            )
+        })
+        .collect();
+    if root.is_dir() {
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(meta) = fs::metadata(&path) {
+                    stats.files += 1;
+                    stats.bytes += meta.len();
+                    // Top-level dir the file sits under; a file loose at
+                    // the corpus root belongs to no category, so it lands
+                    // in `other` rather than becoming a bucket of one.
+                    let rel = path.strip_prefix(&root).ok();
+                    let category = rel
+                        .filter(|rel| rel.components().count() > 1)
+                        .and_then(|rel| rel.components().next())
+                        .and_then(|c| c.as_os_str().to_str())
+                        .unwrap_or("other");
+                    let slot = by_name
+                        .entry(category.to_string())
+                        .or_insert_with(|| CategoryStat {
+                            name: category.to_string(),
+                            files: 0,
+                            bytes: 0,
+                        });
+                    slot.files += 1;
+                    slot.bytes += meta.len();
+                }
             }
         }
     }
+    // `runs/` is reported on its own (mission logs), never as a category.
+    stats.logs = by_name
+        .remove(RUNS)
+        .unwrap_or_else(|| CategoryStat { name: RUNS.to_string(), ..CategoryStat::default() });
+    // CATEGORIES order first, then any extra bucket (e.g. "other");
+    // empty categories are not reported.
+    let mut categories: Vec<CategoryStat> = CATEGORIES
+        .iter()
+        .filter(|c| **c != RUNS)
+        .map(|c| by_name.remove(*c).expect("seeded above"))
+        .collect();
+    categories.extend(by_name.into_values());
+    categories.retain(|c| c.files > 0);
+    stats.categories = categories;
     Ok(stats)
+}
+
+/// One mission transcript in the project corpus `runs/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionLog {
+    /// File name as it sits in `runs/` (e.g. `1786891368-verify.raw`) —
+    /// the value `CORPUS_RUN_LOG` carries and findings cite.
+    pub name: String,
+    /// The agent/mission slug parsed out of `<epoch>-<name>.<ext>`;
+    /// the whole stem when the name predates that convention.
+    pub mission: String,
+    /// Run-start epoch seconds from the name prefix (0 when absent).
+    pub started: u64,
+    pub bytes: u64,
+    /// Extension: `raw` (piped transcript), `json` (opencode export).
+    pub kind: String,
+}
+
+/// List a project's mission logs, newest first. Cheap (one `read_dir`,
+/// no parsing) — the project view calls it alongside `corpus_stats`.
+/// Only regular files directly under `runs/` count, matching what the
+/// stats walk attributes to the logs bucket.
+pub fn mission_logs(store: &Store, project: &str) -> Result<Vec<MissionLog>> {
+    let runs = store.project_corpus_dir(project).join(RUNS);
+    let mut logs = Vec::new();
+    if !runs.is_dir() {
+        return Ok(logs);
+    }
+    for entry in fs::read_dir(&runs)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let kind = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_string();
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+        // `<epoch>-<mission>`: split once, and only when the prefix really
+        // is a number (a mission named `2fa-probe` must not lose its head).
+        let (started, mission) = match stem.split_once('-') {
+            Some((head, rest)) if !rest.is_empty() => match head.parse::<u64>() {
+                Ok(epoch) => (epoch, rest.to_string()),
+                Err(_) => (0, stem.to_string()),
+            },
+            _ => (0, stem.to_string()),
+        };
+        logs.push(MissionLog { name: name.to_string(), mission, started, bytes, kind });
+    }
+    logs.sort_by(|a, b| b.started.cmp(&a.started).then_with(|| a.name.cmp(&b.name)));
+    Ok(logs)
+}
+
+/// Usage aggregation for one (provider, model) pair, summed over every
+/// exported run transcript in the project corpus.
+#[derive(Debug, Clone, Default)]
+pub struct CostRow {
+    pub provider: String,
+    pub model: String,
+    /// Assistant messages counted (each carries one usage record).
+    pub messages: u64,
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_reasoning: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// USD, as reported by opencode's export.
+    pub cost: f64,
+}
+
+/// The project view's Cost section: per-model rows (cost desc) + totals.
+/// Source data: `runs/<epoch>-<agent>.json` opencode exports (piped
+/// `.log` transcripts carry no usage; they are simply not counted).
+#[derive(Debug, Clone, Default)]
+pub struct CostReport {
+    pub rows: Vec<CostRow>,
+    pub tokens: u64,
+    pub cost: f64,
+}
+
+/// Aggregate token/cost usage across a project's exported run
+/// transcripts. Cheap (one parse per runs/*.json) and best-effort: an
+/// unparseable file is skipped, never fatal — a corrupt export must not
+/// blank the view.
+pub fn corpus_cost(store: &Store, project: &str) -> Result<CostReport> {
+    let runs = store.project_corpus_dir(project).join("runs");
+    let mut report = CostReport::default();
+    if !runs.is_dir() {
+        return Ok(report);
+    }
+    let mut rows: std::collections::BTreeMap<(String, String), CostRow> =
+        std::collections::BTreeMap::new();
+    for entry in fs::read_dir(&runs)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else { continue };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(messages) = doc.get("messages").and_then(|m| m.as_array()) else {
+            continue;
+        };
+        for message in messages {
+            let info = message.get("info").cloned().unwrap_or_default();
+            if info.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                continue;
+            }
+            let provider = info
+                .get("providerID")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let model = info
+                .get("modelID")
+                .and_then(|v| v.as_str())
+                .and_then(|m| m.rsplit('/').next())
+                .unwrap_or("unknown")
+                .to_string();
+            let row = rows.entry((provider.clone(), model.clone())).or_insert_with(|| {
+                CostRow { provider, model, ..CostRow::default() }
+            });
+            let tokens = info.get("tokens").cloned().unwrap_or_default();
+            let take = |v: &serde_json::Value, key: &str| {
+                v.get(key).and_then(|n| n.as_u64()).unwrap_or(0)
+            };
+            let cache = tokens.get("cache").cloned().unwrap_or_default();
+            row.messages += 1;
+            row.tokens_input += take(&tokens, "input");
+            row.tokens_output += take(&tokens, "output");
+            row.tokens_reasoning += take(&tokens, "reasoning");
+            row.cache_read += take(&cache, "read");
+            row.cache_write += take(&cache, "write");
+            row.cost += info.get("cost").and_then(|c| c.as_f64()).unwrap_or(0.0);
+            report.tokens += take(&tokens, "total");
+        }
+    }
+    report.rows = rows.into_values().collect();
+    report
+        .rows
+        .sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+    report.cost = report.rows.iter().map(|r| r.cost).sum();
+    Ok(report)
 }
 
 /// A mission record (`store/projects/<p>/missions/<slug>.md`): the
@@ -218,7 +656,7 @@ pub struct Mission {
     /// Per-mission execution budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<String>,
-    /// Lifecycle status (queued | running | done | aborted).
+    /// Lifecycle status (queued | running | done | stopped).
     #[serde(default)]
     pub status: String,
     /// Epoch seconds of creation.
@@ -232,7 +670,7 @@ pub struct Mission {
     /// when live — re-attach after an app relaunch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// The opencode session id (transcript of record) — export-on-dismiss.
+    /// The opencode session id (transcript of record) — export-on-stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_session: Option<String>,
 }
@@ -268,9 +706,21 @@ impl Mission {
     }
 }
 
+/// kebab-case a free-form name ("Dep Bot!" → "dep-bot"). Returns "" when
+/// nothing alphanumeric survives — callers fall back to an id.
+pub fn slugify(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// Validate a project or agent/mission slug: kebab-case, no path escapes.
-pub fn validate_slug(slug: &str) -> Result<()> {
-    if slug.is_empty()
+pub fn validate_slug(slug: &str) -> Result<()> {    if slug.is_empty()
         || slug.len() > 64
         || slug == "."
         || slug == ".."
@@ -330,6 +780,7 @@ impl Store {
             created: now_epoch(),
             cloned_from: None,
             corpus_generation: 0,
+            pins: BTreeMap::new(),
         };
         fs::create_dir_all(self.project_agents_dir(slug))?;
         fs::create_dir_all(self.project_missions_dir(slug))?;
@@ -337,7 +788,11 @@ impl Store {
             fs::create_dir_all(self.project_corpus_dir(slug).join(category))?;
         }
         project.save(self, slug)?;
-        self.seed_core_agents(slug)?;
+        // A new project has NO agents. It used to be seeded with an
+        // operator/researcher pair, which meant every project answered to
+        // those two names — so a mis-scoped server naming one of them
+        // resolved cleanly against the wrong project and looked correct.
+        // Agents are created deliberately, from a role.
         Ok(project)
     }
 
@@ -365,23 +820,30 @@ impl Store {
         Ok(found)
     }
 
-    /// Delete a project (removes its whole subtree).
+    /// Delete a project (removes its whole subtree). No slug is privileged:
+    /// `default` used to be undeletable because an unset `CORPUS_PROJECT`
+    /// silently resolved there, so it had to exist. Nothing defaults now.
     pub fn delete_project(&self, slug: &str) -> Result<()> {
         validate_slug(slug)?;
         let dir = self.project_dir(slug);
         if !dir.is_dir() {
             return Err(Error::Store(format!("project not found: {slug}")));
         }
-        if slug == DEFAULT_PROJECT_SLUG {
-            return Err(Error::Store("refusing to delete the default project".into()));
-        }
         fs::remove_dir_all(&dir)?;
+        // The run dir is a sibling of the store now, so deleting the
+        // project no longer takes it with it. A left-behind run dir holds
+        // a dangling project link and a generated opencode.json naming a
+        // project that is gone.
+        let _ = fs::remove_dir_all(self.project_run_dir(slug));
         Ok(())
     }
 
     /// Clone a project: config + agents + missions, corpus copy optional.
-    /// `create_project` seeds the fresh pair; the source's agent/mission
-    /// trees overwrite it so the clone carries the source's set.
+    /// The clone MIRRORS its source — `create_project` seeds a fresh
+    /// `operator`/`researcher` pair, so those are cleared before the
+    /// source's agent tree is copied in. Without that, cloning a project
+    /// whose agents are named anything else left the clone holding the
+    /// source's agents PLUS two seeded strays that were never in it.
     pub fn clone_project(
         &self,
         from: &str,
@@ -397,6 +859,8 @@ impl Store {
             ..source
         };
         project.save(self, to)?;
+        // Drop the seeded pair so the clone is a mirror, not a merge.
+        let _ = fs::remove_dir_all(self.project_agents_dir(to));
         copy_tree(&self.project_agents_dir(from), &self.project_agents_dir(to))?;
         copy_tree(&self.project_missions_dir(from), &self.project_missions_dir(to))?;
         if with_corpus {
@@ -408,11 +872,39 @@ impl Store {
         Ok(project)
     }
 
+    /// Rename a project's DISPLAY name. The slug is the project's identity —
+    /// it names the directory and is what agents, missions, run dirs, pins
+    /// and chat sessions are keyed by — so a rename touches the label only,
+    /// never the path.
+    pub fn rename_project(&self, slug: &str, name: &str) -> Result<Project> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::Store("project name must not be empty".into()));
+        }
+        let mut project = Project::load(self, slug)?;
+        project.name = name.to_string();
+        project.save(self, slug)?;
+        Ok(project)
+    }
+
     /// Rebind a project's environment plugin (the one mutable binding a
     /// project carries).
     pub fn rebind_project(&self, slug: &str, plugin: &str) -> Result<Project> {
         let mut project = Project::load(self, slug)?;
         project.plugin = plugin.to_string();
+        project.save(self, slug)?;
+        Ok(project)
+    }
+
+    /// Persist a project's source-rev selection (the top-bar dropdowns —
+    /// the plugin defines the revs available, the project owns the pick).
+    pub fn set_project_pins(
+        &self,
+        slug: &str,
+        pins: BTreeMap<String, String>,
+    ) -> Result<Project> {
+        let mut project = Project::load(self, slug)?;
+        project.pins = pins;
         project.save(self, slug)?;
         Ok(project)
     }
@@ -514,6 +1006,53 @@ impl Store {
     }
 }
 
+/// Point `link` at `target`, or say why not. Every failure mode is an
+/// error rather than a shrug: this is the mechanism the project boundary
+/// is made of, so "it didn't work and nobody mentioned it" is the one
+/// outcome that must be impossible.
+#[cfg(unix)]
+fn relink(target: &Path, link: &Path) -> Result<()> {
+    if !target.exists() {
+        // The predecessor returned Ok here. That single line is what would
+        // have turned moving the store out of the repo into a silent
+        // no-op: no MCP config, no sources, and permission patterns
+        // matching nothing — a run that looks fine and is unbounded.
+        return Err(Error::Store(format!(
+            "cannot link {}: it does not exist",
+            target.display()
+        )));
+    }
+    match link.symlink_metadata() {
+        // Already a symlink: repoint it if it aims somewhere stale. The
+        // predecessor never replaced an existing link, so a run dir kept
+        // whichever target it was first given.
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if fs::read_link(link).ok().as_deref() == Some(target) {
+                return Ok(());
+            }
+            fs::remove_file(link)?;
+        }
+        // A real file or directory: never silently accept it as the link.
+        Ok(_) => {
+            return Err(Error::Store(format!(
+                "{} is a real path, not a link to {} — refusing to provision over it",
+                link.display(),
+                target.display()
+            )));
+        }
+        Err(_) => {}
+    }
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn relink(_target: &Path, _link: &Path) -> Result<()> {
+    Err(Error::Store(
+        "run directories need symlinks; this platform has none".into(),
+    ))
+}
+
 /// Create the category directories under a corpus root.
 fn ensure_corpus_categories(corpus: &Path) -> Result<()> {
     for category in CATEGORIES {
@@ -542,216 +1081,22 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-// -------------------------------------------------------------------------
-// Flat-store migration
-// -------------------------------------------------------------------------
-
-/// What the flat-store migration did.
-#[derive(Debug, Clone, Default)]
-pub struct MigrationReport {
-    /// Entries relocated and checksum-verified after the rename.
-    pub moved: Vec<PathBuf>,
-    /// Source entries whose scoped destination already held a copy — never
-    /// overwritten, left where they were.
-    pub skipped: Vec<PathBuf>,
-    /// Entries that survived the rename but FAILED post-move checksum
-    /// verification. Fetch these back up before anything is declared done.
-    pub unverified: Vec<PathBuf>,
-    /// Entries that would move in a dry run (nothing changed).
-    pub would_move: Vec<PathBuf>,
-    /// Legacy category directories removed — only ever after every entry
-    /// they held moved with a verifiable checksum.
-    pub removed_categories: Vec<String>,
-    /// True when the report came from a dry run (no mutations).
-    pub dry_run: bool,
-}
-
-/// Migration knobs.
-#[derive(Debug, Clone, Default)]
-pub struct MigrateOptions {
-    /// Report only; make no changes to the store.
-    pub dry_run: bool,
-}
-
-impl Store {
-    /// See [`Store::migrate_legacy_flat_opt`].
-    pub fn migrate_legacy_flat(&self, project: &str) -> Result<MigrationReport> {
-        self.migrate_legacy_flat_opt(project, MigrateOptions::default())
-    }
-
-    /// Migrate the legacy flat `store/{categories}` layout into
-    /// `store/projects/<project>/corpus/`. Hardened so this class of
-    /// accident is impossible:
-    ///
-    /// - files move with a same-filesystem `rename` (atomic, byte-exact);
-    /// - every moved entry is checksummed BEFORE the move; the destination
-    ///   is checksummed AFTER it and compared — mismatches are reported in
-    ///   `unverified`, never silently accepted;
-    /// - a legacy category directory is removed only when EVERY entry it
-    ///   held relocated with a verified checksum (or the dir was already
-    ///   empty) — never when a move went unverified or an entry was skipped;
-    /// - a pre-populated destination is never overwritten: the source entry
-    ///   is left in place and reported as skipped;
-    /// - `dry_run` reports every decision without changing the store.
-    ///
-    /// Also ensures the default project exists (skipped in dry run).
-    pub fn migrate_legacy_flat_opt(
-        &self,
-        project: &str,
-        opts: MigrateOptions,
-    ) -> Result<MigrationReport> {
-        let mut report = MigrationReport {
-            dry_run: opts.dry_run,
-            ..Default::default()
-        };
-        let project_missing = Project::load(self, project).is_err();
-        if !opts.dry_run && project_missing {
-            self.create_project(project, "Default corpus project", "cdk-regtest")?;
-        }
-        for category in CATEGORIES {
-            let legacy_dir = self.root.join(category);
-            if !legacy_dir.is_dir() {
-                continue;
-            }
-            let mut entries: Vec<PathBuf> = fs::read_dir(&legacy_dir)?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .collect();
-            entries.sort();
-            if entries.is_empty() {
-                // Nothing to verify; the dir may go. Dry runs never mutate.
-                if !opts.dry_run {
-                    fs::remove_dir(&legacy_dir).ok();
-                    report.removed_categories.push(category.to_string());
-                }
-                continue;
-            }
-            let dest_dir = self.project_corpus_dir(project).join(category);
-            if !opts.dry_run {
-                fs::create_dir_all(&dest_dir)?;
-            }
-            // The gate: only this dir may be dropped if EVERY entry it held
-            // moved and checksum-verified (or was left in place as skipped).
-            let mut category_verified = true;
-            for entry in entries {
-                let name = entry
-                    .file_name()
-                    .ok_or_else(|| Error::Store("bad entry name".into()))?;
-                let target = dest_dir.join(&name);
-                if target.exists() {
-                    // Never overwrite: leave the source entry in place.
-                    report.skipped.push(entry);
-                    continue;
-                }
-                if opts.dry_run {
-                    report.would_move.push(entry);
-                    continue;
-                }
-                let expected = checksum(&entry)?;
-                fs::rename(&entry, &target)?;
-                let actual = checksum(&target)?;
-                if actual != expected {
-                    category_verified = false;
-                    report.unverified.push(target);
-                } else {
-                    report.moved.push(target);
-                }
-            }
-            if !opts.dry_run
-                && category_verified
-                && fs::read_dir(&legacy_dir)?.next().is_none()
-            {
-                fs::remove_dir(&legacy_dir).ok();
-                report.removed_categories.push(category.to_string());
-            }
-        }
-        Ok(report)
-    }
-}
-
-// -------------------------------------------------------------------------
-// Checksums (migration + clone verification)
-// -------------------------------------------------------------------------
-
-/// A content hash over an ENTIRE entry: a file's bytes, or — for attack
-/// directories — every file beneath it (sorted, name-length-prefixed so
-/// renames cannot paste different files onto the same checksum).
-pub fn checksum(path: &Path) -> Result<String> {
-    if !path.is_dir() {
-        return Ok(fnv1a_hex(&fs::read(path)?));
-    }
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
-    collect_files(path, path, &mut files)?;
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for (rel, abs) in &files {
-        for b in rel.len().to_be_bytes() {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        for b in rel.as_bytes() {
-            hash ^= u64::from(*b);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        let bytes = fs::read(abs)?;
-        for b in &bytes {
-            hash ^= u64::from(*b);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    Ok(format!("{hash:016x}"))
-}
-
-/// Collect `(relative_path, absolute_path)` for every file under `root`.
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let abs = entry.path();
-        let rel = abs
-            .strip_prefix(root)
-            .expect("collect_files dir is under root")
-            .to_string_lossy()
-            .into_owned();
-        if abs.is_dir() {
-            collect_files(root, &abs, out)?;
-        } else {
-            out.push((rel, abs));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A store in its own world — run dirs are siblings of the store, so
+    /// sharing a parent means sharing `<parent>/var/run/<project>`.
     fn tmp_store(tag: &str) -> Store {
-        let dir = std::env::temp_dir().join(format!("corpus-store-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        Store::new(dir)
+        let world =
+            std::env::temp_dir().join(format!("corpus-store-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&world);
+        Store::new(world.join("store"))
     }
 
     fn write(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
-    }
-
-    /// A seed-less store: the temp root has no templates/agents to copy.
-    /// create_project seeds the core pair, so tests that just need a project
-    /// are fine; tests that need the seed pair present write seed dirs first.
-    fn seed_sample(store: &Store) {
-        let dir = store.seed_agents_dir();
-        for slug in ["operator", "researcher"] {
-            let d = dir.join(slug);
-            fs::create_dir_all(&d).unwrap();
-            fs::write(
-                d.join("opencode.json"),
-                format!(
-                    "{{\"$schema\":\"https://opencode.ai/config.json\",\"agent\":{{\"{slug}\":{{\"description\":\"{slug}\",\"mode\":\"primary\",\"prompt\":\"You are {slug}.\\n\"}}}}}}"
-                ),
-            )
-            .unwrap();
-        }
     }
 
     #[test]
@@ -764,158 +1109,113 @@ mod tests {
         }
     }
 
+    /// The boundary, as a directory. A run dir must expose EXACTLY its own
+    /// project: this is what makes the rendered permission globs a second
+    /// line of defence rather than the only one, and what puts the run cwd
+    /// outside the git repo so opencode cannot discover another project's
+    /// agents above it.
     #[test]
-    fn project_crud() {
-        let store = tmp_store("proj");
-        seed_sample(&store);
-        let project = store.create_project("cdk-a", "CDK team A", "cdk-regtest").unwrap();
-        assert_eq!(project.plugin, "cdk-regtest");
-        assert_eq!(project.corpus_generation, 0);
-        assert!(store.project_dir("cdk-a").join("project.yaml").is_file());
-        assert!(store.project_corpus_dir("cdk-a").join("findings").is_dir());
-        // create_project seeds the core agent pair.
-        assert!(store.project_agent_dir("cdk-a", "operator").join("opencode.json").is_file());
-        assert!(store.project_agent_dir("cdk-a", "researcher").join("opencode.json").is_file());
-        // duplicate create fails
-        assert!(store.create_project("cdk-a", "x", "y").is_err());
-        // list
-        let projects = store.list_projects().unwrap();
-        assert_eq!(projects.len(), 1);
-        // clone without corpus carries agents + missions.
-        store
-            .write_mission(
-                "cdk-a",
-                "m1",
-                &Mission {
-                    agent: "operator".to_string(),
-                    pins: BTreeMap::new(),
-                    budget: None,
-                    status: "queued".to_string(),
-                    created: 1,
-                    name: None,
-                    session: None,
-                    opencode_session: None,
-                },
-                "probe",
-            )
-            .unwrap();
-        store.clone_project("cdk-a", "cdk-b", None, false).unwrap();
-        let b = Project::load(&store, "cdk-b").unwrap();
-        assert_eq!(b.cloned_from.as_deref(), Some("cdk-a"));
-        assert!(store.project_agent_dir("cdk-b", "operator").join("opencode.json").is_file());
-        assert!(store.load_mission("cdk-b", "m1").is_ok(), "clone carries missions");
-        // delete
-        store.delete_project("cdk-b").unwrap();
-        assert!(Project::load(&store, "cdk-b").is_err());
-        let _ = fs::remove_dir_all(store.root());
+    fn a_run_dir_exposes_only_its_own_project() {
+        let store = tmp_store("run-scope");
+        store.create_project("a", "A", "cdk-regtest").unwrap();
+        store.create_project("b", "B", "cdk-regtest").unwrap();
+        let run = store.provision_run_dir("a").unwrap();
+
+        let projects = run.join("store").join("projects");
+        let visible: Vec<String> = fs::read_dir(&projects)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(visible, vec!["a".to_string()], "only its own project");
+        assert!(!projects.join("b").exists(), "project b is not reachable");
+        assert_eq!(
+            fs::read_link(projects.join("a")).unwrap(),
+            store.project_dir("a"),
+            "the link points at the real project"
+        );
+
+        // The cycle guard: a run dir INSIDE the project it links would make
+        // that link infinitely recursive (<p>/var/run/store/projects/<p>/...).
+        assert!(
+            !run.starts_with(store.project_dir("a")),
+            "the run dir must not live inside the project it links: {}",
+            run.display()
+        );
+
+        // Nothing else from the resource tree leaks in: the benchmark
+        // answer key and the harness internals are ABSENT, not deny-listed.
+        assert!(!run.join("benchmarks").exists());
+        assert!(!run.join("plugins").exists());
     }
 
+    /// Provisioning is idempotent AND corrective: a link left pointing at
+    /// the wrong project must be repaired, not accepted. The predecessor
+    /// never replaced an existing link, so a run dir kept whichever target
+    /// it was first given.
     #[test]
-    fn mission_roundtrip() {
-        let store = tmp_store("mission");
-        seed_sample(&store);
-        store.create_project("p", "P", "cdk-regtest").unwrap();
-        let mut pins = BTreeMap::new();
-        pins.insert("cdk".to_string(), "main".to_string());
-        store
-            .write_mission(
-                "p",
-                "m1",
-                &Mission {
-                    agent: "operator".to_string(),
-                    pins: pins.clone(),
-                    budget: Some("40m / 10k$".to_string()),
-                    status: "running".to_string(),
-                    created: 42,
-                    name: None,
-                    session: None,
-                    opencode_session: None,
-                },
-                "# Probe the environment\nPlan: map surfaces.\n",
-            )
-            .unwrap();
-        let m = store.load_mission("p", "m1").unwrap();
-        assert_eq!(m.agent, "operator");
-        assert_eq!(m.budget.as_deref(), Some("40m / 10k$"));
-        assert_eq!(m.pins.get("cdk").map(String::as_str), Some("main"));
-        assert!(store.mission_brief("p", "m1").unwrap().contains("Probe the environment"));
-        let list = store.list_missions("p").unwrap();
-        assert_eq!(list.len(), 1);
-        // dangling agent ref is refused.
-        let err = store
-            .write_mission(
-                "p",
-                "bad",
-                &Mission {
-                    agent: "ghost".to_string(),
-                    pins: BTreeMap::new(),
-                    budget: None,
-                    status: "queued".to_string(),
-                    created: 0,
-                    name: None,
-                    session: None,
-                    opencode_session: None,
-                },
-                "x",
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("ghost"), "{err}");
-        store.delete_mission("p", "m1").unwrap();
-        assert!(store.load_mission("p", "m1").is_err());
-        let _ = fs::remove_dir_all(store.root());
+    fn provisioning_repoints_a_stale_link() {
+        let store = tmp_store("run-stale");
+        store.create_project("a", "A", "cdk-regtest").unwrap();
+        store.create_project("b", "B", "cdk-regtest").unwrap();
+        let run = store.provision_run_dir("a").unwrap();
+        let link = run.join("store").join("projects").join("a");
+
+        // Point it at the wrong project behind our back.
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(store.project_dir("b"), &link).unwrap();
+
+        store.provision_run_dir("a").unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), store.project_dir("a"));
     }
 
+    /// The generated run config is what carries the project scope into
+    /// every corpus-mcp spawn — a hand-run opencode, a fresh tmux pane, a
+    /// server respawn. A SHARED config (the old symlink to the repo's
+    /// opencode.json) named no project at all, so the scope depended on
+    /// inherited environment and silently defaulted when that was lost.
     #[test]
-    fn migrate_relocates_bytes_verbatim() {
-        let store = tmp_store("migrate");
-        seed_sample(&store);
-        // legacy flat layout with bytes that matter
-        write(&store.root().join("findings/1786000000-theft.md"), "---\ntitle: T\nseverity: high\n---\n\nsecret bytes\n");
-        write(&store.root().join("techniques/quote-race.md"), "# quote race\nwith leading em-dash — and trailing.\n");
-        write(&store.root().join("attacks/quote-id-front-run/attack.md"), "# Attack\n\nbody\n");
-        write(&store.root().join("attacks/quote-id-front-run/run.sh"), "#!/bin/sh\necho hi\n");
-        write(&store.root().join("runs/1700000000-op-run.log"), "# run\npayload\n");
-        write(&store.root().join("hypotheses/lead.md"), "---\nstatus: open\n---\n\nbody\n");
+    fn the_run_config_names_its_own_project() {
+        let store = tmp_store("run-config");
+        store.create_project("a", "A", "cdk-regtest").unwrap();
+        let run = store.provision_run_dir("a").unwrap();
+        let config = run.join(".opencode").join("opencode.json");
 
-        let mut before = std::collections::HashMap::new();
-        for (cat, name) in [
-            ("findings", "1786000000-theft.md"),
-            ("techniques", "quote-race.md"),
-            ("attacks", "quote-id-front-run/attack.md"),
-            ("attacks", "quote-id-front-run/run.sh"),
-            ("runs", "1700000000-op-run.log"),
-            ("hypotheses", "lead.md"),
-        ] {
-            let bytes = fs::read(store.root().join(cat).join(name)).unwrap();
-            before.insert(format!("{cat}/{name}"), bytes);
-        }
+        assert!(
+            !config.symlink_metadata().unwrap().file_type().is_symlink(),
+            "a real file per project, never a link to a shared one"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        let env = &doc["mcp"]["corpus"]["environment"];
+        assert_eq!(env[PROJECT_ENV].as_str(), Some("a"));
+        assert_eq!(
+            env[STORE_ENV].as_str(),
+            Some(store.root().to_string_lossy().as_ref())
+        );
+        // Per-RUN identity must NOT be here: it is not a property of the
+        // project, and a server that inherits a scope without an agent
+        // identity is supposed to fail closed.
+        assert!(env.get(AGENT_ENV).is_none(), "no per-run identity: {env}");
+        assert!(env.get(RUN_LOG_ENV).is_none(), "no per-run identity: {env}");
+    }
 
-        let report = store.migrate_legacy_flat(DEFAULT_PROJECT_SLUG).unwrap();
-        assert_eq!(report.moved.len(), 5);
-        assert!(report.unverified.is_empty(), "no unverified moves: {:?}", report.unverified);
-        assert_eq!(report.removed_categories.len(), 5, "all legacy dirs dropped once verified");
-        assert!(!report.dry_run);
-        for cat in CATEGORIES {
-            assert!(!store.root().join(cat).exists(), "{cat} should be empty/gone");
+    /// A run dir for a project that does not exist is a contradiction —
+
+    /// A walk of an empty corpus: totals zeroed, no categories, and the
+    /// logs bucket present-but-empty.
+    fn empty_stats() -> CorpusStats {
+        CorpusStats {
+            logs: CategoryStat { name: RUNS.to_string(), files: 0, bytes: 0 },
+            ..CorpusStats::default()
         }
-        let target = store.project_corpus_dir(DEFAULT_PROJECT_SLUG);
-        for (rel, expected) in &before {
-            let path = target.join(rel);
-            assert!(path.is_file(), "missing {}", path.display());
-            assert_eq!(&fs::read(&path).unwrap(), expected, "byte identity of {rel}");
-        }
-        // idempotent second run
-        let second = store.migrate_legacy_flat(DEFAULT_PROJECT_SLUG).unwrap();
-        assert_eq!(second.moved.len(), 0);
-        let _ = fs::remove_dir_all(store.root());
     }
 
     #[test]
     fn corpus_stats_counts_files_and_bytes() {
         let store = tmp_store("stats");
-        seed_sample(&store);
         store.create_project("p", "P", "cdk-regtest").unwrap();
-        assert_eq!(corpus_stats(&store, "p").unwrap(), CorpusStats::default());
+        assert_eq!(corpus_stats(&store, "p").unwrap(), empty_stats());
         write(&store.project_corpus_dir("p").join("findings/1.md"), "hello world\n");
         write(&store.project_corpus_dir("p").join("techniques/quote.md"), "abcd");
         // attack dirs are directories; their FILE contents count.
@@ -928,16 +1228,102 @@ mod tests {
             (12 + 4 + 11 + 10) as u64,
             "sum of exact byte lengths",
         );
+        // Category attribution, CATEGORIES order, attack dirs descended.
+        let names: Vec<&str> = stats.categories.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["techniques", "findings", "attacks"]);
+        assert_eq!(stats.categories[0].files, 1);
+        assert_eq!(stats.categories[1].bytes, 12);
+        assert_eq!(stats.categories[2].files, 2, "both attack files count");
         // a missing project corpus is empty, not an error
-        assert_eq!(corpus_stats(&store, "ghost").unwrap(), CorpusStats::default());
+        assert_eq!(corpus_stats(&store, "ghost").unwrap(), empty_stats());
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn mission_logs_are_split_out_of_the_categories() {
+        let store = tmp_store("stats-logs");
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        let corpus = store.project_corpus_dir("p");
+        write(&corpus.join("findings/1.md"), "hello world\n"); // 12
+        write(&corpus.join("runs/1786891368-verify.raw"), "transcript\n"); // 11
+        write(&corpus.join("runs/1786856299-discover.json"), "{}"); // 2
+        // A file loose at the corpus root belongs to no category.
+        write(&corpus.join("triage-report.md"), "note\n"); // 5
+
+        let stats = corpus_stats(&store, "p").unwrap();
+        assert_eq!(stats.files, 4, "grand total still counts every file");
+        assert_eq!(stats.bytes, 30);
+        assert_eq!(stats.knowledge_files(), 2, "logs excluded from the corpus count");
+        assert_eq!(stats.knowledge_bytes(), 17);
+        let names: Vec<&str> = stats.categories.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["findings", "other"], "runs is never a category");
+        assert_eq!(stats.logs.files, 2);
+        assert_eq!(stats.logs.bytes, 13);
+
+        // Listing: newest first, epoch/mission/kind parsed off the name.
+        let logs = mission_logs(&store, "p").unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].name, "1786891368-verify.raw");
+        assert_eq!(logs[0].mission, "verify");
+        assert_eq!(logs[0].started, 1_786_891_368);
+        assert_eq!(logs[0].kind, "raw");
+        assert_eq!(logs[0].bytes, 11);
+        assert_eq!(logs[1].mission, "discover");
+        assert!(mission_logs(&store, "ghost").unwrap().is_empty(), "no runs dir is not an error");
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn corpus_cost_aggregates_exports_per_model() {
+        let store = tmp_store("cost");
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        let export = |cost: f64, input: u64, model: &str| {
+            serde_json::json!({
+                "info": {},
+                "messages": [{"info": {
+                    "role": "assistant",
+                    "providerID": "openrouter",
+                    "modelID": model,
+                    "cost": cost,
+                    "tokens": {
+                        "total": input + 8,
+                        "input": input,
+                        "output": 7,
+                        "reasoning": 1,
+                        "cache": {"read": 3, "write": 0}
+                    }
+                }}]
+            })
+            .to_string()
+        };
+        let runs = store.project_corpus_dir("p").join("runs");
+        write(&runs.join("1-operator.json"), &export(0.5, 100, "deepseek/deepseek-v4-flash"));
+        write(&runs.join("2-operator.json"), &export(0.25, 50, "deepseek/deepseek-v4-flash"));
+        write(&runs.join("3-operator.json"), &export(1.5, 200, "moonshotai/kimi-k3"));
+        write(&runs.join("4-operator.log"), "not json — skipped");
+        write(&runs.join("5-operator.json"), "{corrupt");
+        let report = corpus_cost(&store, "p").unwrap();
+        assert_eq!(report.rows.len(), 2);
+        // Cost-desc order: kimi first.
+        assert_eq!(report.rows[0].model, "kimi-k3");
+        assert_eq!(report.rows[0].provider, "openrouter");
+        assert!((report.rows[0].cost - 1.5).abs() < 1e-9);
+        assert_eq!(report.rows[1].messages, 2);
+        assert_eq!(report.rows[1].tokens_input, 150);
+        assert_eq!(report.rows[1].cache_read, 6);
+        assert!((report.cost - 2.25).abs() < 1e-9);
+        assert_eq!(report.tokens, 108 + 58 + 208);
+        assert!(corpus_cost(&store, "ghost").unwrap().rows.is_empty());
         let _ = fs::remove_dir_all(store.root());
     }
 
     #[test]
     fn wipe_project_corpus_bumps_generation() {
         let store = tmp_store("wipe");
-        seed_sample(&store);
         store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "operator", crate::agents::AgentRole::Tester)
+            .unwrap();
         write(&store.project_corpus_dir("p").join("findings/1.md"), "x\n");
         let p = store.wipe_project_corpus("p").unwrap();
         assert_eq!(p.corpus_generation, 1);

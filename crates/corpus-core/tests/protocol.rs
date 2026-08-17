@@ -42,6 +42,52 @@ fn sandbox_exec_returns_output_and_exit_code() {
 }
 
 #[test]
+fn sandbox_exec_forwards_source_pins() {
+    let mut plugin = spawn_echo();
+    let pins: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+        r#"{"cdk":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#,
+    )
+    .unwrap();
+    let result = plugin
+        .sandbox_exec_with_sources("ls", Some(&pins))
+        .expect("sandbox_exec_with_sources");
+    assert_eq!(
+        result.output,
+        r#"echo-container:ls:{"cdk":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#
+    );
+    // None sends no sources key at all (the echo shows nothing extra).
+    let plain = plugin
+        .sandbox_exec_with_sources("ls", None)
+        .expect("sandbox_exec plain");
+    assert_eq!(plain.output, "echo-container:ls");
+}
+
+#[test]
+fn sources_report_default_and_override_pins() {
+    let mut plugin = spawn_echo();
+    let default = plugin.sources().expect("sources");
+    assert_eq!(default.len(), 1);
+    assert_eq!(default[0].name, "cdk");
+    assert_eq!(
+        default[0].sha,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "no pins -> the plugin's default pin"
+    );
+    // Forwarding the mission's resolved pins must change the reported
+    // sha: target_info must not contradict the launched sandbox mounts.
+    let mut pins = serde_json::Map::new();
+    pins.insert(
+        "cdk".to_string(),
+        serde_json::Value::String("cccccccccccccccccccccccccccccccccccccccc".to_string()),
+    );
+    let pinned = plugin
+        .sources_with_sources(Some(&pins))
+        .expect("sources with pins");
+    assert_eq!(pinned[0].sha, "cccccccccccccccccccccccccccccccccccccccc");
+    assert_eq!(pinned[0].mount, "/opt/src/cdk");
+}
+
+#[test]
 fn oracles_and_call_oracle() {
     let mut plugin = spawn_echo();
     let oracles = plugin.oracles().expect("oracles");

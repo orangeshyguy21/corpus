@@ -1,13 +1,15 @@
 # sources.toml — pinned upstream source manifest.
 #
-# The single source of truth for "which code do agents read". SHAs are the
-# pin (tags are mutable); the tag is recorded alongside for display and
-# fetch. Fetched trees live git-ignored under sources/<name>/<sha>/ and are
+# The single source of truth for the DEFAULT pin per repo: "which code do
+# agents read" when a mission doesn't say otherwise. SHAs are the pin (tags
+# are mutable); the tag is recorded alongside for display and fetch.
+# Fetched trees live git-ignored under sources/<name>/<sha>/ and are
 # mounted read-only into agent sandboxes at /opt/src/<name>.
 #
-# The warnet phase will hold multiple revisions per repo here so a mission
-# can be replayed against mints at different versions; today each repo pins
-# exactly one revision, and config.toml [sources] selects which is mounted.
+# Missions may pin ANY rev of a repo (the app dropdown discovers tags via
+# `git ls-remote`, cached under sources/.rev-cache/): launching resolves
+# rev → sha, fetches sources/<name>/<sha>/ when missing, and the sandbox
+# is recreated when its mounts don't match the mission's pins.
 
 # Target implementation: cdk-mintd. Pinned to the v0.17.0 release commit,
 # which is the version the regtest mints report on /v1/info (cdk-mintd/0.17.0).

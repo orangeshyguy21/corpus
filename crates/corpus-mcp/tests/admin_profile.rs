@@ -3,7 +3,6 @@
 //! (dry-run without token, one-shot token completes), the agent validator
 //! round-trip, and rebind plugin validation against the registry.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use corpus_core::{Project, Scope, Store};
@@ -15,21 +14,6 @@ fn echo_plugin() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../corpus-core/tests/echo-plugin")
 }
 
-fn seed_core(store: &Store) {
-    let dir = store.seed_agents_dir();
-    for slug in ["operator", "researcher"] {
-        let d = dir.join(slug);
-        let _ = std::fs::create_dir_all(&d);
-        std::fs::write(
-            d.join("opencode.json"),
-            format!(
-                "{{\"$schema\":\"https://opencode.ai/config.json\",\"agent\":{{\"{slug}\":{{\"description\":\"{slug}\",\"mode\":\"primary\",\"prompt\":\"You are {slug}.\\n\"}}}}}}"
-            ),
-        )
-        .unwrap();
-    }
-}
-
 /// Admin rig: project "proj" + one ops mission + an echo-plugin binding in
 /// the registry (CORPUS_PLUGINS_DIR points at the echo plugin) so rebind
 /// validation sees a real plugin name.
@@ -39,21 +23,19 @@ fn rig(tag: &str) -> (Ctx, Store, PathBuf, String) {
     // Point plugin discovery at the echo plugin so project_rebind validates.
     std::env::set_var("CORPUS_PLUGINS_DIR", echo_plugin().parent().unwrap());
     let store = Store::new(root.clone());
-    seed_core(&store);
     store.create_project("proj", "Proj", "echo-plugin").expect("create project");
-    store.create_blank_agent("proj", "appsec").expect("agent");
-    let ctx = Ctx {
-        plugin: corpus_core::Plugin::spawn(&echo_plugin()).expect("spawn echo plugin"),
-        store: store.clone(),
-        scope: Scope::new("proj"),
-        faucet_spent_sats: 0,
-        faucet_budget_sats: 1_000_000,
-        probe_ready: true,
-        probe_notes: String::new(),
-        last_probe: std::time::Instant::now(),
-        admin: true,
-        pending_confirms: HashMap::new(),
-    };
+    store
+        .create_agent_with_role("proj", "appsec", corpus_core::AgentRole::Researcher)
+        .expect("agent");
+    // The admin profile has no agent identity — the role is irrelevant to
+    // it by design (see the orthogonality test below).
+    let mut ctx = Ctx::for_test(
+        corpus_core::Plugin::spawn(&echo_plugin()).expect("spawn echo plugin"),
+        store.clone(),
+        Scope::new("proj"),
+        corpus_core::AgentRole::Super,
+    );
+    ctx.admin = true;
     (ctx, store, root, "proj".to_string())
 }
 
@@ -247,4 +229,7 @@ fn admin_catalog_carries_no_sandbox_tools() {
     for op in ["project_delete", "agent_delete", "mission_delete", "corpus_wipe"] {
         assert!(names.contains(&op.to_string()), "must carry destructive op {op}");
     }
+    // The model discovery tool (the chat agent resolves exact model ids
+    // through this instead of guessing).
+    assert!(names.contains(&"model_list".to_string()), "must carry model_list");
 }

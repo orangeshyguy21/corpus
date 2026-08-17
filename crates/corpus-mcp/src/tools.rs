@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use corpus_core::{FaucetCall, Plugin, ProbeResult, Scope, Store};
+use corpus_core::{AgentRole, FaucetCall, Plugin, ProbeResult, Scope, Store};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -20,12 +20,22 @@ const OUTPUT_CAP_BYTES: usize = 8 * 1024;
 /// sandbox, regtest-only) lives in the plugin.
 #[derive(Debug)]
 pub struct Ctx {
-    /// The environment plugin driving the harness.
-    pub plugin: Plugin,
-    /// Corpus store root (projects/, templates/).
+    /// The environment plugin driving the harness, when one could be
+    /// resolved. `None` for the store-only admin profile (which has no
+    /// project, hence no plugin binding) and whenever resolution failed —
+    /// `probe_notes` then carries the reason and every sandbox tool refuses.
+    pub plugin: Option<Plugin>,
+    /// Corpus store root (projects/).
     pub store: Store,
-    /// Default write scope: which project corpus writes land in.
-    pub scope: Scope,
+    /// The write scope: which project corpus reads and writes resolve to,
+    /// or why none could be established.
+    ///
+    /// `Err` refuses every scoped tool with that message. Fail-closed for
+    /// the same reason as `role`: this used to default to the project named
+    /// `default`, so a launch that lost `CORPUS_PROJECT` wrote a whole
+    /// mission's findings into another project's corpus and reported
+    /// success.
+    pub scope: std::result::Result<Scope, String>,
     /// Faucet spend within this server session (sats).
     pub faucet_spent_sats: u64,
     /// Per-session faucet budget.
@@ -41,9 +51,31 @@ pub struct Ctx {
     /// Admin profile on: the corpus-admin tool group is exposed and the
     /// probe-required gate is bypassed (admin is store-only, host-side).
     pub admin: bool,
+    /// The capability ceiling of the agent this server is serving, resolved
+    /// from the run's identity (`CORPUS_OPENCODE_AGENT`) at startup.
+    ///
+    /// `Err` means the identity could not be established — the server then
+    /// refuses every sandbox tool with that message rather than guessing.
+    /// Fail-closed on purpose: a gate that is bypassed by UNSETTING a
+    /// variable is not a gate. The `--role` flag is the explicit escape
+    /// hatch for manual invocation.
+    ///
+    /// This is the ONLY capability authority; the agent's permission block
+    /// is opencode's business and is never consulted here.
+    pub role: std::result::Result<AgentRole, String>,
     /// Pending destructive-op confirmations keyed by their one-shot token.
     /// Minted by a dry-run call; consumed by the token-bearing re-call.
     pub pending_confirms: HashMap<String, PendingConfirm>,
+    /// The mission's resolved source pins (`repo -> sha`, from
+    /// CORPUS_SOURCE_PINS at launch) — forwarded to the plugin on every
+    /// sandbox_exec so the sandbox mounts the recorded revs.
+    pub source_pins: Option<serde_json::Map<String, Value>>,
+    /// The basename of the current run's transcript in the project corpus
+    /// `runs/` (from CORPUS_RUN_LOG at launch). Surfaced in `target_info`
+    /// and used as the default `run_log` for `technique_save` when the
+    /// agent omits it — the sandbox has no host FS and cannot enumerate
+    /// `runs/`, so without this the agent must guess.
+    pub run_log: Option<String>,
 }
 
 /// A pending destructive-op confirmation: a single-use, short-TTL token
@@ -63,37 +95,216 @@ const REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 impl Ctx {
     /// Resolve from the environment.
     pub fn from_env() -> Result<Self> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let plugin_dir = std::env::var("CORPUS_PLUGIN_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(format!("{home}/Sites/corpus/plugins/cdk-regtest")));
-        let mut plugin = Plugin::spawn(&plugin_dir)?;
+        let store = Store::from_env();
+        // The project gate runs FIRST: the plugin binding is a property of
+        // the project, so a server that cannot say which project it serves
+        // cannot say which environment it drives either.
+        let scope = Scope::from_env_strict(&store);
+        // A missing plugin is NOT fatal: the admin profile is store-only and
+        // has no project scope by design, so it must still start. The
+        // sandbox tools refuse through the probe gate instead.
+        let mut plugin = match resolve_plugin_dir(&store, &scope) {
+            Ok(dir) => match Plugin::spawn(&dir) {
+                Ok(plugin) => Ok(plugin),
+                Err(e) => Err(format!("plugin at {}: {e}", dir.display())),
+            },
+            Err(e) => Err(e.to_string()),
+        };
         // Probe the environment once at startup; the result gates every
         // tool call (version-pin mismatch included).
-        let probe = plugin.probe().unwrap_or_else(|e| ProbeResult {
-            ready: false,
-            notes: format!("probe failed: {e}"),
-        });
+        let probe = match plugin.as_mut() {
+            Ok(plugin) => plugin.probe().unwrap_or_else(|e| ProbeResult {
+                ready: false,
+                notes: format!("probe failed: {e}"),
+            }),
+            Err(why) => ProbeResult {
+                ready: false,
+                notes: why.clone(),
+            },
+        };
+        let source_pins = std::env::var(corpus_core::SOURCE_PINS_ENV)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|v| v.as_object().cloned());
+        let run_log = std::env::var(corpus_core::RUN_LOG_ENV).ok().filter(|s| !s.is_empty());
+        // The role is resolved against a PROVEN scope: an agent name is only
+        // meaningful inside a project, so a scope failure is a role failure.
+        let role = scope
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|scope| resolve_role(&store, scope));
+        if let Err(why) = &scope {
+            // Loud, because every scoped tool is about to be refused.
+            eprintln!("corpus-mcp: no project scope resolved — {why}");
+        }
+        if let Err(why) = &role {
+            eprintln!("corpus-mcp: no agent role resolved — {why}");
+        }
+        if let Err(why) = &plugin {
+            eprintln!("corpus-mcp: no environment plugin — {why}");
+        }
         Ok(Self {
-            plugin,
-            store: Store::from_env(),
-            scope: Scope::from_env(),
+            plugin: plugin.ok(),
+            store,
+            scope,
             faucet_spent_sats: 0,
             faucet_budget_sats: 1_000_000,
             probe_ready: probe.ready,
             probe_notes: probe.notes,
             last_probe: std::time::Instant::now(),
             admin: false,
+            role,
             pending_confirms: HashMap::new(),
+            source_pins,
+            run_log,
         })
     }
 
-    /// The scope for a write: the configured project scope. The `team`
-    /// argument is accepted for backward-compatibility but ignored —
-    /// the corpus is project-level only.
-    fn write_scope(&self, _args: &Value) -> Result<Scope> {
-        Ok(self.scope.clone())
+    /// A Ctx for tests: probe pre-cleared, no environment read, an explicit
+    /// role. Not `#[cfg(test)]` because the integration tests in `tests/`
+    /// are separate crates; it exists so adding a field here doesn't force
+    /// every one of them to restate the whole struct.
+    pub fn for_test(plugin: Plugin, store: Store, scope: Scope, role: AgentRole) -> Self {
+        Self {
+            plugin: Some(plugin),
+            store,
+            scope: Ok(scope),
+            faucet_spent_sats: 0,
+            faucet_budget_sats: 1_000_000,
+            probe_ready: true,
+            probe_notes: String::new(),
+            last_probe: std::time::Instant::now(),
+            admin: false,
+            role: Ok(role),
+            pending_confirms: HashMap::new(),
+            source_pins: None,
+            run_log: None,
+        }
     }
+
+    /// The scope every scoped tool resolves through — the ONE choke point,
+    /// so a server with no proven project refuses uniformly and early,
+    /// instead of each tool inventing a fallback and failing later with an
+    /// unrelated message. The `team` argument is accepted for
+    /// backward-compatibility but ignored: the corpus is project-level only.
+    ///
+    /// The project must still EXIST at call time: it is checked at startup,
+    /// but a project can be deleted under a live server.
+    fn write_scope(&self, _args: &Value) -> Result<Scope> {
+        let scope = self.scope.clone().map_err(Error::Scope)?;
+        if !self.store.project_dir(&scope.project).join("project.yaml").is_file() {
+            return Err(Error::Scope(format!(
+                "project {:?} does not exist under {} — projects come into being deliberately, \
+                 never as a side effect of a tool call",
+                scope.project,
+                self.store.root().display()
+            )));
+        }
+        Ok(scope)
+    }
+}
+
+/// The corpus category directory for a write. Created on demand — a
+/// freshly wiped project has no category dirs — but only ever INSIDE a
+/// project `write_scope` already proved exists, so a `create_dir_all` here
+/// can no longer conjure a whole corpus tree for a mis-scoped server.
+fn category_dir(ctx: &Ctx, scope: &Scope, category: &str) -> Result<PathBuf> {
+    let dir = scope.corpus_dir(&ctx.store).join(category);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// The plugin directory this server drives. `CORPUS_PLUGIN_DIR` is the
+/// explicit hand-run override; otherwise the binding comes from the
+/// PROJECT record, which is where it is declared. A sole plugin in the
+/// plugins dir is accepted as the last resort so the store-only admin
+/// profile — which has no project scope by design — still starts.
+fn resolve_plugin_dir(
+    store: &Store,
+    scope: &std::result::Result<Scope, String>,
+) -> Result<PathBuf> {
+    if let Some(dir) = std::env::var("CORPUS_PLUGIN_DIR").ok().filter(|s| !s.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    let plugins = corpus_core::plugins_dir();
+    if let Ok(scope) = scope {
+        let project = corpus_core::Project::load(store, &scope.project)
+            .map_err(|e| Error::Scope(format!("project {:?}: {e}", scope.project)))?;
+        return Ok(plugins.join(&project.plugin));
+    }
+    let mut found = corpus_core::discover(&plugins).unwrap_or_default();
+    match found.len() {
+        1 => Ok(found.remove(0).dir),
+        _ => Err(Error::Scope(format!(
+            "cannot resolve a plugin: {} names no project, and {} holds {} plugins — set \
+             CORPUS_PLUGIN_DIR to run this server by hand",
+            corpus_core::PROJECT_ENV,
+            plugins.display(),
+            found.len()
+        ))),
+    }
+}
+
+/// Resolve the run's capability ceiling from its identity, against a scope
+/// that is ALREADY proven. Every failure is distinct: debugging a blanket
+/// deny-all across three different causes is otherwise miserable.
+///
+/// An explicit `--role <name>` argv flag overrides the agent lookup — the
+/// escape hatch for invoking the server by hand. It is no more secure than
+/// the env var (anything that can spawn this binary can pass it), and it is
+/// deliberately checked HERE, after the project gate: it used to return
+/// first, so `--role super` with no `CORPUS_PROJECT` yielded a
+/// full-capability server writing into whatever project happened to be the
+/// default.
+fn resolve_role(store: &Store, scope: &Scope) -> std::result::Result<AgentRole, String> {
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(pos) = argv.iter().position(|a| a == "--role") {
+        let raw = argv.get(pos + 1).ok_or("--role needs a value")?;
+        return AgentRole::parse(raw)
+            .ok_or_else(|| format!("--role {raw:?} is not one of researcher|tester|super"));
+    }
+    let agent = std::env::var(corpus_core::AGENT_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{} is unset — a mission launch always sets it; pass --role <researcher|tester|super> \
+                 to run this server by hand",
+                corpus_core::AGENT_ENV
+            )
+        })?;
+    let config = store.load_agent(&scope.project, &agent).map_err(|e| {
+        format!(
+            "agent {:?} not found in project {:?} ({e}) — the launched identity must name an agent \
+             directory under store/projects/<project>/agents/",
+            agent, scope.project
+        )
+    })?;
+    // An agent that predates roles reads as the safest role, never as a
+    // permissive default.
+    Ok(config.meta.role())
+}
+
+/// The catalog as advertised to THIS run: the full sandbox catalog minus
+/// anything the resolved role cannot call. One server serves one identity,
+/// so filtering here is safe — and it stops a researcher burning turns on
+/// tools it will be refused, and keeps attack-relevant tool descriptions
+/// out of a low-trust agent's context. An unresolved role advertises
+/// nothing, matching the deny-all `dispatch` applies.
+pub fn catalog_for(role: &std::result::Result<AgentRole, String>) -> Value {
+    let Ok(role) = role else {
+        return Value::Array(Vec::new());
+    };
+    let mut out = catalog();
+    if let Some(list) = out.as_array_mut() {
+        list.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(|n| role.allows(n))
+                .unwrap_or(false)
+        });
+    }
+    out
 }
 
 /// The tool catalog advertised in tools/list.
@@ -177,16 +388,16 @@ pub fn catalog() -> Value {
         },
         {
             "name": "technique_save",
-            "description": "Save a technique card into the project corpus. Working notes — no oracle gate — but run_log MUST name an existing file in the project corpus runs/. status: fired | analyzed-only | unresolved-lead. Write one after every mission, negative results included.",
+            "description": "Save a technique card into the project corpus. Working notes — no oracle gate — but run_log MUST name an existing file in the project corpus runs/. status: fired | analyzed-only | unresolved-lead. Write one after every mission, negative results included. Omit run_log to default to this mission's transcript (returned by target_info as run_log).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
                     "status": {"type": "string", "enum": ["fired", "analyzed-only", "unresolved-lead"]},
                     "body": {"type": "string"},
-                    "run_log": {"type": "string", "description": "basename of an existing file in runs/, e.g. 1786392937-operator-call-target-info.log"}
+                    "run_log": {"type": "string", "description": "basename of an existing file in runs/. Omit to default to this mission's run_log (from target_info)."}
                 },
-                "required": ["name", "status", "body", "run_log"]
+                "required": ["name", "status", "body"]
             }
         }
     ])
@@ -194,6 +405,39 @@ pub fn catalog() -> Value {
 
 /// Dispatch a tools/call.
 pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
+    // The ROLE gate runs first — before the probe — so a refused call never
+    // drives a docker/curl re-probe, and so an agent outside its ceiling
+    // gets the same answer whether or not the arena happens to be healthy.
+    // This is the authority: the agent's opencode permission block is
+    // opencode's to enforce and is never consulted here.
+    //
+    // Only KNOWN tools are judged here. An unrecognized name falls through
+    // to the match below and reports "unknown tool" — a typo must not be
+    // explained as a permissions problem.
+    let known = corpus_core::CORPUS_TOOLS
+        .iter()
+        .any(|t| t.trim_start_matches("corpus_") == name);
+    if known {
+        match &ctx.role {
+            Err(why) => {
+                return Err(Error::Args(format!(
+                    "refusing {name}: this run has no resolved agent role — {why}"
+                )));
+            }
+            Ok(role) if !role.allows(name) => {
+                return Err(Error::Args(format!(
+                    "refusing {name}: agent role {:?} does not grant it (allowed: {})",
+                    role.as_str(),
+                    role.tools()
+                        .iter()
+                        .map(|t| t.trim_start_matches("corpus_"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            Ok(_) => {}
+        }
+    }
     // Fail loud: while the environment probe says not-ready (mints down,
     // version-pin mismatch, arena torn down), no tool runs. The notes ARE
     // the error so the agent sees exactly what to fix. The probe is a
@@ -246,14 +490,22 @@ fn resilient<T>(
     ctx: &mut Ctx,
     f: impl FnOnce(&mut corpus_core::Plugin) -> std::result::Result<T, corpus_core::Error>,
 ) -> Result<T> {
-    match f(&mut ctx.plugin) {
+    let plugin = ctx.plugin.as_mut().ok_or_else(|| {
+        Error::Scope(format!(
+            "no environment plugin: {}",
+            ctx.probe_notes.as_str()
+        ))
+    })?;
+    match f(plugin) {
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(
                 error,
                 corpus_core::Error::PluginClosed(_) | corpus_core::Error::Plugin { .. }
             ) {
-                let _ = ctx.plugin.restart();
+                if let Some(plugin) = ctx.plugin.as_mut() {
+                    let _ = plugin.restart();
+                }
             }
             Err(Error::Plugin(error))
         }
@@ -269,7 +521,8 @@ fn require_u64(args: &Value, key: &str) -> Result<u64> {
 fn target_info(ctx: &mut Ctx) -> Result<String> {
     let targets = resilient(ctx, |p| p.targets())?;
     let tools = resilient(ctx, |p| p.tools())?;
-    let sources = resilient(ctx, |p| p.sources())?;
+    let pins = ctx.source_pins.clone();
+    let sources = resilient(ctx, |p| p.sources_with_sources(pins.as_ref()))?;
     Ok(serde_json::to_string_pretty(&json!({
         "targets": targets,
         "scope": "ONLY these URLs may be attacked; the sandbox cannot reach anything else",
@@ -283,13 +536,16 @@ fn target_info(ctx: &mut Ctx) -> Result<String> {
             "session_budget_sats": ctx.faucet_budget_sats,
             "spent_this_session": ctx.faucet_spent_sats
         },
-        "funding_flow": "use the wallet_fund tool — it does quote -> pay -> claim deterministically"
+        "funding_flow": "use the wallet_fund tool — it does quote -> pay -> claim deterministically",
+        "run_log": ctx.run_log.clone(),
+        "run_log_note": "the basename of THIS mission's transcript in runs/. Cite it as the `run_log` argument to technique_save (or omit run_log entirely to default to this)."
     }))
     .unwrap_or_else(|_| "{}".to_string()))
 }
 
 fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
-    let result = resilient(ctx, |p| p.sandbox_exec(command))?;
+    let pins = ctx.source_pins.clone();
+    let result = resilient(ctx, |p| p.sandbox_exec_with_sources(command, pins.as_ref()))?;
     let mut combined = result.output;
     if combined.len() > OUTPUT_CAP_BYTES {
         combined.truncate(OUTPUT_CAP_BYTES);
@@ -452,8 +708,7 @@ fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let slug = slugify(&title);
-    let dir = scope.corpus_dir(&ctx.store).join("findings");
-    std::fs::create_dir_all(&dir)?;
+    let dir = category_dir(ctx, &scope, "findings")?;
     let path = dir.join(format!("{ts}-{slug}.md"));
     let body = format!(
         "---\ntitle: {title}\nseverity: {severity}\noracle_verified: {verified}\nsensitivity: embargoed\ntimestamp: {ts}\n---\n\n\
@@ -475,7 +730,7 @@ fn attack_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
     if slug.is_empty() {
         return Err(Error::Args("name must contain alphanumerics".to_string()));
     }
-    let dir = scope.corpus_dir(&ctx.store).join("attacks").join(&slug);
+    let dir = category_dir(ctx, &scope, "attacks")?.join(&slug);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
         dir.join("attack.md"),
@@ -503,7 +758,22 @@ fn technique_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let name = require_str(args, "name")?;
     let status = require_str(args, "status")?;
     let body = require_str(args, "body")?;
-    let run_log = require_str(args, "run_log")?;
+    // run_log defaults to this mission's transcript (CORPUS_RUN_LOG at
+    // launch) when the agent omits it — the sandbox has no host FS and
+    // cannot enumerate runs/ to discover the name.
+    let run_log = args
+        .get("run_log")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| ctx.run_log.clone())
+        .ok_or_else(|| {
+            Error::Args(
+                "run_log not provided and no CORPUS_RUN_LOG is set for this mission \
+                 (call target_info to see the current run_log, then pass it here)"
+                    .to_string(),
+            )
+        })?;
     let scope = ctx.write_scope(args)?;
 
     if !matches!(status.as_str(), "fired" | "analyzed-only" | "unresolved-lead") {
@@ -538,8 +808,7 @@ fn technique_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
     if slug.is_empty() {
         return Err(Error::Args("name must contain alphanumerics".to_string()));
     }
-    let dir = scope.corpus_dir(&ctx.store).join("techniques");
-    std::fs::create_dir_all(&dir)?;
+    let dir = category_dir(ctx, &scope, "techniques")?;
     let path = dir.join(format!("{slug}.md"));
     let overwrote = path.exists();
     let ts = std::time::SystemTime::now()

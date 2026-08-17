@@ -22,7 +22,8 @@ instructions: |
   - agent_builder role → author/edit opencode.json agent configs
     (agent_*; agent_save runs the core validator — an invalid document is
     refused with the validator's message and never written; always
-    agent_get before editing; slugs are kebab-case).
+    agent_get before editing; slugs are kebab-case; use model_list to
+    resolve exact model ids before writing them into a config).
   - project_manager role → project_* + corpus_wipe + corpus_stats.
   - mission_manager role → mission_* + agent_list; owns the agent→mission
     budget translation below.

@@ -150,24 +150,25 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "new" => {
-            let slug = args.get(2).ok_or("usage: corpus agent new <project> <slug> [--seed <seed-agent>]")?;
-            let mut seed: Option<String> = None;
+            let usage = "usage: corpus agent new <project> <slug> [--role researcher|tester|super]";
+            let slug = args.get(2).ok_or(usage)?;
+            let mut role = corpus_core::AgentRole::Researcher;
             let mut i = 3;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--seed" => {
-                        seed = Some(args.get(i + 1).ok_or("missing value after --seed")?.clone());
+                    "--role" => {
+                        let raw = args.get(i + 1).ok_or("missing value after --role")?;
+                        role = corpus_core::AgentRole::parse(raw)
+                            .ok_or_else(|| format!("--role {raw:?}: {usage}"))?;
                         i += 2;
                     }
                     other => return Err(format!("unknown option: {other}")),
                 }
             }
-            if let Some(ref s) = seed {
-                store.create_agent_from_seed(project, slug, s).map_err(|e| e.to_string())?;
-            } else {
-                store.create_blank_agent(project, slug).map_err(|e| e.to_string())?;
-            }
-            println!("created agent {project}/{slug}");
+            store
+                .create_agent_with_role(project, slug, role)
+                .map_err(|e| e.to_string())?;
+            println!("created agent {project}/{slug} (role: {})", role.as_str());
             Ok(())
         }
         "clone" => {
@@ -188,8 +189,67 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
             println!("deleted agent {project}/{slug}");
             Ok(())
         }
+        "role" => {
+            let slug = args
+                .get(2)
+                .ok_or("usage: corpus agent role <project> <slug> [<researcher|tester|super>]")?;
+            match args.get(3) {
+                None => {
+                    let config = store.load_agent(project, slug).map_err(|e| e.to_string())?;
+                    let assigned = if config.meta.has_role() { "" } else { " (unassigned — defaults)" };
+                    println!("{project}/{slug}: {}{assigned}", config.meta.role().as_str());
+                }
+                Some(raw) => {
+                    let role = corpus_core::AgentRole::parse(raw).ok_or_else(|| {
+                        format!("unknown role {raw:?} — one of researcher|tester|super")
+                    })?;
+                    store.set_agent_role(project, slug, role).map_err(|e| e.to_string())?;
+                    println!("{project}/{slug}: role -> {}", role.as_str());
+                }
+            }
+            Ok(())
+        }
+        // Assign roles to agents that predate the role system, inferring
+        // each from what its permission block already grants. Dry run by
+        // default: a capability change is reviewed before it is written.
+        "migrate-roles" => {
+            let apply = args.iter().any(|a| a == "--apply");
+            let rows = store
+                .migrate_agent_roles(project, apply)
+                .map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                println!("no agents in project {project}");
+                return Ok(());
+            }
+            println!("{:<24} {:<14} {:<10} {}", "AGENT", "CURRENT", "INFERRED", "ACTION");
+            for row in &rows {
+                let current = match row.current {
+                    Some(r) => r.as_str().to_string(),
+                    None => "—".to_string(),
+                };
+                let action = if row.applied {
+                    "assigned"
+                } else if row.current.is_some() {
+                    "kept (already assigned)"
+                } else {
+                    "would assign"
+                };
+                let flag = if row.needs_review { "  ⚠ no permission block — verify" } else { "" };
+                println!(
+                    "{:<24} {:<14} {:<10} {action}{flag}",
+                    row.agent,
+                    current,
+                    row.inferred.as_str()
+                );
+            }
+            if !apply {
+                println!("\ndry run — re-run with --apply to write these roles");
+            }
+            Ok(())
+        }
         _ => Err(
-            "usage: corpus agent list|new|clone|delete <project> [<slug>] ...".to_string(),
+            "usage: corpus agent list|new|clone|delete|role|migrate-roles <project> [<slug>] ..."
+                .to_string(),
         ),
     }
 }
@@ -278,92 +338,5 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
         _ => Err(
             "usage: corpus mission list|new|delete <project> [<slug>] ...".to_string(),
         ),
-    }
-}
-
-/// `corpus store migrate [--dry-run] [--project <slug>] [--confirm]`
-pub fn store_cmd(args: &[String]) -> Result<(), String> {
-    let mut project = corpus_core::DEFAULT_PROJECT_SLUG.to_string();
-    let mut dry_run = false;
-    let confirm = args.iter().any(|a| a == "--confirm");
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "migrate" => i += 1,
-            "--dry-run" => {
-                dry_run = true;
-                i += 1;
-            }
-            "--project" => {
-                project = args.get(i + 1).ok_or("missing value after --project")?.clone();
-                i += 2;
-            }
-            "--confirm" => {
-                i += 1;
-            }
-            other => return Err(format!("unknown store option: {other}")),
-        }
-    }
-    let store = Store::from_env();
-    // v2 migration: if confirm is passed, also remove legacy template
-    // directories (the old permissions/prompts tiers).
-    if confirm {
-        let tpl = store.root().join("templates");
-        for kind in ["permissions", "prompts"] {
-            let dir = tpl.join(kind);
-            if dir.is_dir() {
-                println!("removing legacy template dir {}...", dir.display());
-                std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
-            }
-        }
-        // Also remove per-project template dirs if they exist.
-        if let Ok(projects) = store.list_projects() {
-            for (slug, _) in projects {
-                let pt = store.project_dir(&slug).join("templates");
-                if pt.is_dir() {
-                    let _ = std::fs::remove_dir_all(&pt);
-                    println!("removed project {slug} legacy templates");
-                }
-            }
-        }
-    }
-    let report = store
-        .migrate_legacy_flat_opt(&project, corpus_core::MigrateOptions { dry_run })
-        .map_err(|e| e.to_string())?;
-    if report.dry_run {
-        println!(
-            "dry run: no changes made; {} entrie(s) would move into projects/{project}/corpus/",
-            report.would_move.len()
-        );
-        for entry in &report.would_move {
-            println!("  would move {:?}", entry.display());
-        }
-        return Ok(());
-    }
-    println!("migrated flat store into projects/{project}/corpus/");
-    for moved in &report.moved {
-        let checksum = corpus_core::checksum(moved).map_err(|e| e.to_string())?;
-        println!("  moved {:?} fnv1a={checksum}", moved.display());
-    }
-    for skipped in &report.skipped {
-        println!("  skipped (destination present, never overwritten) {:?}", skipped.display());
-    }
-    for unverified in &report.unverified {
-        eprintln!(
-            "  ** UNVERIFIED (post-move checksum mismatch) {:?} — fetch this back up",
-            unverified.display()
-        );
-    }
-    for category in &report.removed_categories {
-        println!("  removed legacy {category}/ (all entries verified)");
-    }
-    if report.unverified.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "migration produced {} unverified entrie(s); legacy category dirs were \
-             kept in place for them",
-            report.unverified.len()
-        ))
     }
 }

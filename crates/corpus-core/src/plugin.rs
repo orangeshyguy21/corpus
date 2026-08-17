@@ -338,17 +338,46 @@ impl Plugin {
     /// `sources`: the pinned source corpus mounted read-only into the
     /// sandbox at /opt/src/<name>.
     pub fn sources(&mut self) -> Result<Vec<SourceInfo>, Error> {
-        let value = self.call("sources", None)?;
+        self.sources_with_sources(None)
+    }
+
+    /// `sources` carrying the mission's resolved source pins (`repo ->
+    /// sha`), same contract as [`Self::sandbox_exec_with_sources`]: the
+    /// plugin answers with the mounts the mission's sandbox actually gets,
+    /// not its default pins.
+    pub fn sources_with_sources(
+        &mut self,
+        sources: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<Vec<SourceInfo>, Error> {
+        let mut params = serde_json::json!({});
+        if let Some(sources) = sources {
+            params["sources"] = Value::Object(sources.clone());
+        }
+        let value = self.call("sources", Some(params))?;
         Ok(serde_json::from_value(value)?)
     }
 
     /// `sandbox_exec`: run a command inside the plugin-owned sandbox.
     /// Lazy-starts the sandbox if it is not already running.
     pub fn sandbox_exec(&mut self, command: &str) -> Result<SandboxExecResult, Error> {
-        let value = self.call(
-            "sandbox_exec",
-            Some(serde_json::json!({ "command": command })),
-        )?;
+        self.sandbox_exec_with_sources(command, None)
+    }
+
+    /// `sandbox_exec` carrying the mission's resolved source pins
+    /// (`repo -> sha`): the plugin reconciles the sandbox's source mounts
+    /// against them (restarting the long-lived container when its mounts
+    /// don't match), so the agent reads exactly the revs the mission
+    /// recorded. None = the plugin's default pins.
+    pub fn sandbox_exec_with_sources(
+        &mut self,
+        command: &str,
+        sources: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<SandboxExecResult, Error> {
+        let mut params = serde_json::json!({ "command": command });
+        if let Some(sources) = sources {
+            params["sources"] = Value::Object(sources.clone());
+        }
+        let value = self.call("sandbox_exec", Some(params))?;
         Ok(serde_json::from_value(value)?)
     }
 

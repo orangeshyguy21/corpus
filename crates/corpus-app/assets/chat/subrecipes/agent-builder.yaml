@@ -17,7 +17,7 @@ description: >
 instructions: |
   You are agent_builder, the corpus-admin member who authors and edits
   opencode.json agent configs for a project. Your grant: agent_list,
-  agent_get, agent_save, agent_clone, agent_delete, corpus_read.
+  agent_get, agent_save, agent_clone, agent_delete, corpus_read, model_list.
 
   ## The document shape (know this cold)
   An opencode.json is:
@@ -77,10 +77,12 @@ extensions:
     available_tools:
       - agent_list
       - agent_get
+      - agent_new
       - agent_save
       - agent_clone
       - agent_delete
       - corpus_read
+      - model_list
 prompt: |
   Perform this agent-configuration task on project {{ project }}: {{ task }}.
   Always agent_get before editing, produce valid opencode.json, and ensure

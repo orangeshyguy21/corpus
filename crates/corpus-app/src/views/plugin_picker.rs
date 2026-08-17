@@ -37,9 +37,16 @@ pub fn plugin_picker(
     let field_size = egui::vec2(360.0, 28.0);
     let (rect, _) = ui.allocate_exact_size(field_size, egui::Sense::click());
     let id = ui.id().with("plugin_picker_field");
+    // The popup gets its OWN id: egui registers the field's interact on the
+    // BACKGROUND layer but the popup's content on the FOREGROUND layer, and
+    // reusing one id across layers in the same frame trips egui's
+    // WidgetRects guard (panics on the project screen, where the field is a
+    // background widget; it only escaped notice inside Windows, which are
+    // already foreground). The toggle memory must key on the popup id.
+    let popup_id = id.with("popup");
     let response = ui.interact(rect, id, egui::Sense::click());
     if response.clicked() {
-        ui.memory_mut(|mem| mem.toggle_popup(id));
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
     }
 
     let painter = ui.painter();
@@ -69,7 +76,7 @@ pub fn plugin_picker(
 
     egui::popup::popup_above_or_below_widget(
         ui,
-        id,
+        popup_id,
         &response,
         egui::AboveOrBelow::Below,
         egui::popup::PopupCloseBehavior::CloseOnClickOutside,

@@ -84,6 +84,53 @@ sanitized_name() {
     printf '%s' "$1"
 }
 
+# Parse a params.sources object ("<name>": "<sha40>") into env exports for
+# the arena (one "CORPUS_SOURCE_SHA_<NAME>=<sha>" line per entry). Names and
+# shas are strictly validated — they land in env names and docker mount
+# paths, and a malformed pin must never reach either.
+parse_source_overrides() { # parse_source_overrides <params-json> -> env lines
+    local params="$1" pairs line name sha
+    pairs="$(jq -r '.sources // {} | to_entries[] | "\(.key)=\(.value)"' <<<"$params" 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        name="${line%%=*}"; sha="${line#*=}"
+        case "$name" in *[!a-z0-9._-]* | "") return 1 ;; esac
+        case "$sha" in *[!0-9a-f]* | "") return 1 ;; esac
+        [ "${#sha}" -eq 40 ] || return 1
+        printf 'CORPUS_SOURCE_SHA_%s=%s\n' \
+            "$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')" "$sha"
+    done <<<"$pairs"
+}
+
+# The sha the sandbox should mount for a source: the mission-pinned
+# override when present, else the config.toml default pin.
+desired_source_sha() { # desired_source_sha <name> <exports-text>
+    local name="$1" line
+    line="$(grep "^CORPUS_SOURCE_SHA_$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')=" <<<"$2" 2>/dev/null)"
+    if [ -n "$line" ]; then
+        printf '%s' "${line#*=}"
+    else
+        config_get sources "${name}_sha"
+    fi
+}
+
+# Do the live container's /opt/src mounts match the desired shas? The
+# sandbox is long-lived; a mission with different source pins must not
+# inherit the previous mission's mounts.
+sandbox_mounts_match() { # sandbox_mounts_match <exports-text>
+    local name desired live
+    for name in cdk nuts; do
+        desired="$(desired_source_sha "$name" "$1")"
+        [ -n "$desired" ] || continue
+        live="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/src/'"$name"'"}}{{.Source}}{{end}}{{end}}' "$SANDBOX" 2>/dev/null)"
+        case "$live" in
+            */"$desired") ;;  # mount source IS sources/<name>/<sha>
+            *) return 1 ;;
+        esac
+    done
+    return 0
+}
+
 # Is the arena sandbox up and ready to exec into?
 sandbox_ready() {
     [ "$(docker inspect -f '{{.State.Running}}' "$SANDBOX" 2>/dev/null)" = "true" ]
@@ -91,11 +138,21 @@ sandbox_ready() {
 
 # Lazy-start the long-lived testing sandbox (plugin-owned; promise is the
 # same as the PoC's — current behavior preserved, just moved plugin-side).
-ensure_sandbox() { # ensure_sandbox <id>
-    local id="$1"
-    sandbox_ready && return 0
+# Source pins: a running sandbox whose mounts don't match the desired shas
+# is recreated, so a new mission never reads another mission's sources.
+ensure_sandbox() { # ensure_sandbox <id> <exports-text>
+    local id="$1" exports="$2"
+    if sandbox_ready; then
+        sandbox_mounts_match "$exports" && return 0
+        docker rm -f "$SANDBOX" >/dev/null 2>&1 || true
+    fi
     local out
-    if ! out="$("$ARENA" agent testing --detach -- sleep infinity 2>&1)"; then
+    if [ -n "$exports" ]; then
+        if ! out="$(env $exports "$ARENA" agent testing --detach -- sleep infinity 2>&1)"; then
+            reply_err "$id" "sandbox start failed: $out"
+            return 1
+        fi
+    elif ! out="$("$ARENA" agent testing --detach -- sleep infinity 2>&1)"; then
         reply_err "$id" "sandbox start failed: $out"
         return 1
     fi
@@ -121,8 +178,11 @@ handle() {
             elif ! docker network inspect "$(config_get arena network)" >/dev/null 2>&1 \
                 || ! docker network inspect "$(config_get arena egress_network)" >/dev/null 2>&1 \
                 || ! docker image inspect corpus-agent:local >/dev/null 2>&1 \
-                || ! docker inspect "$GW_NAME" >/dev/null 2>&1; then
-                notes="arena not up (run: arena.sh up, or call the up method)"
+                || [ "$(docker inspect "$GW_NAME" --format '{{.State.Running}}' 2>/dev/null)" != "true" ]; then
+                # Liveness, not existence: a stopped gateway still passes
+                # plain `docker inspect` but the sandbox cannot reach the
+                # mints through it (the PoC-blocking provisioning gap).
+                notes="arena not up or target gateway stopped (run: arena.sh up, or call the up method)"
             else
                 m1="$(config_get target mint_url)"; m2="$(config_get target mint_url_2)"
                 local info1 info2
@@ -196,11 +256,13 @@ handle() {
             ;;
         sources)
             # Mounted research corpus: pinned upstream trees at /opt/src/<name>.
-            # The sha comes from config.toml [sources] (what is mounted); the
-            # repo/tag come from the sources.toml manifest (the pin's identity).
-            local items="[]" entry sha repo tag
+            # The sha is the mission-pin override when the call carries one,
+            # else config.toml [sources]; repo/tag come from the sources.toml
+            # manifest (the default pin's identity).
+            local items="[]" entry sha repo tag exports
+            exports="$(parse_source_overrides "$params")" || { reply_err "$id" "invalid sources pins (want <name>: <40-hex sha>)"; return; }
             for entry in cdk nuts; do
-                sha="$(config_get sources "${entry}_sha")"
+                sha="$(desired_source_sha "$entry" "$exports")"
                 [ -n "$sha" ] || continue
                 repo="$(manifest_get "$entry" repo)"
                 tag="$(manifest_get "$entry" tag)"
@@ -211,15 +273,16 @@ handle() {
             reply_ok "$id" "$items"
             ;;
         sandbox_exec)
-            local command
+            local command exports
             command="$(jq -r '.command // ""' <<<"$params")"
             if [ -z "$command" ]; then
                 reply_err "$id" "missing command"; return
             fi
+            exports="$(parse_source_overrides "$params")" || { reply_err "$id" "invalid sources pins (want <name>: <40-hex sha>)"; return; }
             if ! docker info >/dev/null 2>&1; then
                 reply_err "$id" "docker daemon not running"; return
             fi
-            ensure_sandbox "$id" || return
+            ensure_sandbox "$id" "$exports" || return
             local output rc
             output="$(docker exec "$SANDBOX" timeout "$EXEC_TIMEOUT_SECS" \
                 bash -c "$command" 2>&1)"; rc=$?
