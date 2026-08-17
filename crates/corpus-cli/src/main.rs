@@ -57,6 +57,14 @@ corpus — local-first vulnerability research platform
                                mutation a `curator` agent makes is recorded
                                here (intent, then outcome) — no agent can
                                read or edit this log.
+  corpus refusals <project> [--tail N] [--gate G]
+                               What the server turned away, and which gate
+                               did it: identity, role, scope, probe, args,
+                               unknown, harness. Read this before the
+                               transcript — no refusals here means the run
+                               was stopped somewhere other than corpus.
+                               Calls refused before a project could be
+                               resolved are under `_unscoped`.
 
 Environment:
   CORPUS_HOME                  Data root (default: ~/.corpus) — projects,
@@ -86,6 +94,7 @@ fn main() -> ExitCode {
         Some("agent") => store_admin::agent_cmd(&args[1..]),
         Some("mission") => store_admin::mission_cmd(&args[1..]),
         Some("audit") => store_admin::audit_cmd(&args[1..]),
+        Some("refusals") => store_admin::refusals_cmd(&args[1..]),
         Some("help") | Some("--help") | Some("-h") => {
             println!("{}", usage());
             Ok(())

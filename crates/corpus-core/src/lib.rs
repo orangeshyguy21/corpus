@@ -13,6 +13,7 @@ pub mod launch;
 mod models;
 pub mod paths;
 mod plugin;
+pub mod refusal;
 mod registry;
 mod sensitivity;
 mod srcrev;

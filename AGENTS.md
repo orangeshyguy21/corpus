@@ -66,6 +66,8 @@ dev/                 everything uncommitted & machine-local: architecture,
     project.yaml  corpus/  agents/  missions/
   var/run/<slug>/                 the opencode run cwd, per project
   var/chat/<slug>/                goose management-chat scope
+  var/audit/<slug>.jsonl          curator acts (`corpus audit`)
+  var/refusals/<slug>.jsonl       calls the server turned away (`corpus refusals`)
   app.yaml                        app prefs
 ```
 
@@ -170,6 +172,7 @@ corpus mission list|new|delete <project> ...
 # corpus-admin MCP profile: the SAME corpus-mcp binary behind `--admin`
 corpus-mcp --admin                 # stdio MCP server; the 30 admin tools only
 corpus audit <project> [--tail N]  # who changed this project (curator acts)
+corpus refusals <project> [--tail N] [--gate G]  # what the server turned away
 ```
 
 ## corpus-admin MCP profile (dev/decisions.md — chat runtime closeout)
@@ -358,6 +361,16 @@ permissions DERIVED from the role at render time. The stored config can
 only tighten, never widen. A tester's channel into the world is the MCP
 tool catalog; a researcher can never execute.
 
+The rendered block is computed as a typed `Policy` value (agents.rs) and
+serialized once, rather than assembled by mutating a JSON map. Every
+failure that design shipped was a rule that silently did not land because
+the stage meaning to write it had nowhere to write — a scalar `read:
+"allow"` is not a map, so the red lines injected into `read` went nowhere;
+`bash` was defaulted where it meant to be forced, so a stored `allow`
+survived every render. A struct field cannot be absent, which is the point.
+`tests/roles.rs` holds a byte fixture per role plus both halves of the
+merge (a stored block may tighten; it may not widen).
+
 ## The curator role
 
 An agent that manages its own project rather than the target: it creates
@@ -397,6 +410,46 @@ one that should be reading attacker-controlled text.
   agent may write with opencode's own file tools.
 - **It cannot launch.** `mission_new` writes a record; running it stays an
   operator act.
+
+## Debugging a run: the refusal log
+
+`~/.corpus/var/refusals/<project>.jsonl`, written by `corpus-mcp` at the
+one door every tool call passes through (`tools::dispatch`). Every `Err`
+that reaches a caller leaves a line — tool, args, actor, the role in force,
+the message verbatim, the `run_log` basename that places it in the
+transcript, and the **gate** that refused: `identity`, `role`, `scope`,
+`probe`, `args`, `unknown`, `harness`. Read it with
+`corpus refusals <project> [--gate G]`.
+
+Read it BEFORE the transcript. The raw run capture is a PTY dump of a TUI —
+megabytes of ANSI redraw in which the only account of a refusal is the
+model's own prose about it. This is the same facts as values.
+
+- **Empty is a finding.** No refusals for a run that misbehaved means the
+  corpus server never turned it away, which narrows the hunt to opencode's
+  permission block or to a tool description pointing somewhere the agent
+  cannot reach. That is exactly the `/opt/src` namespace split: the mount
+  path in `target_info` is the SANDBOX's, reachable only through
+  `sandbox_exec`, while a host-launched agent has the same trees under
+  `sources/<name>/<sha>` in its run cwd. An agent that believes the former
+  gets denied by opencode, and corpus records nothing, because corpus did
+  nothing.
+- **`unknown` is not a permissions problem.** It is the only gate meaning
+  the server had no opinion at all.
+- **Best-effort, unlike the audit log.** `refusal::record` returns `()` and
+  has no fallible public write path: `audit` REFUSES an act it cannot
+  record, because a curator is trusted on the strength of the record; a
+  diagnostic that could change an outcome would be an observer altering
+  what it observes.
+- **Out of reach of its subject, like the audit log.** It lives outside the
+  project subtree and is read+write denied by path in every rendered
+  permission block — readable, it is a map of every gate and the exact
+  wording that trips it. `corpus refusals` is operator-only; no agent has a
+  tool for it.
+- Calls refused before a project could be resolved land in `_unscoped` —
+  the most diagnostic records there are, so they are never dropped for want
+  of a filename. The slug is sanitized into one path component, since a
+  malformed `CORPUS_PROJECT` is itself a refusal worth logging.
 
 ## Plugin protocol
 

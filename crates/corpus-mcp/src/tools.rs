@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use corpus_core::refusal::Gate;
 use corpus_core::{AgentRole, FaucetCall, Plugin, ProbeResult, Scope, Store};
 use serde_json::{json, Value};
 
@@ -519,9 +520,10 @@ const AGENT_MUTATORS: [&str; 8] = [
 fn curator_dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     let role = match &ctx.role {
         Err(why) => {
-            return Err(Error::Args(format!(
-                "refusing {name}: this run has no resolved agent role — {why}"
-            )));
+            return Err(Error::refused(
+                Gate::Identity,
+                format!("refusing {name}: this run has no resolved agent role — {why}"),
+            ));
         }
         Ok(role) => *role,
     };
@@ -529,12 +531,15 @@ fn curator_dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         // Deliberately NOT "unknown tool": the tool exists, this role does
         // not hold it. Reporting a permissions problem as a typo sends a
         // model hunting for a spelling it will never find.
-        return Err(Error::Args(format!(
-            "refusing {name}: {name} manages a project, and agent role {:?} does not. \
-             This role grants {}.",
-            role.as_str(),
-            grants_line(role)
-        )));
+        return Err(Error::refused(
+            Gate::Role,
+            format!(
+                "refusing {name}: {name} manages a project, and agent role {:?} does not. \
+                 This role grants {}.",
+                role.as_str(),
+                grants_line(role)
+            ),
+        ));
     }
     let scope = ctx.write_scope(args)?;
     let args = with_project(args, &scope.project);
@@ -603,8 +608,40 @@ fn curator_dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     Ok(out)
 }
 
-/// Dispatch a tools/call.
+/// Dispatch a tools/call, and record every refusal.
+///
+/// The recording lives HERE, at the one door every tool call passes
+/// through, rather than at each gate. A per-gate call would log the
+/// refusals someone remembered to instrument, and the interesting refusal
+/// is always the one nobody anticipated — so the log would be silent
+/// exactly where it is needed. Wrapping the door instead makes it total:
+/// every `Err` that reaches a caller leaves a line, including
+/// `unknown tool` and anything a future gate adds without touching this
+/// function.
+///
+/// Recording is best-effort by construction (`refusal::record` returns
+/// `()`), so the result is returned unchanged whatever the log does. An
+/// observer that can alter what it observes is worse than no observer.
 pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
+    let result = dispatch_inner(ctx, name, args);
+    if let Err(error) = &result {
+        let mut entry =
+            corpus_core::refusal::RefusalRecord::new(name, error.gate(), error.to_string());
+        entry.actor = ctx.store.actor().to_string();
+        // Absent when resolving the role is what failed: `Gate::Identity`
+        // says so, and inventing one would claim the run had a ceiling.
+        entry.role = ctx.role.as_ref().ok().map(|r| r.as_str().to_string());
+        entry.args = summarize_args(args);
+        entry.run_log = ctx.run_log.clone();
+        let project = ctx.scope.as_ref().ok().map(|s| s.project.clone());
+        corpus_core::refusal::record(&ctx.store, project.as_deref(), &entry);
+    }
+    result
+}
+
+/// The dispatch proper. Split from [`dispatch`] only so that every exit
+/// path from it is observed.
+fn dispatch_inner(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     // Project-management tools route FIRST — ahead of the corpus-tool gate
     // and ahead of the probe. A curator's work is entirely store-side, so a
     // dead mint or an absent plugin must not stop it from fixing the very
@@ -627,16 +664,20 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     if known {
         match &ctx.role {
             Err(why) => {
-                return Err(Error::Args(format!(
-                    "refusing {name}: this run has no resolved agent role — {why}"
-                )));
+                return Err(Error::refused(
+                    Gate::Identity,
+                    format!("refusing {name}: this run has no resolved agent role — {why}"),
+                ));
             }
             Ok(role) if !role.allows(name) => {
-                return Err(Error::Args(format!(
-                    "refusing {name}: agent role {:?} does not grant it. This role grants {}.",
-                    role.as_str(),
-                    grants_line(*role)
-                )));
+                return Err(Error::refused(
+                    Gate::Role,
+                    format!(
+                        "refusing {name}: agent role {:?} does not grant it. This role grants {}.",
+                        role.as_str(),
+                        grants_line(*role)
+                    ),
+                ));
             }
             Ok(_) => {}
         }
@@ -660,10 +701,10 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         }
     }
     if !ctx.probe_ready {
-        return Err(Error::Args(format!(
-            "harness not ready — probe: {}",
-            ctx.probe_notes
-        )));
+        return Err(Error::refused(
+            Gate::Probe,
+            format!("harness not ready — probe: {}", ctx.probe_notes),
+        ));
     }
     match name {
         "target_info" => target_info(ctx),
@@ -674,7 +715,14 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         "finding_write" => finding_write(ctx, args),
         "attack_save" => attack_save(ctx, args),
         "technique_save" => technique_save(ctx, args),
-        other => Err(Error::Args(format!("unknown tool: {other}"))),
+        // The one refusal that means the corpus server had no opinion. It
+        // is gated as `Unknown` rather than `Args` so a reader can tell
+        // "we turned this away" from "we never recognized it" — the
+        // difference between debugging our gate and debugging opencode's.
+        other => Err(Error::refused(
+            Gate::Unknown,
+            format!("unknown tool: {other}"),
+        )),
     }
 }
 
@@ -693,11 +741,16 @@ fn resilient<T>(
     ctx: &mut Ctx,
     f: impl FnOnce(&mut corpus_core::Plugin) -> std::result::Result<T, corpus_core::Error>,
 ) -> Result<T> {
+    // `Harness`, not `Scope`: a missing plugin is a dead environment, not
+    // an unresolved project. It was reported as a scope error before the
+    // refusal log existed, where the distinction cost nothing; now it is a
+    // field an operator filters on, and a line reading `gate: scope` would
+    // send them auditing CORPUS_PROJECT for a broken docker.
     let plugin = ctx.plugin.as_mut().ok_or_else(|| {
-        Error::Scope(format!(
-            "no environment plugin: {}",
-            ctx.probe_notes.as_str()
-        ))
+        Error::refused(
+            Gate::Harness,
+            format!("no environment plugin: {}", ctx.probe_notes.as_str()),
+        )
     })?;
     match f(plugin) {
         Ok(value) => Ok(value),
@@ -721,6 +774,48 @@ fn require_u64(args: &Value, key: &str) -> Result<u64> {
         .ok_or_else(|| Error::Args(format!("missing integer argument: {key}")))
 }
 
+/// Where the pinned source is, FOR THIS CALLER.
+///
+/// The same trees sit at two addresses, each reachable by exactly one tool:
+/// `sources/<name>/<sha>` in the run cwd, read by opencode's own file
+/// tools, and `/opt/src/<name>`, which exists only inside a `sandbox_exec`
+/// command. So the mount is named only to a role that can enter the
+/// sandbox. The host path is RELATIVE because the trees are reached through
+/// a symlink pointing outside the run dir: the render writes
+/// `external_directory: deny` for every role but `super`, and `super` gets
+/// no key at all, so opencode's own default decides — which in practice has
+/// denied. Relative is the form that works for all four.
+fn source_paths(ctx: &Ctx, sources: &[corpus_core::SourceInfo]) -> Value {
+    let sandboxed = matches!(&ctx.role, Ok(role) if role.allows("sandbox_exec"));
+    let pinned: Vec<Value> = sources
+        .iter()
+        .map(|source| {
+            let mut entry = json!({
+                "name": source.name,
+                "repo": source.repo,
+                "tag": source.tag,
+                "sha": source.sha,
+                "path": format!("sources/{}/{}", source.name, source.sha),
+            });
+            if sandboxed {
+                entry["path_inside_sandbox_exec"] = json!(source.mount);
+            }
+            entry
+        })
+        .collect();
+    let mut out = json!({
+        "note": "the pinned upstream source — target implementation and spec. The only sanctioned source; prefer it over memory and over anything you read on the internet.",
+        "read_with": "your own file tools. `path` is relative to your working directory — use it as given, and do not rewrite it to an absolute path: the trees live outside this directory and only the relative form is readable.",
+        "pinned": pinned
+    });
+    if sandboxed {
+        out["also_inside_sandbox_exec"] = json!(
+            "within a sandbox_exec command — and ONLY there — the same trees are mounted read-only at `path_inside_sandbox_exec`. That path does not exist on the host, so your own file tools cannot open it; `path` is the one to read with those."
+        );
+    }
+    out
+}
+
 fn target_info(ctx: &mut Ctx) -> Result<String> {
     let targets = resilient(ctx, |p| p.targets())?;
     let tools = resilient(ctx, |p| p.tools())?;
@@ -729,10 +824,7 @@ fn target_info(ctx: &mut Ctx) -> Result<String> {
     Ok(serde_json::to_string_pretty(&json!({
         "targets": targets,
         "scope": "ONLY these URLs may be attacked; the sandbox cannot reach anything else",
-        "sources_in_sandbox": {
-            "note": "pinned upstream source, read-only at /opt/src/<name> — the research corpus (target implementation + NUT spec). This is the only sanctioned source; you have no host filesystem.",
-            "mounted": sources
-        },
+        "sources": source_paths(ctx, &sources),
         "tools_in_sandbox": tools,
         "faucet": {
             "max_payment_sats": 100000,

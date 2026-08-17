@@ -402,3 +402,87 @@ pub fn audit_cmd(args: &[String]) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// `corpus refusals <project> [--tail N] [--gate G]`
+///
+/// What the server turned away, and which gate did it. The companion to
+/// `corpus audit`: that one records the acts a curator completed, this one
+/// the calls nobody completed at all.
+///
+/// Read it BEFORE the transcript. A run that misbehaved and shows no
+/// refusals here was not stopped by the corpus server — that narrows the
+/// hunt to opencode's own permission block, or to a tool description
+/// pointing somewhere the agent cannot reach.
+///
+/// Operator-only and read-only, like `audit`: an agent that could read this
+/// would be reading a map of every gate and the exact wording that trips
+/// it.
+pub fn refusals_cmd(args: &[String]) -> Result<(), String> {
+    use corpus_core::refusal;
+    let store = Store::from_env();
+    let project = args
+        .first()
+        .ok_or("usage: corpus refusals <project> [--tail N] [--gate G]")?;
+    let mut tail = 50usize;
+    let mut gate: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--tail" => {
+                tail = args
+                    .get(i + 1)
+                    .ok_or("missing value after --tail")?
+                    .parse()
+                    .map_err(|e| format!("--tail: {e}"))?;
+                i += 2;
+            }
+            "--gate" => {
+                gate = Some(args.get(i + 1).ok_or("missing value after --gate")?.clone());
+                i += 2;
+            }
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+    let records = refusal::tail(&store, project, tail).map_err(|e| e.to_string())?;
+    let records: Vec<_> = match &gate {
+        Some(want) => records
+            .into_iter()
+            .filter(|r| r.gate.as_str() == want.as_str())
+            .collect(),
+        None => records,
+    };
+    if records.is_empty() {
+        // Said positively: for this log, empty is a finding rather than an
+        // absence of data. It is the answer to "was it us?", and the answer
+        // is no.
+        println!(
+            "no refusals recorded for {project}{} ({})",
+            gate.as_ref().map(|g| format!(" at gate {g}")).unwrap_or_default(),
+            refusal::log_path(&store, project).display()
+        );
+        println!("nothing the corpus server refused — a run that still misbehaved was stopped somewhere else.");
+        return Ok(());
+    }
+    for record in records {
+        println!(
+            "{}  {:<9} {:<12} {:<24} {}{}",
+            record.ts,
+            record.gate.as_str(),
+            record.role.as_deref().unwrap_or("-"),
+            record.tool,
+            record.actor,
+            record
+                .run_log
+                .as_deref()
+                .map(|r| format!("  run={r}"))
+                .unwrap_or_default()
+        );
+        for line in record.detail.lines().take(3) {
+            println!("             {line}");
+        }
+        if !record.args.trim().is_empty() && record.args != "{}" {
+            println!("             args: {}", record.args);
+        }
+    }
+    Ok(())
+}
