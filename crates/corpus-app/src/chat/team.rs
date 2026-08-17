@@ -20,8 +20,15 @@
 use std::fmt;
 
 /// The blast radius of every specialist: prohibited by construction.
-pub const DESTRUCTIVE_TOOLS: &[&str] =
-    &["corpus_wipe", "project_delete", "agent_delete", "mission_delete"];
+pub const DESTRUCTIVE_TOOLS: &[&str] = &[
+    "corpus_wipe",
+    "project_delete",
+    "agent_delete",
+    "mission_delete",
+    // Removes research material. Narrower than corpus_wipe — one entry, not
+    // the whole tree — but there is no undo, so it gates like the rest.
+    "entry_delete",
+];
 
 /// Read-only admin tools: NO operator approval — a smart, effective agent
 /// reads freely (the blanket Approve mode buried every `agent_list` under an
@@ -58,6 +65,9 @@ pub const WRITE_TOOLS: &[&str] = &[
     "agent_set_permission",
     "agent_subagent_add",
     "agent_subagent_remove",
+    // Reorganising the corpus: moves nothing out of it and destroys
+    // nothing, so it gates as an ordinary write.
+    "entry_move",
     "mission_new",
     "mission_set_budget",
     "mission_set_pins",
@@ -81,7 +91,7 @@ pub fn mutated_area(tool: &str) -> Option<&'static str> {
         "mission_new" | "mission_delete" | "mission_set_budget" | "mission_set_pins" => {
             Some("missions")
         }
-        "corpus_wipe" => Some("corpus"),
+        "corpus_wipe" | "entry_delete" | "entry_move" => Some("corpus"),
         _ => None,
     }
 }
@@ -138,6 +148,8 @@ pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "corpus_list",
     "corpus_read",
     "corpus_wipe",
+    "entry_delete",
+    "entry_move",
     "model_list",
 ];
 

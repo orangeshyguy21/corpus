@@ -150,8 +150,11 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "new" => {
-            let usage = "usage: corpus agent new <project> <slug> [--role researcher|tester|super]";
-            let slug = args.get(2).ok_or(usage)?;
+            let usage = format!(
+                "usage: corpus agent new <project> <slug> [--role {}]",
+                corpus_core::AgentRole::names()
+            );
+            let slug = args.get(2).ok_or_else(|| usage.clone())?;
             let mut role = corpus_core::AgentRole::Researcher;
             let mut i = 3;
             while i < args.len() {
@@ -192,7 +195,12 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
         "role" => {
             let slug = args
                 .get(2)
-                .ok_or("usage: corpus agent role <project> <slug> [<researcher|tester|super>]")?;
+                .ok_or_else(|| {
+                    format!(
+                        "usage: corpus agent role <project> <slug> [<{}>]",
+                        corpus_core::AgentRole::names()
+                    )
+                })?;
             match args.get(3) {
                 None => {
                     let config = store.load_agent(project, slug).map_err(|e| e.to_string())?;
@@ -201,7 +209,10 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
                 }
                 Some(raw) => {
                     let role = corpus_core::AgentRole::parse(raw).ok_or_else(|| {
-                        format!("unknown role {raw:?} — one of researcher|tester|super")
+                        format!(
+                            "unknown role {raw:?} — one of {}",
+                            corpus_core::AgentRole::names()
+                        )
                     })?;
                     store.set_agent_role(project, slug, role).map_err(|e| e.to_string())?;
                     println!("{project}/{slug}: role -> {}", role.as_str());
@@ -339,4 +350,55 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
             "usage: corpus mission list|new|delete <project> [<slug>] ...".to_string(),
         ),
     }
+}
+
+/// `corpus audit <project> [--tail N]`
+///
+/// The operator's window onto what a curator did. Deliberately read-only
+/// and deliberately not an MCP tool: the subject of a log should not be
+/// its reader, so no agent has a way to see — or edit — this.
+pub fn audit_cmd(args: &[String]) -> Result<(), String> {
+    let store = Store::from_env();
+    let project = args
+        .first()
+        .ok_or("usage: corpus audit <project> [--tail N]")?;
+    let mut tail = 50usize;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--tail" => {
+                tail = args
+                    .get(i + 1)
+                    .ok_or("missing value after --tail")?
+                    .parse()
+                    .map_err(|e| format!("--tail: {e}"))?;
+                i += 2;
+            }
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+    let records = corpus_core::audit::tail(&store, project, tail).map_err(|e| e.to_string())?;
+    if records.is_empty() {
+        println!(
+            "no recorded changes for {project} ({})",
+            corpus_core::audit::log_path(&store, project).display()
+        );
+        return Ok(());
+    }
+    for record in records {
+        println!(
+            "{}  {:<9} {:<22} {:<28} {}",
+            record.ts,
+            format!("{:?}", record.outcome).to_lowercase(),
+            record.actor,
+            record.op,
+            record.target
+        );
+        if !record.detail.trim().is_empty() {
+            for line in record.detail.lines().take(3) {
+                println!("             {line}");
+            }
+        }
+    }
+    Ok(())
 }

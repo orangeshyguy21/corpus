@@ -58,9 +58,16 @@ use crate::store::{now_epoch, validate_slug, Store};
 /// TRUST BOUNDARY: this is enforceable only for agents WITHOUT a host
 /// shell. An agent holding `bash: allow` can re-exec corpus-mcp with a
 /// forged identity, or edit the sidecar through the `store` symlink that
-/// `provision_run_dir` creates. `role_grants_shell` refuses that pairing
-/// so the contradiction is caught at save time rather than believed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+/// `provision_run_dir` creates. `bind_permission` force-denies `bash` for
+/// any role that [`AgentRole::shell_would_defeat_gate`] flags, so a stored
+/// grant cannot survive into the rendered artifact.
+///
+/// Deliberately NOT `Ord`. The three roles below form a chain
+/// (researcher ⊆ tester ⊆ super) over the corpus-tool sets, and a derived
+/// ordering encoded that chain as declaration position — which quietly
+/// stops being true the moment a role's grants live in a different
+/// namespace. [`AgentRole::cap_under`] spells the relation out instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentRole {
     /// Reads and curates; never executes. The contamination-sensitive
@@ -74,6 +81,18 @@ pub enum AgentRole {
     Tester,
     /// Everything: research and penetration both.
     Super,
+    /// Manages the PROJECT rather than the target: creates and edits the
+    /// project's other agents, sets their roles, writes mission records,
+    /// curates the corpus. Holds ZERO sandbox tools and no open internet —
+    /// its whole grant set lives in a different namespace
+    /// ([`AgentRole::admin_tools`]), which is why it is incomparable to the
+    /// three above rather than above or below them.
+    ///
+    /// Declared LAST on purpose: [`AgentRole::ALL`] feeds `infer_role`'s
+    /// first-match search, and a role granting no corpus tools satisfies an
+    /// empty requirement — placed earlier it would relabel every legacy
+    /// agent the moment anyone ran `migrate-roles`.
+    Curator,
 }
 
 /// The sandbox tool catalog, as the permission-block keys spell them
@@ -95,15 +114,56 @@ pub const CORPUS_TOOLS: [&str; 8] = [
 /// Everything else is execution or publication.
 const RESEARCHER_TOOLS: [&str; 2] = ["corpus_target_info", "corpus_technique_save"];
 
+/// The project-management tool catalog, as MCP names (the rendered
+/// permission keys are `corpus_` + these, because the run config names the
+/// server `corpus`).
+///
+/// A SEPARATE namespace from [`CORPUS_TOOLS`], not a superset of it: these
+/// mutate the project's own configuration rather than acting on a target,
+/// so no role holds both. The list is the `corpus-mcp --admin` catalog
+/// minus everything a project-scoped server cannot honestly serve:
+///
+/// - `project_list/new/clone/delete/rebind` and `agent_copy` name a project
+///   by a key other than `project`, so scope injection cannot reach them;
+/// - `corpus_wipe` destroys research output wholesale — an operator act.
+pub const CURATOR_TOOLS: [&str; 23] = [
+    "agent_list",
+    "agent_get",
+    "agent_new",
+    "agent_save",
+    "agent_clone",
+    "agent_set",
+    "agent_set_role",
+    "agent_set_permission",
+    "agent_subagent_add",
+    "agent_subagent_remove",
+    "agent_delete",
+    "mission_list",
+    "mission_get",
+    "mission_new",
+    "mission_delete",
+    "mission_set_budget",
+    "mission_set_pins",
+    "corpus_stats",
+    "corpus_list",
+    "corpus_read",
+    "entry_delete",
+    "entry_move",
+    "model_list",
+];
+
 impl AgentRole {
     /// Parse a role name (config, CLI flag, sidecar).
+    ///
+    /// Derived from [`AgentRole::as_str`], which is exhaustive, rather than
+    /// written as its own `match` with a `_ => None` arm. That arm meant a
+    /// new variant compiled fine and was then silently unparseable at every
+    /// entry point — `--role`, the MCP schemas, the sidecar — with nothing
+    /// but one round-trip assertion standing between that and a role nobody
+    /// could actually select.
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "researcher" => Some(Self::Researcher),
-            "tester" => Some(Self::Tester),
-            "super" => Some(Self::Super),
-            _ => None,
-        }
+        let key = raw.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|role| role.as_str() == key)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -111,11 +171,24 @@ impl AgentRole {
             Self::Researcher => "researcher",
             Self::Tester => "tester",
             Self::Super => "super",
+            Self::Curator => "curator",
         }
     }
 
+    /// The role names, for a usage line: `researcher|tester|super`. Derived
+    /// so a new variant reaches every CLI help string and error message
+    /// without ten separate edits.
+    pub fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(|role| role.as_str())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
     /// Every role, for UI pickers and exhaustiveness tests.
-    pub const ALL: [Self; 3] = [Self::Researcher, Self::Tester, Self::Super];
+    pub const ALL: [Self; 4] =
+        [Self::Researcher, Self::Tester, Self::Super, Self::Curator];
 
     /// The starting prompt for a new agent of this role.
     ///
@@ -134,6 +207,7 @@ impl AgentRole {
             Self::Researcher => include_str!("prompts/researcher.md"),
             Self::Tester => include_str!("prompts/tester.md"),
             Self::Super => include_str!("prompts/super.md"),
+            Self::Curator => include_str!("prompts/curator.md"),
         }
     }
 
@@ -150,6 +224,10 @@ impl AgentRole {
             }
             Self::Super => {
                 "Research and penetration both: the open internet and the sandbox in one agent."
+            }
+            Self::Curator => {
+                "Manages this project: its agents, their roles, its missions and its corpus. \
+                 Runs no missions itself."
             }
         }
     }
@@ -168,6 +246,10 @@ impl AgentRole {
                  No open internet, so an execution turn cannot pull in untrusted text."
             }
             Self::Super => "everything: research and penetration both.",
+            Self::Curator => {
+                "manages the project's agents, missions and corpus through the corpus server. \
+                 No sandbox, no open internet \u{2014} it builds the team rather than joining it."
+            }
         }
     }
 
@@ -182,6 +264,19 @@ impl AgentRole {
             // opencode-enforced (see `grants_web`). The server-enforced
             // boundary is researcher-vs-rest.
             Self::Tester | Self::Super => &CORPUS_TOOLS,
+            // Not a narrower research role \u{2014} a different job. Its grants
+            // are in `admin_tools`.
+            Self::Curator => &[],
+        }
+    }
+
+    /// The project-management tools this role may call. Kept apart from
+    /// [`AgentRole::tools`] because the two catalogs are disjoint: one acts
+    /// on the target, the other on the project's own configuration.
+    pub fn admin_tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Curator => &CURATOR_TOOLS,
+            Self::Researcher | Self::Tester | Self::Super => &[],
         }
     }
 
@@ -208,6 +303,45 @@ impl AgentRole {
     /// forge the identity the server trusts.
     pub fn shell_would_defeat_gate(self) -> bool {
         self.tools().len() < CORPUS_TOOLS.len()
+    }
+
+    /// The role a SUBAGENT entry may render under, given the ceiling the
+    /// server will enforce for the whole session — the primary's, because
+    /// corpus-mcp resolves exactly one role per session from
+    /// `CORPUS_OPENCODE_AGENT`, and that names the primary.
+    ///
+    /// Deliberately not a `min` over a derived ordering. Researcher ⊆
+    /// Tester ⊆ Super holds over the corpus-tool sets, so it is written out
+    /// here as three arms; the moment a role's grants live in a different
+    /// namespace, "which is smaller" stops having an answer and a derived
+    /// `Ord` would return whichever variant happened to be declared first —
+    /// a number, not a decision.
+    pub fn cap_under(self, primary: Self) -> Self {
+        match (primary, self) {
+            (a, b) if a == b => a,
+            // The two incomparable cases come FIRST — the chain arms below
+            // are catch-alls over `sub`, and would otherwise answer
+            // (super, curator) with "curator", handing a research session a
+            // subagent advertising management tools.
+            //
+            // A curator's session is curated end to end: the server resolves
+            // ONE role per session and takes it from the primary, so a
+            // subagent rendered as a researcher would carry
+            // `corpus_target_info: allow` into a session whose server
+            // refuses that tool.
+            (Self::Curator, _) => Self::Curator,
+            // The mirror image. The two grant sets do not intersect, so
+            // there is nothing to inherit and it collapses to the safest
+            // role rather than to the parent's.
+            (_, Self::Curator) => Self::Researcher,
+            // Super carries every ceiling, so a subagent keeps its own.
+            (Self::Super, sub) => sub,
+            // A tester's session cannot serve a wider ceiling than its own.
+            (Self::Tester, Self::Super) => Self::Tester,
+            (Self::Tester, sub) => sub,
+            // The narrowest primary caps everything to itself.
+            (Self::Researcher, _) => Self::Researcher,
+        }
     }
 }
 
@@ -272,6 +406,19 @@ pub struct AgentSidecar {
     /// enforced by opencode, never by the server.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub subagent_roles: std::collections::BTreeMap<String, AgentRole>,
+    /// When this agent was last changed, and by whom
+    /// (`curator:<slug>` / `operator`).
+    ///
+    /// `None` means NEVER RECORDED — a sidecar written before provenance
+    /// existed — and is deliberately distinguishable from an explicit
+    /// `modified_by: operator`, the same way `role: None` is
+    /// distinguishable from an explicit researcher. An agent that a curator
+    /// built should be readable as such from its own sidecar, without
+    /// consulting the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_by: Option<String>,
 }
 
 impl AgentSidecar {
@@ -359,7 +506,7 @@ impl Store {
         // `DEFAULT_AGENT_NAME` placeholder; keeping it out of here means a
         // core-created agent renders under its slug, not a shared placeholder
         // handle, and the render/role tests stay independent of UI defaults.
-        write_sidecar(&dir, slug, None, role, Default::default())?;
+        write_sidecar(&dir, slug, None, role, Default::default(), self.actor())?;
         Ok(())
     }
 
@@ -491,7 +638,7 @@ impl Store {
         });
         validate_agent_doc(&doc, &dir).map_err(|e| Error::Store(format!("agent {slug}: {e}")))?;
         fs::write(dir.join("opencode.json"), serde_json::to_string_pretty(&doc)?)?;
-        write_sidecar(&dir, slug, from, role, Default::default())?;
+        write_sidecar(&dir, slug, from, role, Default::default(), self.actor())?;
         Ok(())
     }
 
@@ -543,7 +690,14 @@ impl Store {
         // — and silently downgrading would break "copy this agent" in a way
         // that only shows up as a refused tool mid-mission.
         let src_meta = read_sidecar(&source, from);
-        write_sidecar(&dest, to, Some(from), src_meta.role(), src_meta.subagent_roles)?;
+        write_sidecar(
+            &dest,
+            to,
+            Some(from),
+            src_meta.role(),
+            src_meta.subagent_roles,
+            self.actor(),
+        )?;
         Ok(())
     }
 
@@ -760,7 +914,7 @@ impl Store {
         )?;
         let mut meta = read_sidecar(&dir, slug);
         if meta.subagent_roles.remove(name).is_some() {
-            fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&meta)?)?;
+            self.stamp_and_write_sidecar(&dir, &mut meta)?;
         }
         Ok(())
     }
@@ -823,6 +977,7 @@ impl Store {
             Some(&format!("{from_project}/{from}")),
             src_meta.role(),
             src_meta.subagent_roles,
+            self.actor(),
         )?;
         Ok(())
     }
@@ -843,7 +998,7 @@ impl Store {
         } else {
             name.to_string()
         };
-        fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&meta)?)?;
+        self.stamp_and_write_sidecar(&dir, &mut meta)?;
         Ok(())
     }
 
@@ -856,7 +1011,7 @@ impl Store {
         }
         let mut meta = read_sidecar(&dir, slug);
         meta.role = Some(role);
-        fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&meta)?)?;
+        self.stamp_and_write_sidecar(&dir, &mut meta)?;
         Ok(())
     }
 
@@ -883,8 +1038,24 @@ impl Store {
         }
         let dir = self.project_agent_dir(project, slug);
         let mut meta = read_sidecar(&dir, slug);
+        // A curator and a research role cannot share a session. The server
+        // resolves ONE role per run, from the primary, so the pairing would
+        // render an entry advertising tools its own session refuses.
+        // `cap_under` already collapses it at render time; refusing here
+        // means the operator finds out now instead of wondering why a
+        // subagent lost its grants at launch.
+        let primary = meta.role();
+        if (primary == AgentRole::Curator) != (role == AgentRole::Curator) {
+            return Err(Error::Store(format!(
+                "agent {project}/{slug} is a {} and cannot hold a {} subagent — one role is \
+                 enforced per session, taken from the primary, so this would render as {}",
+                primary.as_str(),
+                role.as_str(),
+                role.cap_under(primary).as_str()
+            )));
+        }
         meta.subagent_roles.insert(subagent.to_string(), role);
-        fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&meta)?)?;
+        self.stamp_and_write_sidecar(&dir, &mut meta)?;
         Ok(())
     }
 
@@ -1280,7 +1451,7 @@ fn entry_role(meta: &AgentSidecar, entry: &str, slug: &str) -> AgentRole {
         return meta.role();
     }
     match meta.subagent_roles.get(entry) {
-        Some(sub) => (*sub).min(meta.role()),
+        Some(sub) => sub.cap_under(meta.role()),
         None => meta.role(),
     }
 }
@@ -1337,15 +1508,15 @@ fn render_agent_file(
     out.push_str("---\n");
     let description = cfg.get("description").and_then(|v| v.as_str()).unwrap_or("");
     out.push_str("description: ");
-    out.push_str(description);
+    out.push_str(&yaml_scalar(description));
     out.push('\n');
     let mode = cfg.get("mode").and_then(|v| v.as_str()).unwrap_or("primary");
     out.push_str("mode: ");
-    out.push_str(mode);
+    out.push_str(&yaml_scalar(mode));
     out.push('\n');
     if let Some(model) = cfg.get("model").and_then(|v| v.as_str()).filter(|m| !m.is_empty()) {
         out.push_str("model: ");
-        out.push_str(model);
+        out.push_str(&yaml_scalar(model));
         out.push('\n');
     }
     if let Some(temperature) = cfg.get("temperature").and_then(|v| v.as_f64()) {
@@ -1523,7 +1694,49 @@ fn bind_permission(permission: &serde_json::Value, ctx: &RenderCtx<'_>) -> serde
         };
         out.insert(tool.to_string(), Value::String(action.to_string()));
     }
+
+    // The project-management namespace, on the same terms: written for every
+    // role so the artifact never leans on omission-means-allow, and allowed
+    // only where the role actually grants it. Rendered as `corpus_<tool>`
+    // because the run config names the MCP server `corpus` — which is why
+    // three of them come out `corpus_corpus_*`.
+    let granted = role.admin_tools();
+    for tool in CURATOR_TOOLS {
+        let key = format!("corpus_{tool}");
+        let stored = out.get(&key).and_then(Value::as_str);
+        let action = match granted.contains(&tool) {
+            false => "deny",
+            true => stored.unwrap_or("allow"),
+        };
+        out.insert(key, Value::String(action.to_string()));
+    }
+
+    // A host shell defeats the whole gate for any role the server restricts:
+    // it re-execs corpus-mcp with a forged `CORPUS_OPENCODE_AGENT`, or edits
+    // the sidecar through the `store` link the run dir provides. The module
+    // doc has claimed since the roles landed that this pairing is refused —
+    // it never was. `default_path_rules` only DEFAULTS bash to deny, so a
+    // stored `"bash": "allow"` survived the render untouched.
+    if role.shell_would_defeat_gate() {
+        out.insert("bash".to_string(), Value::String("deny".to_string()));
+    }
     Value::Object(out)
+}
+
+/// Emit a string as a YAML scalar that survives a round trip.
+///
+/// The frontmatter used to interpolate these raw, so any description
+/// containing `": "` produced a file whose frontmatter does not parse —
+/// and opencode reads the permission block out of that frontmatter, so the
+/// whole role gate on the opencode side went with it. The `super` role's
+/// own description tripped this, silently, for every agent rendered under
+/// it. Quoting is delegated to serde_yaml rather than hand-rolled: a value
+/// that needs no quotes still renders bare, so the artifacts of every
+/// colon-free description are byte-identical to before.
+fn yaml_scalar(value: &str) -> String {
+    serde_yaml::to_string(value)
+        .map(|s| s.trim_end().to_string())
+        .unwrap_or_else(|_| format!("{value:?}"))
 }
 
 /// The path rules every rendered entry starts from when it says nothing
@@ -1534,7 +1747,16 @@ fn bind_permission(permission: &serde_json::Value, ctx: &RenderCtx<'_>) -> serde
 /// work reaches the sandbox.
 fn default_path_rules(project: &str) -> Vec<(String, serde_json::Value)> {
     let corpus = format!("store/projects/{project}/corpus/**");
-    let write = serde_json::json!({ "*": "deny", corpus: "allow" });
+    // `runs/` is inside the corpus but is not an agent's to change: those
+    // transcripts are what technique cards cite by name, what the cost
+    // report counts, and the only provenance a mission leaves. The corpus
+    // allow would otherwise cover them, and an agent holding opencode's own
+    // `write` tool could clobber one without going near an MCP call.
+    // Ordering is safe rather than incidental: `canonical_json` sorts keys,
+    // and `**` sorts before `runs/**`, so the narrow deny lands after the
+    // broad allow and wins under last-match-wins.
+    let runs = format!("store/projects/{project}/corpus/runs/**");
+    let write = serde_json::json!({ "*": "deny", corpus: "allow", runs: "deny" });
     vec![
         ("read".to_string(), serde_json::json!({ "*": "allow" })),
         ("edit".to_string(), write.clone()),
@@ -1598,7 +1820,7 @@ fn bind_paths(
                 // cwd, and say nothing about `/Users/…/.corpus/store/...`.
                 // The run dir links only one project, so an absolute path
                 // is the one way left to name another project's corpus.
-                inject_data_boundary(rules, project, roots, "corpus");
+                inject_data_boundary(rules, project, roots, "corpus", false);
             }
             if matches!(key.as_str(), "edit" | "write") {
                 // The agent tree holds the role sidecars this gate trusts,
@@ -1607,7 +1829,7 @@ fn bind_paths(
                     "store/projects/*/agents/**".to_string(),
                     Value::String("deny".to_string()),
                 );
-                inject_data_boundary(rules, project, roots, "corpus");
+                inject_data_boundary(rules, project, roots, "corpus", true);
             }
         }
         let key = key.replace("store/projects/*", &format!("store/projects/{project}"));
@@ -1630,6 +1852,7 @@ fn inject_data_boundary(
     project: &str,
     roots: &DataRoots,
     subdir: &str,
+    mutating: bool,
 ) {
     let deny = || serde_json::Value::String("deny".to_string());
     if !roots.data.is_empty() {
@@ -1638,10 +1861,13 @@ fn inject_data_boundary(
         // data root — the agent's own run dir lives under that root too,
         // and a blanket deny would take its cwd (and the `sources` link)
         // with it if opencode resolves paths before matching.
-        rules.insert(
-            format!("{}/var/chat/**", roots.data.trim_end_matches('/')),
-            deny(),
-        );
+        let data = roots.data.trim_end_matches('/');
+        rules.insert(format!("{data}/var/chat/**"), deny());
+        // The audit log. Deny-by-default already covers it for writes —
+        // `'*': deny` with only the corpus re-allowed — but the subject of
+        // a log editing its own entry is the one failure this mechanism
+        // cannot tolerate, so it is stated rather than inferred.
+        rules.insert(format!("{data}/var/audit/**"), deny());
     }
     if roots.store.is_empty() {
         return;
@@ -1652,6 +1878,15 @@ fn inject_data_boundary(
         format!("{store}/projects/{project}/{subdir}/**"),
         serde_json::Value::String("allow".to_string()),
     );
+    // The absolute half of the `runs/` rule. Reading a transcript is fine —
+    // an agent may want its own — but changing one is not, and the relative
+    // patterns describe only what the run cwd exposes.
+    if mutating {
+        rules.insert(
+            format!("{store}/projects/{project}/corpus/runs/**"),
+            deny(),
+        );
+    }
 }
 
 /// The absolute roots a render denies by path. Held as strings because
@@ -1852,6 +2087,7 @@ fn write_sidecar(
     cloned_from: Option<&str>,
     role: AgentRole,
     subagent_roles: std::collections::BTreeMap<String, AgentRole>,
+    actor: &str,
 ) -> Result<()> {
     let sidecar = AgentSidecar {
         name: name.to_string(),
@@ -1861,9 +2097,25 @@ fn write_sidecar(
         // role, not an inherited absence.
         role: Some(role),
         subagent_roles,
+        modified: Some(now_epoch()),
+        modified_by: Some(actor.to_string()),
     };
     fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&sidecar)?)?;
     Ok(())
+}
+
+impl Store {
+    /// Write a sidecar back, stamping who changed it and when. EVERY
+    /// in-place sidecar rewrite goes through here, so a future mutator
+    /// cannot forget provenance by writing the file itself — which is the
+    /// failure mode that made "the operator can audit it" untrue for the
+    /// whole life of the role system.
+    fn stamp_and_write_sidecar(&self, dir: &Path, meta: &mut AgentSidecar) -> Result<()> {
+        meta.modified = Some(now_epoch());
+        meta.modified_by = Some(self.actor().to_string());
+        fs::write(dir.join("agent.yaml"), serde_yaml::to_string(meta)?)?;
+        Ok(())
+    }
 }
 
 /// Read the sidecar, falling back to the SAFEST role when it is missing or
@@ -1881,6 +2133,8 @@ fn read_sidecar(dir: &Path, slug: &str) -> AgentSidecar {
             // the safest role via `role()` and migration can still see it.
             role: None,
             subagent_roles: std::collections::BTreeMap::new(),
+            modified: None,
+            modified_by: None,
         })
 }
 
@@ -2109,6 +2363,8 @@ mod tests {
             cloned_from: None,
             role: Some(AgentRole::Researcher),
             subagent_roles: Default::default(),
+            modified: None,
+            modified_by: None,
         };
         meta.subagent_roles.insert("scout".into(), AgentRole::Super);
         assert_eq!(
@@ -2125,6 +2381,276 @@ mod tests {
             "a narrower subagent stays narrow"
         );
         assert_eq!(entry_role(&meta, "discover", "discover"), AgentRole::Super);
+    }
+
+    /// The subagent cap, as a table rather than as a consequence of
+    /// declaration order. It used to be `min` over a derived `Ord`, so the
+    /// answer for any pair was decided by where the variants happened to sit
+    /// in the enum body; this pins the relation the roles actually have, so
+    /// that adding a role that is NOT part of the chain shows up here as a
+    /// diff to read rather than as a number that silently changed.
+    #[test]
+    fn cap_under_reproduces_the_research_chain() {
+        use AgentRole::{Researcher, Super, Tester};
+        let table = [
+            // (primary, subagent, capped)
+            (Researcher, Researcher, Researcher),
+            (Researcher, Tester, Researcher),
+            (Researcher, Super, Researcher),
+            (Tester, Researcher, Researcher),
+            (Tester, Tester, Tester),
+            (Tester, Super, Tester),
+            (Super, Researcher, Researcher),
+            (Super, Tester, Tester),
+            (Super, Super, Super),
+        ];
+        for (primary, sub, want) in table {
+            assert_eq!(
+                sub.cap_under(primary),
+                want,
+                "{:?} under {:?}",
+                sub.as_str(),
+                primary.as_str()
+            );
+        }
+        // The property the table encodes: a subagent never renders wider
+        // than the session its parent's role bought.
+        for primary in AgentRole::ALL {
+            for sub in AgentRole::ALL {
+                let capped = sub.cap_under(primary);
+                for tool in capped.tools() {
+                    assert!(
+                        primary.allows(tool),
+                        "{} under {} kept {tool}, which the primary cannot call",
+                        sub.as_str(),
+                        primary.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The curator sits outside the research chain, and `cap_under` has to
+    /// say so in both directions. The dangerous case is a curator subagent
+    /// under a SUPER primary: the chain arms are catch-alls over the
+    /// subagent, so an arm ordering that let `(Super, Curator)` fall through
+    /// would hand a research session a subagent advertising management
+    /// tools its own server refuses.
+    #[test]
+    fn curator_is_incomparable_to_the_research_roles() {
+        use AgentRole::{Curator, Researcher, Super, Tester};
+        assert_eq!(Curator.cap_under(Curator), Curator);
+        // A curator primary curates its whole session.
+        for sub in [Researcher, Tester, Super] {
+            assert_eq!(
+                sub.cap_under(Curator),
+                Curator,
+                "{} under a curator",
+                sub.as_str()
+            );
+        }
+        // A curator subagent collapses to the safest role under ANY research
+        // primary — including super, which carries every research ceiling
+        // and still has nothing to lend a curator.
+        for primary in [Researcher, Tester, Super] {
+            assert_eq!(
+                Curator.cap_under(primary),
+                Researcher,
+                "a curator under {}",
+                primary.as_str()
+            );
+        }
+        // The invariant the whole table exists to protect, restated over the
+        // management namespace this time.
+        for primary in AgentRole::ALL {
+            for sub in AgentRole::ALL {
+                for tool in sub.cap_under(primary).admin_tools() {
+                    assert!(
+                        primary.admin_tools().contains(tool),
+                        "{} under {} kept {tool}, which the primary cannot call",
+                        sub.as_str(),
+                        primary.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A role granting no corpus tools satisfies an empty requirement, so
+    /// placing it early in `ALL` would make `infer_role`'s first-match
+    /// search relabel every legacy agent the next time anyone ran
+    /// `migrate-roles`. Position is the guard; this test is what notices if
+    /// someone tidies the enum.
+    #[test]
+    fn a_new_role_cannot_relabel_legacy_agents() {
+        assert_eq!(AgentRole::ALL[0], AgentRole::Researcher, "safest first");
+        assert_eq!(
+            AgentRole::ALL.last().copied(),
+            Some(AgentRole::Curator),
+            "a zero-corpus-tool role must sort last or it matches everything"
+        );
+        // An agent with no permission block at all, and one that grants
+        // nothing: neither is a curator, whatever the tool arithmetic says.
+        for doc in [
+            serde_json::json!({}),
+            serde_json::json!({ "permission": { "bash": "deny" } }),
+        ] {
+            let cfg = doc.as_object().unwrap().clone();
+            assert_ne!(
+                infer_role(&cfg),
+                AgentRole::Curator,
+                "inference must never invent a curator: {doc}"
+            );
+        }
+    }
+
+    /// The module doc has promised since the roles landed that a shell and a
+    /// restricted role cannot coexist. It was never enforced: `bash: deny`
+    /// was only a DEFAULT, so a stored allow rode straight through the
+    /// render — and a shell re-execs corpus-mcp with a forged identity.
+    #[test]
+    fn a_stored_bash_allow_cannot_survive_a_restricted_role() {
+        let store = tmp_store("bash-hole");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        for (slug, role) in [
+            ("res", AgentRole::Researcher),
+            ("cur", AgentRole::Curator),
+            ("sup", AgentRole::Super),
+        ] {
+            store.create_agent_with_role("alpha", slug, role).unwrap();
+            store
+                .save_agent(
+                    "alpha",
+                    slug,
+                    &doc(serde_json::json!({
+                        slug: { "mode": "primary", "permission": { "bash": "allow" } },
+                    })),
+                )
+                .unwrap();
+        }
+        store.render_project_agents("alpha", &[]).unwrap();
+        let read = |slug: &str| {
+            fs::read_to_string(store.opencode_agent_dir("alpha").join(format!("{slug}.md"))).unwrap()
+        };
+        for slug in ["res", "cur"] {
+            assert_eq!(
+                rendered_permission(&read(slug))["bash"].as_str(),
+                Some("deny"),
+                "{slug}: a server-restricted role cannot hold a shell"
+            );
+        }
+        // Super holds every corpus tool, so a shell forges nothing it did
+        // not already have — its stored grant is honoured.
+        assert_eq!(
+            rendered_permission(&read("sup"))["bash"].as_str(),
+            Some("allow"),
+            "the unrestricted role keeps what it asked for"
+        );
+    }
+
+    /// The management namespace is written for every role, denied wherever
+    /// it is not granted — the same discipline the corpus tools get, so the
+    /// artifact never depends on opencode's default for a tool the role has
+    /// an opinion about.
+    #[test]
+    fn render_denies_the_admin_namespace_outside_the_curator() {
+        let store = tmp_store("admin-ns");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("alpha", "res", AgentRole::Researcher)
+            .unwrap();
+        store
+            .create_agent_with_role("alpha", "cur", AgentRole::Curator)
+            .unwrap();
+        store.render_project_agents("alpha", &[]).unwrap();
+        let read = |slug: &str| {
+            rendered_permission(
+                &fs::read_to_string(store.opencode_agent_dir("alpha").join(format!("{slug}.md")))
+                    .unwrap(),
+            )
+        };
+        let (res, cur) = (read("res"), read("cur"));
+        for tool in CURATOR_TOOLS {
+            let key = format!("corpus_{tool}");
+            assert_eq!(res[&key].as_str(), Some("deny"), "researcher: {key}");
+            assert_eq!(cur[&key].as_str(), Some("allow"), "curator: {key}");
+        }
+        // And the reverse: a curator holds no sandbox tools at all.
+        for tool in CORPUS_TOOLS {
+            assert_eq!(cur[tool].as_str(), Some("deny"), "curator: {tool}");
+        }
+        assert_eq!(cur["webfetch"].as_str(), Some("deny"));
+        assert_eq!(cur["bash"].as_str(), Some("deny"));
+    }
+
+    /// One role is enforced per session, taken from the primary — so a
+    /// curator and a research subagent cannot share one. Refused at set
+    /// time, where the operator can see it, rather than silently collapsed
+    /// at render time.
+    #[test]
+    fn a_curator_cannot_hold_a_research_subagent() {
+        let store = tmp_store("mixed-subs");
+        store.create_project("alpha", "A", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("alpha", "cur", AgentRole::Curator)
+            .unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "cur",
+                &doc(serde_json::json!({
+                    "cur": { "mode": "primary" },
+                    "cur-helper": { "mode": "subagent", "description": "d" },
+                })),
+            )
+            .unwrap();
+        let error = store
+            .set_subagent_role("alpha", "cur", "cur-helper", AgentRole::Tester)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("curator"), "{error}");
+        assert!(error.contains("tester"), "{error}");
+        // A curator subagent under a curator is fine.
+        store
+            .set_subagent_role("alpha", "cur", "cur-helper", AgentRole::Curator)
+            .unwrap();
+
+        // And the mirror: a research primary refuses a curator subagent.
+        store
+            .create_agent_with_role("alpha", "res", AgentRole::Researcher)
+            .unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "res",
+                &doc(serde_json::json!({
+                    "res": { "mode": "primary" },
+                    "res-scout": { "mode": "subagent", "description": "d" },
+                })),
+            )
+            .unwrap();
+        assert!(store
+            .set_subagent_role("alpha", "res", "res-scout", AgentRole::Curator)
+            .is_err());
+    }
+
+    /// Every role name survives a round trip. This is the ONLY thing that
+    /// catches a variant missing from `parse` — which is why `parse` is now
+    /// derived from `as_str` rather than written as a second match.
+    #[test]
+    fn every_role_name_round_trips() {
+        for role in AgentRole::ALL {
+            assert_eq!(AgentRole::parse(role.as_str()), Some(role));
+            assert_eq!(AgentRole::parse(&role.as_str().to_uppercase()), Some(role));
+            assert_eq!(AgentRole::parse(&format!("  {}  ", role.as_str())), Some(role));
+            assert!(
+                AgentRole::names().contains(role.as_str()),
+                "{} is missing from the usage line",
+                role.as_str()
+            );
+        }
+        assert_eq!(AgentRole::parse("root"), None);
+        assert_eq!(AgentRole::parse(""), None);
     }
 
     /// Cloning preserves subagents (it used to drop them) and carries the

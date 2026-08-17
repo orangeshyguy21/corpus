@@ -168,7 +168,8 @@ corpus project list|new|clone|delete|rebind|wipe <slug>
 corpus agent list|new|clone|delete <project> ...   # new takes --role
 corpus mission list|new|delete <project> ...
 # corpus-admin MCP profile: the SAME corpus-mcp binary behind `--admin`
-corpus-mcp --admin                 # stdio MCP server; 21 admin tools only
+corpus-mcp --admin                 # stdio MCP server; the 30 admin tools only
+corpus audit <project> [--tail N]  # who changed this project (curator acts)
 ```
 
 ## corpus-admin MCP profile (dev/decisions.md — chat runtime closeout)
@@ -177,11 +178,20 @@ corpus-mcp --admin                 # stdio MCP server; 21 admin tools only
 host-side operator tooling, thin over corpus-core, for natural-language
 store administration via the GDK/goose chat. It sits OUTSIDE the research
 trust domains (no sandbox, no oracles, no targets) and never runs missions
-— it prepares them. The sandbox-facing profile (operator/researcher
-agents) never enables it; the chat session config always does
-(`corpus-mcp --admin`). The tool group lives in
-`crates/corpus-mcp/src/admin.rs`; `main.rs` gates `tools/list` + `tools/call`
-on the flag and the admin profile advertises NO sandbox/finding tools.
+— it prepares them. It is UNSCOPED: 21 of its tools take a `project`
+argument, so it reaches every project. That is why it is the operator's
+profile and not an agent's. The tool group lives in
+`crates/corpus-mcp/src/admin.rs`; `main.rs` gates `tools/list` +
+`tools/call` on the flag and the admin profile advertises NO
+sandbox/finding tools.
+
+The same tools reach an IN-PROJECT agent through a different door: the
+`curator` role. There the ROLE decides the catalog (not an argv flag), and
+`tools::dispatch` injects the project from the proven `CORPUS_PROJECT`
+scope before any handler reads it — so a curator cannot name another
+project, and the seven tools that identify a project by some other key
+(`project_*`, `agent_copy`) are simply not in its grant set. Neither is
+`corpus_wipe`. See "The curator role" below.
 
 Admin tools (all thin over corpus-core): `project_list/new/clone/delete/
 rebind`, `agent_list/get/new/save/clone/delete` (`agent_new` builds the
@@ -336,6 +346,7 @@ the `corpus_sandbox_exec` MCP tool (see Trust domains below).
 |---|---|---|---|
 | **Execution sandbox** | the `tester` ROLE, via `corpus_sandbox_exec` | DENIED by default | benchmarks/, plugins/, oracle implementations, findings of the current mission |
 | **Research zone** | the `researcher` ROLE (reads only) | open internet (webfetch/search) | executes nothing; read-denied on benchmarks/** |
+| **Project management** | the `curator` ROLE, via the scoped admin tools | NO egress, NO sandbox | manages its OWN project's agents, missions and corpus; cannot name another project; every act recorded |
 | **Model inference** | host-side only, local by default | the model endpoint sits on the host | the sandbox has no model access |
 | **Corpus store** | write via MCP tools (`finding_write`, `attack_save`, `technique_save`), gated per artifact | — | — |
 
@@ -346,6 +357,46 @@ the ceiling), and in the rendered `.opencode/agent/*.md` by opencode
 permissions DERIVED from the role at render time. The stored config can
 only tighten, never widen. A tester's channel into the world is the MCP
 tool catalog; a researcher can never execute.
+
+## The curator role
+
+An agent that manages its own project rather than the target: it creates
+and edits the project's other agents, sets their roles, writes mission
+records, and curates the corpus. It holds ZERO sandbox tools and no open
+internet — an agent that can rewrite every other agent's config is the last
+one that should be reading attacker-controlled text.
+
+- **Scoped by construction.** `tools::dispatch` routes the management tools
+  through `curator_dispatch`, which overwrites `args["project"]` from the
+  proven scope before dispatching. The 17 sites in `admin.rs` that read
+  `project` therefore all see the same unforgeable value, and the scoped
+  catalog strips `project` from every advertised schema — a tool that
+  quietly ignores an argument it asked for is worse than one that never
+  asked.
+- **Not comparable to the research roles.** `AgentRole` is deliberately NOT
+  `Ord`; `cap_under` spells the relation out. A subagent under a curator IS
+  a curator (one role is enforced per session, taken from the primary), and
+  a curator subagent under a research primary collapses to researcher —
+  refused at set time by `set_subagent_role` rather than silently collapsed
+  at render time.
+- **It may set roles, including its own.** That is deliberate, and the
+  audit log is what makes it survivable.
+- **Every act is recorded.** `~/.corpus/var/audit/<project>.jsonl`, append
+  only: intent before the call, outcome after, actor on every line. A
+  failure to record REFUSES the call — an act this role cannot account for
+  does not happen. The log lives outside the project subtree, so the agent
+  it describes can neither edit it (`write` is deny-by-default with only
+  its own corpus re-allowed) nor reach it with `entry_delete` (rooted at
+  `corpus/`, category-gated). Read it with `corpus audit <project>`; no
+  agent has a tool for it, because the subject of a log should not be its
+  reader.
+- **`runs/` is nobody's to change.** Technique cards cite those transcripts
+  by name, `corpus_cost` counts them, and they are the provenance an
+  operator audits. Denied to `entry_delete`/`entry_move` AND write-denied
+  in every rendered permission block, since the corpus is the one place an
+  agent may write with opencode's own file tools.
+- **It cannot launch.** `mission_new` writes a record; running it stays an
+  operator act.
 
 ## Plugin protocol
 

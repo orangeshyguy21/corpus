@@ -12,7 +12,13 @@ use std::process::ExitCode;
 
 use corpus_core::{ModelRegistry, Plugin, Scope, Store};
 
-const USAGE: &str = "\
+/// Built rather than `const` so the role list comes from
+/// `AgentRole::names()` — a role the binary supports but the help text
+/// omits is a role nobody discovers.
+fn usage() -> String {
+    let roles = corpus_core::AgentRole::names();
+    format!(
+        "\
 corpus — local-first vulnerability research platform
 
   corpus [tui]                 Launch the TUI dashboard (default)
@@ -34,10 +40,10 @@ corpus — local-first vulnerability research platform
                                Project CRUD (store/projects/<slug>/)
   corpus agent list|new|clone|delete <project> ...
                                Agent CRUD (store/projects/<p>/agents/<slug>/).
-                               `new` takes --role researcher|tester|super
+                               `new` takes --role {roles}
                                (default researcher): the role supplies the
                                starting prompt AND the capability ceiling.
-  corpus agent role <project> <slug> [researcher|tester|super]
+  corpus agent role <project> <slug> [{roles}]
                                Show or set an agent's ROLE — the capability
                                ceiling corpus-mcp enforces server-side.
   corpus agent migrate-roles <project> [--apply]
@@ -46,6 +52,11 @@ corpus — local-first vulnerability research platform
                                already grant. Dry run without --apply.
   corpus mission list|new|delete <project> ...
                                Mission CRUD
+  corpus audit <project> [--tail N]
+                               Who changed this project, and when. Every
+                               mutation a `curator` agent makes is recorded
+                               here (intent, then outcome) — no agent can
+                               read or edit this log.
 
 Environment:
   CORPUS_HOME                  Data root (default: ~/.corpus) — projects,
@@ -60,7 +71,9 @@ Environment:
   CORPUS_PROJECT               Write scope. NO DEFAULT — every command that
                                writes refuses without it.
   CORPUS_TERMINAL              Terminal app for `attach` (default: from $TERM_PROGRAM)
-  CORPUS_NO_TMUX=1             Force the piped run backend (no detached sessions)";
+  CORPUS_NO_TMUX=1             Force the piped run backend (no detached sessions)"
+    )
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -72,11 +85,12 @@ fn main() -> ExitCode {
         Some("project") => store_admin::project_cmd(&args[1..]),
         Some("agent") => store_admin::agent_cmd(&args[1..]),
         Some("mission") => store_admin::mission_cmd(&args[1..]),
+        Some("audit") => store_admin::audit_cmd(&args[1..]),
         Some("help") | Some("--help") | Some("-h") => {
-            println!("{USAGE}");
+            println!("{}", usage());
             Ok(())
         }
-        Some(other) => Err(format!("unknown command: {other}\n\n{USAGE}")),
+        Some(other) => Err(format!("unknown command: {other}\n\n{}", usage())),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

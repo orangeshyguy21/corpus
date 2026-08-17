@@ -36,6 +36,72 @@ pub const DESTRUCTIVE_OPS: [&str; 4] = [
     "corpus_wipe",
 ];
 
+/// Every tool name this group serves. The catalog is asserted against it,
+/// so a tool added to one and not the other fails a test rather than going
+/// quietly unroutable (or unadvertised).
+pub const ADMIN_TOOLS: [&str; 30] = [
+    "project_list",
+    "project_new",
+    "project_clone",
+    "project_delete",
+    "project_rebind",
+    "agent_list",
+    "agent_get",
+    "agent_new",
+    "agent_save",
+    "agent_clone",
+    "agent_copy",
+    "agent_set",
+    "agent_set_role",
+    "agent_set_permission",
+    "agent_subagent_add",
+    "agent_subagent_remove",
+    "agent_delete",
+    "mission_list",
+    "mission_get",
+    "mission_new",
+    "mission_delete",
+    "mission_set_budget",
+    "mission_set_pins",
+    "corpus_wipe",
+    "corpus_stats",
+    "corpus_list",
+    "corpus_read",
+    "entry_delete",
+    "entry_move",
+    "model_list",
+];
+
+/// The catalog filtered to `allowed`, with the `project` argument stripped
+/// from every schema.
+///
+/// The project is not the caller's to choose — a scoped server takes it
+/// from `CORPUS_PROJECT` — so advertising the field would invite a model to
+/// name one and then have it silently overwritten. A tool that quietly
+/// ignores an argument it asked for is worse than one that never asked.
+pub fn scoped_catalog(allowed: &[&str]) -> Value {
+    let mut out = catalog();
+    if let Some(list) = out.as_array_mut() {
+        list.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| allowed.contains(&n))
+        });
+        for tool in list.iter_mut() {
+            let Some(schema) = tool.get_mut("inputSchema") else {
+                continue;
+            };
+            if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+                props.remove("project");
+            }
+            if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+                required.retain(|k| k.as_str() != Some("project"));
+            }
+        }
+    }
+    out
+}
+
 /// The admin tool catalog advertised in tools/list (admin profile only).
 pub fn catalog() -> Value {
     json!([
@@ -127,7 +193,7 @@ pub fn catalog() -> Value {
                     "prompt": {"type": "string", "description": "the system prompt body"},
                     "model": {"type": "string", "description": "optional model id"},
                     "from": {"type": "string", "description": "optional existing agent to inherit permissions/prompts from"},
-                    "role": {"type": "string", "enum": ["researcher", "tester", "super"], "description": "capability ceiling; defaults to researcher (or the inherited agent's role with `from`)"}
+                    "role": {"type": "string", "enum": ["researcher", "tester", "super", "curator"], "description": "capability ceiling; defaults to researcher (or the inherited agent's role with `from`)"}
                 },
                 "required": ["project", "agent", "description", "prompt"]
             }
@@ -189,14 +255,14 @@ pub fn catalog() -> Value {
         },
         {
             "name": "agent_set_role",
-            "description": "Set an agent's ROLE — the capability ceiling the corpus server enforces for missions launched as it. researcher = read + technique_save only; tester = the full sandbox/oracle/faucet/findings set, no open internet; super = everything. A role also regenerates the corpus_* permissions at launch.",
+            "description": "Set an agent's ROLE — the capability ceiling the corpus server enforces for missions launched as it. researcher = read + technique_save only; tester = the full sandbox/oracle/faucet/findings set, no open internet; super = everything; curator = manages THIS project (its agents, missions and corpus) and holds no sandbox tools and no internet at all. A role also regenerates the permissions at launch.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project": {"type": "string"},
                     "agent": {"type": "string"},
                     "subagent": {"type": "string", "description": "set a subagent's role instead (capped by the primary's)"},
-                    "role": {"type": "string", "enum": ["researcher", "tester", "super"]}
+                    "role": {"type": "string", "enum": ["researcher", "tester", "super", "curator"]}
                 },
                 "required": ["project", "agent", "role"]
             }
@@ -227,7 +293,7 @@ pub fn catalog() -> Value {
                     "description": {"type": "string"},
                     "prompt": {"type": "string"},
                     "model": {"type": "string"},
-                    "role": {"type": "string", "enum": ["researcher", "tester", "super"]}
+                    "role": {"type": "string", "enum": ["researcher", "tester", "super", "curator"]}
                 },
                 "required": ["project", "agent", "name", "description", "prompt"]
             }
@@ -378,6 +444,33 @@ pub fn catalog() -> Value {
                 "required": ["project", "path"]
             }
         },
+        {
+            "name": "entry_delete",
+            "description": "Delete ONE entry from the project's corpus by relative path (findings/x.md, attacks/<slug>/, ...). A directory needs recursive: true. runs/ is not deletable — technique cards cite those transcripts by name and the operator audits them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "path": {"type": "string", "description": "relative path under the project corpus"},
+                    "recursive": {"type": "boolean", "description": "required to remove a directory"}
+                },
+                "required": ["project", "path"]
+            }
+        },
+        {
+            "name": "entry_move",
+            "description": "Move or rename ONE entry within the project's corpus — the tool for reorganising it. Both paths are relative and stay inside the same corpus; missing destination directories are created. Refuses an existing destination unless overwrite: true. runs/ is not movable.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "from": {"type": "string"},
+                    "to": {"type": "string"},
+                    "overwrite": {"type": "boolean", "description": "replace an existing destination"}
+                },
+                "required": ["project", "from", "to"]
+            }
+        },
         // --- models ---
         {
             "name": "model_list",
@@ -426,6 +519,8 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         "corpus_stats" => corpus_stats(ctx, &project(args)?),
         "corpus_list" => corpus_list(ctx, args),
         "corpus_read" => corpus_read(ctx, args),
+        "entry_delete" => entry_delete(ctx, args),
+        "entry_move" => entry_move(ctx, args),
         "model_list" => model_list(args),
         other => Err(Error::Args(format!("unknown admin tool: {other}"))),
     }
@@ -511,7 +606,7 @@ fn project_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
             .list_missions(&slug)
             .map(|m| m.len())
             .unwrap_or(0);
-        mint_confirm(ctx, "project_delete", &slug, true, &format!(
+        mint_confirm(ctx, "project_delete", &slug, &format!(
             "DRY RUN — would delete project {slug} (plugin {}, gen {}, agents {}, missions {}, corpus files {})",
             p.plugin, p.corpus_generation, agents, missions, stats.files
         ))
@@ -607,7 +702,10 @@ fn agent_new(ctx: &mut Ctx, args: &Value) -> Result<String> {
     // allowed to do.
     let role = match args.get("role").and_then(Value::as_str) {
         Some(raw) => Some(corpus_core::AgentRole::parse(raw).ok_or_else(|| {
-            Error::Args(format!("role {raw:?} is not one of researcher|tester|super"))
+            Error::Args(format!(
+                "role {raw:?} is not one of {}",
+                corpus_core::AgentRole::names()
+            ))
         })?),
         None => None,
     };
@@ -680,7 +778,10 @@ fn agent_set_role(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let agent = require_str(args, "agent")?;
     let raw = require_str(args, "role")?;
     let role = corpus_core::AgentRole::parse(&raw).ok_or_else(|| {
-        Error::Args(format!("unknown role {raw:?} — one of researcher|tester|super"))
+        Error::Args(format!(
+            "unknown role {raw:?} — one of {}",
+            corpus_core::AgentRole::names()
+        ))
     })?;
     match subagent_arg(args) {
         Some(sub) => {
@@ -735,7 +836,10 @@ fn agent_subagent_add(ctx: &mut Ctx, args: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .map(|r| {
             corpus_core::AgentRole::parse(r).ok_or_else(|| {
-                Error::Args(format!("unknown role {r:?} — one of researcher|tester|super"))
+                Error::Args(format!(
+                    "unknown role {r:?} — one of {}",
+                    corpus_core::AgentRole::names()
+                ))
             })
         })
         .transpose()?;
@@ -765,10 +869,76 @@ fn agent_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
             Ok(format!("deleted agent {project}/{agent}"))
         })
     } else {
-        mint_confirm(ctx, "agent_delete", &target, true, &format!(
-            "DRY RUN — would delete agent {project}/{agent}"
+        // Load the target FIRST. A dry-run that mints a token for an agent
+        // it never looked at spends a turn and then fails on the SECOND
+        // call, with an error about the target rather than about the typo —
+        // and says nothing about what deleting it would cost.
+        let config = ctx
+            .store
+            .load_agent(&project, &agent)
+            .map_err(|e| Error::Args(e.to_string()))?;
+        let subagents = config
+            .doc
+            .get("agent")
+            .and_then(|a| a.as_object())
+            .map_or(0, |m| m.len().saturating_sub(1));
+        let orphaned = delegation_dependents(&ctx.store, &project, &agent);
+        let consequence = match orphaned.is_empty() {
+            true => String::new(),
+            // The delegation-closure check refuses to render a project
+            // whose agents delegate to a name nobody declares, so this
+            // deletion would take the whole project's next launch with it.
+            false => format!(
+                "; {} would be left delegating to entries this removes ({}), and the next \
+                 launch would refuse to render the project until that is fixed",
+                orphaned.len(),
+                orphaned.join(", ")
+            ),
+        };
+        mint_confirm(ctx, "agent_delete", &target, &format!(
+            "DRY RUN — would delete agent {project}/{agent} (role {}, {subagents} subagent(s)){consequence}",
+            config.meta.role().as_str()
         ))
     }
+}
+
+/// Agents that delegate to an entry `agent` declares. Deleting it would
+/// leave their `task:` rules pointing at a name no agent in the project
+/// declares.
+fn delegation_dependents(store: &Store, project: &str, agent: &str) -> Vec<String> {
+    let Ok(agents) = store.list_agents(project) else {
+        return Vec::new();
+    };
+    let entries: Vec<String> = agents
+        .iter()
+        .find(|(slug, _)| slug == agent)
+        .and_then(|(_, cfg)| cfg.doc.get("agent").and_then(|a| a.as_object()))
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for (slug, config) in &agents {
+        if slug == agent {
+            continue;
+        }
+        let Some(map) = config.doc.get("agent").and_then(|a| a.as_object()) else {
+            continue;
+        };
+        let delegates = map.values().any(|entry| {
+            entry
+                .get("permission")
+                .and_then(|p| p.get("task"))
+                .and_then(|t| t.as_object())
+                .is_some_and(|rules| {
+                    rules.iter().any(|(name, action)| {
+                        action.as_str() != Some("deny") && entries.contains(name)
+                    })
+                })
+        });
+        if delegates {
+            out.push(slug.clone());
+        }
+    }
+    out
 }
 
 // --- missions ---
@@ -844,8 +1014,19 @@ fn mission_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
             Ok(format!("deleted mission {project}/{mission}"))
         })
     } else {
-        mint_confirm(ctx, "mission_delete", &target, true, &format!(
-            "DRY RUN — would delete mission {project}/{mission}"
+        let record = ctx
+            .store
+            .load_mission(&project, &mission)
+            .map_err(|e| Error::Args(e.to_string()))?;
+        mint_confirm(ctx, "mission_delete", &target, &format!(
+            "DRY RUN — would delete mission {project}/{mission} (agent {}, status {}{})",
+            record.agent,
+            record.status,
+            record
+                .budget
+                .as_deref()
+                .map(|b| format!(", budget {b}"))
+                .unwrap_or_default()
         ))
     }
 }
@@ -912,7 +1093,7 @@ fn corpus_wipe(ctx: &mut Ctx, args: &Value) -> Result<String> {
         // No token: dry-run. Report what would be deleted; mint the token.
         let stats = walk_corpus_stats(&ctx.store, &project).map_err(|e| Error::Args(e.to_string()))?;
         let p = load_project(&ctx.store, &project)?;
-        mint_confirm(ctx, "corpus_wipe", &project, true, &format!(
+        mint_confirm(ctx, "corpus_wipe", &project, &format!(
             "DRY RUN — would wipe the corpus of project {project} ({} files, {} bytes, generation -> {}); project and its agents survive",
             stats.files, stats.bytes, p.corpus_generation + 1
         ))
@@ -958,19 +1139,39 @@ fn corpus_list(ctx: &mut Ctx, args: &Value) -> Result<String> {
 fn corpus_read(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let project = require_str(args, "project")?;
     let path = require_str(args, "path")?;
-    let corpus = ctx.store.project_corpus_dir(&project);
-    // Path traversal guard: resolve under the corpus root only.
-    let joined = corpus.join(&path);
-    let root = corpus.canonicalize().unwrap_or(corpus.clone());
-    let canonical = joined.canonicalize().map_err(|e| {
-        Error::Args(format!("cannot read {project}/corpus/{path}: {e}"))
-    })?;
-    if !canonical.starts_with(&root) {
-        return Err(Error::Args("path escapes the project corpus".into()));
-    }
-    let text = std::fs::read_to_string(&canonical)
-        .map_err(|e| Error::Args(format!("cannot read {}: {e}", canonical.display())))?;
+    // The shared guard, rather than a second inline one. The version that
+    // lived here compared a canonical path against a possibly-NON-canonical
+    // root, so it refused legal paths whenever the store sat behind a
+    // symlink — which it does whenever a run dir is involved.
+    let resolved = ctx
+        .store
+        .resolve_corpus_entry(&project, &path, corpus_core::EntryAccess::Read)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    let text = std::fs::read_to_string(&resolved)
+        .map_err(|e| Error::Args(format!("cannot read {}: {e}", resolved.display())))?;
     Ok(text)
+}
+
+fn entry_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let project = require_str(args, "project")?;
+    let path = require_str(args, "path")?;
+    let recursive = args.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+    let freed = ctx
+        .store
+        .delete_corpus_entry(&project, &path, recursive)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    Ok(format!("deleted {project}/corpus/{path} ({freed} bytes)"))
+}
+
+fn entry_move(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let project = require_str(args, "project")?;
+    let from = require_str(args, "from")?;
+    let to = require_str(args, "to")?;
+    let overwrite = args.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+    ctx.store
+        .move_corpus_entry(&project, &from, &to, overwrite)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    Ok(format!("moved {project}/corpus/{from} -> {to}"))
 }
 
 // --- models ---
@@ -1034,13 +1235,23 @@ fn now() -> u64 {
 }
 
 /// Mint a one-shot confirm token for a destructive op (dry-run call), store
-/// it with a short TTL, and return the dry-run summary plus the token so the
-/// operator can see intent spelled out before anything commits.
+/// it with a short TTL, and return it with the dry-run summary.
+///
+/// What this IS: a place where the consequences get computed and stated
+/// before anything commits, and a requirement to name the target twice —
+/// which catches the wrong-slug slip at a cost of one turn. In the
+/// operator's `--admin` chat it is also a human gate, because a person
+/// reads the dry run between the two calls.
+///
+/// What it is NOT: a control on an autonomous caller. The token is returned
+/// to whoever asked, so an agent completes the ritual in two calls with
+/// nobody in between. For the curator route the real accounting is the
+/// audit log, which records the intent whether or not the second call ever
+/// comes.
 fn mint_confirm(
     ctx: &mut Ctx,
     op: &str,
     target: &str,
-    _destructive: bool,
     summary: &str,
 ) -> Result<String> {
     let nonce = format!("{}|{}", target, now());
@@ -1055,8 +1266,8 @@ fn mint_confirm(
         },
     );
     Ok(format!(
-        "{summary}\n\nconfirm_token: {token} (one-shot, {}s TTL)\nCall the same op again with confirm_token to commit; \
-         the operator sees this intent spelled out before you can mutate.",
+        "{summary}\n\nconfirm_token: {token} (one-shot, {}s TTL)\n\
+         Call the same op again with confirm_token to commit.",
         CONFIRM_TTL_SECS
     ))
 }

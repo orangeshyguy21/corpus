@@ -216,11 +216,57 @@ fn the_boundary_holds_by_evaluation() {
         ("store/projects/p/agents/researcher/agent.yaml", "deny", "own sidecars"),
         ("store/projects/other/corpus/findings/x.md", "deny", "another project"),
         ("store/hypotheses/legacy-flat-path.md", "deny", "the legacy flat store"),
+        // Transcripts are inside the corpus and still not writable: cards
+        // cite them by name, the cost report counts them, and they are the
+        // provenance an operator audits.
+        ("store/projects/p/corpus/runs/1786-x.raw", "deny", "a run transcript"),
+        (
+            &format!("{root}/projects/p/corpus/runs/1786-x.raw"),
+            "deny",
+            "a run transcript, by absolute path",
+        ),
     ] {
         assert_eq!(
             permission_for(&write, path).as_deref(),
             Some(expected),
             "write {why}: {path}"
+        );
+    }
+
+    // Reading one is fine — an agent may want its own transcript.
+    assert_eq!(
+        permission_for(&read, "store/projects/p/corpus/runs/1786-x.raw").as_deref(),
+        Some("allow"),
+        "a transcript stays readable"
+    );
+}
+
+/// Every role's rendered frontmatter must PARSE.
+///
+/// It did not: descriptions were interpolated raw, so the `super` role —
+/// whose own description contains a colon — rendered a file whose
+/// frontmatter is not valid YAML. opencode reads the permission block out
+/// of that frontmatter, so the entire opencode-side half of the role gate
+/// went missing for every agent rendered under it, silently. Nothing
+/// asserted this because the only fixture was a researcher, whose
+/// description happens to be colon-free.
+#[test]
+fn every_role_renders_parseable_frontmatter() {
+    for role in AgentRole::ALL {
+        let store = tmp_store(&format!("fm-{}", role.as_str()));
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        let rendered = render_role(&store, "p", role);
+        let fm = frontmatter(&rendered);
+        assert_eq!(
+            fm["description"].as_str(),
+            Some(role.default_description()),
+            "{} description must survive the round trip intact",
+            role.as_str()
+        );
+        assert!(
+            fm["permission"].as_mapping().is_some(),
+            "{}: the permission block must be reachable — it is the gate",
+            role.as_str()
         );
     }
 }
