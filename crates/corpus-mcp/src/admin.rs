@@ -126,7 +126,8 @@ pub fn catalog() -> Value {
                     "description": {"type": "string"},
                     "prompt": {"type": "string", "description": "the system prompt body"},
                     "model": {"type": "string", "description": "optional model id"},
-                    "from": {"type": "string", "description": "optional existing agent to inherit permissions/prompts from"}
+                    "from": {"type": "string", "description": "optional existing agent to inherit permissions/prompts from"},
+                    "role": {"type": "string", "enum": ["researcher", "tester", "super"], "description": "capability ceiling; defaults to researcher (or the inherited agent's role with `from`)"}
                 },
                 "required": ["project", "agent", "description", "prompt"]
             }
@@ -601,9 +602,18 @@ fn agent_new(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let prompt = require_str(args, "prompt")?;
     let model = args.get("model").and_then(Value::as_str);
     let from = args.get("from").and_then(Value::as_str);
+    // An explicit role beats inference: inference reads the permission
+    // block the new agent inherited, which says what a DIFFERENT agent was
+    // allowed to do.
+    let role = match args.get("role").and_then(Value::as_str) {
+        Some(raw) => Some(corpus_core::AgentRole::parse(raw).ok_or_else(|| {
+            Error::Args(format!("role {raw:?} is not one of researcher|tester|super"))
+        })?),
+        None => None,
+    };
     // The core validator runs server-side on the built document.
     ctx.store
-        .create_agent(&project, &agent, &description, &prompt, model, from)
+        .create_agent(&project, &agent, &description, &prompt, model, from, role)
         .map_err(|e| Error::Args(e.to_string()))?;
     Ok(format!(
         "created agent {project}/{agent}{} (validator passed)",

@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::models::ModelRegistry;
-use crate::store::{Store, AGENT_ENV, PROJECT_ENV, RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV};
+use crate::store::{Store, AGENT_ENV, HANDLE_ENV, PROJECT_ENV, RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV};
 
 /// One transcript line. In the piped backend the two child streams are
 /// kept apart; in the TUI backend lines come from the raw capture, so
@@ -243,7 +243,16 @@ impl RunSession {
         let opencode = resolve_opencode()?;
         let tmux = resolve_tmux().ok_or_else(|| Error::Store("tmux vanished".into()))?;
         let ts = now_secs();
+        // Two identifiers, on purpose: `agent_stem` is the dir slug (the
+        // run's identity, resolved to a role server-side); `handle` is the
+        // name opencode shows and loads `--agent` by. They coincide for an
+        // unnamed agent.
         let agent_stem = crate::store::slugify(agent);
+        let handle = opencode_agent_handle(store, project, agent);
+        // The session name stays keyed by the dir slug: `session_raw_log`
+        // pairs `corpus-<slug>-<ts>` with `runs/<ts>-<slug>.raw`, and the
+        // raw capture is written by slug. Only opencode's `--agent` (the
+        // HANDLE_ENV below) uses the friendly handle.
         let session = format!("corpus-{agent_stem}-{ts}");
         let export_json = Self::runs_for(store, project, agent, ts, "json");
         let temp = std::env::temp_dir();
@@ -269,6 +278,7 @@ impl RunSession {
         let mut env: Vec<(&str, &str)> = vec![
             ("CORPUS_OPENCODE_BIN", &opencode_bin),
             (AGENT_ENV, &agent_stem),
+            (HANDLE_ENV, &handle),
             ("CORPUS_OPENCODE_MODEL", model),
             (PROJECT_ENV, project),
             (STORE_ENV, &store_root),
@@ -286,6 +296,19 @@ impl RunSession {
         if !status.success() {
             let _ = fs::remove_file(&script);
             return Err(Error::Store(format!("tmux refused the session: {status}")));
+        }
+        // Put the run's identity in the SESSION environment too. The script
+        // exports it into the one pane it execs, which leaves a new window
+        // or split inside a live `corpus-*` session with no identity at
+        // all — the server there fails closed, but the operator just sees
+        // every tool refused. This makes a second pane behave like the
+        // first. Session-scoped, so it dies with the session; it is a
+        // convenience, not a control (the ceiling still comes from the
+        // agent's sidecar, server-side).
+        for (key, value) in &env {
+            let _ = Command::new(&tmux)
+                .args(["set-environment", "-t", &session, key, value])
+                .status();
         }
         // Session-scoped mouse mode: the embedded pane forwards wheel as
         // SGR mouse reports, and tmux answers them with copy-mode scrollback
@@ -347,7 +370,7 @@ impl RunSession {
             let mut log = fs::File::create(&transcript)?;
             log.write_all(header.as_bytes())?;
         }
-        let mut command = opencode_command(&opencode, project, agent, model, mission);
+        let mut command = opencode_command(&opencode, project, agent, model, mission)?;
         if let Some(pins) = source_pins {
             command.env(SOURCE_PINS_ENV, pins);
         }
@@ -533,16 +556,6 @@ impl RunSession {
     }
 }
 
-/// The repo root our runs attach to: the parent of the store root.
-fn repo_root(store: &Store) -> PathBuf {
-    store
-        .root()
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default()
-        .canonicalize()
-        .unwrap_or_else(|_| store.root().to_path_buf())
-}
 
 /// Resolve the effective launch model:
 /// primary-agent model -> launch arg -> registry tool-use default -> refuse.
@@ -647,8 +660,10 @@ fn write_tui_script(
 
 /// The `--agent/--model` prefix shared by every spawn: the agent and model
 /// are always explicit (opencode's ambient default is never inherited).
+/// `--agent` is the display HANDLE (a name), not the dir slug the server
+/// identifies the run by (`$CORPUS_OPENCODE_AGENT`).
 fn make_exec_vars() -> String {
-    "\"$CORPUS_OPENCODE_BIN\" --agent \"$CORPUS_OPENCODE_AGENT\" --model \"$CORPUS_OPENCODE_MODEL\"".to_string()
+    "\"$CORPUS_OPENCODE_BIN\" --agent \"$CORPUS_OPENCODE_HANDLE\" --model \"$CORPUS_OPENCODE_MODEL\"".to_string()
 }
 
 /// Single-quote a dynamic value so it is inert inside the run script.
@@ -941,8 +956,8 @@ pub(crate) fn resolve_opencode() -> Result<PathBuf> {
             return Ok(candidate);
         }
     }
-    if let Some(repo_root) = Store::from_env().root().parent() {
-        let candidate = repo_root
+    if let Some(resources) = crate::paths::resource_root_opt() {
+        let candidate = resources
             .join(".opencode")
             .join("node_modules")
             .join(".bin")
@@ -1028,10 +1043,14 @@ fn opencode_command(
     agent: &str,
     model: Option<&str>,
     mission: &str,
-) -> Command {
+) -> Result<Command> {
     let mut command = Command::new(opencode);
     let agent_stem = crate::store::slugify(agent);
-    command.args(["run", "--agent", &agent_stem]);
+    let store = Store::from_env();
+    // opencode loads `--agent` by the rendered handle (a name); the server
+    // still identifies the run by the dir slug via `AGENT_ENV` below.
+    let handle = opencode_agent_handle(&store, project, agent);
+    command.args(["run", "--agent", &handle]);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(model) = model {
         command.args(["-m", model]);
@@ -1040,13 +1059,12 @@ fn opencode_command(
     if !mission.trim().is_empty() {
         command.arg(mission);
     }
-    let store = Store::from_env();
-    // The run's cwd is the PROJECT's run dir (own .opencode/agent set,
-    // own opencode session pool); provisioning failure falls back to the
-    // repo root rather than refusing the launch.
-    let cwd = store
-        .provision_run_dir(project)
-        .unwrap_or_else(|_| repo_root(&store));
+    // The run's cwd is the PROJECT's run dir (own .opencode/agent set, own
+    // opencode session pool, exactly one project's store subtree visible).
+    // A provisioning failure REFUSES the launch: it used to fall back to
+    // the repo root, where opencode discovers the repo's own agent set and
+    // the whole store — precisely the boundary this cwd exists to enforce.
+    let cwd = store.provision_run_dir(project)?;
     command.current_dir(cwd);
     command
         .env(PROJECT_ENV, project)
@@ -1062,12 +1080,26 @@ fn opencode_command(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    command
+    Ok(command)
 }
 
 /// The materialized agent file stem: bare (slugified) — no team prefix.
 pub fn agent_file_stem(agent: &str) -> String {
     crate::store::slugify(agent)
+}
+
+/// The opencode `--agent` handle for a launched agent: its project-unique,
+/// name-derived identifier (see [`crate::primary_handles`]). This is what
+/// opencode shows and resolves the rendered `.opencode/agent/<handle>.md`
+/// by, so it must match what the renderer wrote. Falls back to the dir slug
+/// when the project can't be listed — the same value the renderer uses for
+/// an unnamed agent.
+pub fn opencode_agent_handle(store: &Store, project: &str, slug: &str) -> String {
+    store
+        .list_agents(project)
+        .ok()
+        .and_then(|agents| crate::primary_handles(&agents).remove(slug))
+        .unwrap_or_else(|| crate::store::slugify(slug))
 }
 
 /// A fresh transcript path + the epoch for headless runs.
@@ -1147,7 +1179,7 @@ fn kill_tree(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::CORE_SEEDS;
+    use crate::agents::AgentRole;
     use std::sync::MutexGuard;
 
     /// The env- and process-mutating launch tests are inherently global
@@ -1161,30 +1193,28 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// A store in its OWN world: the run dir is a sibling of the store
+    /// (`<store parent>/var/run/<project>`), so temp stores that shared a
+    /// parent — every one of them, when the parent was `/tmp` — collided
+    /// on the run dir of any project with the same slug.
     fn tmp_store(tag: &str) -> (Store, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("corpus-launch-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let world =
+            std::env::temp_dir().join(format!("corpus-launch-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&world);
+        let dir = world.join("store");
         (Store::new(dir.clone()), dir)
     }
 
-    fn seed_core(store: &Store) {
-        let seed_dir = store.seed_agents_dir();
-        for slug in CORE_SEEDS {
-            let d = seed_dir.join(slug);
-            let _ = fs::create_dir_all(&d);
-            fs::write(
-                d.join("opencode.json"),
-                format!(
-                    "{{\"$schema\":\"https://opencode.ai/config.json\",\"agent\":{{\"{slug}\":{{\"description\":\"{slug}\",\"mode\":\"primary\",\"prompt\":\"You are {slug}.\\n\"}}}}}}"
-                ),
-            )
-            .unwrap();
-        }
-    }
-
+    /// A project with the two agents the launch tests exercise. Projects
+    /// no longer come with agents — they are created from a role.
     fn core_project(store: &Store) {
-        seed_core(store);
         store.create_project("default", "Default", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("default", "operator", AgentRole::Tester)
+            .unwrap();
+        store
+            .create_agent_with_role("default", "researcher", AgentRole::Researcher)
+            .unwrap();
     }
 
     #[test]
@@ -1326,8 +1356,11 @@ mod tests {
     #[test]
     fn both_launch_paths_export_the_agent_identity() {
         let _guard = env_lock();
-        let (_store, store_dir) = tmp_store("agent-env");
+        let (store, store_dir) = tmp_store("agent-env");
         std::env::set_var("CORPUS_STORE", &store_dir);
+        // A run dir belongs to a project, and provisioning now refuses to
+        // invent one.
+        store.create_project("default", "D", "cdk-regtest").unwrap();
 
         // Piped path: the identity rides the child's environment.
         let command = opencode_command(
@@ -1336,7 +1369,8 @@ mod tests {
             "discover",
             Some("test/model"),
             "probe",
-        );
+        )
+        .expect("provision the run dir");
         let exported: Vec<(String, String)> = command
             .get_envs()
             .filter_map(|(k, v)| {
@@ -1376,7 +1410,7 @@ mod tests {
         // Bare launch: no --session, no --prompt.
         write_tui_script(&script, &[], None, None).unwrap();
         let bare = read(&script);
-        assert!(bare.contains("--agent \"$CORPUS_OPENCODE_AGENT\""), "{bare}");
+        assert!(bare.contains("--agent \"$CORPUS_OPENCODE_HANDLE\""), "{bare}");
         assert!(!bare.contains("--session"), "a fresh launch resumes nothing: {bare}");
         assert!(!bare.contains("--prompt"), "{bare}");
 
@@ -1438,15 +1472,17 @@ mod tests {
     #[test]
     fn materialize_agent_renders_agent_files() {
         let (store, dir) = tmp_store("mat-v2");
-        seed_core(&store);
         store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "operator", AgentRole::Tester)
+            .unwrap();
         let written = store.render_agent("p", "operator", &[]).unwrap();
         assert!(!written.is_empty());
         let dest = &written[0];
         assert!(dest.ends_with("operator.md"), "{dest:?}");
         let text = fs::read_to_string(dest).unwrap();
         assert!(text.contains("mode: primary"), "{text}");
-        assert!(text.contains("You are operator."), "{text}");
+        assert!(text.contains("corpus TESTER"), "the role's prompt: {text}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

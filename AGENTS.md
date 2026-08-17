@@ -30,15 +30,9 @@ benchmarks/
                      benchmarks/results/<model>/*.yaml)
   forensic/          historical-bug forensic suite (CDK-BENCH-XXXX.yaml)
   results/           per-model benchmark score results
-store/               the corpus knowledge base. Core seed agents (versioned
-                     with the app — the one committed part of store/) live
-                     at store/templates/agents/<slug>/{opencode.json, prompts/};
-                     the management-chat recipe (goose, GDK) lives at
-                     store/templates/chat/ (recipe.yaml + subrecipes/);
-                     the data itself is scoped:
-                     store/projects/<slug>/corpus/             (the corpus)
-                     store/projects/<slug>/agents/<slug>/      (agent configs)
-                     store/projects/<slug>/missions/<slug>.md  (mission records)
+crates/corpus-app/assets/chat/
+                     the management-chat recipe (goose, GDK): recipe.yaml +
+                     subrecipes/. Committed code, not user data.
 sources.toml         pinned target source manifest (repo → tag + sha; the
                      DEFAULT pin per repo — the PLUGIN defines the revs
                      available, the PROJECT owns the pick (persisted on
@@ -56,9 +50,47 @@ dev/                 everything uncommitted & machine-local: architecture,
                      app-parity-spec, mission-view-plan)
                      and the demo poster. Git-ignored: may be absent on
                      a fresh clone.
-.opencode/           opencode config + the role agents (operator, researcher,
-                     generated from store/templates/agents — do not hand-edit)
+.opencode/           opencode SKILLS only. No agent files and no
+                     opencode.json: agents are generated per project into
+                     that project's run dir, and the MCP config is written
+                     there too. Anything project-bound checked in here is
+                     discoverable by every run — that is how one project's
+                     agent came to read another's corpus.
 ```
+
+## Where the data lives
+
+```
+~/.corpus/                        CORPUS_HOME — everything the operator produces
+  store/projects/<slug>/          CORPUS_STORE
+    project.yaml  corpus/  agents/  missions/
+  var/run/<slug>/                 the opencode run cwd, per project
+  var/chat/<slug>/                goose management-chat scope
+  app.yaml                        app prefs
+```
+
+A run dir is provisioned per launch and exposes EXACTLY one project:
+
+```
+~/.corpus/var/run/<slug>/                    outside any git repo
+  store/projects/<slug> -> ~/.corpus/store/projects/<slug>   only this one
+  sources               -> <resources>/sources
+  .opencode/opencode.json                    generated; carries CORPUS_PROJECT
+  .opencode/agent/*.md                       rendered from the project's agents
+```
+
+That is the project boundary. The permission globs in a rendered agent are
+the second line of defence, not the only one: another project's corpus is
+absent from the namespace rather than deny-listed, and `benchmarks/` (the
+answer key) and `plugins/` are unreachable rather than forbidden. Because
+the run cwd sits outside the repo, opencode's own upward config discovery
+cannot reach this repo's `.opencode/` either.
+
+The **resource root** (`CORPUS_RESOURCES`, else found from the running
+executable — the directory holding `plugins/` and `sources.toml`) is the
+other half: shipped, read-only, replaced by an upgrade. `corpus-core/paths.rs`
+owns both roots. `store.root().parent()` is NOT the repo root and must never
+be used as one again.
 
 ## Build / test / run commands
 
@@ -98,13 +130,13 @@ Environment is checked via `corpus plugin probe cdk-regtest`. The CLI:
 corpus plugin list
 corpus plugin probe <name>
 corpus plugin call <name> <method> [params-json]
-# Run a mission; the project's agents are materialized to the PROJECT's
-# OWN .opencode/agent/ inside its run directory
-# (store/projects/<p>/var/run/ — provisioned per launch with symlinks to
-# the repo's store/, sources/, and .opencode/opencode.json so relative
-# paths and the MCP config resolve). opencode runs with that dir as cwd:
-# each project owns its agent set AND its opencode session pool — one
-# project never overwrites another's materialized agents. The app
+# Run a mission on CORPUS_PROJECT (no default — an unscoped run refuses).
+# The project's agents are materialized to the PROJECT's OWN
+# .opencode/agent/ inside its run directory (~/.corpus/var/run/<p>/ —
+# provisioned per launch, linking ONLY that project's store subtree plus
+# sources/, with a generated opencode.json carrying CORPUS_PROJECT).
+# opencode runs with that dir as cwd: each project owns its agent set AND
+# its opencode session pool, and no other project exists in its namespace. The app
 # launches the FULL opencode TUI in a
 # DETACHED tmux session (corpus-<agent>-<ts>) and shows it in the
 # EMBEDDED terminal pane (egui_term; the pane runs `tmux attach`
@@ -133,13 +165,8 @@ corpus run <agent> [-m model] [--research] <mission...>
 corpus models list
 # Scoped store admin: projects, agents, missions
 corpus project list|new|clone|delete|rebind|wipe <slug>
-corpus agent list|new|clone|delete <project> ...
+corpus agent list|new|clone|delete <project> ...   # new takes --role
 corpus mission list|new|delete <project> ...
-corpus store migrate [--dry-run] [--project <slug>] [--confirm]
-                                  # relocate a legacy flat store into
-                                  # store/projects/<default>/corpus/ (dry-run
-                                  # reports only; moves are checksum-verified)
-                                  # --confirm also removes legacy template dirs
 # corpus-admin MCP profile: the SAME corpus-mcp binary behind `--admin`
 corpus-mcp --admin                 # stdio MCP server; 21 admin tools only
 ```
@@ -206,7 +233,7 @@ extensions:
   material). goose has no session-db-only override; the supported
   mechanism is `GOOSE_PATH_ROOT` (reroutes the whole config/data/state
   tree), so the sessions DB lands at
-  `store/projects/<p>/var/chat/data/sessions/`. ALWAYS launch the chat
+  `~/.corpus/var/chat/<p>/data/sessions/`. ALWAYS launch the chat
   through the wrapper `scripts/goose-chat [goose args...]` (scope =
   `CORPUS_PROJECT`, default `default`) — it provisions the scope's own
   config.yaml (provider + corpus-admin + developer-off, `GOOSE_INPUT_LIMIT`
@@ -214,14 +241,14 @@ extensions:
   `scripts/goose-chat run -n ops -t "<prompt>"`. A raw `goose run` outside
   the wrapper leaks sessions to the default dir.
 - **The management chat runs the committed recipe**
-  `store/templates/chat/recipe.yaml` — a FLAT single agent with the full
+  `crates/corpus-app/assets/chat/recipe.yaml` — a FLAT single agent with the full
   corpus-admin catalog and the confirm-token gate as the sole hard control
   (D1 verdict: goose subrecipe delegation does not load a subrecipe's
   extensions into subagents, so per-subagent grants are not enforceable via
   subrecipes; `available_tools` DOES filter when a recipe runs as its own
   main recipe — see dev/decisions.md, the chat-runtime closeout). Headless drive:
-  `scripts/goose-chat run --recipe store/templates/chat/recipe.yaml --params "request=<utterance>"`;
-  interactive: `scripts/goose-chat --recipe store/templates/chat/recipe.yaml`.
+  `scripts/goose-chat run --recipe crates/corpus-app/assets/chat/recipe.yaml --params "request=<utterance>"`;
+  interactive: `scripts/goose-chat --recipe crates/corpus-app/assets/chat/recipe.yaml`.
 - **The app's native management chat** (dev/decisions.md, the chat-runtime
   closeout): goose's `Agent` runtime is EMBEDDED in-process as a source-level
   git dependency (pinned rev, Apache-2.0 — see dev/decisions.md for the
@@ -307,14 +334,18 @@ the `corpus_sandbox_exec` MCP tool (see Trust domains below).
 
 | Zone | Who may do it | Egress | Never mounted into the sandbox |
 |---|---|---|---|
-| **Execution sandbox** | the `operator` agent, via `corpus_sandbox_exec` | DENIED by default | benchmarks/, plugins/, oracle implementations, store/findings of the current mission |
-| **Research zone** | the `researcher` agent (reads only) | open internet (webfetch/search) | executes nothing; read-denied on benchmarks/** |
+| **Execution sandbox** | the `tester` ROLE, via `corpus_sandbox_exec` | DENIED by default | benchmarks/, plugins/, oracle implementations, findings of the current mission |
+| **Research zone** | the `researcher` ROLE (reads only) | open internet (webfetch/search) | executes nothing; read-denied on benchmarks/** |
 | **Model inference** | host-side only, local by default | the model endpoint sits on the host | the sandbox has no model access |
 | **Corpus store** | write via MCP tools (`finding_write`, `attack_save`, `technique_save`), gated per artifact | — | — |
 
-Roles are enforced in `.opencode/agent/` by opencode permissions, not
-vibes. The operator has all host reads denied; its only channel into the
-world is the MCP tool catalog. The researcher can never execute.
+Roles are `AgentRole::{Researcher, Tester, Super}` and are enforced twice:
+server-side by corpus-mcp (which resolves the run's agent from
+`CORPUS_OPENCODE_AGENT` + `CORPUS_PROJECT` and refuses everything outside
+the ceiling), and in the rendered `.opencode/agent/*.md` by opencode
+permissions DERIVED from the role at render time. The stored config can
+only tighten, never widen. A tester's channel into the world is the MCP
+tool catalog; a researcher can never execute.
 
 ## Plugin protocol
 
@@ -334,19 +365,32 @@ The reference plugin is `plugins/cdk-regtest`.
   requirement: permissions cover `corpus/**`, so agents may invent any
   subpath; out-of-category files surface in the project view's `other`
   bucket.
-- Core seed agents live at `store/templates/agents/<slug>/` (opencode.json +
-  prompts/) and are the one committed part of store/ (`.gitignore` carves them
-  out of the otherwise-private store). The role agents in `.opencode/agent/`
-  are **generated** from them — regenerate with
-  `cargo run -p corpus-core --example render_seeds` after editing a seed;
-  hand-editing both is drift (the `templates` test enforces byte equality).
-  Every render is **project-bound**: `store/projects/*` permission patterns
-  are rewritten to the concrete project, a wildcard read-allow gains the
-  boundary rules (`store/projects/*: deny`, own-project allow), the trust
-  red lines (`benchmarks/**`, `plugins/**` read denies) are injected
-  unconditionally (they cannot be edited out of an agent JSON), and a
-  "Corpus scope" section is appended naming the exact corpus — a launched
-  agent cannot read or write another project's corpus.
+- There are no seed agent documents. A new agent is created from a ROLE
+  (`corpus agent new <p> <slug> --role researcher|tester|super`), whose
+  starting prompt is compiled into corpus-core
+  (`crates/corpus-core/src/prompts/*.md`) and whose ceiling the renderer
+  derives. Seeds were data pretending to be code: they shipped in the repo,
+  drifted from the renderer, and gave every agent two sources of truth about
+  what it could do. Fixtures for the render live in
+  `crates/corpus-core/tests/fixtures/` — never in a directory opencode
+  discovers — and re-bless with `CORPUS_BLESS=1 cargo test -p corpus-core
+  --test roles`.
+- Every render is **project-bound**: `store/projects/*` permission patterns
+  are rewritten to the concrete project; the path rules exist even when the
+  stored config omits them (silence never means allow); a read-allow gains
+  the boundary rules — relative (`store/projects/*: deny`, own corpus and
+  missions allowed) AND absolute (the data root denied, the one project's
+  corpus re-allowed), because the run cwd's relative globs say nothing
+  about `/Users/…/.corpus/...`; the trust red lines (`benchmarks/**`,
+  `plugins/**`) are injected unconditionally; `task:` is confined to entries
+  the project actually declares; and a "Corpus scope" section names the
+  exact corpus.
+- A rendered agent set must be **closed under delegation**: every name in a
+  `task:` allowlist belongs to an agent the project declares. A dangling
+  name is not inert — opencode resolves it from whatever config it finds
+  above the run cwd, which is exactly how one project's primary came to
+  delegate to another project's scout. `render_project_agents` refuses;
+  `Store::check_project_delegation` is the same check for a pre-launch UI.
 - Slugs are **kebab-case**, one card per technique (no `_` / title drift).
 - `findings/` and `runs/` filenames carry an **epoch-seconds prefix**
   (`<epoch>-<slug>`); they read newest-first. Other categories are A–Z.

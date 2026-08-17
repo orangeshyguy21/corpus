@@ -14,21 +14,6 @@ fn echo_plugin() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../corpus-core/tests/echo-plugin")
 }
 
-fn seed_core(store: &Store) {
-    let dir = store.seed_agents_dir();
-    for slug in ["operator", "researcher"] {
-        let d = dir.join(slug);
-        let _ = std::fs::create_dir_all(&d);
-        std::fs::write(
-            d.join("opencode.json"),
-            format!(
-                "{{\"$schema\":\"https://opencode.ai/config.json\",\"agent\":{{\"{slug}\":{{\"description\":\"{slug}\",\"mode\":\"primary\",\"prompt\":\"You are {slug}.\\n\"}}}}}}"
-            ),
-        )
-        .unwrap();
-    }
-}
-
 /// Admin rig: project "proj" + one ops mission + an echo-plugin binding in
 /// the registry (CORPUS_PLUGINS_DIR points at the echo plugin) so rebind
 /// validation sees a real plugin name.
@@ -38,9 +23,10 @@ fn rig(tag: &str) -> (Ctx, Store, PathBuf, String) {
     // Point plugin discovery at the echo plugin so project_rebind validates.
     std::env::set_var("CORPUS_PLUGINS_DIR", echo_plugin().parent().unwrap());
     let store = Store::new(root.clone());
-    seed_core(&store);
     store.create_project("proj", "Proj", "echo-plugin").expect("create project");
-    store.create_blank_agent("proj", "appsec").expect("agent");
+    store
+        .create_agent_with_role("proj", "appsec", corpus_core::AgentRole::Researcher)
+        .expect("agent");
     // The admin profile has no agent identity — the role is irrelevant to
     // it by design (see the orthogonality test below).
     let mut ctx = Ctx::for_test(

@@ -551,6 +551,12 @@ impl AppState {
         self.store.set_agent_field(project, slug, entry, field, value)
     }
 
+    /// Rename an agent's display label (the slug — its identity in every
+    /// path — is untouched).
+    pub fn set_agent_name(&self, project: &str, slug: &str, name: &str) -> Result<(), Error> {
+        self.store.set_agent_name(project, slug, name)
+    }
+
     /// Set the agent's (or a subagent's) role — the server-enforced ceiling.
     pub fn set_agent_role(
         &self,
@@ -613,17 +619,19 @@ impl AppState {
         self.store.delete_agent(project, slug)
     }
 
-    /// Clone a core seed into the project as a new (auto-id'd) agent —
-    /// the sidebar's "+ agent → clone-from-seed" flow. `seed` is a
-    /// core-seed name (`operator` / `researcher`), or `blank` for the
-    /// empty config.
-    pub fn create_agent_from_seed(&self, project: &str, seed: &str) -> Result<String, Error> {
+    /// Create a new (auto-id'd) agent from a ROLE — the sidebar's
+    /// "+ agent" flow. Roles replaced the seed set: the role already
+    /// decides the capability ceiling the renderer writes, so a seed
+    /// document was only ever contributing a starting prompt, which now
+    /// ships compiled into corpus-core.
+    pub fn create_agent_with_role(&self, project: &str, role: corpus_core::AgentRole) -> Result<String, Error> {
         let id = new_uuid_id();
-        if seed == "blank" {
-            self.store.create_blank_agent(project, &id)?;
-        } else {
-            self.store.create_agent_from_seed(project, &id, seed)?;
-        }
+        self.store.create_agent_with_role(project, &id, role)?;
+        // Stamp the human placeholder name so the Forms tab and the sidebar
+        // show an editable label (and opencode a friendly handle), not the
+        // opaque id. Best-effort: a naming failure must not undo a created
+        // agent.
+        let _ = self.store.set_agent_name(project, &id, corpus_core::DEFAULT_AGENT_NAME);
         Ok(id)
     }
 
@@ -1122,6 +1130,20 @@ impl AppState {
     pub fn agent_default_model(&self, project: &str, agent: &str) -> Option<String> {
         corpus_core::launch::agent_default_model(&self.store, project, agent)
             .or_else(|| self.suggested_model())
+    }
+}
+
+/// The label to show for an agent: its display name, never the opaque
+/// slug (a UUID). Agents predating names — or created before the default
+/// placeholder — carry a sidecar `name` equal to their slug; those fall
+/// back to a friendly placeholder so a raw id never surfaces in the UI.
+/// The slug stays available in hover tooltips and the JSON tab for anyone
+/// who needs the identity.
+pub fn agent_label(name: &str, slug: &str) -> String {
+    if name.is_empty() || name == slug {
+        "unnamed agent".to_string()
+    } else {
+        name.to_string()
     }
 }
 

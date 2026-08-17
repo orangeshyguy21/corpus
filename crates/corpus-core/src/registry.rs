@@ -24,11 +24,17 @@ pub struct PluginDir {
 /// Environment variable overriding the plugins directory.
 pub const PLUGINS_DIR_ENV: &str = "CORPUS_PLUGINS_DIR";
 
-/// Resolve the plugins directory: env override, else `<cwd>/plugins`.
+/// Resolve the plugins directory: env override, else `plugins/` under the
+/// resource root. The old fallback was the RELATIVE `plugins`, so which
+/// plugins existed depended on the process's cwd — a launcher started from
+/// anywhere but the repo silently saw none.
 pub fn plugins_dir() -> PathBuf {
-    std::env::var(PLUGINS_DIR_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("plugins"))
+    if let Some(dir) = std::env::var(PLUGINS_DIR_ENV).ok().filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    crate::paths::resource_root_opt()
+        .map(|root| root.join("plugins"))
+        .unwrap_or_else(|| PathBuf::from("plugins"))
 }
 
 /// Discover all plugins under a directory (invalid entries are skipped
@@ -158,17 +164,14 @@ pub fn plugin_sources(store: &Store, project: &str) -> Result<Vec<SourceRevs>, E
         .collect();
     repos.sort();
 
-    // The repo's sources.toml (sibling of the plugins dir, at the repo
-    // root) provides each source's pin identity + the clone URL; fetched
-    // trees (and the rev cache) live beside it under sources/.
-    let repo_root = pdir
-        .dir
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| pdir.dir.clone());
-    let sources_dir = repo_root.join("sources");
-    let entries = load_source_entries(&repo_root.join("sources.toml"));
+    // sources.toml provides each source's pin identity + the clone URL;
+    // fetched trees (and the rev cache) live beside it under sources/.
+    // Both come from the RESOURCE root — the plugin dir's grandparent used
+    // to stand in for it, which made the plugin layout load-bearing for
+    // path resolution.
+    let resources = crate::paths::resources_for_plugins()?;
+    let sources_dir = resources.join("sources");
+    let entries = load_source_entries(&resources.join("sources.toml"));
 
     let mut out = Vec::new();
     for repo in repos {
@@ -240,14 +243,9 @@ pub fn prepare_source_pins(
                 .collect()
         })
         .unwrap_or_default();
-    let repo_root = pdir
-        .dir
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| pdir.dir.clone());
-    let sources_dir = repo_root.join("sources");
-    let entries = load_source_entries(&repo_root.join("sources.toml"));
+    let resources = crate::paths::resources_for_plugins()?;
+    let sources_dir = resources.join("sources");
+    let entries = load_source_entries(&resources.join("sources.toml"));
     for (name, rev) in pins {
         if rev.trim().is_empty() || !declared.contains(name) {
             continue;

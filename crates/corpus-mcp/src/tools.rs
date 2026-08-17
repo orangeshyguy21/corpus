@@ -20,12 +20,22 @@ const OUTPUT_CAP_BYTES: usize = 8 * 1024;
 /// sandbox, regtest-only) lives in the plugin.
 #[derive(Debug)]
 pub struct Ctx {
-    /// The environment plugin driving the harness.
-    pub plugin: Plugin,
-    /// Corpus store root (projects/, templates/).
+    /// The environment plugin driving the harness, when one could be
+    /// resolved. `None` for the store-only admin profile (which has no
+    /// project, hence no plugin binding) and whenever resolution failed —
+    /// `probe_notes` then carries the reason and every sandbox tool refuses.
+    pub plugin: Option<Plugin>,
+    /// Corpus store root (projects/).
     pub store: Store,
-    /// Default write scope: which project corpus writes land in.
-    pub scope: Scope,
+    /// The write scope: which project corpus reads and writes resolve to,
+    /// or why none could be established.
+    ///
+    /// `Err` refuses every scoped tool with that message. Fail-closed for
+    /// the same reason as `role`: this used to default to the project named
+    /// `default`, so a launch that lost `CORPUS_PROJECT` wrote a whole
+    /// mission's findings into another project's corpus and reported
+    /// success.
+    pub scope: std::result::Result<Scope, String>,
     /// Faucet spend within this server session (sats).
     pub faucet_spent_sats: u64,
     /// Per-session faucet budget.
@@ -85,31 +95,56 @@ const REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 impl Ctx {
     /// Resolve from the environment.
     pub fn from_env() -> Result<Self> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let plugin_dir = std::env::var("CORPUS_PLUGIN_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(format!("{home}/Sites/corpus/plugins/cdk-regtest")));
-        let mut plugin = Plugin::spawn(&plugin_dir)?;
+        let store = Store::from_env();
+        // The project gate runs FIRST: the plugin binding is a property of
+        // the project, so a server that cannot say which project it serves
+        // cannot say which environment it drives either.
+        let scope = Scope::from_env_strict(&store);
+        // A missing plugin is NOT fatal: the admin profile is store-only and
+        // has no project scope by design, so it must still start. The
+        // sandbox tools refuse through the probe gate instead.
+        let mut plugin = match resolve_plugin_dir(&store, &scope) {
+            Ok(dir) => match Plugin::spawn(&dir) {
+                Ok(plugin) => Ok(plugin),
+                Err(e) => Err(format!("plugin at {}: {e}", dir.display())),
+            },
+            Err(e) => Err(e.to_string()),
+        };
         // Probe the environment once at startup; the result gates every
         // tool call (version-pin mismatch included).
-        let probe = plugin.probe().unwrap_or_else(|e| ProbeResult {
-            ready: false,
-            notes: format!("probe failed: {e}"),
-        });
+        let probe = match plugin.as_mut() {
+            Ok(plugin) => plugin.probe().unwrap_or_else(|e| ProbeResult {
+                ready: false,
+                notes: format!("probe failed: {e}"),
+            }),
+            Err(why) => ProbeResult {
+                ready: false,
+                notes: why.clone(),
+            },
+        };
         let source_pins = std::env::var(corpus_core::SOURCE_PINS_ENV)
             .ok()
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .and_then(|v| v.as_object().cloned());
         let run_log = std::env::var(corpus_core::RUN_LOG_ENV).ok().filter(|s| !s.is_empty());
-        let store = Store::from_env();
-        let scope = Scope::from_env();
-        let role = resolve_role(&store, &scope);
+        // The role is resolved against a PROVEN scope: an agent name is only
+        // meaningful inside a project, so a scope failure is a role failure.
+        let role = scope
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|scope| resolve_role(&store, scope));
+        if let Err(why) = &scope {
+            // Loud, because every scoped tool is about to be refused.
+            eprintln!("corpus-mcp: no project scope resolved — {why}");
+        }
         if let Err(why) = &role {
-            // Loud, because every sandbox tool is about to be refused.
             eprintln!("corpus-mcp: no agent role resolved — {why}");
         }
+        if let Err(why) = &plugin {
+            eprintln!("corpus-mcp: no environment plugin — {why}");
+        }
         Ok(Self {
-            plugin,
+            plugin: plugin.ok(),
             store,
             scope,
             faucet_spent_sats: 0,
@@ -131,9 +166,9 @@ impl Ctx {
     /// every one of them to restate the whole struct.
     pub fn for_test(plugin: Plugin, store: Store, scope: Scope, role: AgentRole) -> Self {
         Self {
-            plugin,
+            plugin: Some(plugin),
             store,
-            scope,
+            scope: Ok(scope),
             faucet_spent_sats: 0,
             faucet_budget_sats: 1_000_000,
             probe_ready: true,
@@ -147,22 +182,80 @@ impl Ctx {
         }
     }
 
-    /// The scope for a write: the configured project scope. The `team`
-    /// argument is accepted for backward-compatibility but ignored —
-    /// the corpus is project-level only.
+    /// The scope every scoped tool resolves through — the ONE choke point,
+    /// so a server with no proven project refuses uniformly and early,
+    /// instead of each tool inventing a fallback and failing later with an
+    /// unrelated message. The `team` argument is accepted for
+    /// backward-compatibility but ignored: the corpus is project-level only.
+    ///
+    /// The project must still EXIST at call time: it is checked at startup,
+    /// but a project can be deleted under a live server.
     fn write_scope(&self, _args: &Value) -> Result<Scope> {
-        Ok(self.scope.clone())
+        let scope = self.scope.clone().map_err(Error::Scope)?;
+        if !self.store.project_dir(&scope.project).join("project.yaml").is_file() {
+            return Err(Error::Scope(format!(
+                "project {:?} does not exist under {} — projects come into being deliberately, \
+                 never as a side effect of a tool call",
+                scope.project,
+                self.store.root().display()
+            )));
+        }
+        Ok(scope)
     }
 }
 
-/// Resolve the run's capability ceiling from its identity. Every failure
-/// is distinct: debugging a blanket deny-all across three different causes
-/// is otherwise miserable.
+/// The corpus category directory for a write. Created on demand — a
+/// freshly wiped project has no category dirs — but only ever INSIDE a
+/// project `write_scope` already proved exists, so a `create_dir_all` here
+/// can no longer conjure a whole corpus tree for a mis-scoped server.
+fn category_dir(ctx: &Ctx, scope: &Scope, category: &str) -> Result<PathBuf> {
+    let dir = scope.corpus_dir(&ctx.store).join(category);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// The plugin directory this server drives. `CORPUS_PLUGIN_DIR` is the
+/// explicit hand-run override; otherwise the binding comes from the
+/// PROJECT record, which is where it is declared. A sole plugin in the
+/// plugins dir is accepted as the last resort so the store-only admin
+/// profile — which has no project scope by design — still starts.
+fn resolve_plugin_dir(
+    store: &Store,
+    scope: &std::result::Result<Scope, String>,
+) -> Result<PathBuf> {
+    if let Some(dir) = std::env::var("CORPUS_PLUGIN_DIR").ok().filter(|s| !s.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    let plugins = corpus_core::plugins_dir();
+    if let Ok(scope) = scope {
+        let project = corpus_core::Project::load(store, &scope.project)
+            .map_err(|e| Error::Scope(format!("project {:?}: {e}", scope.project)))?;
+        return Ok(plugins.join(&project.plugin));
+    }
+    let mut found = corpus_core::discover(&plugins).unwrap_or_default();
+    match found.len() {
+        1 => Ok(found.remove(0).dir),
+        _ => Err(Error::Scope(format!(
+            "cannot resolve a plugin: {} names no project, and {} holds {} plugins — set \
+             CORPUS_PLUGIN_DIR to run this server by hand",
+            corpus_core::PROJECT_ENV,
+            plugins.display(),
+            found.len()
+        ))),
+    }
+}
+
+/// Resolve the run's capability ceiling from its identity, against a scope
+/// that is ALREADY proven. Every failure is distinct: debugging a blanket
+/// deny-all across three different causes is otherwise miserable.
 ///
-/// An explicit `--role <name>` argv flag wins — the escape hatch for
-/// invoking the server by hand. It is no more secure than the env var, but
-/// it is explicit and shows up in process listings rather than pretending
-/// to be a security control.
+/// An explicit `--role <name>` argv flag overrides the agent lookup — the
+/// escape hatch for invoking the server by hand. It is no more secure than
+/// the env var (anything that can spawn this binary can pass it), and it is
+/// deliberately checked HERE, after the project gate: it used to return
+/// first, so `--role super` with no `CORPUS_PROJECT` yielded a
+/// full-capability server writing into whatever project happened to be the
+/// default.
 fn resolve_role(store: &Store, scope: &Scope) -> std::result::Result<AgentRole, String> {
     let argv: Vec<String> = std::env::args().collect();
     if let Some(pos) = argv.iter().position(|a| a == "--role") {
@@ -180,14 +273,6 @@ fn resolve_role(store: &Store, scope: &Scope) -> std::result::Result<AgentRole, 
                 corpus_core::AGENT_ENV
             )
         })?;
-    // A silently-defaulted project would resolve the agent against the
-    // WRONG store subtree and look like it worked.
-    if std::env::var(corpus_core::PROJECT_ENV).ok().filter(|s| !s.is_empty()).is_none() {
-        return Err(format!(
-            "{} is unset, so agent {agent:?} cannot be resolved to a project",
-            corpus_core::PROJECT_ENV
-        ));
-    }
     let config = store.load_agent(&scope.project, &agent).map_err(|e| {
         format!(
             "agent {:?} not found in project {:?} ({e}) — the launched identity must name an agent \
@@ -405,14 +490,22 @@ fn resilient<T>(
     ctx: &mut Ctx,
     f: impl FnOnce(&mut corpus_core::Plugin) -> std::result::Result<T, corpus_core::Error>,
 ) -> Result<T> {
-    match f(&mut ctx.plugin) {
+    let plugin = ctx.plugin.as_mut().ok_or_else(|| {
+        Error::Scope(format!(
+            "no environment plugin: {}",
+            ctx.probe_notes.as_str()
+        ))
+    })?;
+    match f(plugin) {
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(
                 error,
                 corpus_core::Error::PluginClosed(_) | corpus_core::Error::Plugin { .. }
             ) {
-                let _ = ctx.plugin.restart();
+                if let Some(plugin) = ctx.plugin.as_mut() {
+                    let _ = plugin.restart();
+                }
             }
             Err(Error::Plugin(error))
         }
@@ -615,8 +708,7 @@ fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let slug = slugify(&title);
-    let dir = scope.corpus_dir(&ctx.store).join("findings");
-    std::fs::create_dir_all(&dir)?;
+    let dir = category_dir(ctx, &scope, "findings")?;
     let path = dir.join(format!("{ts}-{slug}.md"));
     let body = format!(
         "---\ntitle: {title}\nseverity: {severity}\noracle_verified: {verified}\nsensitivity: embargoed\ntimestamp: {ts}\n---\n\n\
@@ -638,7 +730,7 @@ fn attack_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
     if slug.is_empty() {
         return Err(Error::Args("name must contain alphanumerics".to_string()));
     }
-    let dir = scope.corpus_dir(&ctx.store).join("attacks").join(&slug);
+    let dir = category_dir(ctx, &scope, "attacks")?.join(&slug);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
         dir.join("attack.md"),
@@ -716,8 +808,7 @@ fn technique_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
     if slug.is_empty() {
         return Err(Error::Args("name must contain alphanumerics".to_string()));
     }
-    let dir = scope.corpus_dir(&ctx.store).join("techniques");
-    std::fs::create_dir_all(&dir)?;
+    let dir = category_dir(ctx, &scope, "techniques")?;
     let path = dir.join(format!("{slug}.md"));
     let overwrote = path.exists();
     let ts = std::time::SystemTime::now()

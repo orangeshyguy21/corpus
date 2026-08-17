@@ -1,10 +1,10 @@
 /target
-# The corpus store (findings, attacks, runs) is private and stays out of
-# the public app repo. It should eventually be its own private git repo.
-# Core templates under store/templates are the exception: they ship with the
-# app and are versioned (see AGENTS.md — templates are data, in the store).
-/store/*
-!/store/templates/
+# The corpus store lives OUTSIDE this repo now — `~/.corpus` (CORPUS_HOME),
+# with run dirs and chat scopes as siblings of the store. That is what puts
+# an opencode run's cwd outside any git repo, so it cannot discover this
+# repo's `.opencode/` or read `benchmarks/`. Nothing under `store/` should
+# ever come back; this guard is for strays.
+/store
 # Test-run artifacts under corpus-app: the management chat writes its scoped
 # goose config/session tree to a store/ path relative to CARGO_MANIFEST_DIR
 # during integration/live runs. It is never source; ignore it wholesale.

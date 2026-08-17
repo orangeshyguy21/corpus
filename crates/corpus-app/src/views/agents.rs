@@ -45,21 +45,50 @@ pub struct AgentsView {
     /// Which entry the forms are editing: None = the primary, Some = a
     /// subagent by entry name.
     entry: Option<String>,
-    /// Buffered text fields, flushed to the store on focus loss so every
-    /// keystroke isn't a disk write. Keyed by the entry they belong to so
-    /// switching entries can never write one's text onto another.
-    buffers: Option<FieldBuffers>,
+    /// The in-progress edits for the current entry. NOTHING here reaches the
+    /// store until Save — the Forms tab is Save-gated like the JSON tab.
+    /// Keyed by the entry it belongs to; switching entries re-seeds from
+    /// disk (unsaved edits are discarded, as in any Save-gated form).
+    draft: Option<FormDraft>,
     /// The new-subagent form, when open.
     new_subagent: Option<NewSubagent>,
     /// opencode's model catalog, fetched on demand (a subprocess).
     models: Option<corpus_core::ModelList>,
 }
 
-/// Text fields being edited, with the entry they belong to.
-struct FieldBuffers {
+/// The Forms tab's editable state for ONE entry: the current (edited) values
+/// alongside the on-disk baseline they were seeded from. Save writes only
+/// the fields that differ from their baseline; `dirty` compares the two so
+/// the button (and its unsaved marker) can reflect pending work.
+struct FormDraft {
     entry_key: String,
+    /// True when this draft edits the primary (name + sidecar role live on
+    /// the primary only).
+    is_primary: bool,
+    /// The agent's display name (sidecar `name`). Primary only.
+    name: String,
+    role: corpus_core::AgentRole,
+    /// Model id, or empty for "inherit launch default".
+    model: String,
     description: String,
     prompt: String,
+    // On-disk baseline captured at seed time.
+    base_name: String,
+    base_role: corpus_core::AgentRole,
+    base_model: String,
+    base_description: String,
+    base_prompt: String,
+}
+
+impl FormDraft {
+    /// Any field diverges from its on-disk baseline — there is work to Save.
+    fn dirty(&self) -> bool {
+        (self.is_primary && self.name.trim() != self.base_name)
+            || self.role != self.base_role
+            || self.model != self.base_model
+            || self.description != self.base_description
+            || self.prompt != self.base_prompt
+    }
 }
 
 #[derive(Default)]
@@ -78,7 +107,7 @@ impl Default for AgentsView {
             dirty: true,
             tab: Tab::Forms,
             entry: None,
-            buffers: None,
+            draft: None,
             new_subagent: None,
             models: None,
         }
@@ -132,19 +161,28 @@ impl AgentsView {
             self.error = None;
         }
 
-        let name = if agent.meta.name.is_empty() || agent.meta.name == slug {
-            slug.clone()
-        } else {
-            format!("{}  ·{slug}", agent.meta.name)
-        };
+        // The header shows the display NAME, never the opaque slug (the
+        // slug is still in the sidebar hover and the JSON tab for identity).
+        let name = crate::state::agent_label(&agent.meta.name, &slug);
 
-        // --- header (spec §6): `Agent: <slug>` + New Mission / Clone /
+        // --- header (spec §6): `Agent: <name>` + New Mission / Clone /
         // Delete top-right + created stamp, then a hairline.
         ui.horizontal(|ui| {
             ui.label(theme::screen_header(format!("Agent: {name}")));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if theme::destructive_button(ui, "Delete").clicked() {
                     self.delete_agent(state, toasts, &project, &slug);
+                }
+                // Save lives here (not at the foot of the editor, where it
+                // sat below the fold). Both tabs are Save-gated: Forms holds
+                // its edits in a draft and JSON in the text buffer, and
+                // neither reaches the store until this click. A trailing dot
+                // marks a Forms draft with unsaved changes.
+                let unsaved = self.tab == Tab::Forms
+                    && self.draft.as_ref().is_some_and(|d| d.dirty());
+                let label = if unsaved { "Save ●" } else { "Save" };
+                if theme::house_button(ui, label).clicked() {
+                    self.save(state, toasts, &project, &slug);
                 }
                 if theme::house_button(ui, "Clone").clicked() {
                     self.clone_agent(state, toasts, &project, &slug);
@@ -164,9 +202,9 @@ impl AgentsView {
         theme::hairline(ui);
         ui.add_space(8.0);
 
-        // --- Forms | JSON toggle. Forms edits one field at a time through
-        // the granular core calls; JSON is the escape hatch for anything
-        // the forms don't model.
+        // --- Forms | JSON toggle. Forms edits field-by-field into a draft
+        // committed on Save; JSON is the escape hatch for anything the forms
+        // don't model. Both are Save-gated.
         ui.horizontal(|ui| {
             for (tab, label) in [(Tab::Forms, "Forms"), (Tab::Json, "JSON")] {
                 let selected = self.tab == tab;
@@ -175,10 +213,10 @@ impl AgentsView {
                 {
                     self.tab = tab;
                     self.error = None;
-                    // Re-read on the way into JSON so it shows what the
-                    // forms just wrote, and drop stale field buffers.
+                    // Re-read from disk on either crossing; an unsaved draft
+                    // (Forms) or unsaved buffer (JSON) is discarded.
                     self.viewed_agent = None;
-                    self.buffers = None;
+                    self.draft = None;
                 }
             }
         });
@@ -215,25 +253,19 @@ impl AgentsView {
                     });
             });
 
-        // --- inline validation banner (ABOVE the Save row, DANGER 12px) ---
+        // --- inline validation banner (under the editor, DANGER 12px).
+        // Save itself is the top-bar button; an invalid document sets this
+        // and never writes.
         if let Some(error) = &self.error {
             ui.add_space(6.0);
             ui.label(RichText::new(error.clone()).size(12.0).color(theme::DANGER));
         }
-
-        // --- Save (validate core-side; never writes invalid) ---
-        ui.add_space(8.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
-            if theme::house_button(ui, "Save").clicked() {
-                self.save(state, toasts, &project, &slug);
-            }
-        });
     }
 
-    /// The Forms tab. Every control writes ONE field through a granular
-    /// core call and then refreshes — there is no "form state" to save, so
-    /// there is no way to lose an edit by navigating away, and no way for
-    /// the form to clobber a field it doesn't display.
+    /// The Forms tab. Controls mutate a per-entry `FormDraft`; nothing
+    /// reaches the store until the top-bar Save commits the draft. Save
+    /// writes only the fields that changed, so it can never clobber a field
+    /// the form doesn't display.
     fn forms(
         &mut self,
         ui: &mut Ui,
@@ -247,6 +279,11 @@ impl AgentsView {
             ui.label(RichText::new("this agent has no `agent` map — use the JSON tab").color(theme::DANGER));
             return;
         };
+        // A rejected Save (core validation) surfaces here, above the fields.
+        if let Some(error) = &self.error {
+            ui.label(RichText::new(error.clone()).size(12.0).color(theme::DANGER));
+            ui.add_space(8.0);
+        }
         // Entry picker: the primary plus each subagent. Subagents are
         // edited with the SAME controls as the primary.
         let mut subagents: Vec<String> = entries
@@ -261,20 +298,20 @@ impl AgentsView {
         // A stale selection (subagent just removed) falls back to primary.
         if self.entry.as_ref().is_some_and(|e| !subagents.contains(e)) {
             self.entry = None;
-            self.buffers = None;
+            self.draft = None;
         }
         if !subagents.is_empty() {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("editing").size(12.0).color(theme::TEXT_MUTED));
                 if ui.selectable_label(self.entry.is_none(), slug).clicked() {
                     self.entry = None;
-                    self.buffers = None;
+                    self.draft = None;
                 }
                 for sub in &subagents {
                     let selected = self.entry.as_deref() == Some(sub.as_str());
                     if ui.selectable_label(selected, sub).clicked() {
                         self.entry = Some(sub.clone());
-                        self.buffers = None;
+                        self.draft = None;
                     }
                 }
             });
@@ -286,24 +323,51 @@ impl AgentsView {
             return;
         };
         let is_primary = self.entry.is_none();
-        // Re-seed the text buffers when the target changes.
+        // Re-seed the draft (current == baseline) when the target changes.
+        // The RAW stored role is the baseline: a subagent's is capped by the
+        // primary only at render, so seeding the capped value would make an
+        // unchanged super-subagent read as dirty.
         let stale = self
-            .buffers
+            .draft
             .as_ref()
-            .is_none_or(|b| b.entry_key != entry_key);
+            .is_none_or(|d| d.entry_key != entry_key);
         if stale {
-            self.buffers = Some(FieldBuffers {
+            let role = if is_primary {
+                agent.meta.role()
+            } else {
+                agent
+                    .meta
+                    .subagent_roles
+                    .get(&entry_key)
+                    .copied()
+                    .unwrap_or_else(|| agent.meta.role())
+            };
+            let model = cfg.get("model").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let description = cfg
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let prompt = cfg
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            // The sidecar name is the primary's; a subagent has none.
+            let name = agent.meta.name.clone();
+            self.draft = Some(FormDraft {
                 entry_key: entry_key.clone(),
-                description: cfg
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                prompt: cfg
-                    .get("prompt")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                is_primary,
+                name: name.clone(),
+                role,
+                model: model.clone(),
+                description: description.clone(),
+                prompt: prompt.clone(),
+                base_name: name,
+                base_role: role,
+                base_model: model,
+                base_description: description,
+                base_prompt: prompt,
             });
         }
 
@@ -311,16 +375,34 @@ impl AgentsView {
             .id_salt("agent_forms")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if is_primary {
+                    self.name_section(ui);
+                    ui.add_space(20.0);
+                }
                 self.role_section(ui, state, toasts, project, slug, agent, cfg, is_primary);
                 ui.add_space(20.0);
-                self.model_section(ui, state, toasts, project, slug, cfg);
+                self.model_section(ui, state);
                 ui.add_space(20.0);
-                self.text_section(ui, state, toasts, project, slug);
+                self.text_section(ui);
                 ui.add_space(20.0);
                 if is_primary {
                     self.subagents_section(ui, state, toasts, project, slug, &subagents);
                 }
             });
+    }
+
+    /// Name: the agent's display label (sidecar `name`). Edits the draft
+    /// only — committed on Save. The slug — its identity in every path — is
+    /// never touched. Primary only; a subagent has no name of its own.
+    fn name_section(&mut self, ui: &mut Ui) {
+        let Some(draft) = &mut self.draft else { return };
+        ui.label(theme::section_heading("Name"));
+        ui.add_space(8.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut draft.name)
+                .hint_text("new agent")
+                .desired_width(340.0),
+        );
     }
 
     /// Role: the server-enforced ceiling. Shows what it grants and warns
@@ -340,39 +422,26 @@ impl AgentsView {
         is_primary: bool,
     ) {
         use corpus_core::AgentRole;
+        // The draft holds the pending role; edits stay local until Save.
+        let Some(current) = self.draft.as_ref().map(|d| d.role) else { return };
         ui.label(theme::section_heading("Role"));
         ui.add_space(8.0);
-        let current = if is_primary {
-            agent.meta.role()
-        } else {
-            let sub = self.entry.clone().unwrap_or_default();
-            agent
-                .meta
-                .subagent_roles
-                .get(&sub)
-                .copied()
-                .unwrap_or(agent.meta.role())
-                .min(agent.meta.role())
-        };
         ui.horizontal(|ui| {
             for role in AgentRole::ALL {
                 let selected = current == role;
                 if ui
                     .selectable_label(selected, RichText::new(role.as_str()).size(13.0))
-                    .on_hover_text(role_hint(role))
+                    .on_hover_text(role.hint())
                     .clicked()
                     && !selected
                 {
-                    match state.set_agent_role(project, slug, self.entry.as_deref(), role) {
-                        Ok(()) => {
-                            toast(toasts, ToastKind::Success, format!("role -> {}", role.as_str()));
-                            state.refresh_agents(project);
-                        }
-                        Err(e) => toast(toasts, ToastKind::Error, e.to_string()),
+                    if let Some(draft) = &mut self.draft {
+                        draft.role = role;
                     }
                 }
             }
         });
+        let current = self.draft.as_ref().map(|d| d.role).unwrap_or(current);
         ui.add_space(6.0);
         ui.label(
             RichText::new(format!(
@@ -452,23 +521,11 @@ impl AgentsView {
     }
 
     /// Model: opencode's own catalog, so an id here is one a mission can
-    /// actually launch with.
-    fn model_section(
-        &mut self,
-        ui: &mut Ui,
-        state: &mut AppState,
-        toasts: &mut Toasts,
-        project: &str,
-        slug: &str,
-        cfg: &serde_json::Map<String, serde_json::Value>,
-    ) {
+    /// actually launch with. Edits the draft only — committed on Save.
+    fn model_section(&mut self, ui: &mut Ui, state: &mut AppState) {
+        let Some(current) = self.draft.as_ref().map(|d| d.model.clone()) else { return };
         ui.label(theme::section_heading("Model"));
         ui.add_space(8.0);
-        let current = cfg
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
         ui.horizontal(|ui| {
             theme::combo_field(ui, |ui| {
                 egui::ComboBox::from_id_salt("agent_model")
@@ -511,25 +568,8 @@ impl AgentsView {
                                 }
                             }
                         }
-                        if let Some(id) = picked {
-                            let value = if id.is_empty() {
-                                serde_json::Value::Null // clears the field
-                            } else {
-                                id.clone().into()
-                            };
-                            match state.set_agent_field(
-                                project,
-                                slug,
-                                self.entry.as_deref(),
-                                "model",
-                                value,
-                            ) {
-                                Ok(()) => {
-                                    toast(toasts, ToastKind::Success, "model updated");
-                                    state.refresh_agents(project);
-                                }
-                                Err(e) => toast(toasts, ToastKind::Error, e.to_string()),
-                            }
+                        if let (Some(id), Some(draft)) = (picked, &mut self.draft) {
+                            draft.model = id;
                         }
                     });
             });
@@ -539,52 +579,25 @@ impl AgentsView {
         });
     }
 
-    /// Description + prompt. Buffered locally and written on focus loss so
-    /// typing isn't a disk write per keystroke.
-    fn text_section(
-        &mut self,
-        ui: &mut Ui,
-        state: &mut AppState,
-        toasts: &mut Toasts,
-        project: &str,
-        slug: &str,
-    ) {
-        let Some(buffers) = &mut self.buffers else { return };
+    /// Description + prompt. Edits the draft only — committed on Save.
+    fn text_section(&mut self, ui: &mut Ui) {
+        let Some(draft) = &mut self.draft else { return };
         ui.label(theme::section_heading("Description"));
         ui.add_space(8.0);
-        let desc = ui.add(
-            egui::TextEdit::multiline(&mut buffers.description)
+        ui.add(
+            egui::TextEdit::multiline(&mut draft.description)
                 .desired_rows(2)
                 .desired_width(f32::INFINITY),
         );
-        let desc_value = buffers.description.clone();
         ui.add_space(20.0);
         ui.label(theme::section_heading("Prompt"));
         ui.add_space(8.0);
-        let prompt = ui.add(
-            egui::TextEdit::multiline(&mut buffers.prompt)
+        ui.add(
+            egui::TextEdit::multiline(&mut draft.prompt)
                 .font(egui::TextStyle::Monospace)
                 .desired_rows(14)
                 .desired_width(f32::INFINITY),
         );
-        let prompt_value = buffers.prompt.clone();
-
-        let entry = self.entry.clone();
-        let mut write = |field: &str, value: String| {
-            match state.set_agent_field(project, slug, entry.as_deref(), field, value.into()) {
-                Ok(()) => {
-                    toast(toasts, ToastKind::Success, format!("{field} saved"));
-                    state.refresh_agents(project);
-                }
-                Err(e) => toast(toasts, ToastKind::Error, e.to_string()),
-            }
-        };
-        if desc.lost_focus() && desc.changed() {
-            write("description", desc_value);
-        }
-        if prompt.lost_focus() && prompt.changed() {
-            write("prompt", prompt_value);
-        }
     }
 
     /// Subagents: add and remove, each editable with the same controls via
@@ -619,7 +632,7 @@ impl AgentsView {
                             Ok(()) => {
                                 toast(toasts, ToastKind::Success, format!("removed {sub}"));
                                 self.entry = None;
-                                self.buffers = None;
+                                self.draft = None;
                                 state.refresh_agents(project);
                             }
                             Err(e) => toast(toasts, ToastKind::Error, e.to_string()),
@@ -627,7 +640,7 @@ impl AgentsView {
                     }
                     if theme::house_button(ui, "Edit").clicked() {
                         self.entry = Some(sub.clone());
-                        self.buffers = None;
+                        self.draft = None;
                     }
                 });
             });
@@ -699,10 +712,90 @@ impl AgentsView {
         }
     }
 
-    /// Save via the core validator: JSON must parse and the agent document
-    /// must satisfy the structural rules (agent map, one primary, valid
-    /// permissions, resolvable `{file:}` refs). Invalid → red banner, no write.
+    /// The top-bar Save. Dispatches to the tab's own commit: the Forms draft
+    /// or the raw JSON document.
     fn save(&mut self, state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
+        match self.tab {
+            Tab::Forms => self.save_forms(state, toasts, project, slug),
+            Tab::Json => self.save_json(state, toasts, project, slug),
+        }
+    }
+
+    /// Commit the Forms draft: write only the fields that diverge from their
+    /// on-disk baseline, so an unchanged field is never rewritten and a field
+    /// the form doesn't model is never touched. Each write is validated
+    /// core-side; a rejected one leaves an error and keeps the draft so the
+    /// operator can fix and re-Save.
+    fn save_forms(&mut self, state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
+        let Some(mut draft) = self.draft.take() else { return };
+        let entry = if draft.is_primary {
+            None
+        } else {
+            Some(draft.entry_key.clone())
+        };
+        let mut errors: Vec<String> = Vec::new();
+
+        // Name (sidecar, primary only).
+        if draft.is_primary && draft.name.trim() != draft.base_name {
+            match state.set_agent_name(project, slug, draft.name.trim()) {
+                Ok(()) => draft.base_name = draft.name.trim().to_string(),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        // Role (sidecar).
+        if draft.role != draft.base_role {
+            match state.set_agent_role(project, slug, entry.as_deref(), draft.role) {
+                Ok(()) => draft.base_role = draft.role,
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        // Model (`null` clears the field → inherit launch default).
+        if draft.model != draft.base_model {
+            let value = if draft.model.is_empty() {
+                serde_json::Value::Null
+            } else {
+                draft.model.clone().into()
+            };
+            match state.set_agent_field(project, slug, entry.as_deref(), "model", value) {
+                Ok(()) => draft.base_model = draft.model.clone(),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        // Description.
+        if draft.description != draft.base_description {
+            let value = draft.description.clone().into();
+            match state.set_agent_field(project, slug, entry.as_deref(), "description", value) {
+                Ok(()) => draft.base_description = draft.description.clone(),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        // Prompt.
+        if draft.prompt != draft.base_prompt {
+            let value = draft.prompt.clone().into();
+            match state.set_agent_field(project, slug, entry.as_deref(), "prompt", value) {
+                Ok(()) => draft.base_prompt = draft.prompt.clone(),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+
+        state.refresh_agents(project);
+        // Keep the draft (with baselines advanced for whatever landed) so a
+        // failed field stays pending and editable.
+        self.draft = Some(draft);
+        if errors.is_empty() {
+            self.error = None;
+            toast(toasts, ToastKind::Success, format!("saved agent {project}/{slug}"));
+        } else {
+            let msg = errors.join("; ");
+            self.error = Some(msg.clone());
+            toast(toasts, ToastKind::Error, msg);
+        }
+    }
+
+    /// Save the raw JSON document via the core validator: it must parse and
+    /// satisfy the structural rules (agent map, one primary, valid
+    /// permissions, resolvable `{file:}` refs). Invalid → red banner, no write.
+    fn save_json(&mut self, state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
         let doc = match serde_json::from_str::<serde_json::Value>(&self.editor_text) {
             Ok(doc) => doc,
             Err(error) => {
@@ -764,21 +857,6 @@ impl AgentsView {
             }
             Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
         }
-    }
-}
-
-/// One line on what a role means, for the picker's tooltip.
-fn role_hint(role: corpus_core::AgentRole) -> &'static str {
-    match role {
-        corpus_core::AgentRole::Researcher => {
-            "reads and curates: target_info + technique_save, plus the open internet. \
-             No execution — enforced by the corpus server, not just by config."
-        }
-        corpus_core::AgentRole::Tester => {
-            "acts in the regtest arena: sandbox, oracles, faucet, findings, attacks. \
-             No open internet, so an execution turn cannot pull in untrusted text."
-        }
-        corpus_core::AgentRole::Super => "everything: research and penetration both.",
     }
 }
 

@@ -173,15 +173,17 @@ mod live {
         }
     }
 
-    /// The project-scoped goose root: `<store>/projects/<project>/var/chat/`,
+    /// The project-scoped goose root: `<store parent>/var/chat/<project>/`,
     /// ABSOLUTE (goose's GOOSE_PATH_ROOT validation silently drops relative
-    /// paths). Store root resolution rides corpus-core's `store_root_env`
-    /// (CORPUS_STORE, else the canonical default) — never cwd-relative.
+    /// paths).
+    ///
+    /// OUTSIDE the project subtree, deliberately. Chat transcripts range
+    /// over every project the operator administers, while a launched agent
+    /// can read its own project tree — so a chat scope under
+    /// `projects/<p>/var/` would hand one project's agents the operator's
+    /// notes about all the others.
     fn project_scope(project: &str) -> PathBuf {
-        corpus_core::store_root_env()
-            .join("projects")
-            .join(project)
-            .join("var/chat")
+        corpus_core::Store::from_env().project_chat_dir(project)
     }
 
     async fn run(
@@ -673,28 +675,16 @@ Use Markdown formatting for all responses.
         })
     }
 
-    /// Locate the corpus-mcp binary. Order: explicit `CORPUS_MCP` override;
-    /// next to the running executable (app: `target/<profile>/corpus-mcp`;
-    /// tests: `target/<profile>/deps/../corpus-mcp`); last resort the
-    /// build-time workspace target dir. (The old runtime `CARGO_MANIFEST_DIR`
-    /// read falls back to cwd-relative `"."` in a packaged app — wrong.)
+    /// Locate the corpus-mcp binary. The resolution itself lives in
+    /// corpus-core ([`corpus_core::corpus_mcp_bin`]) because the run-dir
+    /// provisioner writes the same path into every generated opencode
+    /// config — two copies of this search would drift, and the chat and a
+    /// mission would then talk to different binaries. An unresolved path
+    /// degrades to the bare name so the extension's own error names it.
     fn corpus_mcp_path() -> String {
-        if let Ok(p) = std::env::var("CORPUS_MCP") {
-            return p;
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let sibling = dir.join("corpus-mcp");
-                if sibling.exists() {
-                    return sibling.to_string_lossy().into_owned();
-                }
-                let up = dir.join("../corpus-mcp");
-                if up.exists() {
-                    return up.to_string_lossy().into_owned();
-                }
-            }
-        }
-        format!("{}/../../target/debug/corpus-mcp", env!("CARGO_MANIFEST_DIR"))
+        corpus_core::corpus_mcp_bin()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "corpus-mcp".to_string())
     }
 
     /// Run one turn: `agent.reply(...)` then translate the streamed

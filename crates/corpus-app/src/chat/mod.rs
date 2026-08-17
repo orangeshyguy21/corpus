@@ -330,15 +330,13 @@ impl Chat for ChatHandle {
 }
 
 /// Write the accumulated in-memory transcript to the project scope
-/// `<store>/projects/<project>/var/chat/<session>.md` (dev/decisions.md
-/// chunk 3). Non-fatal: the durable memory degrades to in-memory only if the
-/// path is unwritable.
+/// `<store parent>/var/chat/<project>/<session>.md` (dev/decisions.md
+/// chunk 3) — outside the project subtree, so a launched agent cannot read
+/// the operator's cross-project notes. Non-fatal: the durable memory
+/// degrades to in-memory only if the path is unwritable.
 fn flush_transcript(project: &str, session_id: Option<&str>, transcript: &[String]) {
     let Some(session_id) = session_id else { return };
-    let dir = corpus_core::store_root_env()
-        .join("projects")
-        .join(project)
-        .join("var/chat");
+    let dir = corpus_core::Store::from_env().project_chat_dir(project);
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }

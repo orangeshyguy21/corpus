@@ -35,15 +35,24 @@
 set -euo pipefail
 
 # --- resolve project scope ---------------------------------------------------
-slug="${CORPUS_PROJECT:-default}"
+# No default project: an unset CORPUS_PROJECT used to resolve to the project
+# literally named "default", so a chat could administer the wrong store
+# scope and look like it worked.
+slug="${CORPUS_PROJECT:?set CORPUS_PROJECT to the project this chat administers}"
 
-store_root="${CORPUS_STORE:-$PWD/store}"
-scope="$store_root/projects/$slug/var/chat"
+# Must match corpus-core's paths.rs: CORPUS_STORE, else <CORPUS_HOME>/store,
+# else ~/.corpus/store. Chat scopes are siblings of the store (var/chat/),
+# NOT inside the project subtree — a launched agent can read its own project
+# tree, and these transcripts range over every project.
+data_root="${CORPUS_HOME:-$HOME/.corpus}"
+store_root="${CORPUS_STORE:-$data_root/store}"
+scope="$(dirname "$store_root")/var/chat/$slug"
 mkdir -p "$scope/config"
 # sessions.db lives under $scope/data/sessions (created by goose on first run)
 
 # --- provision the scope's own config.yaml (deterministic) ------------------
-cat > "$scope/config/config.yaml" <<'YAML'
+corpus_mcp="${CORPUS_MCP:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/corpus-mcp}"
+cat > "$scope/config/config.yaml" <<YAML
 GOOSE_INPUT_LIMIT: 32768
 active_provider: ollama
 providers:
@@ -61,7 +70,7 @@ extensions:
     type: stdio
     name: corpus-admin
     enabled: true
-    cmd: /Users/admin/Sites/corpus/target/debug/corpus-mcp
+    cmd: $corpus_mcp
     args: ["--admin"]
     envs: {}
     timeout: 300

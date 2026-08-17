@@ -33,7 +33,10 @@ corpus — local-first vulnerability research platform
   corpus project list|new|clone|delete|wipe|rebind
                                Project CRUD (store/projects/<slug>/)
   corpus agent list|new|clone|delete <project> ...
-                               Agent CRUD (store/projects/<p>/agents/<slug>/)
+                               Agent CRUD (store/projects/<p>/agents/<slug>/).
+                               `new` takes --role researcher|tester|super
+                               (default researcher): the role supplies the
+                               starting prompt AND the capability ceiling.
   corpus agent role <project> <slug> [researcher|tester|super]
                                Show or set an agent's ROLE — the capability
                                ceiling corpus-mcp enforces server-side.
@@ -43,16 +46,19 @@ corpus — local-first vulnerability research platform
                                already grant. Dry run without --apply.
   corpus mission list|new|delete <project> ...
                                Mission CRUD
-  corpus store migrate [--dry-run] [--project <slug>] [--confirm]
-                               Relocate a legacy flat store into the default
-                               project (projects/<slug>/corpus/).
-                               --confirm also removes legacy template dirs.
 
 Environment:
-  CORPUS_PLUGINS_DIR           Plugins directory (default: ./plugins)
+  CORPUS_HOME                  Data root (default: ~/.corpus) — projects,
+                               run dirs, chat scopes, app prefs
+  CORPUS_STORE                 Store root (default: <CORPUS_HOME>/store).
+                               Moves run dirs and chat scopes with it.
+  CORPUS_RESOURCES             Install root: the directory holding plugins/
+                               and sources.toml (default: found from the
+                               running executable)
+  CORPUS_PLUGINS_DIR           Plugins directory (default: <CORPUS_RESOURCES>/plugins)
   CORPUS_MODELS                models.yaml path (default: ./benchmarks/models.yaml)
-  CORPUS_STORE                 Store root (default: ~/Sites/corpus/store)
-  CORPUS_PROJECT               Default write scope (default: default)
+  CORPUS_PROJECT               Write scope. NO DEFAULT — every command that
+                               writes refuses without it.
   CORPUS_TERMINAL              Terminal app for `attach` (default: from $TERM_PROGRAM)
   CORPUS_NO_TMUX=1             Force the piped run backend (no detached sessions)";
 
@@ -66,7 +72,6 @@ fn main() -> ExitCode {
         Some("project") => store_admin::project_cmd(&args[1..]),
         Some("agent") => store_admin::agent_cmd(&args[1..]),
         Some("mission") => store_admin::mission_cmd(&args[1..]),
-        Some("store") => store_admin::store_cmd(&args[1..]),
         Some("help") | Some("--help") | Some("-h") => {
             println!("{USAGE}");
             Ok(())
@@ -120,7 +125,9 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
     }
 
     let store = Store::from_env();
-    let scope = Scope::from_env();
+    // No default project: a run that cannot name its project would write a
+    // whole mission's output into someone else's corpus.
+    let scope = Scope::from_env_strict(&store)?;
 
     // Check the agent exists on the project.
     if store.load_agent(&scope.project, &agent).is_err() {

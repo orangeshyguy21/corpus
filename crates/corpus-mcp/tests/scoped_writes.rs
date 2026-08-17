@@ -21,29 +21,22 @@ struct TestRig {
     root: PathBuf,
 }
 
-fn seed_core(store: &Store) {
-    let dir = store.seed_agents_dir();
-    for slug in ["operator", "researcher"] {
-        let d = dir.join(slug);
-        let _ = std::fs::create_dir_all(&d);
-        std::fs::write(
-            d.join("opencode.json"),
-            format!(
-                "{{\"$schema\":\"https://opencode.ai/config.json\",\"agent\":{{\"{slug}\":{{\"description\":\"{slug}\",\"mode\":\"primary\",\"prompt\":\"You are {slug}.\\n\"}}}}}}"
-            ),
-        )
-        .unwrap();
-    }
-}
-
 fn rig(tag: &str) -> TestRig {
     let root = std::env::temp_dir().join(format!("corpus-mcp-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let store = Store::new(root.clone());
-    seed_core(&store);
     store
         .create_project("proj", "Proj", "echo-plugin")
         .expect("create project");
+    // Projects no longer arrive with agents — they are created from a role.
+    for (slug, role) in [
+        ("operator", corpus_core::AgentRole::Tester),
+        ("researcher", corpus_core::AgentRole::Researcher),
+    ] {
+        store
+            .create_agent_with_role("proj", slug, role)
+            .expect("create agent");
+    }
     // Super: these tests exercise the WRITE tools, so the role gate must
     // not be what refuses them. Role-gating itself is tested separately.
     let ctx = Ctx::for_test(

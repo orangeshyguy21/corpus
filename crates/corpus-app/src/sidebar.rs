@@ -38,7 +38,7 @@ pub struct Sidebar {
     create_name: String,
     create_plugin: String,
     new_agent: bool,
-    agent_seed: String,
+    agent_role: corpus_core::AgentRole,
     clone_from: Option<String>,
     show_clone: bool,
     clone_name: String,
@@ -69,7 +69,7 @@ impl Default for Sidebar {
             create_name: String::new(),
             create_plugin: "cdk-regtest".to_string(),
             new_agent: false,
-            agent_seed: "operator".to_string(),
+            agent_role: corpus_core::AgentRole::Researcher,
             clone_from: None,
             show_clone: false,
             clone_name: String::new(),
@@ -308,8 +308,11 @@ impl Sidebar {
             let is_sel = on_screen && state.selected_agent.as_deref() == Some(slug.as_str());
             let Row { ui: mut rui, click, .. } = row_ui(ui, is_sel, false, (project, slug));
             rui.add_space(24.0);
+            // Row label is the display NAME, never the opaque slug (a UUID);
+            // the slug moves to the hover text for identity.
+            let name = crate::state::agent_label(&agent.meta.name, slug);
             let label = rui.add(
-                egui::Label::new(RichText::new(slug.clone()).size(13.5).color(theme::TEXT))
+                egui::Label::new(RichText::new(name).size(13.5).color(theme::TEXT))
                     .sense(egui::Sense::click())
                     .truncate(),
             );
@@ -320,7 +323,10 @@ impl Sidebar {
                 state.selected_agent = Some(slug.clone());
                 state.current_screen = Screen::Agents;
             }
-            click.on_hover_text(format!("{project} · {}", &agent.meta.name));
+            click.on_hover_text(format!(
+                "{project} · {} · {slug}",
+                crate::state::agent_label(&agent.meta.name, slug)
+            ));
         }
         if tree.agents.is_empty() {
             row_hint(ui, 24.0, "no agents — press +");
@@ -700,19 +706,15 @@ impl Sidebar {
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -120.0))
             .show(ui.ctx(), |ui| {
-                ui.label("Clone from seed");
-                egui::ComboBox::from_id_salt("agent_seed")
-                    .selected_text(match self.agent_seed.as_str() {
-                        "researcher" => "researcher".to_string(),
-                        "blank" => "blank".to_string(),
-                        _ => "operator".to_string(),
-                    })
+                ui.label("Role");
+                egui::ComboBox::from_id_salt("agent_role")
+                    .selected_text(self.agent_role.as_str())
                     .show_ui(ui, |ui| {
-                        for seed in ["operator", "researcher", "blank"] {
-                            ui.selectable_value(&mut self.agent_seed, seed.to_string(), seed);
+                        for role in corpus_core::AgentRole::ALL {
+                            ui.selectable_value(&mut self.agent_role, role, role.as_str());
                         }
                     });
-                ui.weak(seed_note(&self.agent_seed));
+                ui.weak(self.agent_role.hint());
                 ui.add_space(8.0);
                 if theme::house_button(ui, "Create").clicked() {
                     let project = if self.new_agent_project.is_empty() {
@@ -725,7 +727,7 @@ impl Sidebar {
                         self.new_agent = false;
                         return;
                     }
-                    match state.create_agent_from_seed(&project, &self.agent_seed) {
+                    match state.create_agent_with_role(&project, self.agent_role) {
                         Ok(slug) => {
                             toast(toasts, ToastKind::Success, format!("created agent {project}/{slug}"));
                             state.refresh_agents(&project);
@@ -1004,15 +1006,6 @@ fn delete_project(state: &mut AppState, toasts: &mut Toasts, slug: &str) {
             state.selected_project = None;
         }
         Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
-    }
-}
-
-/// What each seed gives you, for the clone-from-seed picker.
-fn seed_note(seed: &str) -> &'static str {
-    match seed {
-        "researcher" => "read-only research pass (open internet; executes nothing)",
-        "blank" => "an empty config — fill it in with the raw JSON editor",
-        _ => "the sandbox-executing hunter; verified-finding writer",
     }
 }
 
