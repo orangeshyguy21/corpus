@@ -145,6 +145,25 @@ else
     echo "==> tools: cdk-cli already present"
 fi
 
+# corpus-faucet: the host-native cln-rpc funding client that replaces the
+# shell faucet's slow lightning-cli/nix path. Built natively (it runs on the
+# host, not in the Linux sandbox) and dropped next to faucet.sh; the plugin
+# prefers it when present. Best-effort — faucet.sh remains the fallback.
+if [ ! -x "$PLUGIN_DIR/corpus-faucet" ]; then
+    if command -v cargo >/dev/null 2>&1; then
+        echo "==> faucet: building corpus-faucet (host-native cln-rpc client)"
+        ( cd "$PLUGIN_DIR/faucet-src" && cargo build --release ) \
+            && cp "$PLUGIN_DIR/faucet-src/target/release/corpus-faucet" \
+                  "$PLUGIN_DIR/corpus-faucet" \
+            && echo "==> faucet: built $PLUGIN_DIR/corpus-faucet" \
+            || echo "!! faucet: build failed — falling back to shell faucet.sh" >&2
+    else
+        echo "!! faucet: cargo not found — using shell faucet.sh (slow nix path)" >&2
+    fi
+else
+    echo "==> faucet: corpus-faucet already present"
+fi
+
 echo "==> doctor: self-verification probes"
 bash "$PLUGIN_DIR/arena.sh" doctor
 

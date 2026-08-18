@@ -15,7 +15,17 @@ PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARENA="$PLUGIN_DIR/arena.sh"
 CONF="$PLUGIN_DIR/config.toml"
 ORACLES_DIR="$PLUGIN_DIR/oracles"
-FAUCET="$PLUGIN_DIR/faucet.sh"
+# Faucet: prefer the compiled cln-rpc client (corpus-faucet, built by setup.sh)
+# — it talks to CLN "two" directly over its socket, exactly as cdk's own itests
+# do, with no lightning-cli/nix/timeout dependency. Fall back to the shell
+# faucet where the binary is absent. Both honor the same CLI and the same
+# stdout markers (PAID_SATS=, a lnbcrt… bolt11, a bare integer), so the faucet
+# handler's parsing is identical either way.
+if [ -x "$PLUGIN_DIR/corpus-faucet" ]; then
+    FAUCET="$PLUGIN_DIR/corpus-faucet"
+else
+    FAUCET="$PLUGIN_DIR/faucet.sh"
+fi
 TOOLS_DIR="$PLUGIN_DIR/tools"
 EVIDENCE_DIR="$PLUGIN_DIR/evidence"
 MANIFEST="$PLUGIN_DIR/../../sources.toml"
