@@ -93,7 +93,7 @@ impl ProjectsView {
         }
         // Drain a requested plugin re-probe before the picker renders.
         if self.needs_probe {
-            state.refresh_plugins();
+            state.refresh_plugins(Some(&self.edit_plugin));
             self.needs_probe = false;
         }
 
@@ -243,7 +243,9 @@ impl ProjectsView {
             ui.add_space(12.0);
             ui.label(command_label("Pinned sources"));
             ui.add_space(6.0);
-            if state.source_revs.is_empty() {
+            if state.source_revisions_loading(slug) {
+                empty_hint(ui, "loading source revisions…");
+            } else if state.source_revs.is_empty() {
                 empty_hint(ui, "no sources declared by this plugin");
             } else {
                 let revs = state.source_revs.clone();
@@ -315,8 +317,7 @@ impl ProjectsView {
                     }
                 };
                 if command_row(ui, ("project-mission", &slug), &name, status, tone).clicked() {
-                    state.selected_mission = Some(slug);
-                    state.current_screen = crate::nav::Screen::Missions;
+                    state.select_mission(project, &slug);
                 }
             }
         });

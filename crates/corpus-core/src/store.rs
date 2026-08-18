@@ -472,9 +472,11 @@ pub fn corpus_stats(store: &Store, project: &str) -> Result<CorpusStats> {
             for entry in fs::read_dir(&dir)? {
                 let entry = entry?;
                 let path = entry.path();
-                if path.is_dir() {
+                let Ok(kind) = entry.file_type() else { continue };
+                if kind.is_dir() {
                     stack.push(path);
-                } else if let Ok(meta) = fs::metadata(&path) {
+                } else if kind.is_file() {
+                    let Ok(meta) = entry.metadata() else { continue };
                     stats.files += 1;
                     stats.bytes += meta.len();
                     // Top-level dir the file sits under; a file loose at
@@ -545,11 +547,12 @@ pub fn mission_logs(store: &Store, project: &str) -> Result<Vec<MissionLog>> {
     for entry in fs::read_dir(&runs)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(kind) = entry.file_type() else { continue };
+        if !kind.is_file() {
             continue;
         }
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
         let kind = path
             .extension()
             .and_then(|e| e.to_str())
@@ -598,31 +601,73 @@ pub struct CostReport {
     pub cost: f64,
 }
 
+#[derive(Debug, Clone)]
+struct CachedCostFile {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    report: CostReport,
+}
+
+/// Parsed usage records keyed by the durable file identity relevant to the
+/// UI: path plus metadata change signals. A rewritten export invalidates only
+/// itself, not every other transcript in the project.
+#[derive(Debug, Clone, Default)]
+pub struct CorpusCostCache {
+    files: std::collections::BTreeMap<PathBuf, CachedCostFile>,
+}
+
 /// Aggregate token/cost usage across a project's exported run
 /// transcripts. Cheap (one parse per runs/*.json) and best-effort: an
 /// unparseable file is skipped, never fatal — a corrupt export must not
 /// blank the view.
 pub fn corpus_cost(store: &Store, project: &str) -> Result<CostReport> {
+    corpus_cost_cached(store, project, &mut CorpusCostCache::default())
+}
+
+pub fn corpus_cost_cached(
+    store: &Store,
+    project: &str,
+    cache: &mut CorpusCostCache,
+) -> Result<CostReport> {
     let runs = store.project_corpus_dir(project).join("runs");
-    let mut report = CostReport::default();
     if !runs.is_dir() {
-        return Ok(report);
+        cache.files.clear();
+        return Ok(CostReport::default());
     }
-    let mut rows: std::collections::BTreeMap<(String, String), CostRow> =
-        std::collections::BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
     for entry in fs::read_dir(&runs)? {
-        let path = entry?.path();
+        let entry = entry?;
+        let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(raw) = fs::read_to_string(&path) else { continue };
-        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        let Some(messages) = doc.get("messages").and_then(|m| m.as_array()) else {
-            continue;
-        };
-        for message in messages {
+        let Ok(meta) = entry.metadata() else { continue };
+        let modified = meta.modified().ok();
+        let len = meta.len();
+        seen.insert(path.clone());
+        let current = cache.files.get(&path).is_some_and(|cached| {
+            cached.modified == modified && cached.len == len
+        });
+        if !current {
+            let report = parse_cost_file(&path);
+            cache.files.insert(path, CachedCostFile { modified, len, report });
+        }
+    }
+    cache.files.retain(|path, _| seen.contains(path));
+    Ok(merge_cost_reports(cache.files.values().map(|cached| &cached.report)))
+}
+
+fn parse_cost_file(path: &Path) -> CostReport {
+    let mut report = CostReport::default();
+    let mut rows = std::collections::BTreeMap::<(String, String), CostRow>::new();
+    if let Ok(raw) = fs::read_to_string(path) {
+        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) {
+            for message in doc
+                .get("messages")
+                .and_then(|messages| messages.as_array())
+                .into_iter()
+                .flatten()
+            {
             let info = message.get("info").cloned().unwrap_or_default();
             if info.get("role").and_then(|r| r.as_str()) != Some("assistant") {
                 continue;
@@ -654,6 +699,34 @@ pub fn corpus_cost(store: &Store, project: &str) -> Result<CostReport> {
             row.cache_write += take(&cache, "write");
             row.cost += info.get("cost").and_then(|c| c.as_f64()).unwrap_or(0.0);
             report.tokens += take(&tokens, "total");
+            }
+        }
+    }
+    report.rows = rows.into_values().collect();
+    report.cost = report.rows.iter().map(|row| row.cost).sum();
+    report
+}
+
+fn merge_cost_reports<'a>(reports: impl Iterator<Item = &'a CostReport>) -> CostReport {
+    let mut report = CostReport::default();
+    let mut rows = std::collections::BTreeMap::<(String, String), CostRow>::new();
+    for source in reports {
+        report.tokens += source.tokens;
+        for source_row in &source.rows {
+            let row = rows
+                .entry((source_row.provider.clone(), source_row.model.clone()))
+                .or_insert_with(|| CostRow {
+                    provider: source_row.provider.clone(),
+                    model: source_row.model.clone(),
+                    ..CostRow::default()
+                });
+            row.messages += source_row.messages;
+            row.tokens_input += source_row.tokens_input;
+            row.tokens_output += source_row.tokens_output;
+            row.tokens_reasoning += source_row.tokens_reasoning;
+            row.cache_read += source_row.cache_read;
+            row.cache_write += source_row.cache_write;
+            row.cost += source_row.cost;
         }
     }
     report.rows = rows.into_values().collect();
@@ -661,7 +734,7 @@ pub fn corpus_cost(store: &Store, project: &str) -> Result<CostReport> {
         .rows
         .sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
     report.cost = report.rows.iter().map(|r| r.cost).sum();
-    Ok(report)
+    report
 }
 
 /// A mission record (`store/projects/<p>/missions/<slug>.md`): the

@@ -15,11 +15,24 @@ path = "src/main.rs"
 # (goose is an `optional = true` dependency below, gated behind this feature).
 # With the feature OFF the chat backend is a no-op stub that reports a clear error.
 default = ["chat-embed"]
-chat-embed = ["dep:goose"]
+chat-embed = [
+    "dep:goose",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:anyhow",
+    "dep:futures",
+    "dep:rmcp",
+    "dep:idna_adapter",
+    "dep:icu_normalizer",
+    "dep:icu_collections",
+    "dep:icu_locale",
+]
 
 [dependencies]
 corpus-core = { path = "../corpus-core" }
+notify = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
 # The embedded goose runtime (dev/decisions.md). Optional + gated on
 # `chat-embed` so a headless `--no-default-features` build never compiles the
 # goose tree. All goose types are quarantined inside `src/chat/embedded.rs`;
@@ -31,21 +44,21 @@ goose = { workspace = true, optional = true }
 # 2.2` → `icu_collections 2.2`, which conflicts with `icu_locale =2.1.1`.
 # These exact pins force Cargo to the same ICU generation goose's lock uses.
 # Revisit on a deliberate goose bump (dev/decisions.md "bumps are events").
-idna_adapter = "=1.2.1"
-icu_normalizer = "=2.1.1"
-icu_collections = "=2.1.1"
-icu_locale = "=2.1.1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util"] }
-tokio-util = "0.7"
-anyhow = "1"
+idna_adapter = { version = "=1.2.1", optional = true }
+icu_normalizer = { version = "=2.1.1", optional = true }
+icu_collections = { version = "=2.1.1", optional = true }
+icu_locale = { version = "=2.1.1", optional = true }
+tokio = { version = "1", features = ["rt", "sync", "macros"], optional = true }
+tokio-util = { version = "0.7", optional = true }
+anyhow = { version = "1", optional = true }
 # The chat backend runs its tokio runtime on a dedicated background thread
 # (egui is sync); futures drives the reply stream (CancellationToken from
 # tokio-util::sync is always available in 0.7, no feature gate).
-futures = "0.3"
+futures = { version = "0.3", optional = true }
 # MCP model types (Tool, CallToolResult) for the chat's `delegate` frontend
 # tool — version-locked with goose's rmcp (a type-identity dependency, like
 # the ICU pins above; revisit on a deliberate goose bump).
-rmcp = { version = "3.0.0", default-features = false }
+rmcp = { version = "3.0.0", default-features = false, optional = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 # Vendored per the deck-flow-plan table: egui_extras + egui-toast at

@@ -1,0 +1,57 @@
+#!/bin/sh
+# Repeat the default-parallel corpus-core suite under a hard per-run watchdog.
+# A failure or timeout prints that run's complete captured output.
+
+set -eu
+
+runs=${1:-50}
+deadline=${CORPUS_TEST_TIMEOUT_SECS:-30}
+
+case "$runs:$deadline" in
+    *[!0-9:]* | :* | *:) echo "usage: $0 [positive-run-count]" >&2; exit 2 ;;
+esac
+if [ "$runs" -lt 1 ] || [ "$deadline" -lt 1 ]; then
+    echo "run count and CORPUS_TEST_TIMEOUT_SECS must be positive" >&2
+    exit 2
+fi
+
+repeat_tmp=$(mktemp -d "${TMPDIR:-/tmp}/corpus-core-repeat.XXXXXX")
+trap 'rm -r "$repeat_tmp"' EXIT HUP INT TERM
+
+run=1
+while [ "$run" -le "$runs" ]; do
+    log="$repeat_tmp/run-$run.log"
+    set +e
+    /usr/bin/perl -e '
+        use strict;
+        use warnings;
+        my $seconds = shift @ARGV;
+        my $pid = fork();
+        die "fork failed: $!\n" unless defined $pid;
+        if ($pid == 0) {
+            setpgrp(0, 0);
+            exec @ARGV;
+            die "exec failed: $!\n";
+        }
+        local $SIG{ALRM} = sub {
+            kill "TERM", -$pid;
+            select undef, undef, undef, 0.5;
+            kill "KILL", -$pid;
+            waitpid($pid, 0);
+            exit 124;
+        };
+        alarm $seconds;
+        waitpid($pid, 0);
+        alarm 0;
+        exit($? == -1 ? 125 : $? >> 8);
+    ' "$deadline" cargo test -p corpus-core >"$log" 2>&1
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+        echo "corpus-core repetition $run/$runs failed (status $status)" >&2
+        sed -n '1,1200p' "$log" >&2
+        exit "$status"
+    fi
+    printf 'corpus-core repetition %s/%s passed\n' "$run" "$runs"
+    run=$((run + 1))
+done

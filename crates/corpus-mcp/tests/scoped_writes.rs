@@ -333,7 +333,14 @@ fn advertised_catalog_matches_the_role() {
         );
     }
     let sup = names(corpus_core::AgentRole::Super);
-    assert_eq!(sup.len(), corpus_core::CORPUS_TOOLS.len(), "{sup:?}");
+    assert_eq!(
+        sup.len(),
+        corpus_core::CORPUS_TOOLS.len() + corpus_core::SUPER_ADMIN_TOOLS.len(),
+        "{sup:?}"
+    );
+    for tool in corpus_core::SUPER_ADMIN_TOOLS {
+        assert!(sup.contains(&tool.to_string()), "super lacks {tool}: {sup:?}");
+    }
 }
 
 #[test]

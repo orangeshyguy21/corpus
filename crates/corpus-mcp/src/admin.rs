@@ -6,13 +6,17 @@
 //! the research trust domains (no sandbox, no targets, no oracles) and never
 //! runs missions — it prepares them. Every tool is a thin wrapper over the
 //! corpus-core API; nothing here touches the plugin protocol or the
-//! filesystem outside the store.
+//! filesystem outside the store. Destructive handlers are operator-facing:
+//! project-scoped curators receive none of them.
 //!
 //! The sandbox-facing profile (operator/researcher agents) never enables
 //! this group — enforcement is at config level (the `--admin` flag), the
 //! same pattern as the opencode permission files.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use corpus_core::{fnv1a_hex, Mission, Project, Store};
 use serde_json::{json, Value};
@@ -28,12 +32,14 @@ use corpus_core::corpus_stats as walk_corpus_stats;
 /// replayed later to a now-stale target.
 const CONFIRM_TTL_SECS: u64 = 60;
 
-/// The four destructive ops. All require the confirm-token ritual.
-pub const DESTRUCTIVE_OPS: [&str; 4] = [
+/// Every destructive op. All require the confirm-token ritual in the operator
+/// profile; project-scoped curators receive none of them.
+pub const DESTRUCTIVE_OPS: [&str; 5] = [
     "project_delete",
     "agent_delete",
     "mission_delete",
     "corpus_wipe",
+    "entry_delete",
 ];
 
 /// Every tool name this group serves. The catalog is asserted against it,
@@ -197,7 +203,7 @@ pub fn catalog() -> Value {
                     "prompt": {"type": "string", "description": "the system prompt body"},
                     "model": {"type": "string", "description": "optional model id"},
                     "from": {"type": "string", "description": "optional existing agent to inherit permissions/prompts from"},
-                    "role": {"type": "string", "enum": ["researcher", "tester", "super", "curator"], "description": "capability ceiling; defaults to researcher (or the inherited agent's role with `from`)"}
+                    "role": {"type": "string", "enum": ["super", "curator", "tester", "researcher"], "description": "capability ceiling; defaults to researcher (or the inherited agent's role with `from`)"}
                 },
                 "required": ["project", "agent", "description", "prompt"]
             }
@@ -259,14 +265,14 @@ pub fn catalog() -> Value {
         },
         {
             "name": "agent_set_role",
-            "description": "Set an agent's ROLE — the capability ceiling the corpus server enforces for missions launched as it. researcher = read + technique_save only; tester = the full sandbox/oracle/faucet/findings set, no open internet; super = everything; curator = manages THIS project (its agents, missions and corpus) and holds no sandbox tools and no internet at all. A role also regenerates the permissions at launch.",
+            "description": "Set an agent's ROLE — the capability ceiling the corpus server enforces for missions launched as it. super = every current-project research, sandbox, corpus and management capability, including confirmation-gated corpus wipe; curator = scoped project management with agent/mission/entry deletion but no wipe, sandbox or internet; tester = sandbox/oracle/faucet/findings, no internet; researcher = read + technique_save + internet. Cross-project and project-lifecycle administration remain operator-only. A role also regenerates permissions at launch.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project": {"type": "string"},
                     "agent": {"type": "string"},
                     "subagent": {"type": "string", "description": "set a subagent's role instead (capped by the primary's)"},
-                    "role": {"type": "string", "enum": ["researcher", "tester", "super", "curator"]}
+                    "role": {"type": "string", "enum": ["super", "curator", "tester", "researcher"]}
                 },
                 "required": ["project", "agent", "role"]
             }
@@ -297,7 +303,7 @@ pub fn catalog() -> Value {
                     "description": {"type": "string"},
                     "prompt": {"type": "string"},
                     "model": {"type": "string"},
-                    "role": {"type": "string", "enum": ["researcher", "tester", "super", "curator"]}
+                    "role": {"type": "string", "enum": ["super", "curator", "tester", "researcher"]}
                 },
                 "required": ["project", "agent", "name", "description", "prompt"]
             }
@@ -481,13 +487,14 @@ pub fn catalog() -> Value {
         },
         {
             "name": "entry_delete",
-            "description": "Delete ONE entry from the project's corpus by relative path (findings/x.md, attacks/<slug>/, ...). A directory needs recursive: true. runs/ is not deletable — technique cards cite those transcripts by name and the operator audits them.",
+            "description": "CONFIRM-GATED. Delete ONE entry from the project's corpus by relative path (findings/x.md, attacks/<slug>/, ...). Dry-run first; returns a one-shot token bound to the entry's current state. A directory needs recursive: true. runs/ is not deletable — technique cards cite those transcripts by name and the operator audits them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project": {"type": "string"},
                     "path": {"type": "string", "description": "relative path under the project corpus"},
-                    "recursive": {"type": "boolean", "description": "required to remove a directory"}
+                    "recursive": {"type": "boolean", "description": "required to remove a directory"},
+                    "confirm_token": {"type": "string"}
                 },
                 "required": ["project", "path"]
             }
@@ -1545,11 +1552,104 @@ fn entry_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let project = require_str(args, "project")?;
     let path = require_str(args, "path")?;
     let recursive = args.get("recursive").and_then(Value::as_bool).unwrap_or(false);
-    let freed = ctx
+    let resolved = ctx
         .store
-        .delete_corpus_entry(&project, &path, recursive)
+        .resolve_corpus_entry(&project, &path, corpus_core::EntryAccess::Mutate)
         .map_err(|e| Error::Args(e.to_string()))?;
-    Ok(format!("deleted {project}/corpus/{path} ({freed} bytes)"))
+    let preview = entry_preview(&resolved).map_err(|e| {
+        Error::Args(format!("cannot inspect {project}/corpus/{path} before deletion: {e}"))
+    })?;
+    if preview.dirs > 0 && !recursive {
+        return Err(Error::Args(format!(
+            "{path} is a directory — pass recursive to preview and remove it and everything under it"
+        )));
+    }
+    // Bind the token to both the requested deletion mode and a deterministic
+    // snapshot of the target. If the entry changes after the dry-run, the
+    // second call no longer matches and must be previewed again.
+    let target = format!(
+        "{project}/corpus/{path}|recursive={recursive}|snapshot={}",
+        preview.fingerprint
+    );
+    if let Some(token) = args.get("confirm_token").and_then(Value::as_str) {
+        confirm_and_run(ctx, "entry_delete", &target, token, |store| {
+            let freed = store
+                .delete_corpus_entry(&project, &path, recursive)
+                .map_err(|e| Error::Args(e.to_string()))?;
+            Ok(format!("deleted {project}/corpus/{path} ({freed} bytes)"))
+        })
+    } else {
+        let kind = if preview.dirs > 0 { "directory tree" } else { "file" };
+        mint_confirm(
+            ctx,
+            "entry_delete",
+            &target,
+            &format!(
+                "DRY RUN — would delete {kind} {project}/corpus/{path} ({} file(s), {} directory/directories, {} bytes)",
+                preview.files, preview.dirs, preview.bytes
+            ),
+        )
+    }
+}
+
+#[derive(Default)]
+struct EntryPreview {
+    files: u64,
+    dirs: u64,
+    bytes: u64,
+    fingerprint: String,
+}
+
+/// A stable-enough state fingerprint for the short confirm window. It includes
+/// every relative name, type, size and modification timestamp without reading
+/// potentially large attack artifacts into memory.
+fn entry_preview(root: &Path) -> std::io::Result<EntryPreview> {
+    fn visit(
+        path: &Path,
+        rel: &Path,
+        preview: &mut EntryPreview,
+        records: &mut Vec<String>,
+    ) -> std::io::Result<()> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let kind = if metadata.is_dir() {
+            preview.dirs += 1;
+            "dir"
+        } else {
+            preview.files += 1;
+            preview.bytes = preview.bytes.saturating_add(metadata.len());
+            if metadata.file_type().is_symlink() { "link" } else { "file" }
+        };
+        records.push(format!(
+            "{kind}|{}|{}|{modified}",
+            rel.display(),
+            metadata.len()
+        ));
+        if metadata.is_dir() {
+            let mut children = std::fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+            children.sort_by_key(|entry| entry.file_name());
+            for child in children {
+                visit(
+                    &child.path(),
+                    &rel.join(child.file_name()),
+                    preview,
+                    records,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut preview = EntryPreview::default();
+    let mut records = Vec::new();
+    visit(root, Path::new("."), &mut preview, &mut records)?;
+    preview.fingerprint = fnv1a_hex(records.join("\n").as_bytes());
+    Ok(preview)
 }
 
 fn entry_move(ctx: &mut Ctx, args: &Value) -> Result<String> {
@@ -1645,9 +1745,8 @@ fn now() -> u64 {
 ///
 /// What it is NOT: a control on an autonomous caller. The token is returned
 /// to whoever asked, so an agent completes the ritual in two calls with
-/// nobody in between. For the curator route the real accounting is the
-/// audit log, which records the intent whether or not the second call ever
-/// comes.
+/// nobody in between. Project-scoped curators therefore receive no
+/// destructive tools; their audit log is accountability, not authorization.
 fn mint_confirm(
     ctx: &mut Ctx,
     op: &str,

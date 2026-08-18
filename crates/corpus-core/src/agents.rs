@@ -62,11 +62,10 @@ use crate::store::{now_epoch, validate_slug, Store};
 /// any role that [`AgentRole::shell_would_defeat_gate`] flags, so a stored
 /// grant cannot survive into the rendered artifact.
 ///
-/// Deliberately NOT `Ord`. The three roles below form a chain
-/// (researcher ⊆ tester ⊆ super) over the corpus-tool sets, and a derived
-/// ordering encoded that chain as declaration position — which quietly
-/// stops being true the moment a role's grants live in a different
-/// namespace. [`AgentRole::cap_under`] spells the relation out instead.
+/// Deliberately NOT `Ord`. Super contains every current-project capability,
+/// while Curator and Tester occupy different risk domains beneath it. That is
+/// an authority relation, not something enum declaration order can encode.
+/// [`AgentRole::cap_under`] spells the relation out instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentRole {
@@ -79,19 +78,15 @@ pub enum AgentRole {
     /// No open internet — execution turns must not pull in untrusted
     /// external text.
     Tester,
-    /// Everything: research and penetration both.
+    /// Everything inside one project: research, penetration, management, and
+    /// confirmation-gated destructive maintenance. Cross-project and project
+    /// lifecycle administration remain operator-only.
     Super,
     /// Manages the PROJECT rather than the target: creates and edits the
     /// project's other agents, sets their roles, writes mission records,
-    /// curates the corpus. Holds ZERO sandbox tools and no open internet —
-    /// its whole grant set lives in a different namespace
-    /// ([`AgentRole::admin_tools`]), which is why it is incomparable to the
-    /// three above rather than above or below them.
-    ///
-    /// Declared LAST on purpose: [`AgentRole::ALL`] feeds `infer_role`'s
-    /// first-match search, and a role granting no corpus tools satisfies an
-    /// empty requirement — placed earlier it would relabel every legacy
-    /// agent the moment anyone ran `migrate-roles`.
+    /// curates the corpus. Holds zero sandbox tools and no open internet. It
+    /// may perform confirmation-gated agent, mission, and entry deletion, but
+    /// cannot wipe the corpus or perform project-lifecycle operations.
     Curator,
 }
 
@@ -118,33 +113,34 @@ const RESEARCHER_TOOLS: [&str; 2] = ["corpus_target_info", "corpus_technique_sav
 /// permission keys are `corpus_` + these, because the run config names the
 /// server `corpus`).
 ///
-/// A SEPARATE namespace from [`CORPUS_TOOLS`], not a superset of it: these
-/// mutate the project's own configuration rather than acting on a target,
-/// so no role holds both. The list is the `corpus-mcp --admin` catalog
-/// minus everything a project-scoped server cannot honestly serve:
+/// A separate namespace from [`CORPUS_TOOLS`]: these mutate the project's own
+/// configuration rather than acting on a target. Super deliberately holds
+/// both namespaces. The list is the scoped Curator catalog:
 ///
 /// - `project_list/new/clone/delete/rebind` and `agent_copy` name a project
 ///   by a key other than `project`, so scope injection cannot reach them;
-/// - `corpus_wipe` destroys research output wholesale — an operator act.
+/// - project lifecycle and cross-project operations remain operator-only;
+/// - Curator may delete agents, missions, and corpus entries inside the
+///   injected project, but only Super may wipe that project's whole corpus.
 pub const CURATOR_TOOLS: [&str; 27] = [
     "agent_list",
     "agent_get",
     "agent_new",
     "agent_save",
     "agent_clone",
+    "agent_delete",
     "agent_set",
     "agent_set_role",
     "agent_set_permission",
     "agent_subagent_add",
     "agent_subagent_remove",
-    "agent_delete",
     "mission_list",
     "mission_get",
     "mission_status",
     "mission_await",
     "mission_new",
-    "mission_delete",
     "mission_launch",
+    "mission_delete",
     "mission_set_budget",
     "mission_set_pins",
     "corpus_stats",
@@ -155,6 +151,45 @@ pub const CURATOR_TOOLS: [&str; 27] = [
     "entry_write",
     "model_list",
 ];
+
+/// Super's project-management surface: Curator plus project-local corpus wipe.
+/// Destructive calls still pass through scope injection, audit recording, and
+/// the server's dry-run/token confirmation gate.
+pub const SUPER_ADMIN_TOOLS: [&str; 28] = [
+    "agent_list",
+    "agent_get",
+    "agent_new",
+    "agent_save",
+    "agent_clone",
+    "agent_delete",
+    "agent_set",
+    "agent_set_role",
+    "agent_set_permission",
+    "agent_subagent_add",
+    "agent_subagent_remove",
+    "mission_list",
+    "mission_get",
+    "mission_status",
+    "mission_await",
+    "mission_new",
+    "mission_launch",
+    "mission_delete",
+    "mission_set_budget",
+    "mission_set_pins",
+    "corpus_wipe",
+    "corpus_stats",
+    "corpus_list",
+    "corpus_read",
+    "entry_delete",
+    "entry_move",
+    "entry_write",
+    "model_list",
+];
+
+/// Every project-management permission on which a project role has an
+/// opinion. Alias the widest scoped catalog so render rules cannot drift from
+/// Super's server grant set.
+const PROJECT_MANAGEMENT_TOOLS: [&str; 28] = SUPER_ADMIN_TOOLS;
 
 impl AgentRole {
     /// Parse a role name (config, CLI flag, sidecar).
@@ -179,7 +214,7 @@ impl AgentRole {
         }
     }
 
-    /// The role names, for a usage line: `researcher|tester|super`. Derived
+    /// The role names, for a usage line. Derived
     /// so a new variant reaches every CLI help string and error message
     /// without ten separate edits.
     pub fn names() -> String {
@@ -190,8 +225,15 @@ impl AgentRole {
             .join("|")
     }
 
-    /// Every role, for UI pickers and exhaustiveness tests.
+    /// Every role in operator-facing authority/risk order. This is UI order,
+    /// never legacy-inference precedence.
     pub const ALL: [Self; 4] =
+        [Self::Super, Self::Curator, Self::Tester, Self::Researcher];
+
+    /// Safest-covering-first order for legacy permission inference. Kept
+    /// separate from [`AgentRole::ALL`] so changing picker order can never
+    /// silently migrate an old agent to Super.
+    const LEGACY_INFERENCE_ORDER: [Self; 4] =
         [Self::Researcher, Self::Tester, Self::Super, Self::Curator];
 
     /// The starting prompt for a new agent of this role.
@@ -227,7 +269,8 @@ impl AgentRole {
                  (sandbox, oracles, faucet, gated findings). No open internet."
             }
             Self::Super => {
-                "Research and penetration both: the open internet and the sandbox in one agent."
+                "Full authority inside this project: research, sandbox execution, corpus work, \
+                 team and mission management, and confirmation-gated destructive maintenance."
             }
             Self::Curator => {
                 "Manages this project: its agents, their roles, its missions and its corpus. \
@@ -249,10 +292,13 @@ impl AgentRole {
                 "acts in the regtest arena: sandbox, oracles, faucet, findings, attacks. \
                  No open internet, so an execution turn cannot pull in untrusted text."
             }
-            Self::Super => "everything: research and penetration both.",
+            Self::Super => {
+                "all current-project capabilities: web research, sandbox execution, findings, \
+                 project management, and confirmation-gated destructive maintenance."
+            }
             Self::Curator => {
                 "manages the project's agents, missions and corpus through the corpus server. \
-                 No sandbox, no open internet \u{2014} it builds the team rather than joining it."
+                 No sandbox or open internet; corpus wipe and project lifecycle stay above it."
             }
         }
     }
@@ -275,12 +321,13 @@ impl AgentRole {
     }
 
     /// The project-management tools this role may call. Kept apart from
-    /// [`AgentRole::tools`] because the two catalogs are disjoint: one acts
-    /// on the target, the other on the project's own configuration.
+    /// [`AgentRole::tools`] because one acts on the target and the other on
+    /// project configuration. Super deliberately receives both catalogs.
     pub fn admin_tools(self) -> &'static [&'static str] {
         match self {
+            Self::Super => &SUPER_ADMIN_TOOLS,
             Self::Curator => &CURATOR_TOOLS,
-            Self::Researcher | Self::Tester | Self::Super => &[],
+            Self::Researcher | Self::Tester => &[],
         }
     }
 
@@ -303,10 +350,10 @@ impl AgentRole {
     }
 
     /// Would granting a host shell to this role make its tool ceiling a
-    /// fiction? True for any role that is server-restricted: a shell can
-    /// forge the identity the server trusts.
+    /// fiction? All project roles are server-scoped, including Super: a host
+    /// shell could forge a different project identity and escape that scope.
     pub fn shell_would_defeat_gate(self) -> bool {
-        self.tools().len() < CORPUS_TOOLS.len()
+        true
     }
 
     /// The role a SUBAGENT entry may render under, given the ceiling the
@@ -323,23 +370,17 @@ impl AgentRole {
     pub fn cap_under(self, primary: Self) -> Self {
         match (primary, self) {
             (a, b) if a == b => a,
-            // The two incomparable cases come FIRST — the chain arms below
-            // are catch-alls over `sub`, and would otherwise answer
-            // (super, curator) with "curator", handing a research session a
-            // subagent advertising management tools.
-            //
+            // Super contains every current-project role, so any requested
+            // subagent role remains intact under it.
+            (Self::Super, sub) => sub,
             // A curator's session is curated end to end: the server resolves
             // ONE role per session and takes it from the primary, so a
             // subagent rendered as a researcher would carry
             // `corpus_target_info: allow` into a session whose server
             // refuses that tool.
             (Self::Curator, _) => Self::Curator,
-            // The mirror image. The two grant sets do not intersect, so
-            // there is nothing to inherit and it collapses to the safest
-            // role rather than to the parent's.
+            // Non-Super research sessions cannot serve management tools.
             (_, Self::Curator) => Self::Researcher,
-            // Super carries every ceiling, so a subagent keeps its own.
-            (Self::Super, sub) => sub,
             // A tester's session cannot serve a wider ceiling than its own.
             (Self::Tester, Self::Super) => Self::Tester,
             (Self::Tester, sub) => sub,
@@ -375,7 +416,7 @@ pub fn infer_role(cfg: &serde_json::Map<String, serde_json::Value>) -> AgentRole
     };
     let wants_web = ["webfetch", "websearch"].iter().any(|k| granted(k));
     let needed: Vec<&str> = CORPUS_TOOLS.into_iter().filter(|t| granted(t)).collect();
-    AgentRole::ALL
+    AgentRole::LEGACY_INFERENCE_ORDER
         .into_iter()
         .find(|role| {
             needed.iter().all(|t| role.allows(t)) && (!wants_web || role.grants_web())
@@ -1042,14 +1083,19 @@ impl Store {
         }
         let dir = self.project_agent_dir(project, slug);
         let mut meta = read_sidecar(&dir, slug);
-        // A curator and a research role cannot share a session. The server
-        // resolves ONE role per run, from the primary, so the pairing would
+        // A Curator primary cannot serve research tools, and a non-Super
+        // research primary cannot serve management tools. Super is the union
+        // role and may host any project role. The server resolves ONE role per
+        // run, from the primary, so every other cross-domain pairing would
         // render an entry advertising tools its own session refuses.
         // `cap_under` already collapses it at render time; refusing here
         // means the operator finds out now instead of wondering why a
         // subagent lost its grants at launch.
         let primary = meta.role();
-        if (primary == AgentRole::Curator) != (role == AgentRole::Curator) {
+        let incompatible = (primary == AgentRole::Curator && role != AgentRole::Curator)
+            || (role == AgentRole::Curator
+                && !matches!(primary, AgentRole::Curator | AgentRole::Super));
+        if incompatible {
             return Err(Error::Store(format!(
                 "agent {project}/{slug} is a {} and cannot hold a {} subagent — one role is \
                  enforced per session, taken from the primary, so this would render as {}",
@@ -1737,7 +1783,7 @@ impl Policy {
             tools.insert(tool.to_string(), ceiling(role.allows(tool), stored));
         }
         let granted = role.admin_tools();
-        for tool in CURATOR_TOOLS {
+        for tool in PROJECT_MANAGEMENT_TOOLS {
             let key = format!("corpus_{tool}");
             let stored = take_action(&mut stored, &key);
             tools.insert(key, ceiling(granted.contains(&tool), stored));
@@ -2306,9 +2352,11 @@ mod tests {
         }
         assert!(AgentRole::Researcher.tools().len() < CORPUS_TOOLS.len());
         assert_eq!(AgentRole::Super.tools().len(), CORPUS_TOOLS.len());
-        // A restricted role's ceiling is a fiction if it also has a shell.
-        assert!(AgentRole::Researcher.shell_would_defeat_gate());
-        assert!(!AgentRole::Super.shell_would_defeat_gate());
+        // Every role is current-project scoped; a host shell could forge a
+        // different project even when the role already holds every local tool.
+        for role in AgentRole::ALL {
+            assert!(role.shell_would_defeat_gate(), "{role:?}");
+        }
         // Round-trip every name.
         for role in AgentRole::ALL {
             assert_eq!(AgentRole::parse(role.as_str()), Some(role));
@@ -2527,14 +2575,9 @@ mod tests {
         }
     }
 
-    /// The curator sits outside the research chain, and `cap_under` has to
-    /// say so in both directions. The dangerous case is a curator subagent
-    /// under a SUPER primary: the chain arms are catch-alls over the
-    /// subagent, so an arm ordering that let `(Super, Curator)` fall through
-    /// would hand a research session a subagent advertising management
-    /// tools its own server refuses.
+    /// Curator and Tester remain different domains, but Super contains both.
     #[test]
-    fn curator_is_incomparable_to_the_research_roles() {
+    fn super_contains_curator_while_other_research_roles_do_not() {
         use AgentRole::{Curator, Researcher, Super, Tester};
         assert_eq!(Curator.cap_under(Curator), Curator);
         // A curator primary curates its whole session.
@@ -2546,10 +2589,8 @@ mod tests {
                 sub.as_str()
             );
         }
-        // A curator subagent collapses to the safest role under ANY research
-        // primary — including super, which carries every research ceiling
-        // and still has nothing to lend a curator.
-        for primary in [Researcher, Tester, Super] {
+        // Curator remains incompatible with the narrower research roles.
+        for primary in [Researcher, Tester] {
             assert_eq!(
                 Curator.cap_under(primary),
                 Researcher,
@@ -2557,6 +2598,7 @@ mod tests {
                 primary.as_str()
             );
         }
+        assert_eq!(Curator.cap_under(Super), Curator);
         // The invariant the whole table exists to protect, restated over the
         // management namespace this time.
         for primary in AgentRole::ALL {
@@ -2573,18 +2615,25 @@ mod tests {
         }
     }
 
-    /// A role granting no corpus tools satisfies an empty requirement, so
-    /// placing it early in `ALL` would make `infer_role`'s first-match
-    /// search relabel every legacy agent the next time anyone ran
-    /// `migrate-roles`. Position is the guard; this test is what notices if
-    /// someone tidies the enum.
+    /// Picker order and legacy inference order are independent. Curator grants
+    /// no corpus tools and would match empty requirements if it moved earlier
+    /// in inference, while putting Super first would widen every migration.
     #[test]
     fn a_new_role_cannot_relabel_legacy_agents() {
-        assert_eq!(AgentRole::ALL[0], AgentRole::Researcher, "safest first");
         assert_eq!(
-            AgentRole::ALL.last().copied(),
+            AgentRole::ALL,
+            [AgentRole::Super, AgentRole::Curator, AgentRole::Tester, AgentRole::Researcher],
+            "operator-facing authority/risk order"
+        );
+        assert_eq!(
+            AgentRole::LEGACY_INFERENCE_ORDER[0],
+            AgentRole::Researcher,
+            "legacy inference stays safest-covering-first"
+        );
+        assert_eq!(
+            AgentRole::LEGACY_INFERENCE_ORDER.last().copied(),
             Some(AgentRole::Curator),
-            "a zero-corpus-tool role must sort last or it matches everything"
+            "a zero-corpus-tool role must infer last"
         );
         // An agent with no permission block at all, and one that grants
         // nothing: neither is a curator, whatever the tool arithmetic says.
@@ -2629,20 +2678,13 @@ mod tests {
         let read = |slug: &str| {
             fs::read_to_string(store.opencode_agent_dir("alpha").join(format!("{slug}.md"))).unwrap()
         };
-        for slug in ["res", "cur"] {
+        for slug in ["res", "cur", "sup"] {
             assert_eq!(
                 rendered_permission(&read(slug))["bash"].as_str(),
                 Some("deny"),
                 "{slug}: a server-restricted role cannot hold a shell"
             );
         }
-        // Super holds every corpus tool, so a shell forges nothing it did
-        // not already have — its stored grant is honoured.
-        assert_eq!(
-            rendered_permission(&read("sup"))["bash"].as_str(),
-            Some("allow"),
-            "the unrestricted role keeps what it asked for"
-        );
     }
 
     /// The management namespace is written for every role, denied wherever
@@ -2650,7 +2692,7 @@ mod tests {
     /// artifact never depends on opencode's default for a tool the role has
     /// an opinion about.
     #[test]
-    fn render_denies_the_admin_namespace_outside_the_curator() {
+    fn render_derives_the_admin_namespace_for_curator_and_super() {
         let store = tmp_store("admin-ns");
         store.create_project("alpha", "A", "cdk-regtest").unwrap();
         store
@@ -2659,6 +2701,9 @@ mod tests {
         store
             .create_agent_with_role("alpha", "cur", AgentRole::Curator)
             .unwrap();
+        store
+            .create_agent_with_role("alpha", "sup", AgentRole::Super)
+            .unwrap();
         store.render_project_agents("alpha").unwrap();
         let read = |slug: &str| {
             rendered_permission(
@@ -2666,11 +2711,17 @@ mod tests {
                     .unwrap(),
             )
         };
-        let (res, cur) = (read("res"), read("cur"));
-        for tool in CURATOR_TOOLS {
+        let (res, cur, sup) = (read("res"), read("cur"), read("sup"));
+        for tool in PROJECT_MANAGEMENT_TOOLS {
             let key = format!("corpus_{tool}");
             assert_eq!(res[&key].as_str(), Some("deny"), "researcher: {key}");
-            assert_eq!(cur[&key].as_str(), Some("allow"), "curator: {key}");
+            let expected = if CURATOR_TOOLS.contains(&tool) {
+                "allow"
+            } else {
+                "deny"
+            };
+            assert_eq!(cur[&key].as_str(), Some(expected), "curator: {key}");
+            assert_eq!(sup[&key].as_str(), Some("allow"), "super: {key}");
         }
         // And the reverse: a curator holds no sandbox tools at all.
         for tool in CORPUS_TOOLS {
@@ -2729,6 +2780,24 @@ mod tests {
         assert!(store
             .set_subagent_role("alpha", "res", "res-scout", AgentRole::Curator)
             .is_err());
+
+        // Super is the cross-domain union and may host any project role.
+        store
+            .create_agent_with_role("alpha", "sup", AgentRole::Super)
+            .unwrap();
+        store
+            .save_agent(
+                "alpha",
+                "sup",
+                &doc(serde_json::json!({
+                    "sup": { "mode": "primary" },
+                    "sup-curator": { "mode": "subagent", "description": "d" },
+                })),
+            )
+            .unwrap();
+        store
+            .set_subagent_role("alpha", "sup", "sup-curator", AgentRole::Curator)
+            .unwrap();
     }
 
     /// Every role name survives a round trip. This is the ONLY thing that

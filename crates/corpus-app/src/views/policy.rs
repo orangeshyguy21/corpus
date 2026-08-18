@@ -79,11 +79,7 @@ impl RolePolicy {
 
 /// The role the preview must describe. A primary owns its requested ceiling;
 /// a subagent is rendered under the primary session's core-defined cap.
-pub fn effective_role(
-    requested: AgentRole,
-    primary: AgentRole,
-    is_primary: bool,
-) -> AgentRole {
+pub fn effective_role(requested: AgentRole, primary: AgentRole, is_primary: bool) -> AgentRole {
     if is_primary {
         requested
     } else {
@@ -98,7 +94,7 @@ pub fn short_description(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Researcher => "Web and source research; no execution",
         AgentRole::Tester => "Sandbox testing and findings; no web",
-        AgentRole::Super => "Web research plus full sandbox access",
+        AgentRole::Super => "All current-project permissions",
         AgentRole::Curator => "Manages agents, missions, and corpus",
     }
 }
@@ -118,7 +114,7 @@ mod tests {
         let expected = [
             (Researcher, [true, true, false, false, false]),
             (Tester, [false, true, true, true, false]),
-            (Super, [true, true, true, true, false]),
+            (Super, [true, true, true, true, true]),
             (Curator, [false, false, false, false, true]),
         ];
         let capabilities = [
@@ -155,7 +151,7 @@ mod tests {
                 match role {
                     AgentRole::Researcher => 2,
                     AgentRole::Tester => 3,
-                    AgentRole::Super => 4,
+                    AgentRole::Super => 5,
                     AgentRole::Curator => 1,
                 }
             );
@@ -168,8 +164,8 @@ mod tests {
 
         let expected = [
             (Researcher, [Researcher, Researcher, Researcher, Researcher]),
-            (Tester, [Researcher, Tester, Tester, Researcher]),
-            (Super, [Researcher, Tester, Super, Researcher]),
+            (Tester, [Tester, Researcher, Tester, Researcher]),
+            (Super, [Super, Curator, Tester, Researcher]),
             (Curator, [Curator, Curator, Curator, Curator]),
         ];
         for (primary, effective) in expected {
@@ -188,10 +184,7 @@ mod tests {
     fn picker_descriptions_stay_below_fifty_characters() {
         for role in AgentRole::ALL {
             let description = short_description(role);
-            assert!(
-                description.chars().count() < 50,
-                "{role:?}: {description}"
-            );
+            assert!(description.chars().count() < 50, "{role:?}: {description}");
         }
     }
 }

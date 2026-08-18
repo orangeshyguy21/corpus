@@ -111,7 +111,7 @@ impl Sidebar {
 
         // Drain a requested plugin re-probe before the modals render.
         if self.needs_probe {
-            state.refresh_plugins();
+            state.refresh_plugins(Some(&self.create_plugin));
             self.needs_probe = false;
         }
 
@@ -146,35 +146,6 @@ impl Sidebar {
         let selected = state.effective_project();
         let projects = state.projects.clone();
         let trees = state.trees.clone();
-        // Repaint budget follows what the dots are actually doing. Only a
-        // WORKING agent animates, so only that needs the 50 ms stream; a
-        // live-but-waiting session still needs a slow beat so the frame
-        // that notices work STARTING ever gets drawn (the activity poll
-        // rides on update()). Nothing live = no repaints at all.
-        let project = selected.as_deref().unwrap_or_default();
-        let busiest = trees
-            .get(project)
-            .map(|tree| {
-                tree.missions
-                    .iter()
-                    .map(|(slug, _)| state.mission_activity(project, slug))
-                    .max_by_key(|activity| match activity {
-                        MissionActivity::Working => 2,
-                        MissionActivity::Waiting => 1,
-                        MissionActivity::Idle => 0,
-                    })
-                    .unwrap_or(MissionActivity::Idle)
-            })
-            .unwrap_or(MissionActivity::Idle);
-        match busiest {
-            MissionActivity::Working => {
-                ui.ctx().request_repaint_after(Duration::from_millis(50))
-            }
-            MissionActivity::Waiting => {
-                ui.ctx().request_repaint_after(Duration::from_millis(400))
-            }
-            MissionActivity::Idle => {}
-        }
         for (slug, project) in &projects {
             let open = selected.as_deref() == Some(slug.as_str());
             self.project_row(ui, state, toasts, slug, project, open);
@@ -359,7 +330,16 @@ impl Sidebar {
             let (label_resp, _menu_w) = if is_sel || hovered {
                 let menu_w = rui
                     .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.mission_menu(ui, state, toasts, project, slug, live, &label_text)
+                        self.mission_menu(
+                            ui,
+                            state,
+                            toasts,
+                            project,
+                            slug,
+                            live,
+                            mission.opencode_session.is_some(),
+                            &label_text,
+                        )
                     })
                     .response
                     .rect
@@ -410,8 +390,7 @@ impl Sidebar {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             if click.clicked() || label_resp.clicked() {
-                state.selected_mission = Some(slug.clone());
-                state.current_screen = Screen::Missions;
+                state.select_mission(project, slug);
             }
             click.on_hover_text(format!(
                 "{project} · agent={}{}",
@@ -428,11 +407,11 @@ impl Sidebar {
         }
     }
 
-    /// One-click mission create + launch: no modal. Agent = the sidebar-
+    /// One-click mission creation: no modal. Agent = the sidebar-
     /// selected agent (when the project is already selected), else
     /// `operator` if present, else the first agent (refuses with a toast
     /// when the project has none). Pins = the project's top-bar pins.
-    /// Creates, selects, and auto-launches on the mission view. A `+` on
+    /// Creates and selects without launching. A `+` on
     /// a non-selected project's group selects that project first.
     fn new_mission(&mut self, state: &mut AppState, toasts: &mut Toasts, project: &str) {
         if state.effective_project().as_deref() != Some(project) {
@@ -459,13 +438,11 @@ impl Sidebar {
         match state.create_mission(&project, &agent, "") {
             Ok(slug) => {
                 state.refresh_missions(&project);
-                state.selected_mission = Some(slug.clone());
-                state.pending_launch = Some(slug.clone());
-                state.current_screen = Screen::Missions;
+                state.select_mission(&project, &slug);
                 toast(
                     toasts,
                     ToastKind::Success,
-                    format!("launched {agent} on {project} — new mission"),
+                    format!("created mission for {agent} on {project}"),
                 );
             }
             Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
@@ -484,6 +461,7 @@ impl Sidebar {
         project: &str,
         slug: &str,
         live: bool,
+        resumable: bool,
         name: &str,
     ) -> egui::Response {
         egui::menu::menu_custom_button(
@@ -495,14 +473,21 @@ impl Sidebar {
             ))
             .frame(false),
             |ui| {
+                let inflight = state.mission_run_inflight(project, slug);
                 // Launch an existing (never-run, or stopped) mission — the
                 // gap that made curator-created missions dead ends. Disabled
                 // while its session is already live. Selects the mission and
                 // routes to the view so the operator lands on the pane as it
                 // attaches; the brief kicks the session off.
-                let launch = ui.add_enabled(!live, egui::Button::new("Launch"));
+                let launch = ui.add_enabled(!live && !inflight, egui::Button::new("Launch"));
                 if launch.clicked() {
-                    launch_mission(state, project, slug);
+                    launch_mission(state, toasts, project, slug);
+                    ui.close_menu();
+                }
+                let resume =
+                    ui.add_enabled(!live && resumable && !inflight, egui::Button::new("Resume"));
+                if resume.clicked() {
+                    resume_mission(state, toasts, project, slug);
                     ui.close_menu();
                 }
                 let stop = ui.add_enabled(live, egui::Button::new("Stop run"));
@@ -872,8 +857,8 @@ fn row_ui(ui: &mut Ui, selected: bool, has_kebab: bool, id_seed: impl std::hash:
 ///                 here would claim work that isn't happening, so the
 ///                 dot only says "attached".
 ///   - `Working` — health-green with a soft pulsing halo: producing now.
-/// The pulse is pure paint off the repaint clock — no widget, no state
-/// (the caller requests a 50 ms repaint while a mission is working).
+/// The pulse is pure paint off the app's live-producer clock — no widget,
+/// no state. `AppState::live_repaint_after` owns the 50 ms working cadence.
 fn status_dot(ui: &Ui, rect: egui::Rect, activity: MissionActivity) {
     let center = rect.center();
     match activity {
@@ -1033,25 +1018,38 @@ fn delete_project(state: &mut AppState, toasts: &mut Toasts, slug: &str) {
     }
 }
 
-/// Launch an existing mission (Mission ⋮ -> Launch): select it, route to
-/// the Missions view, and hand the view the `pending_launch` it consumes —
-/// the SAME path the create-and-launch `+` uses, so the operator lands on
-/// the pane as the session attaches. A non-selected project is selected
-/// first, so the launch lands where the row lives, not on the current view.
-fn launch_mission(state: &mut AppState, project: &str, slug: &str) {
-    if state.effective_project().as_deref() != Some(project) {
-        state.select_project(project);
+/// Launch is an explicit operator action. It selects the mission first so
+/// progress and attachment paint in the central view, then schedules launch
+/// preparation directly; no render path consumes a deferred spawn token.
+fn launch_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
+    state.select_mission(project, slug);
+    if let Err(error) = state.launch_mission(project, slug) {
+        toast(toasts, ToastKind::Error, error.to_string());
     }
-    state.selected_mission = Some(slug.to_string());
-    state.pending_launch = Some(slug.to_string());
-    state.current_screen = Screen::Missions;
 }
 
-/// Stop a mission's run (Mission ⋮ -> Stop run): best-effort transcript
-/// export, then kill the run and clear its bookkeeping.
+/// Resume is an explicit operator action. Selecting or browsing a mission
+/// never starts a process.
+fn resume_mission(
+    state: &mut AppState,
+    toasts: &mut Toasts,
+    project: &str,
+    slug: &str,
+) {
+    state.select_mission(project, slug);
+    if let Err(error) = state.resume_mission(project, slug) {
+        toast(toasts, ToastKind::Error, error.to_string());
+    }
+}
+
+/// Stop a mission's run (Mission ⋮ -> Stop run): report export/cleanup
+/// failures and clear the durable session only after cleanup succeeds.
 fn stop_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
     match state.stop_mission(project, slug) {
-        Ok(path) => {
+        Ok(crate::state::StopMissionResult::Scheduled) => {
+            toast(toasts, ToastKind::Info, format!("stopping mission {slug}…"));
+        }
+        Ok(crate::state::StopMissionResult::Completed(path)) => {
             let detail = if path.is_empty() {
                 format!("stopped mission {slug}")
             } else {

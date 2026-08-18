@@ -128,23 +128,23 @@ impl ModelList {
 /// opencode is missing, errors, or returns nothing — callers degrade
 /// to free text.
 pub fn model_list(refresh: bool) -> Result<ModelList, Error> {
-    static CACHE: OnceLock<Mutex<Option<(Instant, ModelList)>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<Option<(Instant, Result<ModelList, String>)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     if !refresh {
         let hit = cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .and_then(|(fetched, list)| {
-                (fetched.elapsed() < MODEL_LIST_TTL).then(|| list.clone())
+            .and_then(|(fetched, result)| {
+                (fetched.elapsed() < MODEL_LIST_TTL).then(|| result.clone())
             });
-        if let Some(list) = hit {
-            return Ok(list);
+        if let Some(result) = hit {
+            return result.map_err(Error::Store);
         }
     }
-    let list = pull_model_list(refresh)?;
-    *cache.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), list.clone()));
-    Ok(list)
+    let result = pull_model_list(refresh).map_err(|error| error.to_string());
+    *cache.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), result.clone()));
+    result.map_err(Error::Store)
 }
 
 /// The shell-out: `opencode models --verbose [--refresh]`, parsed.
@@ -282,6 +282,34 @@ fn provider_label(id: &str) -> &str {
 /// server has pulled are selectable for the chat. Errors when `ollama` is
 /// missing or returns nothing — callers degrade to free text.
 pub fn ollama_models() -> Result<ModelList, Error> {
+    ollama_models_refresh(false)
+}
+
+/// Cached Ollama discovery. Both success and failure are retained so a
+/// missing local server cannot turn a picker paint into a subprocess loop.
+/// Explicit refresh bypasses the cache.
+pub fn ollama_models_refresh(refresh: bool) -> Result<ModelList, Error> {
+    static CACHE: OnceLock<Mutex<Option<(Instant, Result<ModelList, String>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if !refresh {
+        let hit = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|(fetched, result)| {
+                (fetched.elapsed() < MODEL_LIST_TTL).then(|| result.clone())
+            });
+        if let Some(result) = hit {
+            return result.map_err(Error::Store);
+        }
+    }
+    let result = pull_ollama_models().map_err(|error| error.to_string());
+    *cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((Instant::now(), result.clone()));
+    result.map_err(Error::Store)
+}
+
+fn pull_ollama_models() -> Result<ModelList, Error> {
     let ollama = std::env::var("OLLAMA").unwrap_or_else(|_| "ollama".to_string());
     let output = Command::new(&ollama)
         .arg("list")

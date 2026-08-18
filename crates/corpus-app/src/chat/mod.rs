@@ -186,9 +186,37 @@ impl ChatHandle {
     /// a specialist registers only its scoped admin domain (by construction),
     /// an `Orchestrator` registers no admin tools.
     pub fn start_scoped(project: &str, model: &str, role: team::TeamRole) -> ChatHandle {
+        Self::start_scoped_inner(project, model, role, None)
+    }
+
+    /// Production entry point: every backend event is placed in the UI
+    /// inbox before egui is woken. Without this bridge streamed replies can
+    /// sit invisible until unrelated pointer input or an ambient repaint.
+    pub(crate) fn start_scoped_with_wake(
+        project: &str,
+        model: &str,
+        role: team::TeamRole,
+        wake: Arc<dyn crate::jobs::RepaintWake>,
+    ) -> ChatHandle {
+        Self::start_scoped_inner(project, model, role, Some(wake))
+    }
+
+    fn start_scoped_inner(
+        project: &str,
+        model: &str,
+        role: team::TeamRole,
+        wake: Option<Arc<dyn crate::jobs::RepaintWake>>,
+    ) -> ChatHandle {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<ChatCommand>();
-        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<ChatEvent>();
-        let session_id = embedded::spawn_backend(project, model, role, ev_tx, cmd_rx);
+        let (visible_tx, ev_rx) = std::sync::mpsc::channel::<ChatEvent>();
+        let backend_tx = if let Some(wake) = wake {
+            let (backend_tx, backend_rx) = std::sync::mpsc::channel::<ChatEvent>();
+            spawn_event_bridge(backend_rx, visible_tx, wake);
+            backend_tx
+        } else {
+            visible_tx
+        };
+        let session_id = embedded::spawn_backend(project, model, role, backend_tx, cmd_rx);
         let handle = ChatInner {
             tx: cmd_tx,
             events: ev_rx,
@@ -224,6 +252,25 @@ impl ChatHandle {
     pub fn project(&self) -> String {
         self.inner.lock().unwrap().project.clone()
     }
+}
+
+fn spawn_event_bridge(
+    source: std::sync::mpsc::Receiver<ChatEvent>,
+    destination: std::sync::mpsc::Sender<ChatEvent>,
+    wake: Arc<dyn crate::jobs::RepaintWake>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("chat-event-wake".into())
+        .spawn(move || {
+            while let Ok(event) = source.recv() {
+                if destination.send(event).is_err() {
+                    break;
+                }
+                // Send first: the frame this requests must always be able to
+                // drain the event that caused it.
+                wake.request_repaint();
+            }
+        });
 }
 
 impl Chat for ChatHandle {
@@ -416,6 +463,19 @@ impl ConfirmGate {
 mod tests {
     use super::*;
 
+    struct InspectWake {
+        events: std::sync::Mutex<std::sync::mpsc::Receiver<ChatEvent>>,
+        observed: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl crate::jobs::RepaintWake for InspectWake {
+        fn request_repaint(&self) {
+            if let Ok(event) = self.events.lock().unwrap().try_recv() {
+                self.observed.lock().unwrap().push(event.kind());
+            }
+        }
+    }
+
     #[test]
     fn event_kinds_are_stable() {
         assert_eq!(ChatEvent::Ready { session_id: "s".into(), project: "p".into() }.kind(), "ready");
@@ -438,6 +498,24 @@ mod tests {
         let h = ChatHandle::idle("default");
         assert_eq!(h.phase(), ChatPhase::Idle);
         assert!(h.poll_events().is_empty());
+    }
+
+    #[test]
+    fn chat_event_is_visible_before_its_repaint_wake() {
+        let (backend_tx, backend_rx) = std::sync::mpsc::channel();
+        let (visible_tx, visible_rx) = std::sync::mpsc::channel();
+        let wake = Arc::new(InspectWake {
+            events: std::sync::Mutex::new(visible_rx),
+            observed: std::sync::Mutex::new(Vec::new()),
+        });
+        spawn_event_bridge(backend_rx, visible_tx, wake.clone());
+
+        backend_tx.send(ChatEvent::TurnStart { turn: 7 }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while wake.observed.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(*wake.observed.lock().unwrap(), vec!["turn_start"]);
     }
 
     #[test]

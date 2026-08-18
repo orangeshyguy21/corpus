@@ -1,5 +1,5 @@
 //! Chunk-1 admin profile: the corpus-admin MCP tool group, thin over
-//! corpus-core. Covers the confirm-token gate on the four destructive ops
+//! corpus-core. Covers the confirm-token gate on every destructive op
 //! (dry-run without token, one-shot token completes), the agent validator
 //! round-trip, and rebind plugin validation against the registry.
 
@@ -148,6 +148,93 @@ fn corpus_wipe_without_token_is_dry_run_and_requires_confirmation() {
 }
 
 #[test]
+fn entry_delete_is_dry_run_first_and_bound_to_current_state() {
+    let (mut ctx, store, root, project) = rig("entry-delete-gate");
+    let finding = proj_corpus(&store).join("findings/f1.md");
+    std::fs::write(&finding, "first\n").unwrap();
+
+    let dry = admin::dispatch(
+        &mut ctx,
+        "entry_delete",
+        &json!({"project": project, "path": "findings/f1.md"}),
+    )
+    .expect("dry run");
+    assert!(dry.contains("DRY RUN"), "{dry}");
+    assert!(dry.contains("confirm_token:"), "{dry}");
+    assert!(finding.is_file(), "dry run must not delete");
+
+    let token = dry
+        .split("confirm_token: ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    // Change the target after approval. The old token must no longer match.
+    std::fs::write(&finding, "changed after preview\n").unwrap();
+    let error = admin::dispatch(
+        &mut ctx,
+        "entry_delete",
+        &json!({
+            "project": project,
+            "path": "findings/f1.md",
+            "confirm_token": token,
+        }),
+    )
+    .expect_err("stale preview token must be refused")
+    .to_string();
+    assert!(error.contains("does not match"), "{error}");
+    assert!(finding.is_file());
+
+    let dry = admin::dispatch(
+        &mut ctx,
+        "entry_delete",
+        &json!({"project": project, "path": "findings/f1.md"}),
+    )
+    .expect("fresh dry run");
+    let token = dry
+        .split("confirm_token: ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let out = admin::dispatch(
+        &mut ctx,
+        "entry_delete",
+        &json!({
+            "project": project,
+            "path": "findings/f1.md",
+            "confirm_token": token,
+        }),
+    )
+    .expect("confirmed deletion");
+    assert!(out.contains("[confirmed with one-shot token]"), "{out}");
+    assert!(!finding.exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn entry_delete_directory_requires_recursive_before_minting() {
+    let (mut ctx, store, root, project) = rig("entry-delete-recursive");
+    let attack = proj_corpus(&store).join("attacks/replay");
+    std::fs::create_dir_all(&attack).unwrap();
+    std::fs::write(attack.join("attack.md"), "attack\n").unwrap();
+    let error = admin::dispatch(
+        &mut ctx,
+        "entry_delete",
+        &json!({"project": project, "path": "attacks/replay"}),
+    )
+    .expect_err("directory needs recursive")
+    .to_string();
+    assert!(error.contains("pass recursive"), "{error}");
+    assert!(!error.contains("confirm_token"), "must not mint unusable token: {error}");
+    assert!(attack.is_dir());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn wrong_token_is_refused() {
     let (mut ctx, store, root, project) = rig("wipe-wrong-token");
     let runs = proj_corpus(&store).join("runs");
@@ -226,10 +313,39 @@ fn admin_catalog_carries_no_sandbox_tools() {
     for bad in ["sandbox_exec", "oracle_run", "faucet", "finding_write", "agent_save_of_missions", "target_info"] {
         assert!(!names.contains(&bad.to_string()), "admin catalog must not carry {bad}");
     }
-    for op in ["project_delete", "agent_delete", "mission_delete", "corpus_wipe"] {
+    for op in [
+        "project_delete",
+        "agent_delete",
+        "mission_delete",
+        "corpus_wipe",
+        "entry_delete",
+    ] {
         assert!(names.contains(&op.to_string()), "must carry destructive op {op}");
     }
     // The model discovery tool (the chat agent resolves exact model ids
     // through this instead of guessing).
     assert!(names.contains(&"model_list".to_string()), "must carry model_list");
+}
+
+#[test]
+fn every_destructive_tool_advertises_confirmation() {
+    let catalog = admin::catalog();
+    for op in admin::DESTRUCTIVE_OPS {
+        let tool = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == op)
+            .unwrap_or_else(|| panic!("destructive op {op} missing from catalog"));
+        assert!(
+            tool["inputSchema"]["properties"]["confirm_token"].is_object(),
+            "{op} is destructive but advertises no confirm_token"
+        );
+        assert!(
+            tool["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("CONFIRM-GATED")),
+            "{op} does not tell the caller it is confirm-gated"
+        );
+    }
 }

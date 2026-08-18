@@ -1,7 +1,8 @@
 //! The shared plugin picker (app-flow chunks 1+3, app-parity-spec §5): a
 //! hand-rolled flat dropdown over the discovered environment plugins with a
-//! live probe badge per entry — a filled health-green dot when ready, a signal-red
-//! dot when not (painted with the painter, not a font glyph). The field is
+//! probe badge per entry — health-green when ready, signal-red when a probe
+//! failed, and muted when discovered but not probed (painted with the painter,
+//! not a font glyph). The field is
 //! a flat PANEL box (1px HAIRLINE, radius 2) with the plugin name in
 //! monospace 14px and a `caret_down` arrow; the popup lists each plugin
 //! with its own badge. A Re-probe affordance schedules a fresh host-side
@@ -108,7 +109,7 @@ fn row(ui: &mut Ui, status: &PluginStatus, current: &mut String) {
         if resp.clicked() {
             *current = status.name.clone();
         }
-        if !status.ready && !status.notes.is_empty() {
+        if status.probed && !status.ready && !status.notes.is_empty() {
             resp.on_hover_text(&status.notes);
             let short: String = status.notes.chars().take(48).collect();
             ui.weak(format!("{short}"));
@@ -117,26 +118,27 @@ fn row(ui: &mut Ui, status: &PluginStatus, current: &mut String) {
 }
 
 /// The probe badge colour for a plugin: health-green when the live probe is
-/// ready, signal-red otherwise (an unknown binding counts as not ready).
+/// ready, signal-red on a checked failure, muted when not checked.
 fn badge_color(status: &PluginStatus) -> Color32 {
-    if status.ready {
+    if !status.probed {
+        theme::TEXT_FAINT
+    } else if status.ready {
         theme::HEALTHY
     } else {
         theme::SIGNAL_RED
     }
 }
 
-/// Paint the probe badge for `name` at `center`: filled health dot when the
-/// plugin's probe is ready, signal dot otherwise.
+/// Paint the probe badge for `name` at `center`.
 fn paint_badge(painter: &egui::Painter, center: egui::Pos2, name: &str, plugins: &[PluginStatus]) {
-    let ready = plugins.iter().any(|p| p.name == name && p.ready);
+    let color = plugins
+        .iter()
+        .find(|plugin| plugin.name == name)
+        .map(badge_color)
+        .unwrap_or(theme::TEXT_FAINT);
     painter.circle_filled(
         center,
         4.0,
-        if ready {
-            theme::HEALTHY
-        } else {
-            theme::SIGNAL_RED
-        },
+        color,
     );
 }

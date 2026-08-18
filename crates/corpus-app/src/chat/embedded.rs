@@ -5,11 +5,11 @@
 //!
 //! Runtime (operator decision 2026-08-14): goose's `Agent` runs IN-PROCESS as
 //! a source-level dependency (git-dep at a pinned rev — see
-//! dev/decisions.md.md "Bumps are deliberate events"). It replaces the old
+//! dev/decisions.md "Bumps are deliberate events"). It replaces the old
 //! `chat/acp.rs`, which spawned a managed `goose acp` subprocess and spoke
 //! Agent Client Protocol. The [`Chat`] seam (`crate::chat`) is UNCHANGED; only
 //! this transport swapped. Git history keeps acp.rs; the fallback story lives
-//! in dev/decisions.md.md's record.
+//! in dev/decisions.md's record.
 //!
 //! Tool source: `corpus-mcp --admin` is spawned DIRECTLY as a stdio MCP
 //! extension (a CORPUS subprocess, our own protocol — not a goose subprocess).

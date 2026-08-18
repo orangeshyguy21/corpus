@@ -283,9 +283,10 @@ fn resolve_role(store: &Store, scope: &Scope) -> std::result::Result<AgentRole, 
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| {
             format!(
-                "{} is unset — a mission launch always sets it; pass --role <researcher|tester|super> \
+                "{} is unset — a mission launch always sets it; pass --role <{}> \
                  to run this server by hand",
-                corpus_core::AGENT_ENV
+                corpus_core::AGENT_ENV,
+                AgentRole::names()
             )
         })?;
     let config = store.load_agent(&scope.project, &agent).map_err(|e| {
@@ -310,13 +311,8 @@ pub fn catalog_for(role: &std::result::Result<AgentRole, String>) -> Value {
     let Ok(role) = role else {
         return Value::Array(Vec::new());
     };
-    // A project-management role serves a different catalog entirely, scoped
-    // to the project this server already proved. The two sets are disjoint:
-    // a curator advertises no sandbox tools, and no research role
-    // advertises a management one.
-    if !role.admin_tools().is_empty() {
-        return crate::admin::scoped_catalog(role.admin_tools());
-    }
+    // Sandbox and management are separate namespaces, but Super receives
+    // both. Curator naturally reduces to only the scoped management half.
     let mut out = catalog();
     if let Some(list) = out.as_array_mut() {
         list.retain(|tool| {
@@ -325,6 +321,9 @@ pub fn catalog_for(role: &std::result::Result<AgentRole, String>) -> Value {
                 .map(|n| role.allows(n))
                 .unwrap_or(false)
         });
+        if let Some(admin) = crate::admin::scoped_catalog(role.admin_tools()).as_array() {
+            list.extend(admin.iter().cloned());
+        }
     }
     out
 }
@@ -460,12 +459,13 @@ fn with_project(args: &Value, project: &str) -> Value {
 
 /// Management tools that only look. Not audited: the log is a record of
 /// acts, and a line per `agent_list` would bury the ones that matter.
-const READ_ONLY_MANAGEMENT: [&str; 9] = [
+const READ_ONLY_MANAGEMENT: [&str; 10] = [
     "agent_list",
     "agent_get",
     "mission_list",
     "mission_get",
     "mission_status",
+    "mission_await",
     "corpus_stats",
     "corpus_list",
     "corpus_read",
@@ -514,6 +514,80 @@ const AGENT_MUTATORS: [&str; 8] = [
     "agent_delete",
 ];
 
+/// A curator manages ordinary project agents but cannot mint or repurpose a
+/// `super` identity. Super agents can reach every research capability, so
+/// authoring one is reserved to an existing Super or the host operator.
+fn enforce_curator_agent_ceiling(
+    ctx: &Ctx,
+    name: &str,
+    args: &Value,
+    project: &str,
+) -> Result<()> {
+    let requested_role = args.get("role").and_then(Value::as_str);
+    if requested_role == Some(AgentRole::Super.as_str()) {
+        return Err(Error::refused(
+            Gate::Role,
+            format!(
+                "refusing {name}: granting the super role is operator-owned; a curator may grant researcher, tester, or curator"
+            ),
+        ));
+    }
+
+    if name == "agent_new"
+        && args.get("from").and_then(Value::as_str).is_some()
+        && requested_role.is_none()
+    {
+        return Err(Error::refused(
+            Gate::Role,
+            "refusing agent_new: super authority is operator-owned; a curator cloning configuration with 'from' must choose an explicit non-super role so inherited permissions cannot infer super",
+        ));
+    }
+
+    if name == "agent_clone" {
+        let from = args.get("from").and_then(Value::as_str).unwrap_or_default();
+        if !from.is_empty()
+            && ctx
+                .store
+                .load_agent(project, from)
+                .is_ok_and(|agent| agent.meta.role() == AgentRole::Super)
+        {
+            return Err(Error::refused(
+                Gate::Role,
+                format!(
+                    "refusing agent_clone: {project}/{from} is a super agent, and copying that capability is operator-owned"
+                ),
+            ));
+        }
+    }
+
+    let mutates_existing = matches!(
+        name,
+        "agent_save"
+            | "agent_set"
+            | "agent_set_role"
+            | "agent_set_permission"
+            | "agent_subagent_add"
+            | "agent_subagent_remove"
+    );
+    if mutates_existing {
+        let agent = args.get("agent").and_then(Value::as_str).unwrap_or_default();
+        if !agent.is_empty()
+            && ctx
+                .store
+                .load_agent(project, agent)
+                .is_ok_and(|config| config.meta.role() == AgentRole::Super)
+        {
+            return Err(Error::refused(
+                Gate::Role,
+                format!(
+                    "refusing {name}: {project}/{agent} is a super agent; editing or downgrading it is operator-owned"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Project-management tools served to an IN-PROJECT agent.
 ///
 /// Three things separate this from the `corpus-mcp --admin` operator
@@ -523,7 +597,7 @@ const AGENT_MUTATORS: [&str; 8] = [
 ///      the caller;
 ///   3. the agent set is re-checked afterwards, so an edit that breaks
 ///      delegation is reported now rather than at the next launch.
-fn curator_dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
+fn scoped_management_dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     let role = match &ctx.role {
         Err(why) => {
             return Err(Error::refused(
@@ -582,7 +656,12 @@ fn curator_dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         })?;
     }
 
-    let result = crate::admin::dispatch(ctx, name, &args);
+    let ceiling = if role == AgentRole::Curator {
+        enforce_curator_agent_ceiling(ctx, name, &args, &scope.project)
+    } else {
+        Ok(())
+    };
+    let result = ceiling.and_then(|()| crate::admin::dispatch(ctx, name, &args));
     if mutating {
         let (outcome, detail) = match &result {
             Ok(text) => (corpus_core::audit::Outcome::Ok, text.clone()),
@@ -653,7 +732,7 @@ fn dispatch_inner(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     // dead mint or an absent plugin must not stop it from fixing the very
     // project whose configuration is broken.
     if crate::admin::ADMIN_TOOLS.contains(&name) {
-        return curator_dispatch(ctx, name, args);
+        return scoped_management_dispatch(ctx, name, args);
     }
     // The ROLE gate runs first — before the probe — so a refused call never
     // drives a docker/curl re-probe, and so an agent outside its ceiling
