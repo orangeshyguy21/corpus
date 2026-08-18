@@ -306,7 +306,7 @@ impl Sidebar {
         let on_screen = project_selected && state.current_screen == Screen::Agents;
         for (slug, agent) in &tree.agents {
             let is_sel = on_screen && state.selected_agent.as_deref() == Some(slug.as_str());
-            let Row { ui: mut rui, click, .. } = row_ui(ui, is_sel, false, (project, slug));
+            let Row { ui: mut rui, click, .. } = row_ui(ui, is_sel, false, ("agent", project, slug));
             rui.add_space(24.0);
             // Row label is the display NAME, never the opaque slug (a UUID);
             // the slug moves to the hover text for identity.
@@ -355,7 +355,7 @@ impl Sidebar {
             // A mission row always reserves the kebab strip (⋮ shown on
             // the selected row and on row hover).
             let Row { ui: mut rui, rect, click, hovered } =
-                row_ui(ui, is_sel, true, (project, slug));
+                row_ui(ui, is_sel, true, ("mission", project, slug));
             let (label_resp, _menu_w) = if is_sel || hovered {
                 let menu_w = rui
                     .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
