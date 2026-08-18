@@ -1,14 +1,10 @@
 //! corpus-app: the operator's window into the research team (egui).
 //!
-//! Mock-driven redesign per dev/app-flow-plan.md: chunk 0 landed the
-//! shell — a design-token module (`theme`), a three-column scaffold
-//! (left sidebar, flex main, collapsible right chat panel) replacing the
-//! old `nav` button list, and a top-bar skeleton (wordmark, placeholder
-//! per-source dropdowns, env dot, chat toggle). `Screen::Launch` is
-//! deleted: `LaunchView` merges into the mission view at chunk 5 — its
-//! machinery is intact, and the run view takes over the main column
-//! while a run is live (no standalone screen). Chunk 1 fills the sidebar
-//! with the scoped lists + `+` flows; chunk 2 wires the top-bar sources.
+//! The shell is a three-column command centre: scoped project navigation,
+//! a flexible Project/Agent/Mission workspace, and collapsible management
+//! chat. The top bar owns source pins and environment health. Missions render
+//! their own terminal directly in the workspace; there is no separate launch
+//! screen or run takeover.
 //!
 //! House rules: corpus-core calls live behind `AppState` (state.rs); one
 //! module per screen; no business logic in widgets.
@@ -31,7 +27,7 @@ use crate::chat::Chat as _;
 use crate::nav::Screen;
 use crate::sidebar::Sidebar;
 use crate::state::AppState;
-use crate::views::{agents, missions, projects};
+use crate::views::{agents, components, missions, projects};
 
 /// corpus-app application state: the app's state layer, per-screen widget
 /// state, and the toast overlay. The active screen and chat toggle live on
@@ -195,6 +191,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(theme::BG))
             .show(ctx, |ui| {
+                components::paint_command_canvas(ui);
             // Chunk 5: the run lives in the Missions view — no `Launch`
             // takeover of the main column. The mission view renders the
             // terminal edge-to-edge (zero margin); Projects/Agents pad
@@ -453,8 +450,8 @@ impl App {
     }
 
     /// The live env status for the selected project's plugin (spec §3): the
-    /// plugin name in 13px TEXT beside an 8px filled dot — OK-green when the
-    /// probe is ready, DANGER-red when not. The STATUS is inline, not hidden
+    /// plugin name in 13px TEXT beside an 8px filled dot — health-green when
+    /// the probe is ready, signal-red when not. The STATUS is inline, not hidden
     /// in a tooltip: a not-ready env appends a short reason (truncated probe
     /// notes) so a dead gateway is visible at a glance. A click forces a
     /// re-probe; hover shows the full probe notes. Rendered as flat text,
@@ -471,7 +468,11 @@ impl App {
                     Some(ver) => format!("{}  {ver}", env.name),
                     None => env.name.clone(),
                 };
-                (theme::OK, label, "environment ready — click to re-probe".to_string())
+                (
+                    theme::HEALTHY,
+                    label,
+                    "environment ready — click to re-probe".to_string(),
+                )
             }
             Some(env) => {
                 // Short inline reason: the first probe-note clause, capped —
@@ -479,7 +480,7 @@ impl App {
                 let short: String = env.notes.chars().take(48).collect();
                 let short = short.trim_end_matches([' ', ',', ';', '—', '(']).to_string();
                 (
-                    theme::DANGER,
+                    theme::SIGNAL_RED,
                     if short.is_empty() {
                         format!("{} — not ready", env.name)
                     } else {

@@ -1,16 +1,8 @@
-//! Project view (app-flow chunk 3, app-parity-spec §5): the mock-faithful
-//! detail screen for the SELECTED project — header `Project: <name>` +
-//! Clone / Delete top-right + the dim `created:` stamp; a Plugin section
-//! (flat dropdown with a live probe badge, Saved via a rebind); a Corpus
-//! section (file/byte summary + an inline red Delete that wipes the corpus
-//! behind a confirm, then the data-driven visual: a proportional strip of
-//! category byte shares + legend); a Mission Logs section (the
-//! `corpus/runs/` transcripts, summarized and listed on their own — they
-//! outweigh the knowledge categories by orders of magnitude, so mixing
-//! them into the Corpus numbers hides everything else); a Cost section
-//! (per-model token/cost table aggregated from the exported run
-//! transcripts, total row); Save bottom-right. The project LIST lives in
-//! the sidebar (chunk 1), so this screen is a detail view, not a table.
+//! Project command dashboard for the selected project. Its fixed header keeps
+//! conditional Save visible and moves Rename/Clone/Delete into overflow. The
+//! responsive body presents environment configuration, team, missions,
+//! corpus, run provenance, and cost from real `AppState` data. The project list
+//! remains in the scoped sidebar.
 //!
 //! No business logic here: corpus-core calls go through `AppState`;
 //! results surface as toasts. Probing is a corpus-core aggregation
@@ -24,7 +16,10 @@ use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 use crate::fmt::fmt_bytes;
 use crate::state::AppState;
 use crate::theme;
+use crate::views::components;
 use crate::views::plugin_picker::plugin_picker;
+
+const TWO_COLUMN_AT: f32 = 940.0;
 
 /// Widget state for the Project view: the plugin picker in progress, the
 /// wipe confirm, and the clone dialog. The selected project itself lives on
@@ -44,6 +39,9 @@ pub struct ProjectsView {
     /// slug never moves).
     show_rename: bool,
     rename_name: String,
+    /// Project deletion is destructive and is never dispatched directly
+    /// from the overflow menu.
+    confirm_delete: bool,
     /// Schedule a fresh plugin probe aggregation next frame (probe state
     /// is fetched on demand, not continuously).
     needs_probe: bool,
@@ -60,6 +58,7 @@ impl Default for ProjectsView {
             clone_corpus: false,
             show_rename: false,
             rename_name: String::new(),
+            confirm_delete: false,
             needs_probe: false,
         }
     }
@@ -69,9 +68,9 @@ impl ProjectsView {
     pub fn show(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
         let Some(slug) = state.effective_project() else {
             ui.add_space(24.0);
-            ui.add(
-                egui::Label::new(RichText::new("no project selected").color(theme::TEXT_FAINT)),
-            );
+            ui.add(egui::Label::new(
+                RichText::new("no project selected").color(theme::TEXT_FAINT),
+            ));
             return;
         };
         // Owned spec copy: no reference into `state` is held, so the view
@@ -98,194 +97,359 @@ impl ProjectsView {
             self.needs_probe = false;
         }
 
-        // --- header (spec §5): `Project: <name>` + Delete / Clone /
-        // created stamp, then a hairline.
         let name = if project.name.is_empty() {
             slug.clone()
         } else {
             project.name.clone()
         };
-        ui.horizontal(|ui| {
-            ui.label(theme::screen_header(format!("Project: {name}")));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::destructive_button(ui, "Delete").clicked() {
-                    self.delete_project(state, toasts, &slug);
-                }
-                if theme::house_button(ui, "Clone").clicked() {
-                    self.clone_name.clear();
-                    self.clone_corpus = false;
-                    self.show_clone = true;
-                }
-                if theme::house_button(ui, "Rename").clicked() {
-                    self.rename_name = name.clone();
-                    self.show_rename = true;
-                }
-                ui.label(
-                    RichText::new(format!("created: {}", fmt_epoch(project.created)))
-                        .size(12.0)
-                        .color(theme::TEXT_FAINT),
-                );
+        let binding_dirty = binding_is_dirty(&self.edit_plugin, &project.plugin);
+        self.header(
+            ui,
+            state,
+            toasts,
+            &slug,
+            &name,
+            project.created,
+            binding_dirty,
+        );
+
+        // The command rail stays fixed while the operational dashboard
+        // scrolls beneath it.
+        egui::ScrollArea::vertical()
+            .id_salt("project_body")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(18.0);
+                self.status_band(ui, state, &slug);
+                ui.add_space(12.0);
+                self.dashboard(ui, state, toasts, &slug);
+                ui.add_space(18.0);
             });
-        });
-        theme::hairline(ui);
-        ui.add_space(24.0);
-
-        // --- Plugin section (spec §5): heading, then the flat field. NO
-        // helper text under it.
-        ui.label(theme::section_heading("Plugin"));
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            plugin_picker(ui, &mut self.edit_plugin, state.plugins(), &mut self.needs_probe);
-        });
-        ui.add_space(28.0);
-
-        // --- Sources section: the project's rev pins (the data lives on
-        // project.yaml — `pins` — so this is its home as well as the top
-        // bar's). One dropdown per plugin-declared source, same widget as
-        // the top bar; a pick persists immediately.
-        ui.label(theme::section_heading("Sources"));
-        ui.add_space(12.0);
-        if state.source_revs.is_empty() {
-            ui.label(
-                RichText::new("no sources declared by this plugin")
-                    .size(12.0)
-                    .color(theme::TEXT_FAINT),
-            );
-        } else {
-            let revs = state.source_revs.clone();
-            ui.horizontal_wrapped(|ui| {
-                for source in &revs {
-                    let selected = state
-                        .source_pins
-                        .get(&source.name)
-                        .cloned()
-                        .unwrap_or_else(|| source.default_rev().to_string());
-                    if let Some(rev) = crate::views::source_dropdown::source_dropdown(
-                        ui,
-                        &format!("project_source_{}", source.name),
-                        source,
-                        &selected,
-                        None, // no live probe on the project page
-                    ) {
-                        if let Err(error) = state.set_source_pin(&slug, &source.name, &rev) {
-                            toast(toasts, ToastKind::Error, error.to_string());
-                        }
-                    }
-                }
-            });
-        }
-        ui.add_space(28.0);
-
-        // --- Corpus section (spec §5): heading, then the stats row + the
-        // inline red Delete (wipe confirm), then the data-driven category
-        // visual (proportional strip + legend). Knowledge categories only
-        // — mission logs get their own section below, since a single run
-        // transcript outweighs the whole corpus and would flatten the
-        // strip to one grey bar.
-        ui.label(theme::section_heading("Corpus"));
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            match state.corpus_stats() {
-                Some(stats) => {
-                    ui.label(
-                        RichText::new(format!("{} files", stats.knowledge_files()))
-                            .size(14.0)
-                            .strong()
-                            .color(theme::TEXT),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(fmt_bytes(stats.knowledge_bytes()))
-                            .size(14.0)
-                            .color(theme::TEXT_MUTED),
-                    );
-                }
-                None => {
-                    ui.label(RichText::new("corpus not computed").color(theme::TEXT_FAINT));
-                }
-            };
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // The wipe is corpus-wide — say so, now that the mission
-                // logs are shown as a section of their own.
-                let delete = theme::destructive_button(ui, "Delete")
-                    .on_hover_text("wipe the whole corpus — mission logs included");
-                if delete.clicked() {
-                    self.confirm_wipe = true;
-                }
-            });
-        });
-        ui.add_space(12.0);
-        if let Some(stats) = state.corpus_stats() {
-            if stats.knowledge_files() > 0 {
-                corpus_visual(ui, &stats.categories);
-            } else {
-                ui.label(
-                    RichText::new("empty — missions write findings, techniques, hypotheses and attacks here")
-                        .size(12.0)
-                        .color(theme::TEXT_FAINT),
-                );
-            }
-        }
-        ui.add_space(28.0);
-
-        // --- Mission Logs section: the `corpus/runs/` transcripts, kept
-        // apart from the corpus above. Summary row, then one row per log
-        // (newest first) with its share of the total as a bar.
-        ui.label(theme::section_heading("Mission Logs"));
-        ui.add_space(12.0);
-        let logs = state.corpus_stats().map(|s| s.logs.clone()).unwrap_or_default();
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("{} logs", logs.files))
-                    .size(14.0)
-                    .strong()
-                    .color(theme::TEXT),
-            );
-            ui.add_space(4.0);
-            ui.label(RichText::new(fmt_bytes(logs.bytes)).size(14.0).color(theme::TEXT_MUTED));
-        });
-        ui.add_space(12.0);
-        if logs.files == 0 {
-            ui.label(
-                RichText::new("no runs yet — each launched mission writes its transcript here")
-                    .size(12.0)
-                    .color(theme::TEXT_FAINT),
-            );
-        } else {
-            mission_log_list(ui, state.mission_logs(), logs.bytes);
-        }
-        ui.add_space(28.0);
-
-        // --- Cost section: per-model usage aggregated from the exported
-        // run transcripts (runs/*.json), cost-desc, with a total row.
-        ui.label(theme::section_heading("Cost"));
-        ui.add_space(12.0);
-        match state.corpus_cost() {
-            Some(report) if !report.rows.is_empty() => {
-                cost_headline(ui, report);
-                ui.add_space(14.0);
-                cost_table(ui, report);
-            }
-            _ => {
-                ui.label(
-                    RichText::new("no usage yet — updates each time an agent finishes a turn")
-                        .size(12.0)
-                        .color(theme::TEXT_FAINT),
-                );
-            }
-        }
-        ui.add_space(28.0);
-
-        // --- Save (rebind) bottom-right (spec §5).
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
-            if theme::house_button(ui, "Save").clicked() {
-                self.save_binding(state, toasts, &slug);
-            }
-        });
 
         self.clone_window(ui, state, toasts, &slug);
         self.rename_window(ui, state, toasts, &slug);
+        self.delete_confirm_window(ui, state, toasts, &slug, &name);
         self.wipe_confirm_window(ui, state, toasts, &slug);
+    }
+
+    fn status_band(&self, ui: &mut Ui, state: &AppState, slug: &str) {
+        components::panel_card(ui, "System status", |ui| {
+            let env = state.env_status(slug);
+            ui.horizontal_wrapped(|ui| {
+                match env {
+                    Some(ref env) if env.ready => {
+                        components::status_badge(ui, "environment ready", components::StatusTone::Healthy)
+                            .on_hover_text(&env.notes);
+                    }
+                    Some(ref env) => {
+                        components::status_badge(ui, "environment degraded", components::StatusTone::Danger)
+                            .on_hover_text(&env.notes);
+                    }
+                    None => {
+                        components::status_badge(ui, "probe unavailable", components::StatusTone::Warning);
+                    }
+                }
+                ui.add_space(18.0);
+                components::metric_cell(
+                    ui,
+                    "source pins",
+                    state.source_pins.len().to_string(),
+                    components::StatusTone::Interaction,
+                );
+                ui.add_space(18.0);
+                components::metric_cell(
+                    ui,
+                    "agents",
+                    state.agents.len().to_string(),
+                    components::StatusTone::Neutral,
+                );
+                ui.add_space(18.0);
+                components::metric_cell(
+                    ui,
+                    "missions",
+                    state.missions.len().to_string(),
+                    components::StatusTone::Neutral,
+                );
+                if let Some(stats) = state.corpus_stats() {
+                    ui.add_space(18.0);
+                    components::metric_cell(
+                        ui,
+                        "corpus files",
+                        stats.knowledge_files().to_string(),
+                        components::StatusTone::Neutral,
+                    );
+                }
+            });
+        });
+    }
+
+    /// Two operational columns on a full command canvas; one predictable
+    /// reading order when the chat panel or a narrow window reduces space.
+    fn dashboard(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        slug: &str,
+    ) {
+        if dashboard_columns(ui.available_width()) == 2 {
+            ui.columns(2, |columns| {
+                let (left, right) = columns.split_at_mut(1);
+                self.configuration_card(&mut left[0], state, toasts, slug);
+                card_gap(&mut left[0]);
+                self.team_card(&mut left[0], state);
+                card_gap(&mut left[0]);
+                self.corpus_card(&mut left[0], state);
+
+                self.missions_card(&mut right[0], state, slug);
+                card_gap(&mut right[0]);
+                self.logs_card(&mut right[0], state);
+                card_gap(&mut right[0]);
+                self.cost_card(&mut right[0], state);
+            });
+        } else {
+            self.configuration_card(ui, state, toasts, slug);
+            card_gap(ui);
+            self.team_card(ui, state);
+            card_gap(ui);
+            self.missions_card(ui, state, slug);
+            card_gap(ui);
+            self.corpus_card(ui, state);
+            card_gap(ui);
+            self.logs_card(ui, state);
+            card_gap(ui);
+            self.cost_card(ui, state);
+        }
+    }
+
+    fn configuration_card(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        slug: &str,
+    ) {
+        components::panel_card(ui, "Configuration", |ui| {
+            ui.label(command_label("Environment plugin"));
+            ui.add_space(6.0);
+            plugin_picker(
+                ui,
+                &mut self.edit_plugin,
+                state.plugins(),
+                &mut self.needs_probe,
+            );
+            ui.add_space(16.0);
+            components::soft_rule(ui);
+            ui.add_space(12.0);
+            ui.label(command_label("Pinned sources"));
+            ui.add_space(6.0);
+            if state.source_revs.is_empty() {
+                empty_hint(ui, "no sources declared by this plugin");
+            } else {
+                let revs = state.source_revs.clone();
+                ui.horizontal_wrapped(|ui| {
+                    for source in &revs {
+                        let selected = state
+                            .source_pins
+                            .get(&source.name)
+                            .cloned()
+                            .unwrap_or_else(|| source.default_rev().to_string());
+                        if let Some(rev) = crate::views::source_dropdown::source_dropdown(
+                            ui,
+                            &format!("project_source_{}", source.name),
+                            source,
+                            &selected,
+                            None,
+                        ) {
+                            if let Err(error) = state.set_source_pin(slug, &source.name, &rev) {
+                                toast(toasts, ToastKind::Error, error.to_string());
+                            }
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                empty_hint(ui, "source selections persist immediately");
+            }
+        });
+    }
+
+    fn team_card(&self, ui: &mut Ui, state: &mut AppState) {
+        components::panel_card(ui, "Team", |ui| {
+            let agents = state.agents.clone();
+            if agents.is_empty() {
+                empty_hint(ui, "no agents in this project");
+                return;
+            }
+            for (slug, agent) in agents {
+                let name = crate::state::agent_label(&agent.meta.name, &slug);
+                let role = agent.meta.role().as_str();
+                if command_row(ui, ("project-agent", &slug), &name, role, components::StatusTone::Interaction)
+                    .clicked()
+                {
+                    state.selected_agent = Some(slug);
+                    state.current_screen = crate::nav::Screen::Agents;
+                }
+            }
+        });
+    }
+
+    fn missions_card(&self, ui: &mut Ui, state: &mut AppState, project: &str) {
+        components::panel_card(ui, "Missions", |ui| {
+            let missions = state.missions.clone();
+            if missions.is_empty() {
+                empty_hint(ui, "no missions in this project");
+                return;
+            }
+            for (slug, mission) in missions {
+                let name = crate::state::mission_label(mission.name.as_deref(), &slug);
+                let activity = state.mission_activity(project, &slug);
+                let (status, tone) = match activity {
+                    crate::state::MissionActivity::Working => {
+                        ("working", components::StatusTone::Healthy)
+                    }
+                    crate::state::MissionActivity::Waiting => {
+                        ("waiting", components::StatusTone::Warning)
+                    }
+                    crate::state::MissionActivity::Idle => {
+                        ("idle", components::StatusTone::Neutral)
+                    }
+                };
+                if command_row(ui, ("project-mission", &slug), &name, status, tone).clicked() {
+                    state.selected_mission = Some(slug);
+                    state.current_screen = crate::nav::Screen::Missions;
+                }
+            }
+        });
+    }
+
+    fn corpus_card(&mut self, ui: &mut Ui, state: &AppState) {
+        components::panel_card(ui, "Corpus signal", |ui| {
+            ui.horizontal(|ui| {
+                match state.corpus_stats() {
+                    Some(stats) => {
+                        ui.label(
+                            RichText::new(format!("{} files", stats.knowledge_files()))
+                                .size(14.0)
+                                .strong()
+                                .color(theme::TEXT),
+                        );
+                        ui.label(
+                            RichText::new(fmt_bytes(stats.knowledge_bytes()))
+                                .size(13.0)
+                                .color(theme::TEXT_MUTED),
+                        );
+                    }
+                    None => empty_hint(ui, "corpus not computed"),
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::destructive_button(ui, "Wipe corpus…")
+                        .on_hover_text("findings, techniques, attacks, hypotheses and logs")
+                        .clicked()
+                    {
+                        self.confirm_wipe = true;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            if let Some(stats) = state.corpus_stats() {
+                if stats.knowledge_files() > 0 {
+                    corpus_visual(ui, &stats.categories);
+                } else {
+                    empty_hint(
+                        ui,
+                        "empty — missions write findings, techniques, hypotheses and attacks here",
+                    );
+                }
+            }
+        });
+    }
+
+    fn logs_card(&self, ui: &mut Ui, state: &AppState) {
+        components::panel_card(ui, "Mission logs", |ui| {
+            let logs = state
+                .corpus_stats()
+                .map(|stats| stats.logs.clone())
+                .unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} logs", logs.files))
+                        .size(14.0)
+                        .strong()
+                        .color(theme::TEXT),
+                );
+                ui.label(
+                    RichText::new(fmt_bytes(logs.bytes))
+                        .size(13.0)
+                        .color(theme::TEXT_MUTED),
+                );
+            });
+            ui.add_space(10.0);
+            if logs.files == 0 {
+                empty_hint(ui, "no runs yet — missions write their transcripts here");
+            } else {
+                mission_log_list(ui, state.mission_logs(), logs.bytes);
+            }
+        });
+    }
+
+    fn cost_card(&self, ui: &mut Ui, state: &AppState) {
+        components::panel_card(ui, "Cost", |ui| match state.corpus_cost() {
+            Some(report) if !report.rows.is_empty() => {
+                cost_headline(ui, report);
+                ui.add_space(12.0);
+                egui::ScrollArea::horizontal()
+                    .id_salt("project_cost_scroll")
+                    .show(ui, |ui| cost_table(ui, report));
+            }
+            _ => empty_hint(ui, "no usage yet — updates when an agent finishes a turn"),
+        });
+    }
+
+    /// Fixed Project command rail. Save exists only while the plugin binding
+    /// is dirty; record-level secondary and destructive actions live in the
+    /// overflow menu.
+    fn header(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        slug: &str,
+        name: &str,
+        created: u64,
+        binding_dirty: bool,
+    ) {
+        components::page_header(
+            ui,
+            "Project",
+            name,
+            &format!("created: {}", fmt_epoch(created)),
+            |ui| {
+                components::action_menu(ui, |ui| {
+                    if ui.button("Rename…").clicked() {
+                        self.rename_name = name.to_string();
+                        self.show_rename = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Clone…").clicked() {
+                        self.clone_name.clear();
+                        self.clone_corpus = false;
+                        self.show_clone = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .button(RichText::new("Delete…").color(theme::SIGNAL_RED))
+                        .clicked()
+                    {
+                        self.confirm_delete = true;
+                        ui.close_menu();
+                    }
+                });
+                if binding_dirty && theme::house_button(ui, "Save •").clicked() {
+                    self.save_binding(state, toasts, slug);
+                }
+            },
+        );
     }
 
     /// Rebind the project's plugin and refresh (projects + the source/env
@@ -315,7 +479,11 @@ impl ProjectsView {
     fn delete_project(&mut self, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
         match state.delete_project(slug) {
             Ok(()) => {
-                toast(toasts, ToastKind::Success, format!("deleted project {slug}"));
+                toast(
+                    toasts,
+                    ToastKind::Success,
+                    format!("deleted project {slug}"),
+                );
                 state.refresh();
                 // ensure_selection re-picks a project next frame.
                 state.selected_project = None;
@@ -324,9 +492,57 @@ impl ProjectsView {
         }
     }
 
+    fn delete_confirm_window(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        slug: &str,
+        name: &str,
+    ) {
+        if !self.confirm_delete {
+            return;
+        }
+        let mut open = self.confirm_delete;
+        let mut deleted = false;
+        let mut cancel = false;
+        egui::Window::new("Delete project")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("Delete {name}?"));
+                ui.label(
+                    RichText::new(format!(
+                        "Project id `{slug}`, its agents, missions, corpus and run logs will be removed. There is no undo."
+                    ))
+                    .size(12.0)
+                    .color(theme::TEXT_MUTED),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if theme::destructive_button(ui, "Delete project").clicked() {
+                        self.delete_project(state, toasts, slug);
+                        deleted = true;
+                    }
+                    if theme::house_button(ui, "Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        self.confirm_delete = open && !deleted && !cancel;
+    }
+
     /// The Corpus Delete confirm: wiping empties the categories and bumps
     /// `corpus_generation` (verified via CLI); the project + agents survive.
-    fn wipe_confirm_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
+    fn wipe_confirm_window(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        slug: &str,
+    ) {
         if !self.confirm_wipe {
             return;
         }
@@ -372,7 +588,13 @@ impl ProjectsView {
     /// The Rename dialog: the project's display LABEL only. The slug is the
     /// project's identity — its directory name and the key agents, missions,
     /// run dirs and pins are filed under — so a rename never moves it.
-    fn rename_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
+    fn rename_window(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        slug: &str,
+    ) {
         if !self.show_rename {
             return;
         }
@@ -443,7 +665,11 @@ impl ProjectsView {
                     };
                     match state.clone_project(from, name, self.clone_corpus) {
                         Ok((to, _)) => {
-                            toast(toasts, ToastKind::Success, format!("cloned project {from} -> {to}"));
+                            toast(
+                                toasts,
+                                ToastKind::Success,
+                                format!("cloned project {from} -> {to}"),
+                            );
                             state.refresh();
                             state.select_project(&to);
                             cloned = true;
@@ -454,7 +680,79 @@ impl ProjectsView {
             });
         self.show_clone = open && !cloned;
     }
+}
 
+fn card_gap(ui: &mut Ui) {
+    ui.add_space(12.0);
+}
+
+fn command_label(text: &str) -> RichText {
+    RichText::new(text.to_uppercase())
+        .size(10.5)
+        .monospace()
+        .color(theme::TEXT_FAINT)
+}
+
+fn empty_hint(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).size(12.0).color(theme::TEXT_FAINT));
+}
+
+/// Dense, full-width navigation row used by the Team and Missions cards.
+/// The right label carries semantic state; the whole row is one target.
+fn command_row(
+    ui: &mut Ui,
+    id: impl std::hash::Hash,
+    label: &str,
+    status: &str,
+    tone: components::StatusTone,
+) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 34.0),
+        egui::Sense::click(),
+    );
+    let response = ui.interact(rect, ui.make_persistent_id(id), egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(rect, 2.0, theme::ROW_HOVER);
+    }
+    ui.painter().line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        egui::Stroke::new(1.0_f32, theme::KEYLINE_SOFT),
+    );
+    let status = status.to_uppercase();
+    let status_galley = ui
+        .painter()
+        .layout_no_wrap(status.clone(), theme::mono(10.5), tone.color());
+    let label_clip = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(
+            (rect.right() - status_galley.size().x - 24.0).max(rect.left()),
+            rect.bottom(),
+        ),
+    );
+    ui.painter().with_clip_rect(label_clip).text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        theme::font(13.5),
+        theme::TEXT,
+    );
+    ui.painter().text(
+        egui::pos2(rect.right() - 8.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        status,
+        theme::mono(10.5),
+        tone.color(),
+    );
+    response
+}
+
+fn binding_is_dirty(edit: &str, saved: &str) -> bool {
+    edit != saved
+}
+
+fn dashboard_columns(available_width: f32) -> usize {
+    if available_width >= TWO_COLUMN_AT { 2 } else { 1 }
 }
 
 /// The corpus visual: a full-width strip segmented by each category's
@@ -476,7 +774,8 @@ fn corpus_visual(ui: &mut Ui, categories: &[corpus_core::CategoryStat]) {
         } else {
             (rect.width() * share).max(2.0)
         };
-        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height()));
+        let seg =
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height()));
         let color = theme::CORPUS_PALETTE[i % theme::CORPUS_PALETTE.len()];
         painter.rect_filled(seg, 0.0, color);
         painter.rect_stroke(
@@ -485,7 +784,8 @@ fn corpus_visual(ui: &mut Ui, categories: &[corpus_core::CategoryStat]) {
             egui::Stroke::new(1.0_f32, theme::BG),
             egui::StrokeKind::Inside,
         );
-        ui.allocate_rect(seg, egui::Sense::hover()).on_hover_text(format!(
+        ui.allocate_rect(seg, egui::Sense::hover())
+            .on_hover_text(format!(
             "{} — {} files, {}",
             category.name,
             category.files,
@@ -497,10 +797,12 @@ fn corpus_visual(ui: &mut Ui, categories: &[corpus_core::CategoryStat]) {
     // Legend: swatch + name + files + bytes per category.
     for (i, category) in categories.iter().enumerate() {
         ui.horizontal(|ui| {
-            let (dot, _) =
-                ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(dot, 1.0, theme::CORPUS_PALETTE[i % theme::CORPUS_PALETTE.len()]);
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter().rect_filled(
+                dot,
+                1.0,
+                theme::CORPUS_PALETTE[i % theme::CORPUS_PALETTE.len()],
+            );
             ui.label(RichText::new(&category.name).size(12.0).color(theme::TEXT));
             ui.label(
                 RichText::new(format!("{} files", category.files))
@@ -530,8 +832,7 @@ fn mission_log_list(ui: &mut Ui, logs: &[corpus_core::MissionLog], total: u64) {
         // above it instead of the window edge.
         ui.allocate_ui(egui::vec2(width, 16.0), |ui| {
             ui.horizontal(|ui| {
-                let (bar, _) =
-                    ui.allocate_exact_size(egui::vec2(90.0, 10.0), egui::Sense::hover());
+                let (bar, _) = ui.allocate_exact_size(egui::vec2(90.0, 10.0), egui::Sense::hover());
                 let painter = ui.painter_at(bar);
                 painter.rect_filled(bar, 1.0, theme::PLATE_FRONT);
                 let share = log.bytes as f32 / total.max(1) as f32;
@@ -604,7 +905,12 @@ fn cost_table(ui: &mut Ui, report: &corpus_core::CostReport) {
     use egui_extras::{Column, TableBuilder};
     let heading = |text: &str| RichText::new(text).size(12.0).color(theme::TEXT_FAINT);
     let cell = |text: String| RichText::new(text).size(12.5).color(theme::TEXT);
-    let num = |text: String| RichText::new(text).size(12.5).monospace().color(theme::TEXT_MUTED);
+    let num = |text: String| {
+        RichText::new(text)
+            .size(12.5)
+            .monospace()
+            .color(theme::TEXT_MUTED)
+    };
     TableBuilder::new(ui)
         .id_salt("project_cost_table")
         .column(Column::initial(170.0).at_least(120.0)) // model
@@ -616,7 +922,9 @@ fn cost_table(ui: &mut Ui, report: &corpus_core::CostReport) {
         .column(Column::exact(70.0)) // cache write
         .column(Column::exact(90.0)) // cost
         .header(20.0, |mut header| {
-            for title in ["model", "provider", "in", "out", "reason", "cache r", "cache w", "cost"] {
+            for title in [
+                "model", "provider", "in", "out", "reason", "cache r", "cache w", "cost",
+            ] {
                 header.col(|ui| {
                     ui.label(heading(title));
                 });
@@ -665,13 +973,20 @@ fn cost_table(ui: &mut Ui, report: &corpus_core::CostReport) {
                 let total_cr: u64 = report.rows.iter().map(|r| r.cache_read).sum();
                 let total_cw: u64 = report.rows.iter().map(|r| r.cache_write).sum();
                 let strong_num = |text: String| {
-                    RichText::new(text).size(12.5).monospace().strong().color(theme::TEXT)
+                    RichText::new(text)
+                        .size(12.5)
+                        .monospace()
+                        .strong()
+                        .color(theme::TEXT)
                 };
                 tr.col(|ui| {
                     ui.label(strong_num("total".to_string()));
                 });
                 tr.col(|ui| {
-                    ui.label(num(format!("{} tok", crate::fmt::fmt_tokens(report.tokens))));
+                    ui.label(num(format!(
+                        "{} tok",
+                        crate::fmt::fmt_tokens(report.tokens)
+                    )));
                 });
                 tr.col(|ui| {
                     ui.label(strong_num(crate::fmt::fmt_tokens(total_in)));
@@ -730,4 +1045,22 @@ fn civil_from_days(z: i64) -> (i64, u64, u64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_save_is_visible_only_for_a_dirty_plugin_binding() {
+        assert!(!binding_is_dirty("cdk-regtest", "cdk-regtest"));
+        assert!(binding_is_dirty("other", "cdk-regtest"));
+    }
+
+    #[test]
+    fn dashboard_stacks_when_chat_or_window_reduces_the_canvas() {
+        assert_eq!(dashboard_columns(TWO_COLUMN_AT - 1.0), 1);
+        assert_eq!(dashboard_columns(TWO_COLUMN_AT), 2);
+        assert_eq!(dashboard_columns(1_440.0), 2);
+    }
 }

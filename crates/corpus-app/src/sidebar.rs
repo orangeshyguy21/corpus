@@ -718,13 +718,24 @@ impl Sidebar {
             .show(ui.ctx(), |ui| {
                 ui.label("Role");
                 egui::ComboBox::from_id_salt("agent_role")
-                    .selected_text(self.agent_role.as_str())
+                    .selected_text(format!(
+                        "{} — {}",
+                        self.agent_role.as_str(),
+                        crate::views::policy::short_description(self.agent_role)
+                    ))
                     .show_ui(ui, |ui| {
                         for role in corpus_core::AgentRole::ALL {
-                            ui.selectable_value(&mut self.agent_role, role, role.as_str());
+                            ui.selectable_value(
+                                &mut self.agent_role,
+                                role,
+                                format!(
+                                    "{:<10}  {}",
+                                    role.as_str().to_uppercase(),
+                                    crate::views::policy::short_description(role)
+                                ),
+                            );
                         }
                     });
-                ui.weak(self.agent_role.hint());
                 ui.add_space(8.0);
                 let submit = ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if theme::house_button(ui, "Create").clicked() || submit {
@@ -856,11 +867,11 @@ fn row_ui(ui: &mut Ui, selected: bool, has_kebab: bool, id_seed: impl std::hash:
 
 /// A mission row's status dot, one glyph per activity state:
 ///   - `Idle`    — steady faint dot: nothing is up.
-///   - `Waiting` — steady OK-green dot, no halo: the opencode session is
+///   - `Waiting` — steady health-green dot, no halo: the opencode session is
 ///                 live but the agent is parked at its prompt. Motion
 ///                 here would claim work that isn't happening, so the
 ///                 dot only says "attached".
-///   - `Working` — OK-green with a soft pulsing halo: producing now.
+///   - `Working` — health-green with a soft pulsing halo: producing now.
 /// The pulse is pure paint off the repaint clock — no widget, no state
 /// (the caller requests a 50 ms repaint while a mission is working).
 fn status_dot(ui: &Ui, rect: egui::Rect, activity: MissionActivity) {
@@ -872,12 +883,13 @@ fn status_dot(ui: &Ui, rect: egui::Rect, activity: MissionActivity) {
             let pulse = ((t * std::f32::consts::TAU * 1.4).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
             let halo_r = 3.0 + 4.0 * pulse;
             let core_r = 2.2 + 0.6 * (pulse - 0.5).abs() * -2.0; // slimmer at the extremes
-            let halo = theme::OK.gamma_multiply(0.10 + 0.20 * pulse);
+            let halo = theme::HEALTHY.gamma_multiply(0.10 + 0.20 * pulse);
             ui.painter().circle_filled(center, halo_r, halo);
-            ui.painter().circle_filled(center, core_r, theme::OK);
+            ui.painter().circle_filled(center, core_r, theme::HEALTHY);
         }
         MissionActivity::Waiting => {
-            ui.painter().circle_filled(center, 2.2, theme::OK.gamma_multiply(0.55));
+            ui.painter()
+                .circle_filled(center, 2.2, theme::HEALTHY.gamma_multiply(0.55));
         }
         MissionActivity::Idle => {
             ui.painter().circle_filled(center, 2.2, theme::TEXT_FAINT);

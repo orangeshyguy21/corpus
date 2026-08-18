@@ -1,54 +1,60 @@
-//! Design tokens (app-flow-plan chunk 0 + app-parity-spec §1): the visual
-//! language the mocks pin down — a FLAT near-black canvas, 1px hairlines
-//! everywhere, a single red accent reserved for the wordmark + destructive
-//! actions, light sans typography over dim text-greys, and monospace for
-//! config/log content. Everything else in the app reads from these tokens;
-//! the ONLY place styles are built (app-parity-spec §1c).
+//! Design tokens for corpus's command-centre visual language: a near-black
+//! technical canvas, smoked surfaces, amber interaction/focus, acid green
+//! health, and signal red reserved for danger and denial. Everything else in
+//! the app reads from these tokens; views do not invent colour literals.
 //!
-//! Foundations (chunk 1 of the parity pass): the Inter-Light proportional
-//! font and the Phosphor icon font are registered here; every helper a view
-//! needs (headers, house/destructive/icon buttons, fields, hairlines) lives
-//! here. No hex literals anywhere else.
+//! Inter-Light and Phosphor fonts, semantic colors, and shared control styles
+//! are registered here. View-specific composition lives in `views/components`;
+//! views consume named tokens instead of inventing color literals.
 
 use egui::{Color32, FontId, TextStyle, Ui, Visuals};
 
 // --- palette ---
-/// Near-black window / canvas background (`#0e0f12`) — the ONLY colour that
-/// fills a panel; flat design means panels tile flush on it.
-pub const BG: Color32 = Color32::from_rgb(0x0e, 0x0f, 0x12);
-/// One step lighter than BG — widget surfaces (buttons, inputs, dropdown
-/// fields, editor frames).
-pub const PANEL: Color32 = Color32::from_rgb(0x18, 0x19, 0x1e);
-/// The single red accent: wordmark, destructive fills, finding-red.
-pub const ACCENT: Color32 = Color32::from_rgb(0xe5, 0x44, 0x2c);
-/// Status: live / ready (env dot, ready badges).
-pub const OK: Color32 = Color32::from_rgb(0x78, 0xc8, 0x78);
-/// Status: down / error (env dot when a probe fails).
-pub const DANGER: Color32 = Color32::from_rgb(0xe5, 0x44, 0x2c);
+/// Near-black window / canvas background.
+pub const BG: Color32 = Color32::from_rgb(0x09, 0x0b, 0x0d);
+/// Smoked widget/card surface. Cards may apply alpha at paint time; the shared
+/// widget default stays opaque so text-field compositing is deterministic.
+pub const PANEL: Color32 = Color32::from_rgb(0x17, 0x18, 0x18);
+/// A slightly stronger smoked surface for raised cards and menus.
+#[allow(dead_code)] // consumed by the Project/Agent card migration in chunks 2-3
+pub const PANEL_RAISED: Color32 = Color32::from_rgb(0x1d, 0x1d, 0x1b);
+/// Amber owns selection, focus, navigation, and primary action emphasis.
+pub const INTERACTION: Color32 = Color32::from_rgb(0xe3, 0x9a, 0x3b);
+pub const INTERACTION_HOVER: Color32 = Color32::from_rgb(0xf0, 0xaf, 0x55);
+/// Signal red is reserved for destructive actions, failures, and denials.
+pub const SIGNAL_RED: Color32 = Color32::from_rgb(0xe5, 0x44, 0x2c);
+/// Acid green is reserved for healthy/live/allowed state.
+pub const HEALTHY: Color32 = Color32::from_rgb(0x91, 0xcf, 0x58);
 /// Status: warn — pickable but degraded (a branch rev served from a
 /// stale rev cache).
-pub const WARN: Color32 = Color32::from_rgb(0xe0, 0xa8, 0x3c);
+pub const WARN: Color32 = Color32::from_rgb(0xf0, 0xb3, 0x46);
 
 // --- type greys ---
 /// Primary light text.
-pub const TEXT: Color32 = Color32::from_rgb(0xd8, 0xd8, 0xd8);
+pub const TEXT: Color32 = Color32::from_rgb(0xe4, 0xe0, 0xd8);
 /// Secondary / body text, icons.
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x8f, 0x90, 0x99);
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x9b, 0x98, 0x90);
 /// De-emphasised / captions / created stamps / hints.
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x5c, 0x5d, 0x66);
+pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x6c, 0x69, 0x62);
 
-/// The 1px hairline border between chrome and canvas (`#2a2b33`).
-pub const HAIRLINE: Color32 = Color32::from_rgb(0x2a, 0x2b, 0x33);
+/// Keyline hierarchy: soft neutral structure and amber-emphasis borders.
+pub const KEYLINE_SOFT: Color32 = Color32::from_rgb(0x32, 0x30, 0x2b);
+pub const KEYLINE: Color32 = Color32::from_rgb(0x6a, 0x47, 0x22);
+pub const KEYLINE_STRONG: Color32 = Color32::from_rgb(0xa8, 0x6d, 0x2d);
+pub const HAIRLINE: Color32 = KEYLINE_SOFT;
+/// Static canvas-grid paint; deliberately quiet enough to sit behind text.
+pub const GRID_LINE: Color32 = Color32::from_rgb(0x10, 0x10, 0x0f);
+pub const GRID_MARK: Color32 = Color32::from_rgb(0x17, 0x15, 0x11);
 
 // --- helper shades (added in the parity pass, spec §0) ---
 /// Selected sidebar row fill (`#1e1f24`).
-pub const ROW_HL: Color32 = Color32::from_rgb(0x1e, 0x1f, 0x24);
+pub const ROW_HL: Color32 = Color32::from_rgb(0x25, 0x1e, 0x13);
 /// Hovered sidebar row fill (`#16171b`) — the pointer feedback band.
-pub const ROW_HOVER: Color32 = Color32::from_rgb(0x16, 0x17, 0x1b);
+pub const ROW_HOVER: Color32 = Color32::from_rgb(0x18, 0x15, 0x10);
 /// JSON editor frame fill (`#101114` — a hair lighter than BG).
-pub const EDITOR_BG: Color32 = Color32::from_rgb(0x10, 0x11, 0x14);
+pub const EDITOR_BG: Color32 = Color32::from_rgb(0x0d, 0x0f, 0x10);
 /// The corpus stack graphic's front-plate fill (`#191a1f`).
-pub const PLATE_FRONT: Color32 = Color32::from_rgb(0x19, 0x1a, 0x1f);
+pub const PLATE_FRONT: Color32 = Color32::from_rgb(0x1b, 0x1b, 0x19);
 /// Category segment colors for the corpus visual (hypotheses, techniques,
 /// findings, attacks, then any extra bucket) — muted, distinct on the dark
 /// panels. Mission logs are not a segment here; they carry `MISSION_LOG`
@@ -56,19 +62,20 @@ pub const PLATE_FRONT: Color32 = Color32::from_rgb(0x19, 0x1a, 0x1f);
 pub const CORPUS_PALETTE: [Color32; 5] = [
     Color32::from_rgb(0x4a, 0x6e, 0x8f), // slate blue
     Color32::from_rgb(0x6f, 0x8f, 0x5a), // moss
-    Color32::from_rgb(0xe5, 0x44, 0x2c), // corpus red (findings)
-    Color32::from_rgb(0x8f, 0x6f, 0x4a), // amber-brown
+    SIGNAL_RED,                          // findings / signal
+    INTERACTION,                         // attacks / amber
     Color32::from_rgb(0x3a, 0x3b, 0x44), // plate grey (other)
 ];
 /// The mission-log accent (`#5c5d66`) — deliberately the quietest tone in
 /// the set: transcripts are bulk, not signal.
 pub const MISSION_LOG: Color32 = Color32::from_rgb(0x5c, 0x5d, 0x66);
 /// The house-button resting fill (`#1c1d22`).
-const HOUSE_FILL: Color32 = Color32::from_rgb(0x1c, 0x1d, 0x22);
+const HOUSE_FILL: Color32 = Color32::from_rgb(0x1c, 0x1c, 0x1a);
 /// The house-button hover fill (`#232429`).
-const HOUSE_HOVER: Color32 = Color32::from_rgb(0x23, 0x24, 0x29);
-/// Destructive-button label (`#1c0b06` — dark red-brown, per the mock).
-const ON_ACCENT: Color32 = Color32::from_rgb(0x1c, 0x0b, 0x06);
+const HOUSE_HOVER: Color32 = Color32::from_rgb(0x28, 0x25, 0x20);
+/// Dark labels on bright amber/red button fills.
+pub const ON_INTERACTION: Color32 = Color32::from_rgb(0x19, 0x12, 0x08);
+pub const ON_DANGER: Color32 = Color32::from_rgb(0x1c, 0x0b, 0x06);
 
 /// Convert a raw (r, g, b) triple into a `Color32` — the sanctioned dynamic
 /// colour builder for syntect-adjacent conversions (keeps `from_rgb`
@@ -100,13 +107,17 @@ pub fn mono(size: f32) -> FontId {
 
 // --- text helpers (spec §1c) ---
 /// The mock's large screen header: 28px, Inter-Light, TEXT.
+#[allow(dead_code)] // compatibility until remaining screens adopt page_header
 pub fn screen_header(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text.into()).size(28.0).color(TEXT)
 }
 
-/// The mock's section heading: 20px, Inter-Light, TEXT.
+/// Compact amber section title used inside command cards.
 pub fn section_heading(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text.into()).size(20.0).color(TEXT)
+    egui::RichText::new(text.into())
+        .size(17.0)
+        .strong()
+        .color(INTERACTION)
 }
 
 // --- control helpers (spec §1c) ---
@@ -122,14 +133,65 @@ pub fn house_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
     .inner
 }
 
-/// A destructive button: fill ACCENT, no stroke, radius 2, dark-on-red
+/// Primary amber action. The larger padding is intentional: this is the
+/// command the page wants the operator to see first.
+#[allow(dead_code)] // Agent New Mission adopts it in chunk 3
+pub fn primary_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
+    ui.scope(|ui| {
+        let style = ui.style_mut();
+        override_button_visuals(style, INTERACTION, ButtonKind::Primary);
+        style.spacing.button_padding = egui::vec2(16.0, 9.0);
+        ui.button(
+            egui::RichText::new(text.into())
+                .size(14.0)
+                .strong()
+                .color(ON_INTERACTION),
+        )
+    })
+    .inner
+}
+
+/// A destructive button: fill SIGNAL_RED, no stroke, radius 2, dark-on-red
 /// 14px text. Hover ~10% lighter red.
 pub fn destructive_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
     ui.scope(|ui| {
         let style = ui.style_mut();
-        override_button_visuals(style, ACCENT, ButtonKind::Destructive);
+        override_button_visuals(style, SIGNAL_RED, ButtonKind::Destructive);
         style.spacing.button_padding = egui::vec2(12.0, 7.0);
-        ui.button(egui::RichText::new(text.into()).size(14.0).color(ON_ACCENT))
+        ui.button(egui::RichText::new(text.into()).size(14.0).color(ON_DANGER))
+    })
+    .inner
+}
+
+/// One item in a compact segmented control. Selection uses amber text and an
+/// amber keyline/fill, never the danger red.
+pub fn segment_button(ui: &mut Ui, selected: bool, text: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let style = ui.style_mut();
+        let fill = if selected {
+            ROW_HL
+        } else {
+            Color32::TRANSPARENT
+        };
+        for ws in [
+            &mut style.visuals.widgets.inactive,
+            &mut style.visuals.widgets.hovered,
+            &mut style.visuals.widgets.active,
+        ] {
+            ws.bg_fill = fill;
+            ws.weak_bg_fill = fill;
+            ws.bg_stroke = egui::Stroke::new(
+                1.0_f32,
+                if selected {
+                    KEYLINE_STRONG
+                } else {
+                    KEYLINE_SOFT
+                },
+            );
+            ws.corner_radius = egui::CornerRadius::same(2);
+        }
+        let color = if selected { INTERACTION } else { TEXT_MUTED };
+        ui.button(egui::RichText::new(text).size(12.5).color(color))
     })
     .inner
 }
@@ -235,7 +297,10 @@ pub fn hairline(ui: &mut Ui) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     ui.painter().line_segment(
-        [egui::pos2(rect.min.x, rect.center().y), egui::pos2(rect.max.x, rect.center().y)],
+        [
+            egui::pos2(rect.min.x, rect.center().y),
+            egui::pos2(rect.max.x, rect.center().y),
+        ],
         egui::Stroke::new(1.0_f32, HAIRLINE),
     );
 }
@@ -282,8 +347,11 @@ pub fn combo_caret(
 }
 
 /// How a button restyles: hover-state fills (house vs destructive).
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Primary is wired by the Agent action-hierarchy chunk
 enum ButtonKind {
     House,
+    Primary,
     Destructive,
 }
 
@@ -292,7 +360,8 @@ enum ButtonKind {
 fn override_button_visuals(style: &mut egui::Style, resting: Color32, kind: ButtonKind) {
     let hover_fill = match kind {
         ButtonKind::House => HOUSE_HOVER,
-        // ~10% lighter red on hover (mix ACCENT toward white).
+        ButtonKind::Primary => INTERACTION_HOVER,
+        // ~10% lighter red on hover.
         ButtonKind::Destructive => Color32::from_rgb(0xed, 0x59, 0x41),
     };
     let radius = egui::CornerRadius::same(2);
@@ -301,7 +370,14 @@ fn override_button_visuals(style: &mut egui::Style, resting: Color32, kind: Butt
         &mut style.visuals.widgets.hovered,
         &mut style.visuals.widgets.active,
     ] {
-        ws.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
+        ws.bg_stroke = egui::Stroke::new(
+            1.0_f32,
+            match kind {
+                ButtonKind::House => KEYLINE_SOFT,
+                ButtonKind::Primary => KEYLINE_STRONG,
+                ButtonKind::Destructive => SIGNAL_RED,
+            },
+        );
         ws.corner_radius = radius;
     }
     // A Button paints `weak_bg_fill`, NOT `bg_fill` (that one is for
@@ -346,29 +422,33 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 
     let mut visuals = Visuals::dark();
-    // Flat: window + every panel fill BG (spec §0, §2).
+    // Near-black shell. Smoked content surfaces are painted by widgets/cards.
     visuals.panel_fill = BG;
     visuals.window_fill = BG;
     visuals.faint_bg_color = BG;
     visuals.widgets.noninteractive.bg_fill = BG;
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE_SOFT);
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT_MUTED);
     // Widget surfaces are one step lighter than the canvas. `weak_bg_fill` is
     // what a Button/ComboBox actually paints, so it tracks `bg_fill` here —
     // set alone, `bg_fill` left every plain button on egui's default grey.
     visuals.widgets.inactive.bg_fill = PANEL;
     visuals.widgets.inactive.weak_bg_fill = PANEL;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE_SOFT);
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x22, 0x23, 0x2a);
-    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x22, 0x23, 0x2a);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x28, 0x25, 0x20);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x28, 0x25, 0x20);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE);
     visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(2);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(0x26, 0x27, 0x30);
-    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0x26, 0x27, 0x30);
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(0x31, 0x29, 0x20);
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0x31, 0x29, 0x20);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE_STRONG);
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(2);
-    visuals.selection.bg_fill = ACCENT;
+    // Selected rows stay subordinate to primary actions: a smoked amber tint
+    // with amber type remains legible in every ComboBox and menu, unlike a
+    // solid interaction slab. Text-edit selection uses the same quiet state.
+    visuals.selection.bg_fill = ROW_HL;
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, INTERACTION);
     // Inline `code` in chat markdown: a dark chip, not egui's light grey
     // block (which glared against the near-black log).
     visuals.code_bg_color = PANEL;
@@ -384,4 +464,42 @@ pub fn apply(ctx: &egui::Context) {
     style.text_styles.insert(TextStyle::Monospace, mono(13.5));
     style.text_styles.insert(TextStyle::Small, font(12.0));
     ctx.set_style(style);
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn linear(channel: u8) -> f32 {
+        let value = channel as f32 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn luminance(color: Color32) -> f32 {
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (bright, dark) = if luminance(a) > luminance(b) {
+            (luminance(a), luminance(b))
+        } else {
+            (luminance(b), luminance(a))
+        };
+        (bright + 0.05) / (dark + 0.05)
+    }
+
+    #[test]
+    fn command_palette_keeps_text_and_actions_legible() {
+        assert!(contrast(TEXT, BG) >= 7.0);
+        assert!(contrast(TEXT_MUTED, BG) >= 4.5);
+        assert!(contrast(INTERACTION, BG) >= 4.5);
+        assert!(contrast(INTERACTION, ROW_HL) >= 4.5);
+        assert!(contrast(SIGNAL_RED, BG) >= 4.5);
+        assert!(contrast(ON_INTERACTION, INTERACTION) >= 4.5);
+        assert!(contrast(ON_DANGER, SIGNAL_RED) >= 4.5);
+        assert_ne!(INTERACTION, SIGNAL_RED);
+    }
 }

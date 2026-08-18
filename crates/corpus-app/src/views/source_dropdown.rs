@@ -112,7 +112,7 @@ pub fn source_dropdown(
     // amber warning otherwise (the warning doubles as the adopt target).
     if let Some(matches) = running_match {
         let (glyph, color) = if matches {
-            (ph::CHECK, theme::OK)
+            (ph::CHECK, theme::HEALTHY)
         } else {
             (ph::WARNING, theme::WARN)
         };
