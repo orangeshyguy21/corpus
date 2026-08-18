@@ -36,6 +36,14 @@ struct RevCache {
     refs: BTreeMap<String, String>,
 }
 
+/// Whether a rev is a full commit sha — 40 lowercase hex chars. Such a
+/// rev needs no name→sha resolution: it IS the sha, and `ensure_source_tree`
+/// fetches it directly. Abbreviated shas are rejected on purpose (ambiguous,
+/// and not fetchable by `git fetch <sha>`).
+pub fn is_commit_sha(rev: &str) -> bool {
+    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// The clone URL for a manifest `repo` value: `owner/name` shorthand goes
 /// to github; anything carrying a scheme or path separator prefix is used
 /// verbatim (tests point at local fixture repos).
@@ -224,35 +232,56 @@ pub fn ensure_source_tree(
             .map(|s| s.success())
             .unwrap_or(false)
     };
-    let status = git(&[
-        "clone",
-        "--quiet",
-        "--depth",
-        "1",
-        "--branch",
-        rev,
-        &remote_url(repo),
-        &tmp.to_string_lossy(),
-    ]);
-    let _ = fs::remove_file(&empty_cfg);
-    if !status {
-        let _ = fs::remove_dir_all(&tmp);
-        return Err(Error::Store(format!(
-            "clone failed: {repo}@{rev} (network? tag gone?)"
-        )));
-    }
-    if !head_matches(&tmp, sha) {
-        // The rev moved between resolve and clone (a branch tip) — fetch
-        // the recorded sha itself and check it out.
+    if is_commit_sha(rev) {
+        // A bare sha is not a valid `--branch`: init an empty repo and
+        // fetch the commit directly (GitHub serves an arbitrary sha via
+        // allowAnySHA1InWant). This is the path a mission pinned to an
+        // exact commit takes — `resolve_rev` is skipped upstream because
+        // there is no name to resolve.
         let dir = tmp.to_string_lossy().into_owned();
-        let fetched = git(&["-C", &dir, "fetch", "--quiet", "--depth", "1", "origin", sha])
+        let ok = fs::create_dir_all(&tmp).is_ok()
+            && git(&["-C", &dir, "init", "--quiet"])
+            && git(&["-C", &dir, "remote", "add", "origin", &remote_url(repo)])
+            && git(&["-C", &dir, "fetch", "--quiet", "--depth", "1", "origin", sha])
             && git(&["-C", &dir, "checkout", "--quiet", "--detach", sha]);
-        if !fetched || !head_matches(&tmp, sha) {
-            let got = head(&tmp).unwrap_or_else(|| "unknown".into());
+        let _ = fs::remove_file(&empty_cfg);
+        if !ok || !head_matches(&tmp, sha) {
             let _ = fs::remove_dir_all(&tmp);
             return Err(Error::Store(format!(
-                "{name}@{rev} moved: expected {sha}, got {got}, and the sha itself is not fetchable — re-pick the rev"
+                "fetch failed: {repo}@{sha} (network? sha not on the remote?)"
             )));
+        }
+    } else {
+        let status = git(&[
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            "--branch",
+            rev,
+            &remote_url(repo),
+            &tmp.to_string_lossy(),
+        ]);
+        let _ = fs::remove_file(&empty_cfg);
+        if !status {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(Error::Store(format!(
+                "clone failed: {repo}@{rev} (network? tag gone?)"
+            )));
+        }
+        if !head_matches(&tmp, sha) {
+            // The rev moved between resolve and clone (a branch tip) — fetch
+            // the recorded sha itself and check it out.
+            let dir = tmp.to_string_lossy().into_owned();
+            let fetched = git(&["-C", &dir, "fetch", "--quiet", "--depth", "1", "origin", sha])
+                && git(&["-C", &dir, "checkout", "--quiet", "--detach", sha]);
+            if !fetched || !head_matches(&tmp, sha) {
+                let got = head(&tmp).unwrap_or_else(|| "unknown".into());
+                let _ = fs::remove_dir_all(&tmp);
+                return Err(Error::Store(format!(
+                    "{name}@{rev} moved: expected {sha}, got {got}, and the sha itself is not fetchable — re-pick the rev"
+                )));
+            }
         }
     }
     let _ = fs::remove_dir_all(&dest);
@@ -299,6 +328,20 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_sha_is_exactly_40_lowercase_hex() {
+        assert!(is_commit_sha("86a7c6cacb362daa67a0d636e303b66faf3965d9"));
+        assert!(is_commit_sha(&"a".repeat(40)));
+        assert!(!is_commit_sha("86A7C6CACB362DAA67A0D636E303B66FAF3965D9")); // uppercase
+        assert!(!is_commit_sha("86a7c6c")); // abbreviated
+        assert!(!is_commit_sha(&"a".repeat(39)));
+        assert!(!is_commit_sha(&"a".repeat(41)));
+        assert!(!is_commit_sha("v0.18.0-rc.0")); // a tag name
+        assert!(!is_commit_sha("main"));
+        assert!(!is_commit_sha("")); // empty
+        assert!(!is_commit_sha(&format!("{}g", "a".repeat(39)))); // non-hex
+    }
 
     /// Build a bare fixture repo with two tags (one annotated) and a main
     /// branch; returns its path for `ls-remote`/clone over the file path.

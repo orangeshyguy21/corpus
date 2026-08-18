@@ -126,7 +126,7 @@ const RESEARCHER_TOOLS: [&str; 2] = ["corpus_target_info", "corpus_technique_sav
 /// - `project_list/new/clone/delete/rebind` and `agent_copy` name a project
 ///   by a key other than `project`, so scope injection cannot reach them;
 /// - `corpus_wipe` destroys research output wholesale — an operator act.
-pub const CURATOR_TOOLS: [&str; 23] = [
+pub const CURATOR_TOOLS: [&str; 27] = [
     "agent_list",
     "agent_get",
     "agent_new",
@@ -140,8 +140,11 @@ pub const CURATOR_TOOLS: [&str; 23] = [
     "agent_delete",
     "mission_list",
     "mission_get",
+    "mission_status",
+    "mission_await",
     "mission_new",
     "mission_delete",
+    "mission_launch",
     "mission_set_budget",
     "mission_set_pins",
     "corpus_stats",
@@ -149,6 +152,7 @@ pub const CURATOR_TOOLS: [&str; 23] = [
     "corpus_read",
     "entry_delete",
     "entry_move",
+    "entry_write",
     "model_list",
 ];
 
@@ -1664,7 +1668,7 @@ struct Policy {
     /// one project by construction; this is the switch deciding whether
     /// that construction can be stepped around.
     external_directory: Action,
-    /// The `corpus_*` switches: 8 research tools and 23 management ones,
+    /// The `corpus_*` switches: 8 research tools and 26 management ones,
     /// every one written explicitly so the artifact never leans on
     /// omission-means-allow. Three come out `corpus_corpus_*` because the
     /// run config names the MCP server `corpus`.

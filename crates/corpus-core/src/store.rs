@@ -10,12 +10,12 @@
 //!     project.yaml                # name, plugin binding, created/cloned-from,
 //!                                 #   corpus_generation
 //!     corpus/                     # THE corpus (hypotheses/ techniques/
-//!                                 #   findings/ attacks/ runs/) — the ONLY
-//!                                 #   corpus scope
+//!                                 #   findings/ attacks/ retro/ runs/) — the
+//!                                 #   ONLY corpus scope
 //!     agents/<agent-slug>/        # agent configs: agent.yaml, opencode.json,
 //!                                 #   prompts/
 //!     missions/<mission>.md       # mission records (agent ref, pins, budget,
-//!                                 #   status, created) + brief body
+//!                                 #   created, sessions) + brief body
 //! ```
 //!
 //! The old flat `store/{hypotheses,techniques,findings,attacks,runs}`
@@ -64,7 +64,8 @@ pub const AGENT_ENV: &str = "CORPUS_OPENCODE_AGENT";
 pub const HANDLE_ENV: &str = "CORPUS_OPENCODE_HANDLE";
 
 /// The corpus category layout.
-pub const CATEGORIES: [&str; 5] = ["hypotheses", "techniques", "findings", "attacks", "runs"];
+pub const CATEGORIES: [&str; 6] =
+    ["hypotheses", "techniques", "findings", "attacks", "retro", "runs"];
 
 /// The mission-log category: a corpus dir like any other on disk, but
 /// summarized on its own (see `CorpusStats`) — run transcripts dwarf the
@@ -665,7 +666,13 @@ pub fn corpus_cost(store: &Store, project: &str) -> Result<CostReport> {
 
 /// A mission record (`store/projects/<p>/missions/<slug>.md`): the
 /// launch unit. Frontmatter carries the agent ref + source pins + budget +
-/// status + created; the markdown body is the mission brief.
+/// created + the session bindings; the markdown body is the mission brief.
+///
+/// There is deliberately no lifecycle `status` field. Whether a mission is
+/// up is DERIVED from the tmux session listing and the run's capture (see
+/// `AppState::mission_activity`), which is the only account that survives
+/// the app being killed mid-run. A persisted status could only drift out of
+/// agreement with it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mission {
     /// Slug of the agent to launch.
@@ -676,9 +683,6 @@ pub struct Mission {
     /// Per-mission execution budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<String>,
-    /// Lifecycle status (queued | running | done | stopped).
-    #[serde(default)]
-    pub status: String,
     /// Epoch seconds of creation.
     #[serde(default)]
     pub created: u64,
@@ -693,6 +697,14 @@ pub struct Mission {
     /// The opencode session id (transcript of record) — export-on-stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_session: Option<String>,
+    /// A launch the CURATOR requested but the app has not yet honored
+    /// (epoch seconds of the request). The curator (an MCP client) cannot
+    /// spawn a run itself — run spawning is the app's alone — so it flags
+    /// the record here and the app's poll beat picks it up, spawns a
+    /// detached session with the brief as the kickoff prompt, and clears
+    /// the flag. `None` on every mission the curator did not ask to launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_requested: Option<u64>,
 }
 
 impl Mission {
@@ -1113,6 +1125,35 @@ impl Store {
         }
         fs::rename(&src, &dst)?;
         Ok(())
+    }
+
+    /// Write ONE entry into a project's corpus, creating it or replacing it
+    /// in place. Returns the bytes written.
+    ///
+    /// This is the tool-shaped write path: the caller names a corpus-
+    /// relative entry (`techniques/foo.md`), never a host path, so an agent
+    /// never has to know where the corpus physically lives or reason about
+    /// the run's cwd — the trap that made writing with raw file tools so
+    /// error-prone. `resolve_corpus_entry` with `Destination` access does
+    /// the whole guard: it refuses an absolute path, `runs/`, a bare
+    /// category, and any symlink that resolves back out of the corpus, and
+    /// it materializes parent directories that do not exist yet.
+    ///
+    /// Creating a NEW category dir under the corpus is not this method's
+    /// job — the resolver rejects a first component that is not one of
+    /// `CATEGORIES`, so a typo lands as a clear error, not a stray tree.
+    pub fn write_corpus_entry(&self, project: &str, rel: &str, content: &str) -> Result<u64> {
+        let path = self.resolve_corpus_entry(project, rel, EntryAccess::Destination)?;
+        if path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false) {
+            return Err(Error::Store(format!(
+                "{rel} is a directory — entry_write replaces a file, not a tree"
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, content)?;
+        Ok(content.len() as u64)
     }
 
     // --- missions ---

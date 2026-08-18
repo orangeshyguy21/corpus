@@ -343,11 +343,7 @@ impl Sidebar {
         let on_screen = project_selected && state.current_screen == Screen::Missions;
         for (slug, mission) in &tree.missions {
             let is_sel = on_screen && state.selected_mission.as_deref() == Some(slug.as_str());
-            let label_text = if mission.name.as_deref().is_some_and(|n| !n.is_empty()) {
-                mission.name.clone().unwrap_or_default()
-            } else {
-                "new".to_string()
-            };
+            let label_text = crate::state::mission_label(mission.name.as_deref(), slug);
             let live = mission
                 .session
                 .as_ref()
@@ -418,13 +414,12 @@ impl Sidebar {
                 state.current_screen = Screen::Missions;
             }
             click.on_hover_text(format!(
-                "{project} · agent={} · {}{}",
+                "{project} · agent={}{}",
                 mission.agent,
-                mission.status,
                 match activity {
                     MissionActivity::Working => " · working",
                     MissionActivity::Waiting => " · session live, waiting",
-                    MissionActivity::Idle => "",
+                    MissionActivity::Idle => " · idle",
                 }
             ));
         }
@@ -500,6 +495,16 @@ impl Sidebar {
             ))
             .frame(false),
             |ui| {
+                // Launch an existing (never-run, or stopped) mission — the
+                // gap that made curator-created missions dead ends. Disabled
+                // while its session is already live. Selects the mission and
+                // routes to the view so the operator lands on the pane as it
+                // attaches; the brief kicks the session off.
+                let launch = ui.add_enabled(!live, egui::Button::new("Launch"));
+                if launch.clicked() {
+                    launch_mission(state, project, slug);
+                    ui.close_menu();
+                }
                 let stop = ui.add_enabled(live, egui::Button::new("Stop run"));
                 if stop.clicked() {
                     stop_mission(state, toasts, project, slug);
@@ -616,7 +621,7 @@ impl Sidebar {
     /// segmented bar of the knowledge categories (same colors as the
     /// project view, no legend). Mission logs are excluded, matching the
     /// count. Self-updating: the corpus is re-walked on a throttle
-    /// (`poll_corpus_stats`), so there is no refresh button.
+    /// (`poll_project_scope`), so there is no refresh button.
     fn footer(&mut self, ui: &mut Ui, state: &mut AppState) {
         // Corpus-only totals: mission logs live in the project view's own
         // section, never folded into the line that says `Corpus`.
@@ -1007,6 +1012,20 @@ fn delete_project(state: &mut AppState, toasts: &mut Toasts, slug: &str) {
         }
         Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
     }
+}
+
+/// Launch an existing mission (Mission ⋮ -> Launch): select it, route to
+/// the Missions view, and hand the view the `pending_launch` it consumes —
+/// the SAME path the create-and-launch `+` uses, so the operator lands on
+/// the pane as the session attaches. A non-selected project is selected
+/// first, so the launch lands where the row lives, not on the current view.
+fn launch_mission(state: &mut AppState, project: &str, slug: &str) {
+    if state.effective_project().as_deref() != Some(project) {
+        state.select_project(project);
+    }
+    state.selected_mission = Some(slug.to_string());
+    state.pending_launch = Some(slug.to_string());
+    state.current_screen = Screen::Missions;
 }
 
 /// Stop a mission's run (Mission ⋮ -> Stop run): best-effort transcript

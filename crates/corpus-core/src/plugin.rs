@@ -60,6 +60,19 @@ pub struct ProbeResult {
     /// Human-readable detail (what is missing, versions, etc.).
     #[serde(default)]
     pub notes: String,
+    /// The version the target is ACTUALLY running right now, discovered
+    /// live by the probe (e.g. the mint's `/v1/info`). `None` when the
+    /// target is unreachable or the plugin does not report one. Live-only:
+    /// never persisted — a stored value would drift the moment the target
+    /// restarts. `#[serde(default)]` so an older plugin that omits it still
+    /// deserializes.
+    #[serde(default)]
+    pub running_version: Option<String>,
+    /// The rev name the manifest EXPECTS to be running (the `sources.toml`
+    /// tag), for a "runs X, pins Y" readout without re-reading the manifest.
+    /// `None` when the plugin does not report one.
+    #[serde(default)]
+    pub expected_tag: Option<String>,
 }
 
 /// One oracle as advertised by `oracles`.

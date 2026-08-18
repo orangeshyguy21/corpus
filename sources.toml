@@ -11,12 +11,13 @@
 # rev → sha, fetches sources/<name>/<sha>/ when missing, and the sandbox
 # is recreated when its mounts don't match the mission's pins.
 
-# Target implementation: cdk-mintd. Pinned to the v0.17.0 release commit,
-# which is the version the regtest mints report on /v1/info (cdk-mintd/0.17.0).
+# Target implementation: cdk-mintd. Pinned to the v0.18.0-rc.0 release-
+# candidate commit, matching the version the regtest mints report on
+# /v1/info (cdk-mintd/0.18.0-rc.0).
 [sources.cdk]
 repo = "cashubtc/cdk"
-tag = "v0.17.0"
-sha = "86a7c6cacb362daa67a0d636e303b66faf3965d9"
+tag = "v0.18.0-rc.0"
+sha = "4ecf992f031a37154ff9e651d029d7053608b37e"
 
 # Cashu protocol spec (the NUTs the mint implements). Pinned to origin/main;
 # the spec repo has no releases, so the branch tip is the reference.

@@ -16,33 +16,79 @@ use crate::theme;
 
 /// The `repo: rev` dropdown for one source. `id_salt` must be unique per
 /// render location (top bar vs project page) — the popup keys off it.
-/// Returns `Some(rev)` when the user picks a DIFFERENT rev; the caller
-/// persists the pin (top bar: `AppState::set_source_pin`).
+/// `running_rev` is the rev the ENVIRONMENT is actually running (the top
+/// bar passes `Some("v0.18.0-rc.0")`; the project page has no live probe
+/// and passes `None`): a match paints a green check, a mismatch an amber
+/// warning, and when the running rev is selectable the warning is a
+/// one-click "adopt it" affordance.
+///
+/// Returns `Some(rev)` when the user picks a DIFFERENT rev — from the popup
+/// OR by clicking the adopt affordance; the caller persists the pin (top
+/// bar: `AppState::set_source_pin`).
 pub fn source_dropdown(
     ui: &mut Ui,
     id_salt: &str,
     source: &SourceRevs,
     selected: &str,
+    running_rev: Option<&str>,
 ) -> Option<String> {
     let stale = stale_branch(source, selected);
     let tooltip = rev_tooltip(source, selected);
     let label = format!("{}: {}", source.name, selected);
     let text_color = if stale { theme::WARN } else { theme::TEXT };
 
+    // Match state against the live environment: Some(true) = the pin equals
+    // what is running, Some(false) = a mismatch, None = no live probe.
+    let running_match = running_rev.map(|r| r == selected);
+    // The mismatch is fixable in one click only when the running rev is
+    // actually offered in this source's list.
+    let adoptable = running_match == Some(false)
+        && running_rev.is_some_and(|r| source.revs.iter().any(|x| x == r));
+
     // Field: size to the label (min 120px), 28px tall — the plugin
-    // picker's chrome at the top bar's density.
+    // picker's chrome at the top bar's density. Reserve an indicator slot
+    // (left of the caret) when there is a match state to show.
     let galley = ui
         .painter()
         .layout_no_wrap(label.clone(), egui::FontId::monospace(13.0), text_color);
-    let width = (galley.size().x + 10.0 + 28.0).max(120.0);
+    let indicator = running_match.is_some();
+    let extra = if indicator { 18.0 } else { 0.0 };
+    let width = (galley.size().x + 10.0 + 28.0 + extra).max(120.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
     // The popup gets its OWN id (plugin_picker.rs): reusing one id across
     // the background field layer and the foreground popup layer trips
     // egui's WidgetRects guard.
     let id = ui.id().with(id_salt);
     let popup_id = id.with("popup");
-    let response = ui.interact(rect, id, egui::Sense::click());
-    if response.clicked() {
+
+    // The indicator sits just left of the caret. When adoptable it is its
+    // own click target, so clicking it adopts the running rev instead of
+    // opening the popup — the field's click rect excludes it.
+    let ind_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 30.0, rect.center().y),
+        egui::vec2(18.0, 18.0),
+    );
+    let mut picked = None;
+    if adoptable {
+        let adopt = ui.interact(ind_rect, id.with("adopt"), egui::Sense::click());
+        adopt
+            .clone()
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!(
+                "environment runs {} — click to pin it",
+                running_rev.unwrap_or_default()
+            ));
+        if adopt.clicked() {
+            picked = Some(running_rev.unwrap_or_default().to_string());
+        }
+    }
+    let field_click_rect = if adoptable {
+        egui::Rect::from_min_max(rect.min, egui::pos2(ind_rect.left(), rect.max.y))
+    } else {
+        rect
+    };
+    let response = ui.interact(field_click_rect, id, egui::Sense::click());
+    if response.clicked() && picked.is_none() {
         ui.memory_mut(|mem| mem.toggle_popup(popup_id));
     }
     response.clone().on_hover_text(tooltip);
@@ -62,6 +108,22 @@ pub fn source_dropdown(
         egui::FontId::monospace(13.0),
         text_color,
     );
+    // Match indicator: green check when the pin matches the running env,
+    // amber warning otherwise (the warning doubles as the adopt target).
+    if let Some(matches) = running_match {
+        let (glyph, color) = if matches {
+            (ph::CHECK, theme::OK)
+        } else {
+            (ph::WARNING, theme::WARN)
+        };
+        painter.text(
+            ind_rect.center(),
+            Align2::CENTER_CENTER,
+            glyph,
+            egui::FontId::new(13.0, egui::FontFamily::Name("phosphor".into())),
+            color,
+        );
+    }
     painter.text(
         egui::pos2(rect.right() - 14.0, rect.center().y),
         Align2::CENTER_CENTER,
@@ -70,7 +132,6 @@ pub fn source_dropdown(
         theme::TEXT_MUTED,
     );
 
-    let mut picked = None;
     egui::popup::popup_above_or_below_widget(
         ui,
         popup_id,

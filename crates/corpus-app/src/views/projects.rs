@@ -165,6 +165,7 @@ impl ProjectsView {
                         &format!("project_source_{}", source.name),
                         source,
                         &selected,
+                        None, // no live probe on the project page
                     ) {
                         if let Err(error) = state.set_source_pin(&slug, &source.name, &rev) {
                             toast(toasts, ToastKind::Error, error.to_string());

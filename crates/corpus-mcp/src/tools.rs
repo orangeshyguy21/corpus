@@ -125,10 +125,14 @@ impl Ctx {
             Ok(plugin) => plugin.probe().unwrap_or_else(|e| ProbeResult {
                 ready: false,
                 notes: format!("probe failed: {e}"),
+                running_version: None,
+                expected_tag: None,
             }),
             Err(why) => ProbeResult {
                 ready: false,
                 notes: why.clone(),
+                running_version: None,
+                expected_tag: None,
             },
         };
         let source_pins = std::env::var(corpus_core::SOURCE_PINS_ENV)
@@ -456,11 +460,12 @@ fn with_project(args: &Value, project: &str) -> Value {
 
 /// Management tools that only look. Not audited: the log is a record of
 /// acts, and a line per `agent_list` would bury the ones that matter.
-const READ_ONLY_MANAGEMENT: [&str; 8] = [
+const READ_ONLY_MANAGEMENT: [&str; 9] = [
     "agent_list",
     "agent_get",
     "mission_list",
     "mission_get",
+    "mission_status",
     "corpus_stats",
     "corpus_list",
     "corpus_read",
@@ -475,6 +480,7 @@ fn audit_target(name: &str, args: &Value) -> String {
         n if n.starts_with("mission_") => format!("missions/{}", arg("mission")),
         "entry_delete" => format!("corpus/{}", arg("path")),
         "entry_move" => format!("corpus/{} -> {}", arg("from"), arg("to")),
+        "entry_write" => format!("corpus/{}", arg("path")),
         other => other.to_string(),
     }
 }
