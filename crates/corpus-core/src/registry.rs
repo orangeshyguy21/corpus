@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::Error;
-use crate::plugin::{Plugin, PluginManifest};
+use crate::plugin::{Plugin, PluginManifest, ProbeResult};
 use crate::store::Store;
 
 /// A discovered plugin directory with a valid manifest.
@@ -71,12 +71,20 @@ pub fn discover(dir: &Path) -> Result<Vec<PluginDir>, Error> {
 pub struct PluginStatus {
     /// Plugin name (unique within the registry).
     pub name: String,
+    /// The PLUGIN's own manifest version — NOT the target version. See
+    /// `running_version` for what the environment is actually running.
     pub version: Option<String>,
     pub description: Option<String>,
     /// Environment readiness from a live probe.
     pub ready: bool,
     /// Human-readable detail (what is missing, versions, etc.).
     pub notes: String,
+    /// The version the TARGET is actually running right now (from the live
+    /// probe), e.g. the mint's reported version. `None` when unreachable.
+    pub running_version: Option<String>,
+    /// The rev name the manifest expects to be running (the probe's view of
+    /// the `sources.toml` tag).
+    pub expected_tag: Option<String>,
 }
 
 /// Discover every plugin and probe each one live. Failures are folded
@@ -85,19 +93,30 @@ pub struct PluginStatus {
 pub fn plugin_status() -> Vec<PluginStatus> {
     let mut out = Vec::new();
     for plugin in discover(&plugins_dir()).unwrap_or_default() {
-        let (ready, notes) = match Plugin::spawn(&plugin.dir) {
-            Ok(mut spawned) => match spawned.probe() {
-                Ok(result) => (result.ready, result.notes),
-                Err(error) => (false, format!("probe failed: {error}")),
+        // Keep the whole ProbeResult so the version fields survive — a
+        // `(ready, notes)` destructure was what dropped them before.
+        let probe = match Plugin::spawn(&plugin.dir) {
+            Ok(mut spawned) => spawned.probe().unwrap_or_else(|error| ProbeResult {
+                ready: false,
+                notes: format!("probe failed: {error}"),
+                running_version: None,
+                expected_tag: None,
+            }),
+            Err(error) => ProbeResult {
+                ready: false,
+                notes: format!("spawn failed: {error}"),
+                running_version: None,
+                expected_tag: None,
             },
-            Err(error) => (false, format!("spawn failed: {error}")),
         };
         out.push(PluginStatus {
             name: plugin.manifest.name.clone(),
             version: plugin.manifest.version.clone(),
             description: plugin.manifest.description.clone(),
-            ready,
-            notes,
+            ready: probe.ready,
+            notes: probe.notes,
+            running_version: probe.running_version,
+            expected_tag: probe.expected_tag,
         });
     }
     out
@@ -203,6 +222,50 @@ pub fn plugin_sources(store: &Store, project: &str) -> Result<Vec<SourceRevs>, E
     Ok(out)
 }
 
+/// Validate ONE author-time pin `(name, rev)` structurally — NO network.
+///
+/// The pin surfaces that accept free text (the curator's `mission_new` /
+/// `mission_set_pins`, the CLI `--pin`) call this so a rev that could never
+/// resolve is rejected at authoring, with a clear error, instead of a
+/// silent time-bomb that only detonates at launch (deep in
+/// `prepare_source_pins`). It deliberately does not `ls-remote`: it checks
+/// the rev against the DISK rev cache only, so it stays fast and offline-
+/// safe. Real resolution + fetch still happens at launch.
+///
+/// A rev is accepted when it is (a) the manifest tag, (b) a rev in the
+/// source's selectable set, (c) `main`/`master`, or (d) a 40-hex commit
+/// sha. FAIL-OPEN when the source name is not among the project's declared
+/// sources — mirrors `prepare_source_pins` ignoring undeclared repos, and
+/// keeps test rigs (no discoverable plugin) working.
+pub fn validate_pin(store: &Store, project: &str, name: &str, rev: &str) -> Result<(), Error> {
+    let rev = rev.trim();
+    if rev.is_empty() {
+        return Err(Error::Store(format!("pin {name}: rev is empty")));
+    }
+    // Fail-open on any inability to enumerate the source set (plugin not
+    // discoverable, no [sources] table, etc.): validation is best-effort —
+    // launch still resolves for real. We only REJECT when we positively
+    // know the rev set and the pin is not in it.
+    let Ok(sources) = plugin_sources(store, project) else {
+        return Ok(());
+    };
+    let Some(source) = sources.iter().find(|s| s.name == name) else {
+        return Ok(()); // undeclared source: not this check's to reject
+    };
+    let ok = rev == source.pinned
+        || source.revs.iter().any(|r| r == rev)
+        || matches!(rev, "main" | "master")
+        || crate::srcrev::is_commit_sha(rev);
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Store(format!(
+            "pin {name}={rev:?} is not a known rev, tag, main/master, or a 40-hex commit sha — known: {}",
+            source.revs.join(", ")
+        )))
+    }
+}
+
 /// Resolve a mission's `repo → rev` pins to `repo → sha`, fetching any
 /// source tree not yet materialized under `sources/`. Launch calls this
 /// so the sha set is fixed at pick time (a branch pin records where the
@@ -266,7 +329,11 @@ pub fn prepare_source_pins(
         // fallback — but ONLY for the manifest's own rev; any other pin
         // stays a loud error.
         let branch_default = matches!(entry.tag.as_str(), "main" | "master");
-        let sha = if rev == &entry.tag && !entry.sha.is_empty() && !branch_default {
+        let sha = if crate::srcrev::is_commit_sha(rev) {
+            // A pin that IS a commit sha needs no name resolution — it is
+            // already the sha. `ensure_source_tree` fetches it directly.
+            rev.clone()
+        } else if rev == &entry.tag && !entry.sha.is_empty() && !branch_default {
             entry.sha.clone()
         } else {
             match crate::srcrev::resolve_rev(&sources_dir, name, &entry.repo, rev) {
@@ -355,6 +422,9 @@ mod tests {
             assert!(status.success());
         };
         run(&["init", "--quiet", "-b", "main"]);
+        // Let a bare-sha fetch work from this LOCAL fixture the way GitHub
+        // serves one (the sha-direct path in ensure_source_tree).
+        run(&["config", "uploadpack.allowAnySHA1InWant", "true"]);
         run(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "--allow-empty", "-m", "one"]);
         run(&["tag", "v0.1.0"]);
         run(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "--allow-empty", "-m", "two"]);
@@ -431,6 +501,24 @@ mod tests {
         pins.clear();
         pins.insert("ghost".to_string(), "main".to_string());
         assert!(prepare_source_pins(&store, "p", &pins).unwrap().is_empty());
+
+        // A raw commit SHA pins DIRECTLY — no name resolution (the failure
+        // mode this fixes), fetched by sha into sources/cdk/<sha>/.
+        pins.clear();
+        pins.insert("cdk".to_string(), tag_sha.clone());
+        let resolved = prepare_source_pins(&store, "p", &pins).unwrap();
+        assert_eq!(resolved["cdk"], tag_sha);
+        assert!(root.join("sources/cdk").join(&tag_sha).join(".git").is_dir());
+
+        // validate_pin (author-time, structural): the manifest tag, main, a
+        // selectable tag, and a 40-hex sha all pass; a typo fails; an
+        // undeclared source is fail-open (mirrors prepare_source_pins).
+        assert!(validate_pin(&store, "p", "cdk", "v0.17.0").is_ok());
+        assert!(validate_pin(&store, "p", "cdk", "main").is_ok());
+        assert!(validate_pin(&store, "p", "cdk", "v0.1.0").is_ok());
+        assert!(validate_pin(&store, "p", "cdk", &tag_sha).is_ok());
+        assert!(validate_pin(&store, "p", "cdk", "v9.9.9").is_err());
+        assert!(validate_pin(&store, "p", "ghost", "anything").is_ok());
 
         std::env::remove_var("CORPUS_PLUGINS_DIR");
         let _ = std::fs::remove_dir_all(&root);

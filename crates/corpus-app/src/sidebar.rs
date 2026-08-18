@@ -306,7 +306,7 @@ impl Sidebar {
         let on_screen = project_selected && state.current_screen == Screen::Agents;
         for (slug, agent) in &tree.agents {
             let is_sel = on_screen && state.selected_agent.as_deref() == Some(slug.as_str());
-            let Row { ui: mut rui, click, .. } = row_ui(ui, is_sel, false, (project, slug));
+            let Row { ui: mut rui, click, .. } = row_ui(ui, is_sel, false, ("agent", project, slug));
             rui.add_space(24.0);
             // Row label is the display NAME, never the opaque slug (a UUID);
             // the slug moves to the hover text for identity.
@@ -343,11 +343,7 @@ impl Sidebar {
         let on_screen = project_selected && state.current_screen == Screen::Missions;
         for (slug, mission) in &tree.missions {
             let is_sel = on_screen && state.selected_mission.as_deref() == Some(slug.as_str());
-            let label_text = if mission.name.as_deref().is_some_and(|n| !n.is_empty()) {
-                mission.name.clone().unwrap_or_default()
-            } else {
-                "new".to_string()
-            };
+            let label_text = crate::state::mission_label(mission.name.as_deref(), slug);
             let live = mission
                 .session
                 .as_ref()
@@ -359,7 +355,7 @@ impl Sidebar {
             // A mission row always reserves the kebab strip (⋮ shown on
             // the selected row and on row hover).
             let Row { ui: mut rui, rect, click, hovered } =
-                row_ui(ui, is_sel, true, (project, slug));
+                row_ui(ui, is_sel, true, ("mission", project, slug));
             let (label_resp, _menu_w) = if is_sel || hovered {
                 let menu_w = rui
                     .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -418,13 +414,12 @@ impl Sidebar {
                 state.current_screen = Screen::Missions;
             }
             click.on_hover_text(format!(
-                "{project} · agent={} · {}{}",
+                "{project} · agent={}{}",
                 mission.agent,
-                mission.status,
                 match activity {
                     MissionActivity::Working => " · working",
                     MissionActivity::Waiting => " · session live, waiting",
-                    MissionActivity::Idle => "",
+                    MissionActivity::Idle => " · idle",
                 }
             ));
         }
@@ -500,6 +495,16 @@ impl Sidebar {
             ))
             .frame(false),
             |ui| {
+                // Launch an existing (never-run, or stopped) mission — the
+                // gap that made curator-created missions dead ends. Disabled
+                // while its session is already live. Selects the mission and
+                // routes to the view so the operator lands on the pane as it
+                // attaches; the brief kicks the session off.
+                let launch = ui.add_enabled(!live, egui::Button::new("Launch"));
+                if launch.clicked() {
+                    launch_mission(state, project, slug);
+                    ui.close_menu();
+                }
                 let stop = ui.add_enabled(live, egui::Button::new("Stop run"));
                 if stop.clicked() {
                     stop_mission(state, toasts, project, slug);
@@ -594,9 +599,10 @@ impl Sidebar {
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -120.0))
             .show(ui.ctx(), |ui| {
                 ui.label("Display name (the slug stays as the id)");
-                ui.text_edit_singleline(&mut self.rename_name);
+                let entry = ui.text_edit_singleline(&mut self.rename_name);
                 ui.add_space(8.0);
-                if theme::house_button(ui, "Rename").clicked() {
+                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::house_button(ui, "Rename").clicked() || submit {
                     match state.rename_mission(&project, &slug, &self.rename_name) {
                         Ok(()) => {
                             state.refresh_missions(&project);
@@ -616,7 +622,7 @@ impl Sidebar {
     /// segmented bar of the knowledge categories (same colors as the
     /// project view, no legend). Mission logs are excluded, matching the
     /// count. Self-updating: the corpus is re-walked on a throttle
-    /// (`poll_corpus_stats`), so there is no refresh button.
+    /// (`poll_project_scope`), so there is no refresh button.
     fn footer(&mut self, ui: &mut Ui, state: &mut AppState) {
         // Corpus-only totals: mission logs live in the project view's own
         // section, never folded into the line that says `Corpus`.
@@ -668,11 +674,12 @@ impl Sidebar {
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
             .show(ui.ctx(), |ui| {
                 ui.label("Display name (the id is generated)");
-                ui.text_edit_singleline(&mut self.create_name);
+                let entry = ui.text_edit_singleline(&mut self.create_name);
                 ui.label("Environment plugin");
                 plugin_picker(ui, &mut self.create_plugin, state.plugins(), &mut self.needs_probe);
                 ui.add_space(8.0);
-                if theme::house_button(ui, "Create").clicked() {
+                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::house_button(ui, "Create").clicked() || submit {
                     let name = self.create_name.trim();
                     if name.is_empty() {
                         toast(toasts, ToastKind::Warning, "display name is required");
@@ -686,6 +693,9 @@ impl Sidebar {
                                 );
                                 state.refresh();
                                 state.select_project(&id);
+                                // Land on the new project's page, not
+                                // wherever the operator happened to be.
+                                state.current_screen = Screen::Projects;
                                 self.create_name.clear();
                                 done = true;
                             }
@@ -716,7 +726,8 @@ impl Sidebar {
                     });
                 ui.weak(self.agent_role.hint());
                 ui.add_space(8.0);
-                if theme::house_button(ui, "Create").clicked() {
+                let submit = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::house_button(ui, "Create").clicked() || submit {
                     let project = if self.new_agent_project.is_empty() {
                         state.effective_project().unwrap_or_default()
                     } else {
@@ -761,10 +772,11 @@ impl Sidebar {
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -100.0))
             .show(ui.ctx(), |ui| {
                 ui.label("Display name (optional — defaults to the source's)");
-                ui.text_edit_singleline(&mut self.clone_name);
+                let entry = ui.text_edit_singleline(&mut self.clone_name);
                 ui.checkbox(&mut self.clone_corpus, "copy the shared corpus");
                 ui.add_space(8.0);
-                if theme::house_button(ui, "Clone").clicked() {
+                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::house_button(ui, "Clone").clicked() || submit {
                     let name = if self.clone_name.trim().is_empty() {
                         None
                     } else {
@@ -1007,6 +1019,20 @@ fn delete_project(state: &mut AppState, toasts: &mut Toasts, slug: &str) {
         }
         Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
     }
+}
+
+/// Launch an existing mission (Mission ⋮ -> Launch): select it, route to
+/// the Missions view, and hand the view the `pending_launch` it consumes —
+/// the SAME path the create-and-launch `+` uses, so the operator lands on
+/// the pane as the session attaches. A non-selected project is selected
+/// first, so the launch lands where the row lives, not on the current view.
+fn launch_mission(state: &mut AppState, project: &str, slug: &str) {
+    if state.effective_project().as_deref() != Some(project) {
+        state.select_project(project);
+    }
+    state.selected_mission = Some(slug.to_string());
+    state.pending_launch = Some(slug.to_string());
+    state.current_screen = Screen::Missions;
 }
 
 /// Stop a mission's run (Mission ⋮ -> Stop run): best-effort transcript

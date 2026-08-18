@@ -156,9 +156,21 @@ impl eframe::App for App {
         // Keep the sidebar's agent status dots honest: poll tmux on a
         // throttle when a live session can exist (never per frame).
         self.state.poll_live_sessions();
-        // Keep the sidebar's corpus summary current as missions write
-        // (throttled re-walk — replaces the old manual refresh button).
-        self.state.poll_corpus_stats();
+        // Keep the selected project's agent list, mission list and corpus
+        // summary current as the curator mutates them from the MCP process
+        // (throttled re-list — replaces the old manual refresh button).
+        self.state.poll_project_scope();
+        // Notice a run ending wherever the operator happens to be: polled
+        // here rather than only in the mission view, which sees nothing
+        // while another screen is up. A run that dies on its own used to
+        // pass in total silence — the pane simply went idle.
+        self.state.poll_run();
+        self.report_run_exit();
+        // Honor any launch the curator requested (from the MCP process) and
+        // announce it — an autonomous launch the operator did not initiate
+        // should still surface, wherever they are.
+        self.state.poll_launch_requests();
+        self.report_launch_notices();
         self.clamp_panel_widths(ctx);
         // Screen-change hooks.
         if self.state.current_screen != self.last_screen {
@@ -224,6 +236,57 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Report a run that ended on its own — once, wherever the operator is.
+    ///
+    /// A non-zero code is an ERROR toast: the agent died, and the only
+    /// other sign is a pane that stopped moving. A clean exit is an INFO
+    /// one — the operator quit opencode themselves, so it needs
+    /// acknowledgement, not alarm. An operator STOP reports through its
+    /// own action and never lands here.
+    fn report_run_exit(&mut self) {
+        let Some(exit) = self.state.take_run_exit() else {
+            return;
+        };
+        let (kind, text) = exit_notice(&exit);
+        self.toasts.add(
+            egui_toast::Toast::new()
+                .kind(kind)
+                .text(text)
+                .options(
+                    egui_toast::ToastOptions::default()
+                        .duration(std::time::Duration::from_secs(8)),
+                ),
+        );
+    }
+
+    /// Announce each launch the curator carried out this beat. A success is
+    /// an INFO toast pointing the operator at the sidebar (the mission is
+    /// now a live TUI they can select and watch); a failure is an ERROR one
+    /// naming what went wrong, since nothing else surfaced it.
+    fn report_launch_notices(&mut self) {
+        for notice in self.state.take_launch_notices() {
+            let (kind, text) = match &notice.result {
+                Ok(()) => (
+                    egui_toast::ToastKind::Info,
+                    format!("curator launched {} — select it to watch", notice.mission),
+                ),
+                Err(error) => (
+                    egui_toast::ToastKind::Error,
+                    format!("curator launch of {} failed: {error}", notice.mission),
+                ),
+            };
+            self.toasts.add(
+                egui_toast::Toast::new()
+                    .kind(kind)
+                    .text(text)
+                    .options(
+                        egui_toast::ToastOptions::default()
+                            .duration(std::time::Duration::from_secs(8)),
+                    ),
+            );
+        }
+    }
+
     /// The top bar (spec §3): wordmark left, per-source rev dropdowns +
     /// the live env dot center, chat toggle far right.
     fn top_bar(&mut self, ctx: &egui::Context) {
@@ -280,14 +343,40 @@ impl App {
                 .map(|(_, p)| if p.name.is_empty() { slug.clone() } else { p.name.clone() })
                 .unwrap_or(slug)
         });
-        let segments: [(Option<String>, Screen); 3] = [
-            (project, Screen::Projects),
-            (self.state.selected_agent.clone(), Screen::Agents),
-            (self.state.selected_mission.clone(), Screen::Missions),
-        ];
+        // Match the nesting project > agent > mission, but only as deep as
+        // the current screen: an agent screen stops at the agent, a project
+        // screen at the project. Labels are display NAMES via the *_label
+        // helpers — never the raw uuid slug the selections hold.
+        let mut segments: Vec<(String, Screen)> = Vec::new();
+        if let Some(label) = project {
+            segments.push((label, Screen::Projects));
+        }
+        match self.state.current_screen {
+            Screen::Projects => {}
+            Screen::Agents => {
+                if let Some(slug) = self.state.selected_agent.clone() {
+                    segments.push((self.state.agent_label(&slug), Screen::Agents));
+                }
+            }
+            Screen::Missions => {
+                if let Some(slug) = self.state.selected_mission.clone() {
+                    // A mission's driving agent is the middle of the trail.
+                    if let Some(agent) = self
+                        .state
+                        .missions
+                        .iter()
+                        .find(|(s, _)| s == &slug)
+                        .map(|(_, m)| m.agent.clone())
+                        .filter(|a| !a.is_empty())
+                    {
+                        segments.push((self.state.agent_label(&agent), Screen::Agents));
+                    }
+                    segments.push((self.state.mission_label(&slug), Screen::Missions));
+                }
+            }
+        }
         let mut first = true;
         for (label, screen) in segments {
-            let Some(label) = label else { continue };
             if !first {
                 ui.label(egui::RichText::new("›").size(12.0).color(theme::TEXT_FAINT));
             }
@@ -318,6 +407,13 @@ impl App {
     fn source_dropdowns(&mut self, ui: &mut egui::Ui) {
         let revs = self.state.source_revs.clone();
         let project = self.state.effective_project();
+        // The rev the live environment is running, as a rev NAME — the mint
+        // reports `0.18.0-rc.0`, the matching tag is `v0.18.0-rc.0`.
+        let running_rev = project
+            .as_deref()
+            .and_then(|p| self.state.env_status(p))
+            .and_then(|env| env.running_version)
+            .map(|ver| format!("v{ver}"));
         for source in &revs {
             let selected = self
                 .state
@@ -325,11 +421,19 @@ impl App {
                 .get(&source.name)
                 .cloned()
                 .unwrap_or_else(|| source.default_rev().to_string());
+            // The running version only pertains to the source it VERSIONS:
+            // pass it only when it's a rev this source could hold (its tag
+            // set, or already selected). Otherwise the spec repo would flash
+            // a false mismatch against a mint version that isn't its own.
+            let source_running = running_rev.as_deref().filter(|r| {
+                source.revs.iter().any(|x| x == r) || selected == **r
+            });
             if let Some(rev) = crate::views::source_dropdown::source_dropdown(
                 ui,
                 &format!("top_source_{}", source.name),
                 source,
                 &selected,
+                source_running,
             ) {
                 // Persist the pick onto the project.
                 if let Some(project) = &project {
@@ -360,27 +464,31 @@ impl App {
             return;
         };
         let (dot, label, notes) = match self.state.env_status(&project) {
-            Some((name, true, _)) => (
-                theme::OK,
-                name,
-                "environment ready — click to re-probe".to_string(),
-            ),
-            Some((name, false, notes)) => {
+            Some(env) if env.ready => {
+                // Ready: name + the version the mint is actually running,
+                // so "what's up" is legible at a glance, not buried.
+                let label = match &env.running_version {
+                    Some(ver) => format!("{}  {ver}", env.name),
+                    None => env.name.clone(),
+                };
+                (theme::OK, label, "environment ready — click to re-probe".to_string())
+            }
+            Some(env) => {
                 // Short inline reason: the first probe-note clause, capped —
                 // the full notes stay on hover.
-                let short: String = notes.chars().take(48).collect();
+                let short: String = env.notes.chars().take(48).collect();
                 let short = short.trim_end_matches([' ', ',', ';', '—', '(']).to_string();
                 (
                     theme::DANGER,
                     if short.is_empty() {
-                        format!("{name} — not ready")
+                        format!("{} — not ready", env.name)
                     } else {
-                        format!("{name} — {short}")
+                        format!("{} — {short}", env.name)
                     },
-                    if notes.is_empty() {
+                    if env.notes.is_empty() {
                         "environment not ready — click to re-probe".to_string()
                     } else {
-                        format!("not ready — {notes}")
+                        format!("not ready — {}", env.notes)
                     },
                 )
             }
@@ -658,6 +766,25 @@ impl App {
     }
 }
 
+/// How an unasked-for run exit reads to the operator. Split from the
+/// toast plumbing so the rule itself is testable: a crash must not be
+/// mistakable for a session the operator closed.
+fn exit_notice(exit: &state::RunExit) -> (egui_toast::ToastKind, String) {
+    let who = exit
+        .mission
+        .as_deref()
+        .map(|label| format!("mission {label}"))
+        .unwrap_or_else(|| "the run".to_string());
+    if exit.code == 0 {
+        (egui_toast::ToastKind::Info, format!("{who} ended — session closed"))
+    } else {
+        (
+            egui_toast::ToastKind::Error,
+            format!("{who} exited with code {} — see the transcript", exit.code),
+        )
+    }
+}
+
 /// A padded child: Projects/Agents apply the view's 24/18 inset themselves
 /// now that the central panel renders the mission (terminal) edge-to-edge.
 fn padded<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -698,6 +825,26 @@ mod tests {
 
     fn drag(width: f32, x: f32) -> DividerDrag {
         DividerDrag { target: Divider::Sidebar, start_width: width, start_x: x }
+    }
+
+    #[test]
+    fn a_crash_is_reported_as_an_error_and_names_the_mission() {
+        let crashed = state::RunExit { mission: Some("recon".into()), code: 1 };
+        let (kind, text) = exit_notice(&crashed);
+        assert_eq!(kind, egui_toast::ToastKind::Error);
+        assert!(text.contains("recon"), "names the mission: {text}");
+        assert!(text.contains("code 1"), "names the code: {text}");
+
+        // A session the operator closed is not an alarm.
+        let closed = state::RunExit { mission: Some("recon".into()), code: 0 };
+        let (kind, _) = exit_notice(&closed);
+        assert_eq!(kind, egui_toast::ToastKind::Info);
+
+        // A run with no mission behind it still gets reported.
+        let orphan = state::RunExit { mission: None, code: 137 };
+        let (kind, text) = exit_notice(&orphan);
+        assert_eq!(kind, egui_toast::ToastKind::Error);
+        assert!(text.contains("the run"), "{text}");
     }
 
     #[test]

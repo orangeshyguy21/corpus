@@ -58,5 +58,5 @@ max_payment_sats = 100000
 # maps back to the default pin (fail loud rather than let agents read code
 # that is not what they attack); missions pinned elsewhere are deliberate
 # replay-against-another-version runs.
-cdk_sha = "86a7c6cacb362daa67a0d636e303b66faf3965d9"
+cdk_sha = "4ecf992f031a37154ff9e651d029d7053608b37e"
 nuts_sha = "3bc8b6d5b160d4427cbde01b4cd1c782ce6a835a"

@@ -14,6 +14,9 @@
 # cdk-regtest plugin runtime state: sandbox evidence and compiled tools.
 /plugins/cdk-regtest/evidence
 /plugins/cdk-regtest/tools/cdk-cli
+# corpus-faucet: source is committed (faucet-src/), the build output is not.
+/plugins/cdk-regtest/corpus-faucet
+/plugins/cdk-regtest/faucet-src/target
 # Pinned source cache (derived data, content-addressed). The SHAs live in
 # sources.toml (committed); the trees themselves are fetched host-side.
 /sources

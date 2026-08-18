@@ -165,6 +165,7 @@ impl ProjectsView {
                         &format!("project_source_{}", source.name),
                         source,
                         &selected,
+                        None, // no live probe on the project page
                     ) {
                         if let Err(error) = state.set_source_pin(&slug, &source.name, &rev) {
                             toast(toasts, ToastKind::Error, error.to_string());
@@ -260,10 +261,14 @@ impl ProjectsView {
         ui.label(theme::section_heading("Cost"));
         ui.add_space(12.0);
         match state.corpus_cost() {
-            Some(report) if !report.rows.is_empty() => cost_table(ui, report),
+            Some(report) if !report.rows.is_empty() => {
+                cost_headline(ui, report);
+                ui.add_space(14.0);
+                cost_table(ui, report);
+            }
             _ => {
                 ui.label(
-                    RichText::new("no usage recorded — cost is aggregated from exported run transcripts (runs/*.json)")
+                    RichText::new("no usage yet — updates each time an agent finishes a turn")
                         .size(12.0)
                         .color(theme::TEXT_FAINT),
                 );
@@ -426,10 +431,11 @@ impl ProjectsView {
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
             .show(ui.ctx(), |ui| {
                 ui.label("Display name (optional — defaults to the source's)");
-                ui.text_edit_singleline(&mut self.clone_name);
+                let entry = ui.text_edit_singleline(&mut self.clone_name);
                 ui.checkbox(&mut self.clone_corpus, "copy the corpus");
                 ui.add_space(8.0);
-                if theme::house_button(ui, "Clone").clicked() {
+                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::house_button(ui, "Clone").clicked() || submit {
                     let name = if self.clone_name.trim().is_empty() {
                         None
                     } else {
@@ -571,6 +577,25 @@ fn mission_log_list(ui: &mut Ui, logs: &[corpus_core::MissionLog], total: u64) {
                 .color(theme::TEXT_FAINT),
         );
     }
+}
+
+/// The Cost section's headline: the two figures that matter at a glance —
+/// total tokens across the project, and total USD. Cost stays $0 for local /
+/// free providers, so tokens lead: they are the real usage signal here. The
+/// per-model table below is the breakdown.
+fn cost_headline(ui: &mut Ui, report: &corpus_core::CostReport) {
+    let stat = |ui: &mut Ui, value: String, label: &str| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(value).size(22.0).strong().color(theme::TEXT));
+            ui.add_space(2.0);
+            ui.label(RichText::new(label).size(11.0).color(theme::TEXT_FAINT));
+        });
+    };
+    ui.horizontal(|ui| {
+        stat(ui, crate::fmt::fmt_tokens(report.tokens), "total tokens");
+        ui.add_space(32.0);
+        stat(ui, crate::fmt::fmt_usd(report.cost), "total cost");
+    });
 }
 
 /// The Cost table: one row per (model, provider) with token breakdown,

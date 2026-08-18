@@ -277,10 +277,9 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
         "list" => {
             for (slug, mission) in store.list_missions(project).map_err(|e| e.to_string())? {
                 println!(
-                    "{:<20} agent={} status={} budget={} created={} pins={:?}",
+                    "{:<20} agent={} budget={} created={} pins={:?}",
                     slug,
                     mission.agent,
-                    mission.status,
                     mission.budget.as_deref().unwrap_or("-"),
                     mission.created,
                     mission.pins
@@ -321,11 +320,15 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
                 }
             }
             let agent = agent.ok_or("missing required --agent <agent>")?;
+            // Reject a rev that could never resolve, here at authoring —
+            // not at launch (structural, no network).
+            for (repo, rev) in &pins {
+                corpus_core::validate_pin(&store, project, repo, rev).map_err(|e| e.to_string())?;
+            }
             let mission = Mission {
                 agent,
                 pins,
                 budget,
-                status: "queued".to_string(),
                 created: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -333,6 +336,7 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
                 name: None,
                 session: None,
                 opencode_session: None,
+                launch_requested: None,
             };
             store
                 .write_mission(project, slug, &mission, &brief_words.join(" "))

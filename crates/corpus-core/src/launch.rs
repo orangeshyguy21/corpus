@@ -492,7 +492,15 @@ impl RunSession {
                     Backend::Tui { raw, .. } => raw.clone(),
                     Backend::Piped { .. } => self.transcript.clone(),
                 };
-                let path = self.export_transcript().unwrap_or(fallback);
+                let path = match self.export_transcript() {
+                    Ok(path) => path,
+                    Err(error) => {
+                        // Best-effort, but not silent: a broken export
+                        // must be diagnosable, not just an empty Cost panel.
+                        eprintln!("corpus: transcript export on stop failed: {error}");
+                        fallback
+                    }
+                };
                 self.close_tui();
                 if let Backend::Tui { stopped, .. } = &mut self.backend {
                     *stopped = true;
@@ -504,7 +512,10 @@ impl RunSession {
 
     /// `opencode export <session-id>`: the newest session opened in the
     /// project dir since launch, written as clean JSON to
-    /// `<epoch>-<agent>.json`. Returns the written path.
+    /// `runs/<session-id>.json`. Keyed by session id (not launch epoch) so
+    /// a re-export overwrites in place — usage is captured every turn, and
+    /// one file per session is what keeps the cost aggregation from double
+    /// counting. Returns the written path.
     fn export_transcript(&mut self) -> Result<PathBuf> {
         let Backend::Tui {
             export_json,
@@ -529,12 +540,19 @@ impl RunSession {
             }
         };
         let json = export_opencode_json(repo.as_path(), &id)?;
-        if let Some(parent) = export_json.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&*export_json, json)?;
+        // Key by opencode SESSION id, not the launch epoch: the turn-boundary
+        // re-export must overwrite this file in place, never accumulate a
+        // second double-counted copy. The runs/ dir is export_json's parent.
+        let runs = export_json
+            .parent()
+            .ok_or_else(|| Error::Store("export path has no runs dir".into()))?
+            .to_path_buf();
+        fs::create_dir_all(&runs)?;
+        let out = runs.join(format!("{id}.json"));
+        fs::write(&out, json)?;
+        *export_json = out.clone();
         *exported = true;
-        Ok(export_json.clone())
+        Ok(out)
     }
 
     /// Kill the tmux session (the whole TUI process tree) and drop the
@@ -885,6 +903,80 @@ pub fn run_idle_secs(log: &Path) -> Option<u64> {
     Some(modified.elapsed().map(|d| d.as_secs()).unwrap_or(0))
 }
 
+/// How recently a run's TUI must have painted for the agent to count as
+/// WORKING. opencode animates while a turn is in flight (spinner, token
+/// stream, tool output), so a live-but-quiet capture for this long means
+/// the turn is over and it's waiting. Long enough to ride out a slow frame,
+/// short enough that the state settles as soon as the answer lands.
+pub const WORKING_WINDOW_SECS: u64 = 3;
+
+/// What a mission is actually doing right now — the signal behind the app's
+/// sidebar dots, and what the curator polls to pace a team. Derived live
+/// from tmux + the raw capture; never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionActivity {
+    /// No live session — the mission is not up.
+    Idle,
+    /// The session is live but quiet: the turn is finished and it is
+    /// waiting on the operator (or on a reply). Not work.
+    Waiting,
+    /// The agent is producing right now — streaming, spinning, running
+    /// tools.
+    Working,
+}
+
+/// The pure activity rule, split out so it is testable and SHARED by the
+/// app (which feeds an aged in-memory reading) and the one-shot
+/// `mission_run_state` (which stats the capture fresh): a live session is
+/// only `Working` when something was painted within `WORKING_WINDOW_SECS`.
+/// No reading at all (`None`) is NOT evidence of work — it falls through to
+/// `Waiting`, never `Working` (the case that used to pulse forever).
+pub fn activity_from_idle(live: bool, idle_secs: Option<u64>) -> MissionActivity {
+    if !live {
+        return MissionActivity::Idle;
+    }
+    match idle_secs {
+        Some(secs) if secs < WORKING_WINDOW_SECS => MissionActivity::Working,
+        _ => MissionActivity::Waiting,
+    }
+}
+
+/// A mission's live run state: its activity plus how long since its TUI
+/// last painted (`None` = no live capture to read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissionRunState {
+    pub activity: MissionActivity,
+    pub idle_secs: Option<u64>,
+}
+
+/// Compute a mission's live run state ONE-SHOT — the same answer the app's
+/// dots show, from any process that has the store + tmux (the curator's MCP
+/// server). `live` is the current tmux listing (`live_tui_sessions()`),
+/// passed in so a caller reporting many missions shells out once. A mission
+/// whose recorded `session` is not live — or that has none (a piped
+/// headless run, which only the app can see) — reads as `Idle`.
+pub fn mission_run_state(
+    store: &Store,
+    project: &str,
+    mission: &crate::store::Mission,
+    live: &[String],
+) -> MissionRunState {
+    let is_live = mission
+        .session
+        .as_deref()
+        .is_some_and(|s| live.iter().any(|l| l == s));
+    let idle_secs = mission
+        .session
+        .as_deref()
+        .filter(|_| is_live)
+        .and_then(|s| session_raw_log(store, project, s))
+        .and_then(|log| run_idle_secs(&log));
+    MissionRunState {
+        activity: activity_from_idle(is_live, idle_secs),
+        idle_secs,
+    }
+}
+
 /// Kill a corpus tmux session (Stop for a re-attached run). No-op when
 /// tmux is unavailable; the session may already be dead.
 pub fn kill_tmux_session(session: &str) {
@@ -918,18 +1010,20 @@ fn tui_session_live(session: &str, cache: &mut (std::time::Instant, bool)) -> bo
 }
 
 /// Export an opencode session's transcript of record to the project
-/// corpus `runs/<epoch>-<agent>.json` (Stop for a re-attached run
-/// that no longer has an app-owned handle). Reuses the pretty-export
+/// corpus `runs/<session-id>.json`. Used both on turn completion (the app
+/// re-exports a live conversation every time it settles into `Waiting`) and
+/// on Stop for a re-attached run with no app-owned handle. Keyed by session
+/// id so repeated exports overwrite in place — one file per session keeps
+/// the cost aggregation from double counting. Reuses the pretty-export
 /// internals of the TUI backend.
-pub fn export_session(project: &str, agent: &str, opencode_session_id: &str) -> Result<PathBuf> {
+pub fn export_session(project: &str, opencode_session_id: &str) -> Result<PathBuf> {
     let store = Store::from_env();
     let repo = store.provision_run_dir(project)?;
     let json = export_opencode_json(&repo, opencode_session_id)?;
-    let ts = now_secs();
     let path = store
         .project_corpus_dir(project)
         .join("runs")
-        .join(format!("{ts}-{agent}.json"));
+        .join(format!("{opencode_session_id}.json"));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1495,6 +1589,46 @@ mod tests {
         assert_eq!(session_raw_log(&store, "p", "my-editor"), None);
         assert_eq!(session_raw_log(&store, "p", "corpus-discover-later"), None);
         assert_eq!(session_raw_log(&store, "p", "corpus-1786911614"), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn activity_rule_maps_liveness_and_idle_to_state() {
+        use MissionActivity::*;
+        // Not live is always Idle, whatever the reading.
+        assert_eq!(activity_from_idle(false, Some(0)), Idle);
+        assert_eq!(activity_from_idle(false, None), Idle);
+        // Live + painted within the window = Working.
+        assert_eq!(activity_from_idle(true, Some(0)), Working);
+        assert_eq!(activity_from_idle(true, Some(WORKING_WINDOW_SECS - 1)), Working);
+        // Live but quiet past the window = Waiting (not Working).
+        assert_eq!(activity_from_idle(true, Some(WORKING_WINDOW_SECS)), Waiting);
+        assert_eq!(activity_from_idle(true, Some(600)), Waiting);
+        // Live with no reading is absence of evidence, not work.
+        assert_eq!(activity_from_idle(true, None), Waiting);
+    }
+
+    #[test]
+    fn mission_run_state_is_idle_without_a_live_session() {
+        let (store, dir) = tmp_store("run-state");
+        let mut mission = crate::store::Mission {
+            agent: "recon".to_string(),
+            pins: Default::default(),
+            budget: None,
+            created: 0,
+            name: None,
+            session: None,
+            opencode_session: None,
+            launch_requested: None,
+        };
+        // No session at all → Idle, no reading.
+        let s = mission_run_state(&store, "p", &mission, &[]);
+        assert_eq!(s.activity, MissionActivity::Idle);
+        assert_eq!(s.idle_secs, None);
+        // A recorded session that is NOT in the live listing → still Idle.
+        mission.session = Some("corpus-recon-1786911614".to_string());
+        let s = mission_run_state(&store, "p", &mission, &["corpus-other-1".to_string()]);
+        assert_eq!(s.activity, MissionActivity::Idle);
         let _ = fs::remove_dir_all(&dir);
     }
 

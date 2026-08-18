@@ -15,16 +15,65 @@ PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARENA="$PLUGIN_DIR/arena.sh"
 CONF="$PLUGIN_DIR/config.toml"
 ORACLES_DIR="$PLUGIN_DIR/oracles"
-FAUCET="$PLUGIN_DIR/faucet.sh"
+# Faucet: prefer the compiled cln-rpc client (corpus-faucet, built by setup.sh)
+# — it talks to CLN "two" directly over its socket, exactly as cdk's own itests
+# do, with no lightning-cli/nix/timeout dependency. Fall back to the shell
+# faucet where the binary is absent. Both honor the same CLI and the same
+# stdout markers (PAID_SATS=, a lnbcrt… bolt11, a bare integer), so the faucet
+# handler's parsing is identical either way.
+if [ -x "$PLUGIN_DIR/corpus-faucet" ]; then
+    FAUCET="$PLUGIN_DIR/corpus-faucet"
+else
+    FAUCET="$PLUGIN_DIR/faucet.sh"
+fi
 TOOLS_DIR="$PLUGIN_DIR/tools"
 EVIDENCE_DIR="$PLUGIN_DIR/evidence"
 MANIFEST="$PLUGIN_DIR/../../sources.toml"
 GW_NAME="corpus-target-gw"
 SANDBOX="corpus-sandbox-testing"
 EXEC_TIMEOUT_SECS="${CORPUS_EXEC_TIMEOUT_SECS:-90}"
+# Host-side wall-clock cap for a single oracle. MUST stay comfortably under
+# the plugin's call timeout (CORPUS_PLUGIN_CALL_TIMEOUT_MS in corpus-core,
+# default 120s): a slow oracle has to abort ITSELF and return `inconclusive`,
+# never let the plugin's global timeout fire and kill the whole process tree
+# (which took down every verify call in the first cdk campaign).
+ORACLE_TIMEOUT_SECS="${CORPUS_ORACLE_TIMEOUT_SECS:-90}"
 
 reply_ok()   { printf '{"id":%s,"ok":true,"result":%s}\n' "$1" "$2"; }
 reply_err()  { printf '{"id":%s,"ok":false,"error":%s}\n' "$1" "$(jq -Rn --arg e "$2" '$e')"; }
+
+# run_with_timeout <secs> <outfile> <cmd...>
+# Run cmd with combined stdout+stderr redirected to <outfile>, killed after
+# <secs>. Returns cmd's exit code, or 124 if it was timed out. Prefers
+# timeout(1)/gtimeout(1) when present; macOS ships neither, so it falls back
+# to a pure-bash watchdog that TERMs then KILLs the process on the deadline.
+run_with_timeout() {
+    local secs="$1" outfile="$2"; shift 2
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@" >"$outfile" 2>&1; return $?
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$secs" "$@" >"$outfile" 2>&1; return $?
+    fi
+    local marker="$outfile.killed"
+    rm -f "$marker"
+    "$@" >"$outfile" 2>&1 &
+    local cmd_pid=$!
+    # Watchdog: only fires (and marks) if the command is still alive at the
+    # deadline, so a natural early exit is never misreported as a timeout.
+    ( sleep "$secs"
+      if kill -0 "$cmd_pid" 2>/dev/null; then
+          : >"$marker"
+          kill -TERM "$cmd_pid" 2>/dev/null
+          sleep 2
+          kill -KILL "$cmd_pid" 2>/dev/null
+      fi ) >/dev/null 2>&1 &
+    local watch_pid=$!
+    wait "$cmd_pid" 2>/dev/null; local rc=$?
+    kill "$watch_pid" 2>/dev/null; wait "$watch_pid" 2>/dev/null
+    if [ -f "$marker" ]; then rm -f "$marker"; return 124; fi
+    return "$rc"
+}
 
 config_get() { # config_get <section> <key>
     awk -v section="$1" -v key="$2" '
@@ -171,6 +220,11 @@ handle() {
     case "$method" in
         probe)
             local ready=false notes net egress_net m1 m2
+            # The running mint's version + the manifest's expected tag,
+            # reported to the app as STRUCTURED fields (not just spliced into
+            # notes): the app shows what is actually running and flags a pin
+            # that disagrees. Empty until the mint answers /v1/info.
+            local running_version="" expected_tag=""
             if ! command -v docker >/dev/null 2>&1; then
                 notes="docker not found (install OrbStack or Docker Desktop)"
             elif ! docker info >/dev/null 2>&1; then
@@ -202,6 +256,10 @@ handle() {
                         mtag="$(manifest_get cdk tag)"
                         msha="$(manifest_get cdk sha)"
                         csha="$(config_get sources cdk_sha)"
+                        # Report what is running even when it MISMATCHES: that
+                        # is exactly when the operator needs to see the version.
+                        running_version="$ver"
+                        expected_tag="$mtag"
                         if [ -n "$mtag" ] && [ "$tag" != "$mtag" ]; then
                             # The dangerous case: agent reads source for a
                             # version the mint is NOT running.
@@ -217,7 +275,10 @@ handle() {
                 fi
             fi
             reply_ok "$id" "$(jq -nc --argjson ready "$ready" --arg notes "$notes" \
-                '{ready:$ready, notes:$notes}')"
+                --arg running_version "$running_version" --arg expected_tag "$expected_tag" \
+                '{ready:$ready, notes:$notes,
+                  running_version:(if $running_version=="" then null else $running_version end),
+                  expected_tag:(if $expected_tag=="" then null else $expected_tag end)}')"
             ;;
         up)
             out="$("$ARENA" up 2>&1)" && reply_ok "$id" "$(jq -nc '{notes:"arena up"}')" \
@@ -309,14 +370,24 @@ handle() {
             name="$(sanitized_name "$name")" || { reply_err "$id" "bad oracle name"; return; }
             local script="$ORACLES_DIR/$name.sh"
             [ -f "$script" ] || { reply_err "$id" "unknown oracle: $name"; return; }
-            local out rc verdict
-            out="$(MINT_URL="$(config_get target mint_url)" \
-                MINT_URL_2="$(config_get target mint_url_2)" \
-                EVIDENCE_DIR="$EVIDENCE_DIR" bash "$script" 2>&1)" && rc=0 || rc=$?
+            local out rc verdict outfile
+            outfile="$(mktemp "${TMPDIR:-/tmp}/corpus-oracle.XXXXXX")"
+            # Export rather than prefix: env-prefix semantics on a shell
+            # function are ambiguous across bash versions. Overwritten each
+            # call, so leaking them into the plugin env is harmless.
+            export MINT_URL="$(config_get target mint_url)"
+            export MINT_URL_2="$(config_get target mint_url_2)"
+            export EVIDENCE_DIR
+            run_with_timeout "$ORACLE_TIMEOUT_SECS" "$outfile" bash "$script"
+            rc=$?
+            out="$(cat "$outfile" 2>/dev/null)"; rm -f "$outfile"
             case "$rc" in
-                0) verdict="hold" ;;
-                1) verdict="violated" ;;
-                *) verdict="inconclusive" ;;
+                0)   verdict="hold" ;;
+                1)   verdict="violated" ;;
+                124) verdict="inconclusive"
+                     out="oracle timed out after ${ORACLE_TIMEOUT_SECS}s — killed before the plugin call timeout so the plugin stays alive. Partial output follows:
+$out" ;;
+                *)   verdict="inconclusive" ;;
             esac
             reply_ok "$id" "$(jq -nc --arg verdict "$verdict" --arg log "$out" \
                 '{verdict:$verdict, log:$log}')"

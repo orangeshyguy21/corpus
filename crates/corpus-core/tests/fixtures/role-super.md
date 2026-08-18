@@ -20,14 +20,18 @@ permission:
   corpus_corpus_stats: deny
   corpus_entry_delete: deny
   corpus_entry_move: deny
+  corpus_entry_write: deny
   corpus_faucet: allow
   corpus_finding_write: allow
+  corpus_mission_await: deny
   corpus_mission_delete: deny
   corpus_mission_get: deny
+  corpus_mission_launch: deny
   corpus_mission_list: deny
   corpus_mission_new: deny
   corpus_mission_set_budget: deny
   corpus_mission_set_pins: deny
+  corpus_mission_status: deny
   corpus_model_list: deny
   corpus_oracle_run: allow
   corpus_sandbox_exec: allow

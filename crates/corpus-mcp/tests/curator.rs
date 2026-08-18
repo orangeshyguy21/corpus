@@ -156,6 +156,32 @@ fn curator_schemas_never_advertise_a_project() {
 
 /// The heart of it: a curator scoped to `alpha` that explicitly names
 /// `beta` gets alpha's answer, and beta is never touched.
+/// Author-time pin validation is wired into `mission_new`, but it FAILS
+/// OPEN when the source set can't be enumerated (the echo rig has no
+/// `[sources]`): pinning a mission must still succeed, and the pin must
+/// land on the record. This guards the wiring — a regression that made
+/// `validate_pin` propagate the enumeration error would reject every
+/// pinned mission here.
+#[test]
+fn a_pinned_mission_authors_cleanly_when_sources_are_unknown() {
+    let mut rig = rig("pin", AgentRole::Curator);
+    tools::dispatch(
+        &mut rig.ctx,
+        "mission_new",
+        &json!({
+            "slug": "m1", "agent": "keeper", "brief": "b",
+            "pins": { "cdk": "8716e53de0472e5224d6a74866a680f7bc7b4513" },
+        }),
+    )
+    .expect("a pinned mission authors cleanly (validation fails open)");
+    let m = rig.store.load_mission("alpha", "m1").unwrap();
+    assert_eq!(
+        m.pins.get("cdk").map(String::as_str),
+        Some("8716e53de0472e5224d6a74866a680f7bc7b4513"),
+        "the pin is recorded verbatim"
+    );
+}
+
 #[test]
 fn a_curator_cannot_reach_another_project() {
     let mut rig = rig("cross", AgentRole::Curator);
@@ -195,6 +221,151 @@ fn a_curator_cannot_reach_another_project() {
         rig.store.load_agent("beta", "untouched").is_ok(),
         "beta's own agent survives"
     );
+}
+
+/// The curator writes corpus entries through `entry_write`, not raw file
+/// tools: a relative path lands in the scoped project's corpus, and the
+/// resolver's guards travel with it — an absolute path and a write into
+/// `runs/` are both refused, so no spelling reaches outside the corpus.
+#[test]
+fn a_curator_writes_corpus_entries_by_relative_path() {
+    let mut rig = rig("write", AgentRole::Curator);
+
+    let out = tools::dispatch(
+        &mut rig.ctx,
+        "entry_write",
+        &json!({
+            "project": "beta",
+            "path": "techniques/plan.md",
+            "content": "# team plan\n\nrecon -> hunt -> validate\n",
+        }),
+    )
+    .expect("entry_write lands");
+    assert!(out.contains("techniques/plan.md"), "names the entry: {out}");
+
+    // The SCOPE decides where it landed, never the argument: alpha, not the
+    // beta the caller named.
+    let written = rig
+        .store
+        .project_corpus_dir("alpha")
+        .join("techniques/plan.md");
+    assert!(written.exists(), "the write landed in the scoped corpus");
+    assert!(
+        !rig.store.project_corpus_dir("beta").join("techniques/plan.md").exists(),
+        "nothing may be written into another project's corpus"
+    );
+    assert!(
+        std::fs::read_to_string(&written).unwrap().contains("team plan"),
+        "the content is the body we passed"
+    );
+
+    // Re-writing the same path replaces it in place — this is the "rewrite
+    // an entry" case the curator does most.
+    tools::dispatch(
+        &mut rig.ctx,
+        "entry_write",
+        &json!({ "project": "alpha", "path": "techniques/plan.md", "content": "v2\n" }),
+    )
+    .expect("a rewrite lands");
+    assert_eq!(std::fs::read_to_string(&written).unwrap(), "v2\n");
+
+    // An absolute path is not a corpus-relative one: refused, not resolved.
+    assert!(
+        tools::dispatch(
+            &mut rig.ctx,
+            "entry_write",
+            &json!({ "project": "alpha", "path": "/etc/passwd", "content": "x" }),
+        )
+        .is_err(),
+        "an absolute path is refused"
+    );
+
+    // runs/ holds transcripts the operator audits — never writable.
+    assert!(
+        tools::dispatch(
+            &mut rig.ctx,
+            "entry_write",
+            &json!({ "project": "alpha", "path": "runs/forged.raw", "content": "x" }),
+        )
+        .is_err(),
+        "runs/ is not writable"
+    );
+}
+
+/// `mission_launch` flags the mission record for the app to spawn — the
+/// MCP process cannot start a run itself. The flag lands on the scoped
+/// project's mission, the brief is untouched, and a second call is a no-op
+/// (the request is already pending).
+#[test]
+fn a_curator_requests_a_launch_by_flagging_the_record() {
+    let mut rig = rig("launch", AgentRole::Curator);
+
+    tools::dispatch(
+        &mut rig.ctx,
+        "mission_new",
+        &json!({ "slug": "m1", "agent": "keeper", "brief": "probe the mint" }),
+    )
+    .expect("mission");
+
+    // Before launch: no request pending.
+    assert!(
+        rig.store.load_mission("alpha", "m1").unwrap().launch_requested.is_none(),
+        "a fresh mission carries no launch request"
+    );
+
+    let out = tools::dispatch(
+        &mut rig.ctx,
+        "mission_launch",
+        &json!({ "project": "beta", "mission": "m1" }),
+    )
+    .expect("launch requested");
+    assert!(out.contains("launch requested"), "{out}");
+
+    // The flag landed on the SCOPE (alpha), not the beta the caller named,
+    // and the brief survived the record rewrite.
+    let m = rig.store.load_mission("alpha", "m1").unwrap();
+    assert!(m.launch_requested.is_some(), "the launch is now requested");
+    assert_eq!(
+        rig.store.mission_brief("alpha", "m1").unwrap().trim(),
+        "probe the mint",
+        "the brief is preserved — it is the kickoff prompt"
+    );
+
+    // Idempotent: asking again does not stack or error.
+    let first = m.launch_requested;
+    tools::dispatch(&mut rig.ctx, "mission_launch", &json!({ "mission": "m1" }))
+        .expect("a second request is fine");
+    assert_eq!(
+        rig.store.load_mission("alpha", "m1").unwrap().launch_requested,
+        first,
+        "a pending request is left as it is"
+    );
+}
+
+/// `mission_status` reports the live run state. A mission with no session
+/// reads as `idle`; the scope is injected (callable with only the mission
+/// arg), and an all-missions poll lists each by slug.
+#[test]
+fn a_curator_polls_live_mission_status() {
+    let mut rig = rig("status", AgentRole::Curator);
+    tools::dispatch(
+        &mut rig.ctx,
+        "mission_new",
+        &json!({ "slug": "m1", "agent": "keeper", "brief": "b" }),
+    )
+    .expect("mission");
+
+    // Single mission, scope injected (no project key): a never-launched
+    // mission has no session, so it is idle.
+    let one = tools::dispatch(&mut rig.ctx, "mission_status", &json!({ "mission": "m1" }))
+        .expect("status answers");
+    assert!(one.contains("m1"), "names the mission: {one}");
+    assert!(one.contains("idle"), "no session reads as idle: {one}");
+    assert!(!one.contains("running"), "nothing is running: {one}");
+
+    // All missions (no mission arg): still lists m1.
+    let all = tools::dispatch(&mut rig.ctx, "mission_status", &json!({})).expect("status all");
+    assert!(all.contains("m1"), "the all-poll lists the mission: {all}");
 }
 
 /// A research role reaching for a management tool is told it is a
@@ -369,7 +540,7 @@ fn destructive_dry_runs_verify_and_price_their_target() {
     let dry = tools::dispatch(&mut rig.ctx, "mission_delete", &json!({ "mission": "m1" }))
         .expect("dry run");
     assert!(dry.contains("keeper"), "names the agent: {dry}");
-    assert!(dry.contains("queued"), "names the status: {dry}");
+    assert!(dry.contains("live no"), "names whether a session is up: {dry}");
     assert!(
         tools::dispatch(&mut rig.ctx, "mission_delete", &json!({ "mission": "ghost" })).is_err(),
         "a mission that does not exist is not a dry run"

@@ -39,7 +39,7 @@ pub const DESTRUCTIVE_OPS: [&str; 4] = [
 /// Every tool name this group serves. The catalog is asserted against it,
 /// so a tool added to one and not the other fails a test rather than going
 /// quietly unroutable (or unadvertised).
-pub const ADMIN_TOOLS: [&str; 30] = [
+pub const ADMIN_TOOLS: [&str; 34] = [
     "project_list",
     "project_new",
     "project_clone",
@@ -59,8 +59,11 @@ pub const ADMIN_TOOLS: [&str; 30] = [
     "agent_delete",
     "mission_list",
     "mission_get",
+    "mission_status",
+    "mission_await",
     "mission_new",
     "mission_delete",
+    "mission_launch",
     "mission_set_budget",
     "mission_set_pins",
     "corpus_wipe",
@@ -69,6 +72,7 @@ pub const ADMIN_TOOLS: [&str; 30] = [
     "corpus_read",
     "entry_delete",
     "entry_move",
+    "entry_write",
     "model_list",
 ];
 
@@ -327,7 +331,7 @@ pub fn catalog() -> Value {
         // --- missions ---
         {
             "name": "mission_list",
-            "description": "List a project's missions (slug, agent, budget, status, pins).",
+            "description": "List a project's missions — per row: slug, agent, budget, and `live`. `live` only reports whether a launch session for the mission currently exists (yes) or not (no); a finished agent parked at its prompt STILL reads live=yes, so this is not a working/done signal. To tell whether an agent is actually running, waiting, or idle, use mission_status. For a mission's brief and pins, use mission_get.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"project": {"type": "string"}},
@@ -336,7 +340,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "mission_get",
-            "description": "Read a mission record (frontmatter + brief body).",
+            "description": "Read one mission in full: its agent, budget, source pins, and brief body. The `live` line means only that a launch session exists — not that the agent is working. For run state (running / waiting / idle), use mission_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"project": {"type": "string"}, "mission": {"type": "string"}},
@@ -344,8 +348,26 @@ pub fn catalog() -> Value {
             }
         },
         {
+            "name": "mission_status",
+            "description": "Poll the LIVE run state of missions: 'running' (the agent is producing right now), 'waiting · last active <dur>' (session live but parked at its prompt — done, stuck, or awaiting input), or 'idle' (nothing up). This — NOT the `live` flag from mission_list/mission_get — is how you tell whether an agent is still working or has stopped. Use it to pace a team you launched; a mission that just flipped running→waiting has finished its turn, and combining it with corpus_list shows what that turn produced. Omit 'mission' to status every mission on the project, or name one for a single row. This returns ONE snapshot and comes back immediately; to WAIT for the next change instead of polling in a loop, use mission_await.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"project": {"type": "string"}, "mission": {"type": "string", "description": "optional — one mission's status; omitted = all"}},
+                    "required": ["project"]
+                }
+        },
+        {
+            "name": "mission_await",
+            "description": "BLOCK until a launched mission changes, then return WHAT changed — the wake-me-when-it's-done tool, so you pace a team without polling in a loop or asking the operator. Waits server-side (up to timeout_secs, default 45, max 90) and returns the moment a watched mission's run state flips (e.g. running → waiting: its turn just finished) OR new corpus output appears (a technique card, finding, or attack it wrote). If nothing changes before the cap it returns the current state plus 'call again' — re-call to keep waiting. Typical loop: launch, mission_await, react to what it reports, launch the next step. Omit 'mission' to wake on ANY mission on the project, or name one to wait on just it. Note: while this blocks, the session shows as working and cannot service another call until it returns.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project": {"type": "string"}, "mission": {"type": "string", "description": "optional — one mission's status; omitted = all"}},
+                "required": ["project"]
+            }
+        },
+        {
             "name": "mission_new",
-            "description": "Create a mission for an existing agent on the project.",
+            "description": "Create a mission for an existing agent on the project. 'slug' is the mission's id (kebab-case); 'name' is the human display label shown in the app's mission nav — set it so the operator sees a real name, not a placeholder (defaults to the slug when omitted).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -353,10 +375,23 @@ pub fn catalog() -> Value {
                     "slug": {"type": "string"},
                     "agent": {"type": "string"},
                     "brief": {"type": "string"},
+                    "name": {"type": "string", "description": "operator-facing display name for the mission nav"},
                     "budget": {"type": "string"},
                     "pins": {"type": "object"}
                 },
                 "required": ["project", "slug", "agent", "brief"]
+            }
+        },
+        {
+            "name": "mission_launch",
+            "description": "Launch a mission: the app spawns a full opencode TUI session for it and kicks it off with the mission's brief as the prompt. The operator can watch and steer the session live in the app. Use this when a mission is ready to run — mission_new only writes the record; this starts it. The launch happens the moment the app picks up the request; a mission whose session is already live is left alone.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "mission": {"type": "string"}
+                },
+                "required": ["project", "mission"]
             }
         },
         {
@@ -422,7 +457,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "corpus_list",
-            "description": "List entries in a corpus category (hypotheses | techniques | findings | attacks | runs).",
+            "description": "List entries in a corpus category (hypotheses | techniques | findings | attacks | retro | runs).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -471,6 +506,19 @@ pub fn catalog() -> Value {
                 "required": ["project", "from", "to"]
             }
         },
+        {
+            "name": "entry_write",
+            "description": "Write (create or replace in place) ONE entry in the project's corpus by relative path (techniques/plan.md, findings/x.md, ...). The path is relative and stays inside the corpus — pass 'techniques/plan.md', never an absolute or cwd path. Missing parent directories are created. The first path segment must be a real corpus category (hypotheses, techniques, findings, attacks, retro). runs/ is not writable — those are mission transcripts. Prefer this over raw file tools: it needs no knowledge of where the corpus lives on disk, and every write is recorded in the audit log.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "path": {"type": "string", "description": "relative path under the project corpus, e.g. techniques/plan.md"},
+                    "content": {"type": "string", "description": "the full entry body to write — replaces any existing content at this path"}
+                },
+                "required": ["project", "path", "content"]
+            }
+        },
         // --- models ---
         {
             "name": "model_list",
@@ -511,7 +559,19 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         "agent_delete" => agent_delete(ctx, args),
         "mission_list" => mission_list(ctx, &project(args)?),
         "mission_get" => mission_get(ctx, &project(args)?, &require_str(args, "mission")?),
+        "mission_status" => mission_status(
+            ctx,
+            &project(args)?,
+            args.get("mission").and_then(Value::as_str),
+        ),
+        "mission_await" => mission_await(
+            ctx,
+            &project(args)?,
+            args.get("mission").and_then(Value::as_str),
+            args.get("timeout_secs").and_then(Value::as_u64),
+        ),
         "mission_new" => mission_new(ctx, args),
+        "mission_launch" => mission_launch(ctx, args),
         "mission_delete" => mission_delete(ctx, args),
         "mission_set_budget" => mission_set_budget(ctx, args),
         "mission_set_pins" => mission_set_pins(ctx, args),
@@ -521,6 +581,7 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         "corpus_read" => corpus_read(ctx, args),
         "entry_delete" => entry_delete(ctx, args),
         "entry_move" => entry_move(ctx, args),
+        "entry_write" => entry_write(ctx, args),
         "model_list" => model_list(args),
         other => Err(Error::Args(format!("unknown admin tool: {other}"))),
     }
@@ -943,20 +1004,38 @@ fn delegation_dependents(store: &Store, project: &str, agent: &str) -> Vec<Strin
 
 // --- missions ---
 
+/// Whether a mission is up RIGHT NOW, derived rather than stored: its
+/// recorded tmux session appears in the live listing. The mission record
+/// keeps no lifecycle field — a mission is live because a session is, and
+/// that account stays true across an app crash where a stored one would
+/// not. `live` is the listing, taken once per call.
+fn mission_live(mission: &Mission, live: &[String]) -> bool {
+    mission
+        .session
+        .as_deref()
+        .is_some_and(|session| live.iter().any(|l| l == session))
+}
+
+/// `yes`/`no` for the operator-facing listings.
+fn live_label(mission: &Mission, live: &[String]) -> &'static str {
+    if mission_live(mission, live) { "yes" } else { "no" }
+}
+
 fn mission_list(ctx: &mut Ctx, project: &str) -> Result<String> {
     let missions = ctx
         .store
         .list_missions(project)
         .map_err(|e| Error::Args(e.to_string()))?;
+    let live = corpus_core::live_tui_sessions();
     Ok(missions
         .iter()
         .map(|(slug, m)| {
             format!(
-                "{:<20} agent={} budget={} status={}",
+                "{:<20} agent={} budget={} live={}",
                 slug,
                 m.agent,
                 m.budget.as_deref().unwrap_or("-"),
-                m.status
+                live_label(m, &live)
             )
         })
         .collect::<Vec<_>>()
@@ -972,14 +1051,272 @@ fn mission_get(ctx: &mut Ctx, project: &str, slug: &str) -> Result<String> {
         .store
         .mission_brief(project, slug)
         .map_err(|e| Error::Args(e.to_string()))?;
+    let live = corpus_core::live_tui_sessions();
     Ok(format!(
-        "--- mission {project}/{slug} ---\nagent: {}\nbudget: {}\nstatus: {}\npins: {:?}\n\n{}",
+        "--- mission {project}/{slug} ---\nagent: {}\nbudget: {}\nlive: {}\npins: {:?}\n\n{}",
         mission.agent,
         mission.budget.as_deref().unwrap_or("-"),
-        mission.status,
+        live_label(&mission, &live),
         mission.pins,
         brief
     ))
+}
+
+/// The live run state of a mission, worded for the curator: `running`
+/// (the agent is producing right now), `waiting · last active <dur>` (session
+/// live but parked at its prompt), or `idle` (nothing up). This is the same
+/// signal the app's sidebar dots show — the curator polls it to pace a team.
+fn status_label(state: &corpus_core::MissionRunState) -> String {
+    match state.activity {
+        corpus_core::MissionActivity::Working => "running".to_string(),
+        corpus_core::MissionActivity::Waiting => match state.idle_secs {
+            Some(secs) => format!("waiting · last active {}", fmt_idle(secs)),
+            None => "waiting".to_string(),
+        },
+        corpus_core::MissionActivity::Idle => "idle".to_string(),
+    }
+}
+
+/// A compact idle duration: `<Ns` / `<Nm` / `<NhNm`.
+fn fmt_idle(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Report the LIVE activity of missions — `running` / `waiting` / `idle` —
+/// derived from tmux + the run capture, not a stored field. With `mission`,
+/// one row; else every mission on the project. The tmux listing is fetched
+/// once and shared across rows.
+fn mission_status(ctx: &mut Ctx, project: &str, mission: Option<&str>) -> Result<String> {
+    let live = corpus_core::live_tui_sessions();
+    let rows: Vec<(String, Mission)> = match mission {
+        Some(slug) => {
+            let m = ctx
+                .store
+                .load_mission(project, slug)
+                .map_err(|e| Error::Args(e.to_string()))?;
+            vec![(slug.to_string(), m)]
+        }
+        None => ctx
+            .store
+            .list_missions(project)
+            .map_err(|e| Error::Args(e.to_string()))?,
+    };
+    if rows.is_empty() {
+        return Ok(format!("no missions on {project}"));
+    }
+    Ok(rows
+        .iter()
+        .map(|(slug, m)| {
+            let state = corpus_core::mission_run_state(&ctx.store, project, m, &live);
+            format!("{:<24} {}", slug, status_label(&state))
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// How often `mission_await` re-checks while it blocks.
+const AWAIT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Default and hard cap for how long ONE `mission_await` call blocks. Kept
+/// short of a typical MCP client's tool-call timeout — the curator re-calls
+/// to keep waiting — and a modest cap also bounds how long a blocked call
+/// withholds this single-threaded server from its next request (a cancel
+/// included). Tune to opencode's actual tool timeout if it differs.
+const AWAIT_DEFAULT_SECS: u64 = 45;
+const AWAIT_CAP_SECS: u64 = 90;
+
+/// The missions `mission_await`/`mission_status` watch: one named, or all on
+/// the project.
+fn watched_missions(
+    store: &Store,
+    project: &str,
+    mission: Option<&str>,
+) -> Result<Vec<(String, Mission)>> {
+    match mission {
+        Some(slug) => {
+            let m = store
+                .load_mission(project, slug)
+                .map_err(|e| Error::Args(e.to_string()))?;
+            Ok(vec![(slug.to_string(), m)])
+        }
+        None => store
+            .list_missions(project)
+            .map_err(|e| Error::Args(e.to_string())),
+    }
+}
+
+/// Per-mission run state right now, keyed by slug — what `mission_await`
+/// diffs across polls to notice a mission stopping (or starting) work.
+fn state_snapshot(
+    store: &Store,
+    project: &str,
+    missions: &[(String, Mission)],
+    live: &[String],
+) -> std::collections::BTreeMap<String, corpus_core::MissionRunState> {
+    missions
+        .iter()
+        .map(|(slug, m)| {
+            (
+                slug.clone(),
+                corpus_core::mission_run_state(store, project, m, live),
+            )
+        })
+        .collect()
+}
+
+/// Every corpus entry path (relative, all categories including runs) — the
+/// snapshot `mission_await` diffs to notice new output a mission produced.
+/// A running mission's `runs/` capture already exists at entry, so its
+/// growth is not seen here; a freshly written technique/finding/attack is.
+fn corpus_entry_set(store: &Store, project: &str) -> std::collections::BTreeSet<String> {
+    let root = store.project_corpus_dir(project);
+    let mut out = std::collections::BTreeSet::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(rel) = path.strip_prefix(&root) {
+                out.insert(rel.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out
+}
+
+fn activity_word(a: corpus_core::MissionActivity) -> &'static str {
+    match a {
+        corpus_core::MissionActivity::Working => "running",
+        corpus_core::MissionActivity::Waiting => "waiting",
+        corpus_core::MissionActivity::Idle => "idle",
+    }
+}
+
+/// The change report `mission_await` returns — or `None` when nothing the
+/// curator would act on has happened yet. Pure over the before/after run
+/// states and the corpus paths that appeared since, so it is tested without
+/// tmux or sleeps: an activity flip (running→waiting = a turn finished) or
+/// any new corpus output is a wake; a mission unchanged and silent is not.
+fn await_report(
+    before: &std::collections::BTreeMap<String, corpus_core::MissionRunState>,
+    now: &std::collections::BTreeMap<String, corpus_core::MissionRunState>,
+    new_entries: &[String],
+) -> Option<String> {
+    let mut lines = Vec::new();
+    for (slug, state) in now {
+        let prev = before.get(slug).map(|b| b.activity);
+        if prev != Some(state.activity) {
+            let was = prev.map(activity_word).unwrap_or("new");
+            lines.push(format!("{slug}: {was} → {}", status_label(state)));
+        }
+    }
+    if lines.is_empty() && new_entries.is_empty() {
+        return None;
+    }
+    if !new_entries.is_empty() {
+        lines.push(format!("new corpus output: {}", new_entries.join(", ")));
+    }
+    Some(lines.join("\n"))
+}
+
+/// Block until a watched mission's run state flips or new corpus output
+/// lands, then report it — the curator's wake-me signal, so it paces a team
+/// without a polling loop. Bounded by `timeout_secs` (default 45, max 90):
+/// on timeout it returns the current state and invites another call.
+fn mission_await(
+    ctx: &mut Ctx,
+    project: &str,
+    mission: Option<&str>,
+    timeout_secs: Option<u64>,
+) -> Result<String> {
+    let cap = timeout_secs.unwrap_or(AWAIT_DEFAULT_SECS).clamp(1, AWAIT_CAP_SECS);
+    let missions = watched_missions(&ctx.store, project, mission)?;
+    if missions.is_empty() {
+        return Ok(format!("no missions on {project}"));
+    }
+    let before = state_snapshot(
+        &ctx.store,
+        project,
+        &missions,
+        &corpus_core::live_tui_sessions(),
+    );
+    let entries0 = corpus_entry_set(&ctx.store, project);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(cap);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            let live = corpus_core::live_tui_sessions();
+            let status = state_snapshot(&ctx.store, project, &missions, &live)
+                .iter()
+                .map(|(slug, st)| format!("{slug}: {}", status_label(st)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(format!(
+                "no change in {cap}s — call mission_await again to keep waiting.\n{status}"
+            ));
+        }
+        std::thread::sleep(AWAIT_POLL);
+        // Re-load records so a mission created, deleted, or relaunched (new
+        // session id) since entry is reflected, not stale.
+        let missions_now =
+            watched_missions(&ctx.store, project, mission).unwrap_or_else(|_| missions.clone());
+        let live = corpus_core::live_tui_sessions();
+        let now = state_snapshot(&ctx.store, project, &missions_now, &live);
+        let new_entries: Vec<String> = corpus_entry_set(&ctx.store, project)
+            .difference(&entries0)
+            .cloned()
+            .collect();
+        if let Some(report) = await_report(&before, &now, &new_entries) {
+            return Ok(report);
+        }
+    }
+}
+
+#[cfg(test)]
+mod await_tests {
+    use super::*;
+    use corpus_core::{MissionActivity, MissionRunState};
+
+    fn st(a: MissionActivity, idle: Option<u64>) -> MissionRunState {
+        MissionRunState { activity: a, idle_secs: idle }
+    }
+
+    fn map(pairs: &[(&str, MissionRunState)]) -> std::collections::BTreeMap<String, MissionRunState> {
+        pairs.iter().map(|(s, r)| (s.to_string(), *r)).collect()
+    }
+
+    #[test]
+    fn no_change_and_no_output_is_none() {
+        let before = map(&[("recon", st(MissionActivity::Working, Some(1)))]);
+        let now = map(&[("recon", st(MissionActivity::Working, Some(2)))]);
+        assert!(await_report(&before, &now, &[]).is_none());
+    }
+
+    #[test]
+    fn a_finished_turn_is_reported() {
+        let before = map(&[("recon", st(MissionActivity::Working, Some(1)))]);
+        let now = map(&[("recon", st(MissionActivity::Waiting, Some(9)))]);
+        let report = await_report(&before, &now, &[]).expect("a flip is a wake");
+        assert!(report.contains("recon: running → waiting"), "{report}");
+    }
+
+    #[test]
+    fn new_output_alone_is_reported() {
+        let before = map(&[("recon", st(MissionActivity::Working, Some(1)))]);
+        let now = map(&[("recon", st(MissionActivity::Working, Some(2)))]);
+        let report = await_report(&before, &now, &["techniques/c2.md".to_string()])
+            .expect("new output is a wake even with no state flip");
+        assert!(report.contains("new corpus output: techniques/c2.md"), "{report}");
+    }
 }
 
 fn mission_new(ctx: &mut Ctx, args: &Value) -> Result<String> {
@@ -988,20 +1325,53 @@ fn mission_new(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let agent = require_str(args, "agent")?;
     let brief = require_str(args, "brief")?;
     let budget = args.get("budget").and_then(Value::as_str).map(str::to_string);
+    // The operator-facing display name (the sidebar label). Optional: an
+    // empty/absent name falls back to the slug in the nav.
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let pins = parse_pins(args.get("pins"))?;
+    validate_pins(ctx, &project, &pins)?;
     let mission = Mission {
         agent,
-        pins: parse_pins(args.get("pins"))?,
+        pins,
         budget,
-        status: "queued".to_string(),
         created: now(),
-        name: None,
+        name,
         session: None,
         opencode_session: None,
+        launch_requested: None,
     };
     ctx.store
         .write_mission(&project, &slug, &mission, &brief)
         .map_err(|e| Error::Args(e.to_string()))?;
     Ok(format!("created mission {project}/{slug} (agent {})", mission.agent))
+}
+
+/// Request that the app launch a mission — flag the record and let the
+/// app's poll beat spawn the session. The MCP process cannot spawn a run
+/// itself (run spawning, tmux, and the embedded pane are the app's), so
+/// this is a REQUEST, honored the moment the app sees it. Idempotent: a
+/// mission already flagged (or already live) is left as it is.
+fn mission_launch(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let project = require_str(args, "project")?;
+    let slug = require_str(args, "mission")?;
+    let mut mission = ctx
+        .store
+        .load_mission(&project, &slug)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    if mission.launch_requested.is_none() {
+        mission.launch_requested = Some(now());
+        ctx.store
+            .update_mission(&project, &slug, &mission)
+            .map_err(|e| Error::Args(e.to_string()))?;
+    }
+    Ok(format!(
+        "launch requested for {project}/{slug} — the app will spawn its opencode session and kick it off with the brief"
+    ))
 }
 
 fn mission_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
@@ -1018,10 +1388,13 @@ fn mission_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
             .store
             .load_mission(&project, &mission)
             .map_err(|e| Error::Args(e.to_string()))?;
+        // Liveness belongs in the dry run above all: deleting the record of
+        // a mission whose session is still up orphans a running agent.
+        let live = corpus_core::live_tui_sessions();
         mint_confirm(ctx, "mission_delete", &target, &format!(
-            "DRY RUN — would delete mission {project}/{mission} (agent {}, status {}{})",
+            "DRY RUN — would delete mission {project}/{mission} (agent {}, live {}{})",
             record.agent,
-            record.status,
+            live_label(&record, &live),
             record
                 .budget
                 .as_deref()
@@ -1059,6 +1432,7 @@ fn mission_set_pins(ctx: &mut Ctx, args: &Value) -> Result<String> {
         .load_mission(&project, &mission_slug)
         .map_err(|e| Error::Args(e.to_string()))?;
     mission.pins = parse_pins(args.get("pins"))?;
+    validate_pins(ctx, &project, &mission.pins)?;
     ctx.store
         .update_mission(&project, &mission_slug, &mission)
         .map_err(|e| Error::Args(e.to_string()))?;
@@ -1076,6 +1450,21 @@ fn parse_pins(value: Option<&Value>) -> Result<std::collections::BTreeMap<String
         }
     }
     Ok(pins)
+}
+
+/// Reject a pin the curator authored that could never resolve — a typo'd
+/// rev fails HERE, at authoring, not at launch. Structural (no network);
+/// a raw commit sha and the manifest tag are both accepted.
+fn validate_pins(
+    ctx: &Ctx,
+    project: &str,
+    pins: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    for (repo, rev) in pins {
+        corpus_core::validate_pin(&ctx.store, project, repo, rev)
+            .map_err(|e| Error::Args(e.to_string()))?;
+    }
+    Ok(())
 }
 
 // --- corpus ---
@@ -1172,6 +1561,17 @@ fn entry_move(ctx: &mut Ctx, args: &Value) -> Result<String> {
         .move_corpus_entry(&project, &from, &to, overwrite)
         .map_err(|e| Error::Args(e.to_string()))?;
     Ok(format!("moved {project}/corpus/{from} -> {to}"))
+}
+
+fn entry_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let project = require_str(args, "project")?;
+    let path = require_str(args, "path")?;
+    let content = require_str(args, "content")?;
+    let bytes = ctx
+        .store
+        .write_corpus_entry(&project, &path, &content)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    Ok(format!("wrote {project}/corpus/{path} ({bytes} bytes)"))
 }
 
 // --- models ---

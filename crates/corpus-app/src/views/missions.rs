@@ -73,8 +73,8 @@ impl MissionsView {
 
         // A just-created mission launches automatically (once): a BARE TUI
         // at an empty prompt. pending_launch is consumed even on failure.
-        // launch_mission REPLACES a live run (export + tear-down), so a
-        // new mission never inherits the previous mission's session.
+        // launch_mission BACKGROUNDS a live run rather than replacing it,
+        // so creating a mission never disturbs the one already working.
         if state.pending_launch.as_deref() == Some(slug.as_str()) {
             state.pending_launch = None;
             if let Err(error) = state.launch_mission(&project, &mission.agent, &slug) {
@@ -153,11 +153,7 @@ impl MissionsView {
     /// restore: its name + a faint reason. No actions — a mission is
     /// launched from the sidebar, and a resumable one restores itself.
     fn idle(&mut self, ui: &mut Ui, slug: &str, mission: &corpus_core::Mission) {
-        let label = mission
-            .name
-            .clone()
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| slug.to_string());
+        let label = crate::state::mission_label(mission.name.as_deref(), slug);
         let rect = ui.max_rect();
         ui.allocate_new_ui(
             egui::UiBuilder::new()
@@ -168,7 +164,7 @@ impl MissionsView {
                 ui.label(RichText::new(&label).size(15.0).color(theme::TEXT));
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new(format!("agent={} · {}", mission.agent, mission.status))
+                    RichText::new(format!("agent={}", mission.agent))
                         .size(12.0)
                         .color(theme::TEXT_FAINT),
                 );

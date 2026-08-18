@@ -17,13 +17,6 @@ use corpus_core::{
 
 use crate::nav::Screen;
 
-/// How recently a run's TUI must have painted for the agent to count as
-/// WORKING. opencode animates while a turn is in flight (spinner, token
-/// stream, tool output), so a live-but-quiet capture for this long means
-/// the turn is over and it's waiting on the operator. Long enough to ride
-/// out a slow frame, short enough that the dot settles as soon as the
-/// answer lands.
-const WORKING_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 /// How often the raw captures are re-stat'd. Cheap next to the tmux
 /// listing (no subprocess), so it runs on the faster beat.
 const ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -119,8 +112,11 @@ pub struct AppState {
     pub run_lines: Vec<RunLine>,
     /// None = still running; Some = final state (set once, at exit).
     pub run_status: Option<RunStatus>,
-    /// The durable transcript path of the last stopped run.
-    pub export_path: Option<String>,
+    /// A run that ended ON ITS OWN, held for exactly one report to the
+    /// operator. An operator stop is not queued here — the act already
+    /// answered itself with a toast; this is for the exits nobody asked
+    /// for, which used to leave the pane silently idle.
+    run_exit: Option<RunExit>,
     /// Live corpus tmux sessions seen at the last `refresh_live_sessions`
     /// — the re-attach list a relaunched app offers (chunk 7).
     pub live_sessions: Vec<String>,
@@ -135,34 +131,71 @@ pub struct AppState {
     /// When `session_activity` was last refreshed (a `stat` per live
     /// session — cheap, so polled faster than the tmux listing).
     session_activity_polled_at: Option<std::time::Instant>,
+    /// Per tmux session, the moment we last re-exported its usage transcript.
+    /// The turn-completion sweep exports only when the session last painted
+    /// (its `session_activity` instant) is NEWER than this — so a finished
+    /// turn records exactly once, and a session parked quiet at its prompt
+    /// is not re-exported every beat.
+    last_exported_at: BTreeMap<String, std::time::Instant>,
+    /// When the app last scanned mission records for a curator's
+    /// `launch_requested` flag (throttled — the scan reads every mission
+    /// off disk, so never per frame).
+    launch_requests_polled_at: Option<std::time::Instant>,
+    /// Curator-requested launches the app has honored, queued for one
+    /// report to the operator each. Drained by the app loop into toasts —
+    /// an autonomous launch the operator did not initiate should still
+    /// announce itself.
+    launch_notices: Vec<LaunchNotice>,
 }
 
-/// What a mission's row is showing: nothing live, a live session parked
-/// at its prompt, or an agent actually producing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MissionActivity {
-    /// No live run and no live session — the mission is not up.
-    Idle,
-    /// The opencode session is live but quiet: the turn is finished and
-    /// it is waiting on the operator (or on a reply). Not work.
-    Waiting,
-    /// The agent is producing right now — streaming, spinning, running
-    /// tools. The only state that earns the pulse.
-    Working,
+/// A curator-requested launch the app carried out (or tried to), queued
+/// for a single operator-facing toast.
+#[derive(Debug, Clone)]
+pub struct LaunchNotice {
+    pub mission: String,
+    pub result: Result<(), String>,
 }
 
-/// The status dot's decision, given whether the session is up and when
-/// its TUI last painted. Split out from `AppState` so the rule itself is
-/// testable: a LIVE session is only `Working` when something was painted
-/// inside `WORKING_WINDOW` — no capture reading is not evidence of work,
-/// which is precisely the case that used to pulse forever.
+/// The env probe as the top bar consumes it: readiness + notes, plus the
+/// version the target is ACTUALLY running (live probe). `running_version`
+/// is `None` when the target is unreachable — the top bar then simply omits
+/// the version. (The manifest's `expected_tag` stays on `PluginStatus`; the
+/// mismatch it implies is already spelled out in `notes`.)
+#[derive(Debug, Clone)]
+pub struct EnvStatus {
+    pub name: String,
+    pub ready: bool,
+    pub notes: String,
+    pub running_version: Option<String>,
+}
+
+/// The activity signal (Idle / Waiting / Working) is owned by corpus-core
+/// now, so the app's dots and the curator's `mission_status` tool read the
+/// SAME rule and window. Re-exported here so `crate::state::MissionActivity`
+/// callers (the sidebar dot, the repaint budget) are unchanged.
+pub use corpus_core::MissionActivity;
+
+/// The status dot's decision from the app's aged in-memory reading: turns a
+/// `last_paint` Instant into idle-seconds and defers to the shared core
+/// rule (`corpus_core::activity_from_idle`). The app keeps its own polled
+/// cache (statting per frame would be far too much I/O) — only the rule and
+/// the window are shared.
 fn activity_for(live: bool, last_paint: Option<std::time::Instant>) -> MissionActivity {
-    if !live {
-        return MissionActivity::Idle;
-    }
+    corpus_core::activity_from_idle(live, last_paint.map(|p| p.elapsed().as_secs()))
+}
+
+/// The turn-completion export gate: given a `Waiting` session's last paint
+/// and the moment we last exported it, should we re-export now? Yes only when
+/// it painted output more recently than our last export (a real turn since),
+/// or was never exported. No paint reading ⇒ nothing to record. Keeps
+/// capture to once per completed turn — see [`AppState::sweep_usage_exports`].
+fn should_reexport(
+    last_paint: Option<std::time::Instant>,
+    last_export: Option<std::time::Instant>,
+) -> bool {
     match last_paint {
-        Some(painted) if painted.elapsed() < WORKING_WINDOW => MissionActivity::Working,
-        _ => MissionActivity::Waiting,
+        Some(paint) => last_export.is_none_or(|e| paint > e),
+        None => false,
     }
 }
 
@@ -173,6 +206,16 @@ pub struct RunMeta {
     /// fallback): the pane must outlive the dropped session handle, so
     /// attach state lives on the META, not the backend.
     pub pty_attach: Option<Vec<String>>,
+}
+
+/// A run that ended on its own, queued for one report to the operator.
+/// `mission` is the display label of the mission it belonged to (None for
+/// a non-mission run), resolved at exit while the bookkeeping still says
+/// who it was.
+#[derive(Debug, Clone)]
+pub struct RunExit {
+    pub mission: Option<String>,
+    pub code: i32,
 }
 
 /// The final state of a run.
@@ -218,11 +261,14 @@ impl AppState {
             run_mission: None,
             run_lines: Vec::new(),
             run_status: None,
-            export_path: None,
+            run_exit: None,
             live_sessions: Vec::new(),
             live_sessions_polled_at: None,
             session_activity: BTreeMap::new(),
             session_activity_polled_at: None,
+            last_exported_at: BTreeMap::new(),
+            launch_requests_polled_at: None,
+            launch_notices: Vec::new(),
         };
         state.refresh();
         state
@@ -358,9 +404,11 @@ impl AppState {
         Ok(())
     }
 
-    /// The current env-status aggregation for a project's plugin, as a
-    /// `(name, ready)` pair plus the probe notes.
-    pub fn env_status(&self, project: &str) -> Option<(String, bool, String)> {
+    /// The current env-status aggregation for a project's plugin: the
+    /// probe's readiness and notes PLUS the version the target is actually
+    /// running (from the live probe), so the top bar can show what is up
+    /// and flag a source pin that disagrees.
+    pub fn env_status(&self, project: &str) -> Option<EnvStatus> {
         let (_slug, spec) = self
             .projects
             .iter()
@@ -368,7 +416,12 @@ impl AppState {
         self.plugins
             .iter()
             .find(|p| p.name == spec.plugin)
-            .map(|p| (p.name.clone(), p.ready, p.notes.clone()))
+            .map(|p| EnvStatus {
+                name: p.name.clone(),
+                ready: p.ready,
+                notes: p.notes.clone(),
+                running_version: p.running_version.clone(),
+            })
     }
 
     /// Re-probe the env for a project (spawns the plugin's probe on the
@@ -636,14 +689,13 @@ impl AppState {
     }
 
     /// Create a mission record: auto-id slug, the agent ref, the current
-    /// top-bar pins stamped in, status `queued`. Returns the mission slug.
+    /// top-bar pins stamped in. Returns the mission slug.
     pub fn create_mission(&self, project: &str, agent: &str, brief: &str) -> Result<String, Error> {
         let id = new_uuid_id();
         let mission = Mission {
             agent: agent.to_string(),
             pins: self.source_pins.clone(),
             budget: None,
-            status: "queued".to_string(),
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -651,6 +703,7 @@ impl AppState {
             name: None,
             session: None,
             opencode_session: None,
+            launch_requested: None,
         };
         self.store.write_mission(project, &id, &mission, brief)?;
         Ok(id)
@@ -669,12 +722,10 @@ impl AppState {
     }
 
     /// Materialize the agent and spawn the mission on the project
-    /// scope. One active run at a time. `pinned` is the launch's source
-    /// pins (rev + resolved sha), rendered into the materialized agent
-    /// files so research-zone agents read the right `sources/<name>/<sha>/`
-    /// tree; empty for a launch with none. `source_pins_json` is the
-    /// resolved `repo -> sha` map exported to the run (None = the
-    /// plugin's default pins).
+    /// scope. Runs OVERLAP: the caller backgrounds the live one first
+    /// (`background_active_run`), and the handle this adopts replaces it.
+    /// `source_pins_json` is the resolved `repo -> sha` map exported to
+    /// the run (None = the plugin's default pins).
     pub fn launch(
         &mut self,
         project: &str,
@@ -683,11 +734,6 @@ impl AppState {
         mission: &str,
         source_pins_json: Option<&str>,
     ) -> Result<(), Error> {
-        if self.run.is_some() {
-            return Err(Error::Store(
-                "a run is already active — stop it or wait for it first".into(),
-            ));
-        }
         // Fail loudly on an unknown agent, then materialize the WHOLE
         // project: the agent list opencode shows is project-scoped.
         self.store.load_agent(project, agent)?;
@@ -711,7 +757,8 @@ impl AppState {
     }
 
     /// Drain any new transcript lines; mark the run finished the moment
-    /// it exits. Called every frame by the Launch screen.
+    /// it exits. Called every frame by the app loop (so an exit is noticed
+    /// on any screen) and by the mission view.
     pub fn poll_run(&mut self) {
         let Some(mut session) = self.run.take() else {
             return;
@@ -723,20 +770,59 @@ impl AppState {
             // An operator stop already recorded its terminal state;
             // everything else surfaces as its exit code.
             if self.run_status != Some(RunStatus::Stopped) {
-                self.run_status = Some(RunStatus::Exited(status.code().unwrap_or(1)));
+                let code = status.code().unwrap_or(1);
+                self.run_status = Some(RunStatus::Exited(code));
+                // Queue the report NOW: `run_mission` still names the
+                // mission, and once the handle is gone the only evidence
+                // this run existed is the pane going quiet.
+                self.run_exit = Some(RunExit {
+                    mission: self.run_mission.clone().map(|slug| self.mission_label(&slug)),
+                    code,
+                });
             }
             return;
         }
         self.run = Some(session);
     }
 
+    /// Take the pending end-of-run report, if one is waiting. Drained by
+    /// the app loop once per exit.
+    pub fn take_run_exit(&mut self) -> Option<RunExit> {
+        self.run_exit.take()
+    }
+
+    /// A mission's operator-facing label (from the cache): its name, else
+    /// its human slug, else `new` — the same rule the nav uses. Never a raw
+    /// uuid.
+    pub fn mission_label(&self, slug: &str) -> String {
+        let name = self
+            .missions
+            .iter()
+            .find(|(s, _)| s == slug)
+            .and_then(|(_, m)| m.name.clone());
+        mission_label(name.as_deref(), slug)
+    }
+
+    /// An agent's operator-facing label from the selected project's cache:
+    /// its name, else its human slug, else `unnamed agent` — never a raw
+    /// uuid. Mirrors [`Self::mission_label`].
+    pub fn agent_label(&self, slug: &str) -> String {
+        let name = self
+            .agents
+            .iter()
+            .find(|(s, _)| s == slug)
+            .map(|(_, a)| a.meta.name.clone())
+            .unwrap_or_default();
+        agent_label(&name, slug)
+    }
+
     /// Operator-initiated stop: best-effort transcript-of-record export,
     /// then kill the run. Returns the durable transcript path (the
-    /// exported JSON when it lands, else the raw/.log fallback).
+    /// exported JSON when it lands, else the raw/.log fallback) — the
+    /// caller is what reports it, so nothing is stored here.
     pub fn stop_run(&mut self) -> Option<PathBuf> {
         let mut session = self.run.take()?;
         let path = session.stop();
-        self.export_path = Some(path.display().to_string());
         self.run_status = Some(RunStatus::Stopped);
         Some(path)
     }
@@ -790,6 +876,7 @@ impl AppState {
             // every live mission has its conversation recorded.
             if let Some(project) = self.effective_project() {
                 self.sweep_conversations(&project);
+                self.sweep_usage_exports(&project);
             }
         }
         // Activity is a `stat` per live session — no subprocess, so it
@@ -807,13 +894,104 @@ impl AppState {
         }
     }
 
-    /// Keep the sidebar's corpus summary current on its own, so new
-    /// findings/attacks a running mission writes just appear — no manual
-    /// refresh. The walk is a cheap `read_dir` + `stat` pass (bounded by
-    /// file COUNT, not size), so a throttle this tight is comfortable.
-    /// Selection-change refreshes still happen immediately elsewhere;
-    /// this only fills the gaps between them.
-    pub fn poll_corpus_stats(&mut self) {
+    /// Honor any launch the CURATOR requested (its `mission_launch` tool
+    /// set `launch_requested` on a mission record from the MCP process —
+    /// run spawning is the app's alone). Throttled (2 s): the scan reads
+    /// every project's mission records off disk, since the flag was written
+    /// by another process and the cached tree does not have it.
+    ///
+    /// The request is cleared BEFORE the spawn, so a launch that fails
+    /// reports once instead of retrying every beat. A mission whose
+    /// requested session is already live just clears — the curator asked
+    /// for a run and there is one. Scans EVERY project, not just the
+    /// selected one: the curator is scoped to its own project, which the
+    /// operator need not be viewing when the launch fires.
+    pub fn poll_launch_requests(&mut self) {
+        let due = self
+            .launch_requests_polled_at
+            .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(2));
+        if !due {
+            return;
+        }
+        self.launch_requests_polled_at = Some(std::time::Instant::now());
+
+        // Gather flagged missions off disk first (the authoritative record —
+        // the flag came from the MCP process).
+        let projects: Vec<String> = self.projects.iter().map(|(s, _)| s.clone()).collect();
+        let mut pending: Vec<(String, String, Option<String>)> = Vec::new();
+        for project in &projects {
+            let Ok(missions) = self.store.list_missions(project) else {
+                continue;
+            };
+            for (slug, m) in missions {
+                if m.launch_requested.is_some() {
+                    pending.push((project.clone(), slug, m.session.clone()));
+                }
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+        // A fresh listing so "already live" is a real answer, not a stale
+        // one that would spawn a duplicate.
+        self.refresh_live_sessions();
+        for (project, slug, session) in pending {
+            // Clear FIRST: a spawn failure must not loop the request.
+            if let Err(error) = self.clear_launch_request(&project, &slug) {
+                self.launch_notices.push(LaunchNotice {
+                    mission: slug.clone(),
+                    result: Err(error.to_string()),
+                });
+                continue;
+            }
+            let already_live = session
+                .as_deref()
+                .is_some_and(|s| self.live_sessions.iter().any(|l| l == s));
+            if already_live {
+                continue;
+            }
+            let label = self.mission_display_label(&project, &slug);
+            let result = self
+                .launch_mission_detached(&project, &slug)
+                .map_err(|e| e.to_string());
+            self.launch_notices.push(LaunchNotice { mission: label, result });
+        }
+    }
+
+    /// Drain the curator-launch reports queued since the last call — the
+    /// app loop turns each into a toast.
+    pub fn take_launch_notices(&mut self) -> Vec<LaunchNotice> {
+        std::mem::take(&mut self.launch_notices)
+    }
+
+    /// Clear a mission's `launch_requested` flag, preserving its brief.
+    fn clear_launch_request(&mut self, project: &str, slug: &str) -> Result<(), Error> {
+        let mut mission = self.store.load_mission(project, slug)?;
+        mission.launch_requested = None;
+        self.store.update_mission(project, slug, &mission)
+    }
+
+    /// A mission's operator-facing label from its DISK record (name, else
+    /// its human slug, else `new`) — the cache covers only the selected
+    /// project, and a curator launch can name any.
+    fn mission_display_label(&self, project: &str, slug: &str) -> String {
+        let name = self.store.load_mission(project, slug).ok().and_then(|m| m.name);
+        mission_label(name.as_deref(), slug)
+    }
+
+    /// Keep the selected project's scoped caches — its agent list, its
+    /// mission list, and the corpus summary — current on their own, so a
+    /// change the CURATOR makes from the MCP process (deletes a mission,
+    /// spawns an agent, writes a finding) just appears. Without this the
+    /// lists refreshed only on the app's OWN CRUD or a reselect, so an
+    /// external mutation stayed invisible until the operator clicked away
+    /// and back. All three are cheap `read_dir` + `stat` passes (bounded
+    /// by file COUNT, not size), so a throttle this tight is comfortable.
+    /// Selection is held by slug and both views fall back when its target
+    /// vanishes, so a background re-list never yanks the operator's cursor.
+    /// Selection-change refreshes still happen immediately elsewhere; this
+    /// only fills the gaps between them.
+    pub fn poll_project_scope(&mut self) {
         let Some(project) = self.effective_project() else {
             return;
         };
@@ -821,6 +999,9 @@ impl AppState {
             .corpus_polled_at
             .is_none_or(|t| t.elapsed() > CORPUS_POLL);
         if due {
+            self.refresh_agents(&project);
+            self.refresh_missions(&project);
+            // Stamps `corpus_polled_at`, closing the throttle for all three.
             self.refresh_corpus_stats(&project);
         }
     }
@@ -905,17 +1086,26 @@ impl AppState {
             .and_then(|argv| AppState::pty_attach_session(&argv))
     }
 
-    /// Launch a mission's run: a BARE opencode TUI (empty prompt — the
-    /// operator types the mission into opencode's own input), then persist
-    /// the spawned tmux session on the mission record so a relaunched app
-    /// re-attaches by selection. One active run at a time: a live run is
-    /// REPLACED (transcript exported when possible, torn down either way)
-    /// so a new mission always lands on a fresh opencode session.
+    /// Launch a mission's run: a full opencode TUI in a detached tmux
+    /// session, kicked off with the mission's BRIEF as the opencode
+    /// `--prompt` (an empty brief lands at a bare prompt, the old
+    /// behaviour — the sidebar `+` creates briefless missions on purpose).
+    /// The spawned tmux session is persisted on the mission record so a
+    /// relaunched app re-attaches by selection. A live run is BACKGROUNDED,
+    /// not replaced: it keeps running under its own tmux session (and its
+    /// own mission record), while this mission lands on a fresh opencode
+    /// session that the operator watches and steers in the embedded pane.
+    ///
+    /// This ADOPTS the run as the app-owned one, so the mission view
+    /// attaches its pane immediately — the path for an operator who clicked
+    /// Launch and wants to watch. A curator's autonomous launch takes
+    /// `launch_mission_detached` instead, which does not hijack the pane.
     pub fn launch_mission(&mut self, project: &str, agent: &str, slug: &str) -> Result<(), Error> {
         let (_record, pins_json) = self.prepare_launch(project, slug)?;
+        let prompt = self.mission_kickoff_prompt(project, slug);
         self.background_active_run();
         let model = self.agent_default_model(project, agent);
-        self.launch(project, agent, model.as_deref(), "", pins_json.as_deref())?;
+        self.launch(project, agent, model.as_deref(), &prompt, pins_json.as_deref())?;
         self.run_mission = Some(slug.to_string());
         if let Some(session) = self.live_run_session() {
             self.set_tmux_session(project, slug, Some(session))?;
@@ -927,10 +1117,76 @@ impl AppState {
         Ok(())
     }
 
+    /// The kickoff prompt for a mission launch: its brief, trimmed. Empty
+    /// (a briefless mission, e.g. the sidebar `+`) means a bare TUI at an
+    /// empty prompt. A brief read failure is not fatal — a launch with no
+    /// prompt still runs — so it degrades to empty rather than refusing.
+    fn mission_kickoff_prompt(&self, project: &str, slug: &str) -> String {
+        self.store
+            .mission_brief(project, slug)
+            .map(|b| b.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Spawn a mission's run in the BACKGROUND — a full opencode TUI in a
+    /// detached tmux session, kicked off with the brief — WITHOUT adopting
+    /// it as the app-owned run. This is the curator's autonomous launch:
+    /// the session is real and watchable (the operator selects the mission
+    /// to attach the pane and interact), but it does not seize the pane
+    /// from whatever the operator is already watching.
+    ///
+    /// The tmux session name is recorded on the mission record before the
+    /// handle is dropped, so the app's own discovery (`refresh_live_sessions`
+    /// + `sweep_conversations`) adopts it exactly like any run that
+    /// outlived the app — attach, activity dot, and eventual export all
+    /// follow from the recorded session. A no-tmux fallback cannot be
+    /// backgrounded (the piped child lives on the handle), so there it
+    /// adopts the run rather than orphaning it.
+    pub fn launch_mission_detached(&mut self, project: &str, slug: &str) -> Result<(), Error> {
+        let (record, pins_json) = self.prepare_launch(project, slug)?;
+        let prompt = self.mission_kickoff_prompt(project, slug);
+        let model = self.agent_default_model(project, &record.agent);
+        // Same materialization as an adopted launch: the run's agent set is
+        // this project's, rendered fresh.
+        self.store.load_agent(project, &record.agent)?;
+        self.store.render_project_agents(project)?;
+        let session = corpus_core::RunSession::spawn(
+            project,
+            &record.agent,
+            model.as_deref(),
+            &prompt,
+            pins_json.as_deref(),
+        )?;
+        let tmux = session
+            .pty_attach_command()
+            .and_then(|argv| AppState::pty_attach_session(&argv));
+        match tmux {
+            Some(name) => {
+                // A detached TUI: record the session and let go. Discovery
+                // takes it from here.
+                self.set_tmux_session(project, slug, Some(name))?;
+                self.set_opencode_session(project, slug, None)?;
+                drop(session);
+            }
+            None => {
+                // Piped fallback: the child lives on the handle, so it
+                // must be adopted or it leaks. This does take the pane —
+                // there is no detached session to hand off.
+                self.background_active_run();
+                self.adopt_run(session);
+                self.run_mission = Some(slug.to_string());
+                self.set_opencode_session(project, slug, None)?;
+            }
+        }
+        self.refresh_live_sessions();
+        self.refresh_missions(project);
+        Ok(())
+    }
+
     /// Re-open a mission's recorded opencode conversation in a fresh TUI
     /// (`opencode --session <id>`), so an old mission whose tmux session
-    /// died is steerable again with its history intact. Same one-run-at-a-
-    /// time rule as `launch_mission`: a live run is replaced.
+    /// died is steerable again with its history intact. Same rule as
+    /// `launch_mission`: a live run is backgrounded, not stopped.
     pub fn resume_mission(&mut self, project: &str, slug: &str) -> Result<(), Error> {
         let (record, pins_json) = self.prepare_launch(project, slug)?;
         let id = record.opencode_session.clone().ok_or_else(|| {
@@ -990,11 +1246,20 @@ impl AppState {
     /// the handle is gone. So the id is claimed here, while the handle still
     /// exists. `sweep_conversations` is the backstop for a run displaced
     /// before opencode had created its session at all.
+    ///
+    /// Only a tmux run can be left behind: it is detached, so dropping the
+    /// handle costs nothing but the record already names the session. The
+    /// piped fallback lives ON the handle — dropping it would orphan the
+    /// child and lose the transcript — so that one is stopped (exported)
+    /// rather than backgrounded.
     fn background_active_run(&mut self) {
         if !self.run_active() {
             return;
         }
         self.capture_opencode_session();
+        if self.live_pty_attach().is_none() {
+            self.stop_run();
+        }
     }
 
     /// Ids already bound to other missions.
@@ -1036,6 +1301,55 @@ impl AppState {
         }
         if changed {
             self.refresh_missions(project);
+        }
+    }
+
+    /// Re-export the opencode transcript of every live mission that has just
+    /// finished a turn — i.e. its session settled into `Waiting` (done
+    /// working, parked at the prompt). This is what keeps the Cost panel
+    /// honest for an ACTIVE conversation: usage updates at each turn
+    /// boundary, not only at Stop (which a run killed with the app never
+    /// reaches). Keyed by opencode session id, the export overwrites in
+    /// place, so the file just grows more accurate turn by turn.
+    ///
+    /// Fires at most once per completed turn: the guard is the session's
+    /// last paint (`session_activity`) being newer than our last export
+    /// (`last_exported_at`). A session parked quiet since the last export
+    /// has nothing new to record and is skipped; a failed export leaves the
+    /// stamp untouched, so the next beat simply retries.
+    fn sweep_usage_exports(&mut self, project: &str) {
+        // (slug, opencode_session, tmux_session) for missions we could export.
+        let pending: Vec<(String, String, String)> = self
+            .missions
+            .iter()
+            .filter_map(|(slug, m)| {
+                Some((slug.clone(), m.opencode_session.clone()?, m.session.clone()?))
+            })
+            .filter(|(slug, _, _)| {
+                matches!(self.mission_activity(project, slug), MissionActivity::Waiting)
+            })
+            .filter(|(_, _, tmux)| {
+                // New output since our last export (or never exported) ⇒ a
+                // turn happened. No activity reading ⇒ nothing to record.
+                should_reexport(
+                    self.session_activity.get(tmux).copied(),
+                    self.last_exported_at.get(tmux).copied(),
+                )
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for (_slug, opencode, tmux) in pending {
+            if corpus_core::export_session(project, &opencode).is_ok() {
+                self.last_exported_at.insert(tmux, std::time::Instant::now());
+                changed = true;
+            }
+        }
+        if changed {
+            // Fold the fresh exports into the Cost panel straight away.
+            self.refresh_corpus_stats(project);
         }
     }
 
@@ -1135,14 +1449,13 @@ impl AppState {
             let exported = mission
                 .opencode_session
                 .as_deref()
-                .and_then(|id| corpus_core::export_session(project, &mission.agent, id).ok())
+                .and_then(|id| corpus_core::export_session(project, id).ok())
                 .map(|p| p.display().to_string());
             corpus_core::kill_tmux_session(session);
             exported
         };
-        if let Some(path) = &path {
-            self.export_path = Some(path.clone());
-        }
+        // A stop the operator asked for reports itself: the path goes back
+        // to the caller, which toasts it. Nothing to stash.
         self.set_tmux_session(project, slug, None)?;
         self.refresh_live_sessions();
         Ok(path.unwrap_or_default())
@@ -1168,18 +1481,53 @@ impl AppState {
     }
 }
 
-/// The label to show for an agent: its display name, never the opaque
-/// slug (a UUID). Agents predating names — or created before the default
-/// placeholder — carry a sidecar `name` equal to their slug; those fall
-/// back to a friendly placeholder so a raw id never surfaces in the UI.
-/// The slug stays available in hover tooltips and the JSON tab for anyone
-/// who needs the identity.
+/// The label to show for an agent: its display name, never an opaque
+/// UUID slug.
+///
+/// A real name always wins. "unnamed agent" is only for an agent with no
+/// meaningful handle: an empty name, or a name equal to the app's own
+/// UUID slug — which the `+` flow writes into the sidecar before it stamps
+/// the placeholder, so a raw id never surfaces if that stamp is lost.
+///
+/// The `name == slug` case is qualified by UUID-shape ON PURPOSE. The
+/// curator names an agent by a human slug (`reporter`), and `create_agent`
+/// records that slug as the name — so `name == slug` there is a REAL name,
+/// not a missing one. Collapsing it unconditionally is what made every
+/// curator-built agent read as "unnamed agent" while its own form showed
+/// the name. The slug stays in hover tooltips and the JSON tab for identity.
 pub fn agent_label(name: &str, slug: &str) -> String {
-    if name.is_empty() || name == slug {
+    if name.is_empty() || (name == slug && is_uuid_like(slug)) {
         "unnamed agent".to_string()
     } else {
         name.to_string()
     }
+}
+
+/// The label to show for a mission in the nav: its display name, else its
+/// slug when that is a human handle (the curator names a mission
+/// `cdk-proto-attack` — show it), else `new` for the app's own UUID-slug
+/// missions created before they are named. Mirrors [`agent_label`].
+pub fn mission_label(name: Option<&str>, slug: &str) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => name.to_string(),
+        None if !is_uuid_like(slug) => slug.to_string(),
+        None => "new".to_string(),
+    }
+}
+
+/// Whether a slug is one of the app's generated UUIDs (see `new_uuid_id`):
+/// 36 chars, `8-4-4-4-12` hex with dashes at the canonical offsets. A human
+/// slug (`reporter`, `recon-mapper`) never matches, so it is never mistaken
+/// for a placeholder id.
+fn is_uuid_like(slug: &str) -> bool {
+    let bytes = slug.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, b)| match i {
+        8 | 13 | 18 | 23 => *b == b'-',
+        _ => b.is_ascii_hexdigit(),
+    })
 }
 
 /// Mission list order, newest-CREATED first (slug tiebreak). The store
@@ -1238,6 +1586,47 @@ mod tests {
     }
 
     #[test]
+    fn mission_label_prefers_name_then_human_slug_then_new() {
+        // An explicit name always wins.
+        assert_eq!(mission_label(Some("recon sweep"), "cdk-recon"), "recon sweep");
+        // No name, human slug: show the slug (the curator's mission id).
+        assert_eq!(mission_label(None, "cdk-proto-attack"), "cdk-proto-attack");
+        assert_eq!(mission_label(Some("  "), "cdk-proto-attack"), "cdk-proto-attack");
+        // No name, UUID slug (the app's `+` before naming): placeholder.
+        let uuid = new_uuid_id();
+        assert_eq!(mission_label(None, &uuid), "new");
+    }
+
+    #[test]
+    fn agent_label_shows_a_human_slug_but_hides_a_uuid() {
+        // A curator names an agent by a human slug, and create_agent records
+        // that slug as the name. name == slug there is a REAL name.
+        assert_eq!(agent_label("reporter", "reporter"), "reporter");
+        assert_eq!(agent_label("recon-mapper", "recon-mapper"), "recon-mapper");
+
+        // The app's `+` flow assigns a UUID slug; if its placeholder stamp
+        // is lost the name equals that UUID — hide it, never show a raw id.
+        let uuid = new_uuid_id();
+        assert_eq!(agent_label(&uuid, &uuid), "unnamed agent");
+        // The stamped placeholder (name != the UUID slug) shows as itself.
+        assert_eq!(agent_label("unnamed agent", &uuid), "unnamed agent");
+        // A real name over a UUID slug wins.
+        assert_eq!(agent_label("hunter", &uuid), "hunter");
+        // No name at all falls back.
+        assert_eq!(agent_label("", "reporter"), "unnamed agent");
+    }
+
+    #[test]
+    fn uuid_shape_detection_rejects_human_slugs() {
+        assert!(is_uuid_like(&new_uuid_id()));
+        assert!(!is_uuid_like("reporter"));
+        assert!(!is_uuid_like("recon-mapper"));
+        assert!(!is_uuid_like("")); // empty is not a uuid
+        // Right length, wrong content (a 'z' where hex is required).
+        assert!(!is_uuid_like("zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"));
+    }
+
+    #[test]
     fn generated_ids_differ_across_calls() {
         let a = new_uuid_id();
         let b = new_uuid_id();
@@ -1249,11 +1638,11 @@ mod tests {
             agent: "operator".to_string(),
             pins: std::collections::BTreeMap::new(),
             budget: None,
-            status: "queued".to_string(),
             created,
             name: None,
             session: None,
             opencode_session: None,
+            launch_requested: None,
         }
     }
 
@@ -1267,10 +1656,28 @@ mod tests {
         assert_eq!(activity_for(true, Some(now)), MissionActivity::Working);
         // Live but quiet past the window: an opencode TUI parked at its
         // prompt. This is the case that used to pulse forever.
-        let stale = now - (WORKING_WINDOW + Duration::from_secs(1));
+        let stale = now - Duration::from_secs(corpus_core::WORKING_WINDOW_SECS + 1);
         assert_eq!(activity_for(true, Some(stale)), MissionActivity::Waiting);
         // Live with no capture to read: absence of evidence, not work.
         assert_eq!(activity_for(true, None), MissionActivity::Waiting);
+    }
+
+    #[test]
+    fn reexport_fires_once_per_turn() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let earlier = now - Duration::from_secs(30);
+        // Never exported, but the session painted output: capture it.
+        assert!(should_reexport(Some(now), None));
+        // Painted more recently than our last export: a new turn happened.
+        assert!(should_reexport(Some(now), Some(earlier)));
+        // Nothing painted since we last exported: the turn is already
+        // recorded — do not re-export every beat while it sits quiet.
+        assert!(!should_reexport(Some(earlier), Some(now)));
+        assert!(!should_reexport(Some(now), Some(now)));
+        // No activity reading at all: nothing to record.
+        assert!(!should_reexport(None, None));
+        assert!(!should_reexport(None, Some(earlier)));
     }
 
     #[test]

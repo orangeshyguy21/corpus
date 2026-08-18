@@ -39,6 +39,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "agent_get",
     "mission_list",
     "mission_get",
+    "mission_status",
     "corpus_stats",
     "corpus_list",
     "corpus_read",
@@ -68,7 +69,17 @@ pub const WRITE_TOOLS: &[&str] = &[
     // Reorganising the corpus: moves nothing out of it and destroys
     // nothing, so it gates as an ordinary write.
     "entry_move",
+    // Writing an entry create-or-replaces one file inside the corpus. It
+    // can overwrite in place, but never reaches outside the corpus and
+    // never touches runs/, so it gates as an ordinary write, not a
+    // destructive one.
+    "entry_write",
     "mission_new",
+    // Launching a mission spawns an autonomous, spending run. In the CHAT
+    // (operator present), it gates as a write so the operator sees it
+    // before it fires. A curator running AS A MISSION holds the same tool
+    // ungated — that is the autonomous-launch capability, by design.
+    "mission_launch",
     "mission_set_budget",
     "mission_set_pins",
 ];
@@ -88,10 +99,9 @@ pub fn mutated_area(tool: &str) -> Option<&'static str> {
         "agent_new" | "agent_save" | "agent_clone" | "agent_delete" | "agent_copy"
         | "agent_set" | "agent_set_role" | "agent_set_permission" | "agent_subagent_add"
         | "agent_subagent_remove" => Some("agents"),
-        "mission_new" | "mission_delete" | "mission_set_budget" | "mission_set_pins" => {
-            Some("missions")
-        }
-        "corpus_wipe" | "entry_delete" | "entry_move" => Some("corpus"),
+        "mission_new" | "mission_delete" | "mission_launch" | "mission_set_budget"
+        | "mission_set_pins" => Some("missions"),
+        "corpus_wipe" | "entry_delete" | "entry_move" | "entry_write" => Some("corpus"),
         _ => None,
     }
 }
@@ -140,8 +150,10 @@ pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "agent_delete",
     "mission_list",
     "mission_get",
+    "mission_status",
     "mission_new",
     "mission_delete",
+    "mission_launch",
     "mission_set_budget",
     "mission_set_pins",
     "corpus_stats",
@@ -150,6 +162,7 @@ pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "corpus_wipe",
     "entry_delete",
     "entry_move",
+    "entry_write",
     "model_list",
 ];
 
@@ -204,6 +217,7 @@ impl TeamRole {
             TeamRole::MissionManager => &[
                 "mission_list",
                 "mission_get",
+                "mission_status",
                 "mission_new",
                 "mission_set_budget",
                 "mission_set_pins",
@@ -214,6 +228,7 @@ impl TeamRole {
                 "agent_get",
                 "mission_list",
                 "mission_get",
+                "mission_status",
                 "corpus_stats",
                 "corpus_list",
                 "corpus_read",

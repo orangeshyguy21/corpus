@@ -8,7 +8,13 @@
 # stuck, a quote settled twice, or fee/rounding exploited upward.
 #
 # Runs host-side against the live regtest environment (just regtest).
-# Requires the regtest nix shell tools (lightning-cli, lncli) on PATH.
+# Needs lightning-cli and lncli (plus sqlite3, jq). Resolution order per
+# tool: the CORPUS_LIGHTNING_CLI / CORPUS_LNCLI / CORPUS_SQLITE3 / CORPUS_JQ
+# absolute-path override, else PATH. A missing tool yields a fast
+# `inconclusive` — deliberately NOT a `nix develop .#regtest` re-exec:
+# instantiating that devshell rebuilds the regtest start-scripts on every
+# call and blows past the harness oracle timeout (the plugin then killed the
+# whole process tree). Point the overrides at real binaries instead.
 set -uo pipefail
 
 ENV_FILE="/tmp/cdk_regtest_env"
@@ -22,18 +28,30 @@ if [ -z "${CDK_ITESTS_DIR:-}" ] || [ ! -d "$CDK_ITESTS_DIR" ]; then
     echo "CDK_ITESTS_DIR missing"
     exit 2
 fi
-for tool in sqlite3 jq lightning-cli lncli; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        # Re-exec inside the regtest nix shell if possible (one-time cost).
-        if [ -z "${CORPUS_NIX_REEXEC:-}" ] && command -v nix >/dev/null 2>&1; then
-            repo="${CORPUS_CDK_REPO:-$HOME/Sites/cdk}"
-            CORPUS_NIX_REEXEC=1 exec nix develop "$repo#regtest" \
-                -c bash "$0" "$@" 2>/dev/null
-        fi
-        echo "$tool not on PATH (enter the regtest nix shell: nix develop .#regtest)"
-        exit 2
+# Resolve a tool to an absolute path: an explicit override wins, else PATH.
+# No `nix develop` re-exec by design — see the header note.
+resolve_tool() { # resolve_tool <override> <command-name>
+    local override="$1" name="$2" path
+    if [ -n "$override" ]; then
+        [ -x "$override" ] && { printf '%s\n' "$override"; return 0; }
+        echo "override for $name is not executable: $override" >&2
+        return 1
     fi
-done
+    path="$(command -v "$name" 2>/dev/null)" && { printf '%s\n' "$path"; return 0; }
+    return 1
+}
+
+missing=""
+SQLITE3="$(resolve_tool "${CORPUS_SQLITE3:-}" sqlite3)"                   || missing="$missing sqlite3"
+JQ="$(resolve_tool "${CORPUS_JQ:-}" jq)"                                  || missing="$missing jq"
+LIGHTNING_CLI="$(resolve_tool "${CORPUS_LIGHTNING_CLI:-}" lightning-cli)" || missing="$missing lightning-cli"
+LNCLI="$(resolve_tool "${CORPUS_LNCLI:-}" lncli)"                         || missing="$missing lncli"
+if [ -n "$missing" ]; then
+    echo "conservation oracle cannot run — tools not resolvable:$missing"
+    echo "fix: set CORPUS_LIGHTNING_CLI / CORPUS_LNCLI (and CORPUS_SQLITE3 / CORPUS_JQ if needed)"
+    echo "     to absolute paths, or run from a shell that already has them on PATH."
+    exit 2
+fi
 
 # In-flight operations (melt paid, change pending) can transiently skew the
 # sums by a few sats; only flag discrepancies beyond this tolerance.
@@ -41,7 +59,7 @@ TOL_SATS=1000
 
 # Outstanding liabilities in sat-denominated keysets (other units skipped).
 liabilities() { # liabilities <mint db>
-    sqlite3 "$1" "SELECT COALESCE(SUM(p.amount), 0)
+    "$SQLITE3" "$1" "SELECT COALESCE(SUM(p.amount), 0)
                   FROM proof p JOIN keyset k ON p.keyset_id = k.id
                   WHERE k.unit = 'sat'
                     AND p.state IN ('UNSPENT', 'PENDING', 'RESERVED');"
@@ -56,7 +74,7 @@ if [ ! -f "$cln_db" ] || [ ! -S "$cln_rpc" ]; then
     echo "cln mint artifacts missing"
     exit 2
 fi
-cln_msat="$(lightning-cli --rpc-file="$cln_rpc" listfunds | jq '
+cln_msat="$("$LIGHTNING_CLI" --rpc-file="$cln_rpc" listfunds | "$JQ" '
     ([.outputs[]?.amount_msat, .channels[]?.our_amount_msat]
      | map(tostring | sub("msat$"; "") | tonumber) | add) // 0')"
 cln_balance=$((cln_msat / 1000))
@@ -75,14 +93,14 @@ if [ ! -f "$lnd_db" ] || [ ! -f "$lnd_dir/tls.cert" ]; then
     exit 2
 fi
 lnd_balance="$({
-    lncli --rpcserver=localhost:10010 \
+    "$LNCLI" --rpcserver=localhost:10010 \
           --tlscertpath="$lnd_dir/tls.cert" \
           --macaroonpath="$lnd_dir/data/chain/bitcoin/regtest/admin.macaroon" \
-          walletbalance | jq '.total_balance | tonumber'
-    lncli --rpcserver=localhost:10010 \
+          walletbalance | "$JQ" '.total_balance | tonumber'
+    "$LNCLI" --rpcserver=localhost:10010 \
           --tlscertpath="$lnd_dir/tls.cert" \
           --macaroonpath="$lnd_dir/data/chain/bitcoin/regtest/admin.macaroon" \
-          channelbalance | jq '(.balance // .local_balance.sat // 0) | tonumber'
+          channelbalance | "$JQ" '(.balance // .local_balance.sat // 0) | tonumber'
 } | awk '{s += $1} END {print s}')"
 lnd_liab="$(liabilities "$lnd_db")"
 echo "lnd mint:  liabilities=${lnd_liab} sat  node_balance=${lnd_balance} sat"

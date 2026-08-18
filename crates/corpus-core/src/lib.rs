@@ -22,9 +22,10 @@ mod store;
 pub use agents::{AgentConfig, AgentSidecar, DEFAULT_AGENT_NAME, OPENCODE_SCHEMA, SourcePin};
 pub use error::{Error, Result};
 pub use launch::{
-    agent_default_model, agent_file_stem, export_session, kill_tmux_session, live_tui_sessions,
-    opencode_agent_handle, run_idle_secs, session_conversation, session_raw_log, tui_attach_command,
-    RunLine, RunSession,
+    activity_from_idle, agent_default_model, agent_file_stem, export_session, kill_tmux_session,
+    live_tui_sessions, mission_run_state, opencode_agent_handle, run_idle_secs, session_conversation,
+    session_raw_log, tui_attach_command, MissionActivity, MissionRunState, RunLine, RunSession,
+    WORKING_WINDOW_SECS,
 };
 pub use models::{model_list, ollama_models, ModelEntry, ModelList, ModelOption, ModelProviderGroup, ModelRegistry};
 pub use paths::{
@@ -38,9 +39,9 @@ pub use plugin::{
 pub use agents::{
     infer_role, primary_handles, AgentRole, RoleMigration, CORPUS_TOOLS, CURATOR_TOOLS,
 };
-pub use registry::{discover, plugin_sources, plugin_status, plugins_dir, prepare_source_pins, PluginDir, PluginStatus, SourceRevs};
+pub use registry::{discover, plugin_sources, plugin_status, plugins_dir, prepare_source_pins, validate_pin, PluginDir, PluginStatus, SourceRevs};
 pub use sensitivity::Sensitivity;
-pub use srcrev::{ensure_source_tree, resolve_rev, revs_cache_fetched, selectable_revs, REV_CACHE_TTL_SECS};
+pub use srcrev::{ensure_source_tree, is_commit_sha, resolve_rev, revs_cache_fetched, selectable_revs, REV_CACHE_TTL_SECS};
 pub use store::{
     corpus_cost, corpus_stats, fnv1a_hex, mission_logs, project_slug_env, slugify,
     store_root_env, validate_slug, AppPrefs, CategoryStat, CorpusStats, CostReport, CostRow,
