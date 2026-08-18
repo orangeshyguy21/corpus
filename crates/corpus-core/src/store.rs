@@ -1587,6 +1587,43 @@ mod tests {
     }
 
     #[test]
+    fn corpus_cost_reexport_overwrites_not_doubles() {
+        // A live conversation is re-exported every turn to the SAME
+        // session-keyed file (`runs/<session-id>.json`), so its cumulative
+        // usage must REPLACE the prior read, never stack on top of it.
+        let store = tmp_store("cost-reexport");
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        let export = |total: u64, input: u64| {
+            serde_json::json!({
+                "info": {},
+                "messages": [{"info": {
+                    "role": "assistant",
+                    "providerID": "ollama",
+                    "modelID": "qwen/qwen3",
+                    "cost": 0.0,
+                    "tokens": {"total": total, "input": input, "output": 0,
+                               "reasoning": 0, "cache": {"read": 0, "write": 0}}
+                }}]
+            })
+            .to_string()
+        };
+        let runs = store.project_corpus_dir("p").join("runs");
+        let file = runs.join("ses_abc.json");
+        // Turn 1.
+        write(&file, &export(100, 100));
+        let r1 = corpus_cost(&store, "p").unwrap();
+        assert_eq!(r1.tokens, 100);
+        assert_eq!(r1.rows.len(), 1);
+        // Turn 2: same session, cumulative totals, same filename → overwrite.
+        write(&file, &export(250, 250));
+        let r2 = corpus_cost(&store, "p").unwrap();
+        assert_eq!(r2.tokens, 250, "re-export overwrote — must not be 100+250");
+        assert_eq!(r2.rows.len(), 1);
+        assert_eq!(r2.rows[0].tokens_input, 250);
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
     fn wipe_project_corpus_bumps_generation() {
         let store = tmp_store("wipe");
         store.create_project("p", "P", "cdk-regtest").unwrap();

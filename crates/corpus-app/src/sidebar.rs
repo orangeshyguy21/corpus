@@ -599,9 +599,10 @@ impl Sidebar {
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -120.0))
             .show(ui.ctx(), |ui| {
                 ui.label("Display name (the slug stays as the id)");
-                ui.text_edit_singleline(&mut self.rename_name);
+                let entry = ui.text_edit_singleline(&mut self.rename_name);
                 ui.add_space(8.0);
-                if theme::house_button(ui, "Rename").clicked() {
+                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::house_button(ui, "Rename").clicked() || submit {
                     match state.rename_mission(&project, &slug, &self.rename_name) {
                         Ok(()) => {
                             state.refresh_missions(&project);
@@ -673,11 +674,12 @@ impl Sidebar {
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
             .show(ui.ctx(), |ui| {
                 ui.label("Display name (the id is generated)");
-                ui.text_edit_singleline(&mut self.create_name);
+                let entry = ui.text_edit_singleline(&mut self.create_name);
                 ui.label("Environment plugin");
                 plugin_picker(ui, &mut self.create_plugin, state.plugins(), &mut self.needs_probe);
                 ui.add_space(8.0);
-                if theme::house_button(ui, "Create").clicked() {
+                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::house_button(ui, "Create").clicked() || submit {
                     let name = self.create_name.trim();
                     if name.is_empty() {
                         toast(toasts, ToastKind::Warning, "display name is required");
@@ -691,6 +693,9 @@ impl Sidebar {
                                 );
                                 state.refresh();
                                 state.select_project(&id);
+                                // Land on the new project's page, not
+                                // wherever the operator happened to be.
+                                state.current_screen = Screen::Projects;
                                 self.create_name.clear();
                                 done = true;
                             }
@@ -721,7 +726,8 @@ impl Sidebar {
                     });
                 ui.weak(self.agent_role.hint());
                 ui.add_space(8.0);
-                if theme::house_button(ui, "Create").clicked() {
+                let submit = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::house_button(ui, "Create").clicked() || submit {
                     let project = if self.new_agent_project.is_empty() {
                         state.effective_project().unwrap_or_default()
                     } else {
@@ -766,10 +772,11 @@ impl Sidebar {
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -100.0))
             .show(ui.ctx(), |ui| {
                 ui.label("Display name (optional — defaults to the source's)");
-                ui.text_edit_singleline(&mut self.clone_name);
+                let entry = ui.text_edit_singleline(&mut self.clone_name);
                 ui.checkbox(&mut self.clone_corpus, "copy the shared corpus");
                 ui.add_space(8.0);
-                if theme::house_button(ui, "Clone").clicked() {
+                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::house_button(ui, "Clone").clicked() || submit {
                     let name = if self.clone_name.trim().is_empty() {
                         None
                     } else {

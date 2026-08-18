@@ -492,7 +492,15 @@ impl RunSession {
                     Backend::Tui { raw, .. } => raw.clone(),
                     Backend::Piped { .. } => self.transcript.clone(),
                 };
-                let path = self.export_transcript().unwrap_or(fallback);
+                let path = match self.export_transcript() {
+                    Ok(path) => path,
+                    Err(error) => {
+                        // Best-effort, but not silent: a broken export
+                        // must be diagnosable, not just an empty Cost panel.
+                        eprintln!("corpus: transcript export on stop failed: {error}");
+                        fallback
+                    }
+                };
                 self.close_tui();
                 if let Backend::Tui { stopped, .. } = &mut self.backend {
                     *stopped = true;
@@ -504,7 +512,10 @@ impl RunSession {
 
     /// `opencode export <session-id>`: the newest session opened in the
     /// project dir since launch, written as clean JSON to
-    /// `<epoch>-<agent>.json`. Returns the written path.
+    /// `runs/<session-id>.json`. Keyed by session id (not launch epoch) so
+    /// a re-export overwrites in place — usage is captured every turn, and
+    /// one file per session is what keeps the cost aggregation from double
+    /// counting. Returns the written path.
     fn export_transcript(&mut self) -> Result<PathBuf> {
         let Backend::Tui {
             export_json,
@@ -529,12 +540,19 @@ impl RunSession {
             }
         };
         let json = export_opencode_json(repo.as_path(), &id)?;
-        if let Some(parent) = export_json.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&*export_json, json)?;
+        // Key by opencode SESSION id, not the launch epoch: the turn-boundary
+        // re-export must overwrite this file in place, never accumulate a
+        // second double-counted copy. The runs/ dir is export_json's parent.
+        let runs = export_json
+            .parent()
+            .ok_or_else(|| Error::Store("export path has no runs dir".into()))?
+            .to_path_buf();
+        fs::create_dir_all(&runs)?;
+        let out = runs.join(format!("{id}.json"));
+        fs::write(&out, json)?;
+        *export_json = out.clone();
         *exported = true;
-        Ok(export_json.clone())
+        Ok(out)
     }
 
     /// Kill the tmux session (the whole TUI process tree) and drop the
@@ -992,18 +1010,20 @@ fn tui_session_live(session: &str, cache: &mut (std::time::Instant, bool)) -> bo
 }
 
 /// Export an opencode session's transcript of record to the project
-/// corpus `runs/<epoch>-<agent>.json` (Stop for a re-attached run
-/// that no longer has an app-owned handle). Reuses the pretty-export
+/// corpus `runs/<session-id>.json`. Used both on turn completion (the app
+/// re-exports a live conversation every time it settles into `Waiting`) and
+/// on Stop for a re-attached run with no app-owned handle. Keyed by session
+/// id so repeated exports overwrite in place — one file per session keeps
+/// the cost aggregation from double counting. Reuses the pretty-export
 /// internals of the TUI backend.
-pub fn export_session(project: &str, agent: &str, opencode_session_id: &str) -> Result<PathBuf> {
+pub fn export_session(project: &str, opencode_session_id: &str) -> Result<PathBuf> {
     let store = Store::from_env();
     let repo = store.provision_run_dir(project)?;
     let json = export_opencode_json(&repo, opencode_session_id)?;
-    let ts = now_secs();
     let path = store
         .project_corpus_dir(project)
         .join("runs")
-        .join(format!("{ts}-{agent}.json"));
+        .join(format!("{opencode_session_id}.json"));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

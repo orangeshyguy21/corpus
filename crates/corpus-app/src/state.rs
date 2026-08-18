@@ -131,6 +131,12 @@ pub struct AppState {
     /// When `session_activity` was last refreshed (a `stat` per live
     /// session — cheap, so polled faster than the tmux listing).
     session_activity_polled_at: Option<std::time::Instant>,
+    /// Per tmux session, the moment we last re-exported its usage transcript.
+    /// The turn-completion sweep exports only when the session last painted
+    /// (its `session_activity` instant) is NEWER than this — so a finished
+    /// turn records exactly once, and a session parked quiet at its prompt
+    /// is not re-exported every beat.
+    last_exported_at: BTreeMap<String, std::time::Instant>,
     /// When the app last scanned mission records for a curator's
     /// `launch_requested` flag (throttled — the scan reads every mission
     /// off disk, so never per frame).
@@ -176,6 +182,21 @@ pub use corpus_core::MissionActivity;
 /// the window are shared.
 fn activity_for(live: bool, last_paint: Option<std::time::Instant>) -> MissionActivity {
     corpus_core::activity_from_idle(live, last_paint.map(|p| p.elapsed().as_secs()))
+}
+
+/// The turn-completion export gate: given a `Waiting` session's last paint
+/// and the moment we last exported it, should we re-export now? Yes only when
+/// it painted output more recently than our last export (a real turn since),
+/// or was never exported. No paint reading ⇒ nothing to record. Keeps
+/// capture to once per completed turn — see [`AppState::sweep_usage_exports`].
+fn should_reexport(
+    last_paint: Option<std::time::Instant>,
+    last_export: Option<std::time::Instant>,
+) -> bool {
+    match last_paint {
+        Some(paint) => last_export.is_none_or(|e| paint > e),
+        None => false,
+    }
 }
 
 /// Who the active (or last-finished) run was.
@@ -245,6 +266,7 @@ impl AppState {
             live_sessions_polled_at: None,
             session_activity: BTreeMap::new(),
             session_activity_polled_at: None,
+            last_exported_at: BTreeMap::new(),
             launch_requests_polled_at: None,
             launch_notices: Vec::new(),
         };
@@ -854,6 +876,7 @@ impl AppState {
             // every live mission has its conversation recorded.
             if let Some(project) = self.effective_project() {
                 self.sweep_conversations(&project);
+                self.sweep_usage_exports(&project);
             }
         }
         // Activity is a `stat` per live session — no subprocess, so it
@@ -1281,6 +1304,55 @@ impl AppState {
         }
     }
 
+    /// Re-export the opencode transcript of every live mission that has just
+    /// finished a turn — i.e. its session settled into `Waiting` (done
+    /// working, parked at the prompt). This is what keeps the Cost panel
+    /// honest for an ACTIVE conversation: usage updates at each turn
+    /// boundary, not only at Stop (which a run killed with the app never
+    /// reaches). Keyed by opencode session id, the export overwrites in
+    /// place, so the file just grows more accurate turn by turn.
+    ///
+    /// Fires at most once per completed turn: the guard is the session's
+    /// last paint (`session_activity`) being newer than our last export
+    /// (`last_exported_at`). A session parked quiet since the last export
+    /// has nothing new to record and is skipped; a failed export leaves the
+    /// stamp untouched, so the next beat simply retries.
+    fn sweep_usage_exports(&mut self, project: &str) {
+        // (slug, opencode_session, tmux_session) for missions we could export.
+        let pending: Vec<(String, String, String)> = self
+            .missions
+            .iter()
+            .filter_map(|(slug, m)| {
+                Some((slug.clone(), m.opencode_session.clone()?, m.session.clone()?))
+            })
+            .filter(|(slug, _, _)| {
+                matches!(self.mission_activity(project, slug), MissionActivity::Waiting)
+            })
+            .filter(|(_, _, tmux)| {
+                // New output since our last export (or never exported) ⇒ a
+                // turn happened. No activity reading ⇒ nothing to record.
+                should_reexport(
+                    self.session_activity.get(tmux).copied(),
+                    self.last_exported_at.get(tmux).copied(),
+                )
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for (_slug, opencode, tmux) in pending {
+            if corpus_core::export_session(project, &opencode).is_ok() {
+                self.last_exported_at.insert(tmux, std::time::Instant::now());
+                changed = true;
+            }
+        }
+        if changed {
+            // Fold the fresh exports into the Cost panel straight away.
+            self.refresh_corpus_stats(project);
+        }
+    }
+
     /// Point a mission at a tmux session (or clear a dead one). The
     /// opencode session is left alone: the tmux session is where the run
     /// is ATTACHED, while the opencode session is what the mission IS —
@@ -1377,7 +1449,7 @@ impl AppState {
             let exported = mission
                 .opencode_session
                 .as_deref()
-                .and_then(|id| corpus_core::export_session(project, &mission.agent, id).ok())
+                .and_then(|id| corpus_core::export_session(project, id).ok())
                 .map(|p| p.display().to_string());
             corpus_core::kill_tmux_session(session);
             exported
@@ -1588,6 +1660,24 @@ mod tests {
         assert_eq!(activity_for(true, Some(stale)), MissionActivity::Waiting);
         // Live with no capture to read: absence of evidence, not work.
         assert_eq!(activity_for(true, None), MissionActivity::Waiting);
+    }
+
+    #[test]
+    fn reexport_fires_once_per_turn() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let earlier = now - Duration::from_secs(30);
+        // Never exported, but the session painted output: capture it.
+        assert!(should_reexport(Some(now), None));
+        // Painted more recently than our last export: a new turn happened.
+        assert!(should_reexport(Some(now), Some(earlier)));
+        // Nothing painted since we last exported: the turn is already
+        // recorded — do not re-export every beat while it sits quiet.
+        assert!(!should_reexport(Some(earlier), Some(now)));
+        assert!(!should_reexport(Some(now), Some(now)));
+        // No activity reading at all: nothing to record.
+        assert!(!should_reexport(None, None));
+        assert!(!should_reexport(None, Some(earlier)));
     }
 
     #[test]
