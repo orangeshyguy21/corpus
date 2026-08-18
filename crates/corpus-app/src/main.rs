@@ -343,14 +343,40 @@ impl App {
                 .map(|(_, p)| if p.name.is_empty() { slug.clone() } else { p.name.clone() })
                 .unwrap_or(slug)
         });
-        let segments: [(Option<String>, Screen); 3] = [
-            (project, Screen::Projects),
-            (self.state.selected_agent.clone(), Screen::Agents),
-            (self.state.selected_mission.clone(), Screen::Missions),
-        ];
+        // Match the nesting project > agent > mission, but only as deep as
+        // the current screen: an agent screen stops at the agent, a project
+        // screen at the project. Labels are display NAMES via the *_label
+        // helpers — never the raw uuid slug the selections hold.
+        let mut segments: Vec<(String, Screen)> = Vec::new();
+        if let Some(label) = project {
+            segments.push((label, Screen::Projects));
+        }
+        match self.state.current_screen {
+            Screen::Projects => {}
+            Screen::Agents => {
+                if let Some(slug) = self.state.selected_agent.clone() {
+                    segments.push((self.state.agent_label(&slug), Screen::Agents));
+                }
+            }
+            Screen::Missions => {
+                if let Some(slug) = self.state.selected_mission.clone() {
+                    // A mission's driving agent is the middle of the trail.
+                    if let Some(agent) = self
+                        .state
+                        .missions
+                        .iter()
+                        .find(|(s, _)| s == &slug)
+                        .map(|(_, m)| m.agent.clone())
+                        .filter(|a| !a.is_empty())
+                    {
+                        segments.push((self.state.agent_label(&agent), Screen::Agents));
+                    }
+                    segments.push((self.state.mission_label(&slug), Screen::Missions));
+                }
+            }
+        }
         let mut first = true;
         for (label, screen) in segments {
-            let Some(label) = label else { continue };
             if !first {
                 ui.label(egui::RichText::new("›").size(12.0).color(theme::TEXT_FAINT));
             }

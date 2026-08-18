@@ -781,6 +781,19 @@ impl AppState {
         mission_label(name.as_deref(), slug)
     }
 
+    /// An agent's operator-facing label from the selected project's cache:
+    /// its name, else its human slug, else `unnamed agent` — never a raw
+    /// uuid. Mirrors [`Self::mission_label`].
+    pub fn agent_label(&self, slug: &str) -> String {
+        let name = self
+            .agents
+            .iter()
+            .find(|(s, _)| s == slug)
+            .map(|(_, a)| a.meta.name.clone())
+            .unwrap_or_default();
+        agent_label(&name, slug)
+    }
+
     /// Operator-initiated stop: best-effort transcript-of-record export,
     /// then kill the run. Returns the durable transcript path (the
     /// exported JSON when it lands, else the raw/.log fallback) — the
