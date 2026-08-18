@@ -203,7 +203,7 @@ impl MissionsView {
                 for line in &state.run_lines {
                     let text = strip_ansi(&line.text);
                     if line.stderr {
-                        ui.colored_label(theme::DANGER, text);
+                        ui.colored_label(theme::SIGNAL_RED, text);
                     } else {
                         ui.monospace(text);
                     }

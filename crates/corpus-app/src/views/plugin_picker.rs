@@ -1,6 +1,6 @@
 //! The shared plugin picker (app-flow chunks 1+3, app-parity-spec §5): a
 //! hand-rolled flat dropdown over the discovered environment plugins with a
-//! live probe badge per entry — a filled OK-green dot when ready, a DANGER
+//! live probe badge per entry — a filled health-green dot when ready, a signal-red
 //! dot when not (painted with the painter, not a font glyph). The field is
 //! a flat PANEL box (1px HAIRLINE, radius 2) with the plugin name in
 //! monospace 14px and a `caret_down` arrow; the popup lists each plugin
@@ -116,19 +116,27 @@ fn row(ui: &mut Ui, status: &PluginStatus, current: &mut String) {
     });
 }
 
-/// The probe badge colour for a plugin: OK-green when the live probe is
-/// ready, DANGER-red otherwise (an unknown binding counts as not ready).
+/// The probe badge colour for a plugin: health-green when the live probe is
+/// ready, signal-red otherwise (an unknown binding counts as not ready).
 fn badge_color(status: &PluginStatus) -> Color32 {
     if status.ready {
-        theme::OK
+        theme::HEALTHY
     } else {
-        theme::DANGER
+        theme::SIGNAL_RED
     }
 }
 
-/// Paint the probe badge for `name` at `center`: filled OK dot when the
-/// plugin's probe is ready, filled DANGER dot otherwise.
+/// Paint the probe badge for `name` at `center`: filled health dot when the
+/// plugin's probe is ready, signal dot otherwise.
 fn paint_badge(painter: &egui::Painter, center: egui::Pos2, name: &str, plugins: &[PluginStatus]) {
     let ready = plugins.iter().any(|p| p.name == name && p.ready);
-    painter.circle_filled(center, 4.0, if ready { theme::OK } else { theme::DANGER });
+    painter.circle_filled(
+        center,
+        4.0,
+        if ready {
+            theme::HEALTHY
+        } else {
+            theme::SIGNAL_RED
+        },
+    );
 }

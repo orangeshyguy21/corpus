@@ -450,13 +450,13 @@ impl ChatPanelView {
         match chat.phase() {
             ChatPhase::Idle => ("no backend — pick a model".into(), crate::theme::TEXT_FAINT),
             ChatPhase::Connecting => ("connecting…".into(), crate::theme::rgb(200, 150, 80)),
-            ChatPhase::Ready => ("ready".into(), crate::theme::OK),
+            ChatPhase::Ready => ("ready".into(), crate::theme::HEALTHY),
             ChatPhase::Finished => (
                 match &self.last_error {
                     Some(_) => "failed — see log".into(),
                     None => "session ended".into(),
                 },
-                crate::theme::DANGER,
+                crate::theme::SIGNAL_RED,
             ),
         }
     }
@@ -608,7 +608,7 @@ impl ChatPanelView {
                             ui.add_space(6.0);
                             ui.label(
                                 egui::RichText::new(&m.text)
-                                    .color(crate::theme::DANGER)
+                                    .color(crate::theme::SIGNAL_RED)
                                     .small(),
                             );
                         }
@@ -914,7 +914,7 @@ impl ChatPanelView {
             ui.add_space(8.0);
             egui::Frame::default()
                 .fill(crate::theme::PANEL)
-                .stroke(egui::Stroke::new(1.0_f32, crate::theme::ACCENT))
+                .stroke(egui::Stroke::new(1.0_f32, crate::theme::INTERACTION))
                 .corner_radius(egui::CornerRadius::same(6))
                 .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
@@ -923,7 +923,7 @@ impl ChatPanelView {
                     ui.label(crate::theme::icon_text(
                         egui_phosphor::regular::SHIELD_WARNING,
                         14.0,
-                        crate::theme::ACCENT,
+                        crate::theme::INTERACTION,
                     ));
                     ui.add(
                         egui::Label::new(
@@ -1091,8 +1091,14 @@ fn tool_cards(ui: &mut egui::Ui, cards: &[ToolCard]) {
                 egui_phosphor::regular::CIRCLE_DASHED,
                 crate::theme::rgb(200, 150, 80),
             ),
-            Some(_) if card.is_error => (egui_phosphor::regular::X_CIRCLE, crate::theme::DANGER),
-            Some(_) => (egui_phosphor::regular::CHECK_CIRCLE, crate::theme::OK),
+            Some(_) if card.is_error => (
+                egui_phosphor::regular::X_CIRCLE,
+                crate::theme::SIGNAL_RED,
+            ),
+            Some(_) => (
+                egui_phosphor::regular::CHECK_CIRCLE,
+                crate::theme::HEALTHY,
+            ),
         };
         egui::CollapsingHeader::new(crate::theme::icon_label(
             glyph,
