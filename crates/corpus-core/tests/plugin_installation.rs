@@ -121,7 +121,7 @@ while IFS= read -r line; do
       printf '{"id":%s,"ok":true,"result":{"ready":true}}\n' "$id" ;;
     doctor|status)
       if [[ -f "$state/ready" ]]; then
-        printf '{"id":%s,"ok":true,"result":{"ready":true,"docker":{"required":false}}}\n' "$id"
+        printf '{"id":%s,"ok":true,"result":{"ready":true,"docker":{"required":false},"environment_lock":"lock:prepared","image_digest":"sha256:prepared","backbone":{"topology":"fixture-full","ownership":"owned"}}}\n' "$id"
       else
         printf '{"id":%s,"ok":false,"error":{"code":"setup_required","message":"run plugin setup","retryable":true}}\n' "$id"
       fi ;;
@@ -254,6 +254,36 @@ fn external_read_only_bundle_recovers_setup_and_populates_sources() {
     assert!(
         selected_status.probed && selected_status.ready,
         "{selected_status:?}"
+    );
+    assert_eq!(
+        selected_status.protocol.as_deref(),
+        Some(corpus_core::ENVIRONMENT_PROTOCOL_V1)
+    );
+    assert_eq!(
+        selected_status.capabilities,
+        ["lifecycle.setup", "sessions"]
+    );
+    assert_eq!(selected_status.origin, corpus_core::PluginOrigin::Installed);
+    assert_eq!(
+        selected_status.bundle_digest.as_deref(),
+        Some(receipt.digest.as_str())
+    );
+    assert_eq!(selected_status.prepared.docker_required, Some(false));
+    assert_eq!(
+        selected_status.prepared.environment_lock.as_deref(),
+        Some("lock:prepared")
+    );
+    assert_eq!(
+        selected_status.prepared.image_digest.as_deref(),
+        Some("sha256:prepared")
+    );
+    assert_eq!(
+        selected_status.prepared.topology.as_deref(),
+        Some("fixture-full")
+    );
+    assert_eq!(
+        selected_status.prepared.backbone_ownership.as_deref(),
+        Some("owned")
     );
 
     let store = Store::new(root.join("home/store"));

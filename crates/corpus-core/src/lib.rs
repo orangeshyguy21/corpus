@@ -93,7 +93,8 @@ pub use agents::{
 };
 pub use registry::{
     discover, find_plugin, plugin_catalog, plugin_sources, plugin_status, plugins_dir,
-    prepare_source_pins, selected_plugin_status, validate_pin, PluginDir, PluginStatus, SourceRevs,
+    prepare_source_pins, selected_plugin_status, validate_pin, PluginDir, PluginPreparedStatus,
+    PluginStatus, SourceRevs,
 };
 pub use sensitivity::Sensitivity;
 pub use srcrev::{ensure_source_tree, is_commit_sha, resolve_rev, revs_cache_fetched, selectable_revs, REV_CACHE_TTL_SECS};

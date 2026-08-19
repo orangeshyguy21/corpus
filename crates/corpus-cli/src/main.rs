@@ -124,7 +124,8 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod usage_tests {
-    use super::usage;
+    use super::{effective_headless_pins, usage};
+    use std::collections::BTreeMap;
 
     #[test]
     fn bare_cli_help_documents_headless_surface_only() {
@@ -132,6 +133,32 @@ mod usage_tests {
         assert!(help.contains("corpus run <agent>"));
         assert!(help.contains("corpus plugin probe <name>"));
         assert!(!help.contains("corpus [tui]"));
+    }
+
+    #[test]
+    fn headless_run_fills_manifest_defaults_without_overwriting_project_pins() {
+        let selected = BTreeMap::from([("nutshell".into(), "custom".into())]);
+        let sources = vec![
+            corpus_core::SourceRevs {
+                name: "nutshell".into(),
+                pinned: "0.20.3".into(),
+                revs: vec!["main".into(), "0.20.3".into()],
+                refs_fetched: None,
+            },
+            corpus_core::SourceRevs {
+                name: "nuts".into(),
+                pinned: "main".into(),
+                revs: vec!["main".into()],
+                refs_fetched: None,
+            },
+        ];
+        assert_eq!(
+            effective_headless_pins(selected, sources),
+            BTreeMap::from([
+                ("nutshell".into(), "custom".into()),
+                ("nuts".into(), "main".into()),
+            ])
+        );
     }
 }
 
@@ -202,7 +229,14 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
 
     let project_record =
         corpus_core::Project::load(&store, &scope.project).map_err(|error| error.to_string())?;
-    let resolved = corpus_core::prepare_source_pins(&store, &scope.project, &project_record.pins)
+    // The app stamps every visible source selection into a mission. The
+    // headless command has no mission record, so fill only missing entries
+    // from the plugin manifest defaults; an empty project pin map must not
+    // open a v1 session with no source trees.
+    let sources =
+        corpus_core::plugin_sources(&store, &scope.project).map_err(|error| error.to_string())?;
+    let pins = effective_headless_pins(project_record.pins.clone(), sources);
+    let resolved = corpus_core::prepare_source_pins(&store, &scope.project, &pins)
         .map_err(|error| error.to_string())?;
     let pins_json = (!resolved.is_empty())
         .then(|| serde_json::to_string(&resolved))
@@ -293,6 +327,16 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
             Err(format!("{run}; environment cleanup also failed: {cleanup}"))
         }
     }
+}
+
+fn effective_headless_pins(
+    mut selected: std::collections::BTreeMap<String, String>,
+    sources: Vec<corpus_core::SourceRevs>,
+) -> std::collections::BTreeMap<String, String> {
+    for source in sources {
+        selected.entry(source.name).or_insert(source.pinned);
+    }
+    selected
 }
 
 /// Pump a session's lines to the terminal until it exits, then flush

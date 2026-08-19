@@ -9,7 +9,7 @@
 use std::collections::{hash_map::RandomState, BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corpus_core::{
@@ -272,6 +272,42 @@ pub struct ProjectTree {
     pub missions: Vec<(String, Mission)>,
 }
 
+/// A durable environment lease projected for the selected project. Every
+/// field comes from Corpus's session record; the Project view never inspects
+/// Docker, plugin state directories, or mission files while painting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginLeaseView {
+    pub mission: String,
+    pub state: corpus_core::EnvironmentSessionState,
+    pub plugin_version: String,
+    pub plugin_digest: String,
+    pub source_shas: BTreeMap<String, String>,
+    pub environment_lock: Option<String>,
+    pub image_digest: Option<String>,
+    pub drift: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginOperationState {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// Retained operator-facing lifecycle state. Progress callbacks update this
+/// shared prepared value; the UI only clones it and draws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginOperationView {
+    pub plugin: String,
+    pub operation: String,
+    pub state: PluginOperationState,
+    pub phase: Option<String>,
+    pub detail: String,
+    pub recovery: Option<String>,
+}
+
 /// App-wide state: the corpus-core store handle plus the data the
 /// screens render. Owned by `App`, passed by reference to the views.
 pub struct AppState {
@@ -344,7 +380,13 @@ pub struct AppState {
     /// Latest requested binding and the binding owned by the in-flight job.
     /// They differ when a project/picker changes during a probe.
     plugin_probe_target: Option<String>,
+    plugin_probe_project: Option<String>,
     plugin_probe_active: Option<Option<String>>,
+    plugin_probe_active_project: Option<Option<String>>,
+    /// Durable non-closed environment leases loaded by the SAME selected
+    /// plugin probe job. There is no lease watcher or render-time I/O.
+    plugin_leases: Vec<PluginLeaseView>,
+    plugin_operation: Arc<Mutex<Option<PluginOperationView>>>,
     /// The model picker reads this state only; discovery is performed once
     /// per cache lifetime (including failures), or on explicit refresh.
     opencode_models: ModelDiscovery,
@@ -465,8 +507,11 @@ pub enum FindingDiscovery {
 enum AppJobOutput {
     Plugins {
         target: Option<String>,
+        project: Option<String>,
         statuses: Vec<PluginStatus>,
+        leases: Vec<PluginLeaseView>,
     },
+    PluginInstalled(corpus_core::InstallReceipt),
     PluginLifecycle(PluginLifecycleResult),
     SourceRevisions(Vec<SourceRevs>),
     OpencodeModels(corpus_core::ModelList),
@@ -771,10 +816,17 @@ impl AppState {
                 continue;
             }
             match result.terminal {
-                JobTerminal::Success(AppJobOutput::Plugins { target, statuses }) => {
+                JobTerminal::Success(AppJobOutput::Plugins {
+                    target,
+                    project,
+                    statuses,
+                    leases,
+                }) => {
                     self.plugin_probe_active = None;
-                    if target == self.plugin_probe_target {
+                    self.plugin_probe_active_project = None;
+                    if target == self.plugin_probe_target && project == self.plugin_probe_project {
                         self.plugins = merge_plugin_statuses(&self.plugins, statuses);
+                        self.plugin_leases = leases;
                         self.plugins_loading = false;
                         self.plugins_error = None;
                     } else {
@@ -785,6 +837,25 @@ impl AppState {
                         let desired = self.plugin_probe_target.clone();
                         self.refresh_plugins(desired.as_deref());
                     }
+                }
+                JobTerminal::Success(AppJobOutput::PluginInstalled(receipt)) => {
+                    if let Some(operation) = self.plugin_operation.lock().unwrap().as_mut() {
+                        operation.plugin = receipt.id.clone();
+                    }
+                    self.finish_plugin_operation(
+                        PluginOperationState::Succeeded,
+                        format!(
+                            "installed {}@{} · {}",
+                            receipt.id, receipt.version, receipt.digest
+                        ),
+                        None,
+                    );
+                    notices.push((
+                        false,
+                        format!("installed {}@{}", receipt.id, receipt.version),
+                    ));
+                    let desired = self.plugin_probe_target.clone();
+                    self.refresh_plugins(desired.as_deref());
                 }
                 JobTerminal::Success(AppJobOutput::PluginLifecycle(lifecycle)) => {
                     let phases = if lifecycle.phases.is_empty() {
@@ -799,7 +870,13 @@ impl AppState {
                             lifecycle.plugin, lifecycle.operation, phases, lifecycle.result
                         ),
                     ));
-                    self.refresh_plugins(Some(&lifecycle.plugin));
+                    self.finish_plugin_operation(
+                        PluginOperationState::Succeeded,
+                        lifecycle.result.to_string(),
+                        None,
+                    );
+                    let desired = self.plugin_probe_target.clone();
+                    self.refresh_plugins(desired.as_deref());
                 }
                 JobTerminal::Success(AppJobOutput::SourceRevisions(revs)) => {
                     self.apply_source_revisions(&result.scope.project, revs);
@@ -990,7 +1067,8 @@ impl AppState {
         let Some(finished) = self.plugin_probe_active.take() else {
             return false;
         };
-        if finished == self.plugin_probe_target {
+        let finished_project = self.plugin_probe_active_project.take().flatten();
+        if finished == self.plugin_probe_target && finished_project == self.plugin_probe_project {
             return false;
         }
         let desired = self.plugin_probe_target.clone();
@@ -1025,10 +1103,25 @@ impl AppState {
         match kind {
             JobKind::PluginProbe => {
                 self.plugin_probe_active = None;
+                self.plugin_probe_active_project = None;
                 self.plugins_loading = false;
                 self.plugins_error = Some(error.to_string());
             }
-            JobKind::PluginSetup | JobKind::PluginDoctor | JobKind::PluginStop => {}
+            JobKind::PluginInstall
+            | JobKind::PluginSetup
+            | JobKind::PluginDoctor
+            | JobKind::PluginStop => {
+                let state = if error == "cancelled" {
+                    PluginOperationState::Cancelled
+                } else {
+                    PluginOperationState::Failed
+                };
+                self.finish_plugin_operation(
+                    state,
+                    error.to_string(),
+                    plugin_recovery_hint(error).map(str::to_string),
+                );
+            }
             JobKind::SourceRevisions => {
                 // Keep the previous revision list/pins; only the refresh failed.
                 self.source_revs_loading = false;
@@ -1041,6 +1134,20 @@ impl AppState {
                 self.fail_findings(&scope.project, error);
             }
             _ => {}
+        }
+    }
+
+    fn finish_plugin_operation(
+        &self,
+        state: PluginOperationState,
+        detail: String,
+        recovery: Option<String>,
+    ) {
+        let mut operation = self.plugin_operation.lock().unwrap();
+        if let Some(current) = operation.as_mut() {
+            current.state = state;
+            current.detail = detail;
+            current.recovery = recovery;
         }
     }
 
@@ -1195,7 +1302,11 @@ impl AppState {
             plugins_loading: false,
             plugins_error: None,
             plugin_probe_target: None,
+            plugin_probe_project: None,
             plugin_probe_active: None,
+            plugin_probe_active_project: None,
+            plugin_leases: Vec::new(),
+            plugin_operation: Arc::new(Mutex::new(None)),
             opencode_models: ModelDiscovery::Loading,
             agents: Vec::new(),
             agents_project: None,
@@ -1286,15 +1397,25 @@ impl AppState {
     /// Host process work stays in corpus-core and on the P1 job boundary.
     pub fn refresh_plugins(&mut self, selected: Option<&str>) {
         let target = selected.map(str::to_string);
+        let project = self.effective_project();
         self.plugin_probe_target = target.clone();
+        self.plugin_probe_project = project.clone();
         self.plugins_loading = true;
         self.plugins_error = None;
         let Some(jobs) = self.jobs.as_mut() else {
             self.plugins = corpus_core::selected_plugin_status(target.as_deref());
+            self.plugin_leases = prepared_plugin_leases(
+                &self.store,
+                project.as_deref(),
+                target.as_deref(),
+                &self.plugins,
+            );
             self.plugins_loading = false;
             return;
         };
         let work_target = target.clone();
+        let work_project = project.clone();
+        let store = self.store.clone();
         let outcome = jobs.start(
             JobKind::PluginProbe,
             JobScope {
@@ -1305,20 +1426,77 @@ impl AppState {
             },
             Duration::from_secs(30),
             move |_| {
+                let statuses = corpus_core::selected_plugin_status(work_target.as_deref());
                 Ok(AppJobOutput::Plugins {
-                    statuses: corpus_core::selected_plugin_status(work_target.as_deref()),
+                    leases: prepared_plugin_leases(
+                        &store,
+                        work_project.as_deref(),
+                        work_target.as_deref(),
+                        &statuses,
+                    ),
+                    statuses,
                     target: work_target,
+                    project: work_project,
                 })
             },
         );
         if matches!(outcome, StartOutcome::Started(_)) {
             self.plugin_probe_active = Some(target);
+            self.plugin_probe_active_project = Some(project);
         }
     }
 
     /// The last plugin probe results (empty until `refresh_plugins`).
     pub fn plugins(&self) -> &[PluginStatus] {
         &self.plugins
+    }
+
+    pub fn plugin_leases(&self) -> &[PluginLeaseView] {
+        &self.plugin_leases
+    }
+
+    pub fn plugin_operation(&self) -> Option<PluginOperationView> {
+        self.plugin_operation.lock().unwrap().clone()
+    }
+
+    /// Install and atomically select a local immutable v1 bundle without
+    /// asking the operator to leave the app. Archive download remains a
+    /// release/marketplace concern; Chunk 7 accepts an unpacked bundle path.
+    pub(crate) fn start_plugin_install(&mut self, bundle: &str) -> Result<bool, String> {
+        let bundle = bundle.trim();
+        if bundle.is_empty() {
+            return Err("choose an unpacked plugin bundle directory".into());
+        }
+        let Some(jobs) = self.jobs.as_mut() else {
+            return Err("plugin installation requires the app background-job runtime".into());
+        };
+        if plugin_work_active(jobs) {
+            return Ok(false);
+        }
+        let path = PathBuf::from(bundle);
+        *self.plugin_operation.lock().unwrap() = Some(PluginOperationView {
+            plugin: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("plugin bundle")
+                .to_string(),
+            operation: "install".into(),
+            state: PluginOperationState::Running,
+            phase: Some("validating bundle".into()),
+            detail: path.display().to_string(),
+            recovery: None,
+        });
+        Ok(matches!(
+            jobs.start(
+                JobKind::PluginInstall,
+                global_job_scope(),
+                Duration::from_secs(120),
+                move |_| corpus_core::install_plugin_bundle(&path)
+                    .map(AppJobOutput::PluginInstalled)
+                    .map_err(|error| error.to_string()),
+            ),
+            StartOutcome::Started(_)
+        ))
     }
 
     /// Start an installation-scoped plugin lifecycle operation. The worker
@@ -1345,20 +1523,27 @@ impl AppState {
             Duration::from_secs(120)
         };
         let plugin_id = plugin_id.to_string();
-        let scope = self
-            .effective_project()
-            .map(|project| self.job_scope(&project, None))
-            .unwrap_or(JobScope {
-                project: String::new(),
-                project_generation: 0,
-                corpus_revision: None,
-                run_id: None,
-            });
         let Some(jobs) = self.jobs.as_mut() else {
             return Err("plugin lifecycle requires the app background-job runtime".into());
         };
+        if plugin_work_active(jobs) {
+            return Ok(false);
+        }
+        let operation_state = self.plugin_operation.clone();
+        *operation_state.lock().unwrap() = Some(PluginOperationView {
+            plugin: plugin_id.clone(),
+            operation: operation.into(),
+            state: PluginOperationState::Running,
+            phase: Some(if operation == "setup" {
+                "preparing sources".into()
+            } else {
+                format!("running {operation}")
+            }),
+            detail: String::new(),
+            recovery: None,
+        });
         Ok(matches!(
-            jobs.start(kind, scope, timeout, move |cancellation| {
+            jobs.start(kind, global_job_scope(), timeout, move |cancellation| {
                 let selected = corpus_core::find_plugin(&plugin_id)
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| format!("plugin not found: {plugin_id}"))?;
@@ -1368,7 +1553,18 @@ impl AppState {
                     operation,
                     timeout.saturating_sub(Duration::from_secs(1)),
                     || cancellation.is_cancelled(),
-                    |progress| phases.push(progress.phase.clone()),
+                    |progress| {
+                        phases.push(progress.phase.clone());
+                        if let Some(current) = operation_state.lock().unwrap().as_mut() {
+                            current.phase = Some(progress.phase.clone());
+                            current.detail = match (progress.completed, progress.total) {
+                                (Some(completed), Some(total)) => {
+                                    format!("{} · {completed}/{total}", progress.message)
+                                }
+                                _ => progress.message.clone(),
+                            };
+                        }
+                    },
                 )
                 .map_err(|error| error.to_string())?;
                 Ok(AppJobOutput::PluginLifecycle(PluginLifecycleResult {
@@ -1404,6 +1600,10 @@ impl AppState {
         self.jobs
             .as_ref()
             .is_some_and(|jobs| jobs.is_kind_active(kind))
+    }
+
+    pub(crate) fn plugin_work_active(&self) -> bool {
+        self.jobs.as_ref().is_some_and(plugin_work_active)
     }
 
     pub fn env_probe_loading(&self, project: &str) -> bool {
@@ -4102,6 +4302,144 @@ fn merge_plugin_statuses(
         .collect()
 }
 
+fn global_job_scope() -> JobScope {
+    JobScope {
+        project: String::new(),
+        project_generation: 0,
+        corpus_revision: None,
+        run_id: None,
+    }
+}
+
+fn plugin_work_active(jobs: &JobSet<AppJobOutput>) -> bool {
+    [
+        JobKind::PluginInstall,
+        JobKind::PluginSetup,
+        JobKind::PluginDoctor,
+        JobKind::PluginStop,
+    ]
+    .into_iter()
+    .any(|kind| jobs.is_kind_active(kind))
+}
+
+/// Load durable leases and evaluate only drift that can be proven without a
+/// fetch: immutable plugin identity, manifest-default pins, and literal SHA
+/// pins. Named custom revs remain visible as recorded identities but are not
+/// guessed from ambient network state.
+fn prepared_plugin_leases(
+    store: &Store,
+    project: Option<&str>,
+    plugin_id: Option<&str>,
+    statuses: &[PluginStatus],
+) -> Vec<PluginLeaseView> {
+    let (Some(project), Some(plugin_id)) = (project, plugin_id) else {
+        return Vec::new();
+    };
+    let selected = statuses.iter().find(|status| status.name == plugin_id);
+    let manifest = corpus_core::find_plugin(plugin_id).ok().flatten();
+    let mut leases = Vec::new();
+    for (mission_slug, mission) in store.list_missions(project).unwrap_or_default() {
+        let Some(key) = mission.environment_session.as_deref() else {
+            continue;
+        };
+        let Ok(record) = store.load_environment_session_key(plugin_id, key) else {
+            continue;
+        };
+        if record.state == corpus_core::EnvironmentSessionState::Closed {
+            continue;
+        }
+        let mut drift = Vec::new();
+        if record.plugin_id != plugin_id {
+            drift.push(format!(
+                "plugin id {} != selected {plugin_id}",
+                record.plugin_id
+            ));
+        }
+        if let Some(status) = selected {
+            if status.version.as_deref() != Some(record.plugin_version.as_str()) {
+                drift.push(format!(
+                    "plugin version {} != selected {}",
+                    record.plugin_version,
+                    status.version.as_deref().unwrap_or("unknown")
+                ));
+            }
+            if status.bundle_digest.as_deref() != Some(record.plugin_digest.as_str()) {
+                drift.push("plugin bundle digest differs from selected install".into());
+            }
+            if let (Some(prepared), Some(lease)) = (
+                status.prepared.environment_lock.as_deref(),
+                record.environment_lock.as_deref(),
+            ) {
+                if prepared != lease {
+                    drift.push("environment lock differs from prepared environment".into());
+                }
+            }
+        }
+        if let Some(plugin) = manifest.as_ref() {
+            for source in &plugin.manifest.sources {
+                let chosen = mission
+                    .pins
+                    .get(&source.id)
+                    .map(String::as_str)
+                    .unwrap_or(source.default_rev.as_str());
+                let expected = if corpus_core::is_commit_sha(chosen) {
+                    Some(chosen)
+                } else if chosen == source.default_rev {
+                    Some(source.default_sha.as_str())
+                } else {
+                    None
+                };
+                if let (Some(expected), Some(active)) =
+                    (expected, record.source_shas.get(&source.id))
+                {
+                    if expected != active {
+                        drift.push(format!(
+                            "{} pin resolves to {} but lease runs {}",
+                            source.id, expected, active
+                        ));
+                    }
+                }
+            }
+        }
+        leases.push(PluginLeaseView {
+            mission: mission_slug,
+            state: record.state,
+            plugin_version: record.plugin_version,
+            plugin_digest: record.plugin_digest,
+            source_shas: record.source_shas,
+            environment_lock: record.environment_lock,
+            image_digest: record.image_digest,
+            drift,
+            error: record.error,
+        });
+    }
+    leases.sort_by(|a, b| a.mission.cmp(&b.mission));
+    leases
+}
+
+fn plugin_recovery_hint(error: &str) -> Option<&'static str> {
+    let error = error.to_ascii_lowercase();
+    if error.contains("sessions_active") || error.contains("session(s) are active") {
+        Some("Stop or retry cleanup for every live mission lease, then retry environment Stop.")
+    } else if error.contains("source_missing")
+        || error.contains("source identity mismatch")
+        || error.contains("target identity")
+        || error.contains("environment lock")
+    {
+        Some("Review the project source pins and selected plugin version, then run Setup and Doctor again.")
+    } else if error.contains("isolation") || error.contains("cross_session") {
+        Some("Stop the affected mission lease; retry only after Doctor confirms isolation.")
+    } else if error.contains("cleanup") || error.contains("could not stop") {
+        Some("Retry Stop. If a mission lease remains, use that mission's Retry cleanup action first.")
+    } else if error.contains("docker") {
+        Some("Start Docker and retry Setup or Doctor.")
+    } else if error.contains("immutable") || error.contains("already installed with digest") {
+        Some("Install a new plugin version; immutable installed versions cannot be overwritten.")
+    } else {
+        None
+    }
+}
+
 /// A fresh RFC-4122-v4-formatted id, generated without new dependencies:
 /// `RandomState` seeds each process with 128 bits of system entropy, and
 /// SipHash-128 over two fixed salts extracts two independent 64-bit
@@ -4467,12 +4805,110 @@ mod tests {
             },
             running_version: None,
             expected_tag: None,
+            protocol: Some(corpus_core::ENVIRONMENT_PROTOCOL_V1.into()),
+            capabilities: Vec::new(),
+            origin: corpus_core::PluginOrigin::Installed,
+            bundle_digest: Some(format!("sha256:{name}")),
+            prepared: corpus_core::PluginPreparedStatus::default(),
         };
         let previous = vec![status("a", true, true), status("b", false, false)];
         let next = vec![status("a", false, false), status("b", true, false)];
         let merged = merge_plugin_statuses(&previous, next);
         assert!(merged[0].probed && merged[0].ready);
         assert!(merged[1].probed && !merged[1].ready);
+    }
+
+    #[test]
+    fn prepared_lease_projection_exposes_identity_drift_and_hides_closed_leases() {
+        let root =
+            std::env::temp_dir().join(format!("corpus-plugin-lease-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::new(root.join("store"));
+        store.create_project("p", "P", "fixture-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "tester", corpus_core::AgentRole::Tester)
+            .unwrap();
+        let id = RunId {
+            project: "p".into(),
+            mission: "mission".into(),
+            generation: 1,
+        };
+        let mission = Mission {
+            agent: "tester".into(),
+            pins: BTreeMap::new(),
+            budget: None,
+            created: 1,
+            name: None,
+            session: None,
+            opencode_session: None,
+            environment_session: Some(id.storage_key()),
+            launch_requested: None,
+        };
+        store
+            .write_mission("p", "mission", &mission, "probe")
+            .unwrap();
+        let mut record = corpus_core::EnvironmentSessionRecord {
+            id,
+            plugin_id: "fixture-regtest".into(),
+            plugin_version: "1.0.0".into(),
+            plugin_digest: "sha256:old".into(),
+            state: corpus_core::EnvironmentSessionState::Ready,
+            source_shas: BTreeMap::from([("target".into(), "a".repeat(40))]),
+            environment_lock: Some("lock:old".into()),
+            image_digest: Some("sha256:target".into()),
+            created: 1,
+            updated: 1,
+            error: None,
+        };
+        store.save_environment_session(&record).unwrap();
+        let statuses = vec![PluginStatus {
+            name: "fixture-regtest".into(),
+            version: Some("2.0.0".into()),
+            description: None,
+            probed: true,
+            ready: true,
+            notes: "ready".into(),
+            running_version: None,
+            expected_tag: None,
+            protocol: Some(corpus_core::ENVIRONMENT_PROTOCOL_V1.into()),
+            capabilities: vec!["sessions".into()],
+            origin: corpus_core::PluginOrigin::Installed,
+            bundle_digest: Some("sha256:new".into()),
+            prepared: corpus_core::PluginPreparedStatus {
+                environment_lock: Some("lock:new".into()),
+                ..Default::default()
+            },
+        }];
+        let leases = prepared_plugin_leases(&store, Some("p"), Some("fixture-regtest"), &statuses);
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].image_digest.as_deref(), Some("sha256:target"));
+        assert_eq!(leases[0].drift.len(), 3, "{:?}", leases[0].drift);
+
+        record.state = corpus_core::EnvironmentSessionState::Closed;
+        store.save_environment_session(&record).unwrap();
+        assert!(
+            prepared_plugin_leases(&store, Some("p"), Some("fixture-regtest"), &statuses,)
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_failures_map_to_actionable_recovery() {
+        assert!(
+            plugin_recovery_hint("sessions_active: 2 environment session(s) are active")
+                .unwrap()
+                .contains("mission lease")
+        );
+        assert!(plugin_recovery_hint("source identity mismatch")
+            .unwrap()
+            .contains("source pins"));
+        assert!(plugin_recovery_hint("cross_session isolation failed")
+            .unwrap()
+            .contains("isolation"));
+        assert!(plugin_recovery_hint("cleanup_failed")
+            .unwrap()
+            .contains("Retry Stop"));
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub(crate) struct JobId(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum JobKind {
     PluginProbe,
+    PluginInstall,
     PluginSetup,
     PluginDoctor,
     PluginStop,
@@ -69,6 +70,7 @@ impl JobKind {
     fn thread_name(self) -> &'static str {
         match self {
             Self::PluginProbe => "corpus-plugin-probe",
+            Self::PluginInstall => "corpus-plugin-install",
             Self::PluginSetup => "corpus-plugin-setup",
             Self::PluginDoctor => "corpus-plugin-doctor",
             Self::PluginStop => "corpus-plugin-stop",
@@ -90,6 +92,7 @@ impl JobKind {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::PluginProbe => "plugin probe",
+            Self::PluginInstall => "plugin install",
             Self::PluginSetup => "plugin setup",
             Self::PluginDoctor => "plugin doctor",
             Self::PluginStop => "plugin stop",

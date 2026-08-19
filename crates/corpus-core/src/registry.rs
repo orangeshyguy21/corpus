@@ -55,6 +55,32 @@ pub struct PluginStatus {
     /// The rev name the manifest expects to be running (the probe's view of
     /// the `sources.toml` tag).
     pub expected_tag: Option<String>,
+    /// Negotiated protocol identity from the immutable manifest. Legacy
+    /// adapters leave this empty rather than pretending to speak v1.
+    pub protocol: Option<String>,
+    /// Capability vocabulary declared by the manifest and checked against
+    /// `hello` for v1 plugins.
+    pub capabilities: Vec<String>,
+    /// Whether this exact selected bundle came from an override, an immutable
+    /// install, or the transitional bundled catalog.
+    pub origin: corpus_observe::PluginOrigin,
+    /// Digest of the selected bundle bytes. This is computed on the probe
+    /// worker, never while painting, and is the identity launch records use.
+    pub bundle_digest: Option<String>,
+    /// Generic, bounded preparation facts from the lifecycle status payload.
+    pub prepared: PluginPreparedStatus,
+}
+
+/// The cross-plugin subset of lifecycle `status` that operator surfaces may
+/// render. Plugin-private diagnostics stay in `notes`; these fields are the
+/// cohesive environment vocabulary shared by CDK and Nutshell.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginPreparedStatus {
+    pub docker_required: Option<bool>,
+    pub environment_lock: Option<String>,
+    pub image_digest: Option<String>,
+    pub topology: Option<String>,
+    pub backbone_ownership: Option<String>,
 }
 
 /// Discover every plugin and probe each one live. Failures are folded
@@ -77,7 +103,7 @@ fn plugin_status_for(selected: Option<&str>, probe_all: bool) -> Vec<PluginStatu
         let should_probe = probe_all || selected == Some(plugin.manifest.name.as_str());
         // Keep the whole ProbeResult so the version fields survive — a
         // `(ready, notes)` destructure was what dropped them before.
-        let probe = if should_probe {
+        let (probe, prepared) = if should_probe {
             match Plugin::spawn(&plugin.dir) {
                 Ok(mut spawned) => {
                     let result = if plugin.manifest.manifest_version
@@ -85,30 +111,59 @@ fn plugin_status_for(selected: Option<&str>, probe_all: bool) -> Vec<PluginStatu
                     {
                         v1_status(&plugin, &mut spawned)
                     } else {
-                        spawned.probe()
+                        spawned
+                            .probe()
+                            .map(|probe| (probe, PluginPreparedStatus::default()))
                     };
-                    result.unwrap_or_else(|error| ProbeResult {
-                        ready: false,
-                        notes: format!("probe failed: {error}"),
-                        running_version: None,
-                        expected_tag: None,
+                    result.unwrap_or_else(|error| {
+                        (
+                            ProbeResult {
+                                ready: false,
+                                notes: format!("probe failed: {error}"),
+                                running_version: None,
+                                expected_tag: None,
+                            },
+                            PluginPreparedStatus::default(),
+                        )
                     })
                 }
-                Err(error) => ProbeResult {
+                Err(error) => (
+                    ProbeResult {
+                        ready: false,
+                        notes: format!("spawn failed: {error}"),
+                        running_version: None,
+                        expected_tag: None,
+                    },
+                    PluginPreparedStatus::default(),
+                ),
+            }
+        } else {
+            (
+                ProbeResult {
                     ready: false,
-                    notes: format!("spawn failed: {error}"),
+                    notes: "not probed".into(),
                     running_version: None,
                     expected_tag: None,
                 },
-            }
-        } else {
-            ProbeResult {
-                ready: false,
-                notes: "not probed".into(),
-                running_version: None,
-                expected_tag: None,
-            }
+                PluginPreparedStatus::default(),
+            )
         };
+        let bundle_digest = should_probe
+            .then(|| {
+                if plugin.origin == corpus_observe::PluginOrigin::Installed {
+                    plugin
+                        .manifest
+                        .version
+                        .as_deref()
+                        .and_then(|version| {
+                            crate::installed_record(&plugin.manifest.name, version).ok()
+                        })
+                        .map(|record| record.digest)
+                } else {
+                    crate::plugin_bundle_digest(&plugin.dir).ok()
+                }
+            })
+            .flatten();
         out.push(PluginStatus {
             name: plugin.manifest.name.clone(),
             version: plugin.manifest.version.clone(),
@@ -118,12 +173,20 @@ fn plugin_status_for(selected: Option<&str>, probe_all: bool) -> Vec<PluginStatu
             notes: probe.notes,
             running_version: probe.running_version,
             expected_tag: probe.expected_tag,
+            protocol: plugin.manifest.protocol.clone(),
+            capabilities: plugin.manifest.capabilities.clone(),
+            origin: plugin.origin,
+            bundle_digest,
+            prepared,
         });
     }
     out
 }
 
-fn v1_status(plugin: &PluginDir, spawned: &mut Plugin) -> Result<ProbeResult, Error> {
+fn v1_status(
+    plugin: &PluginDir,
+    spawned: &mut Plugin,
+) -> Result<(ProbeResult, PluginPreparedStatus), Error> {
     spawned.hello()?;
     let params = crate::plugin_lifecycle_params(plugin)?;
     let result = spawned.lifecycle_call(
@@ -132,25 +195,45 @@ fn v1_status(plugin: &PluginDir, spawned: &mut Plugin) -> Result<ProbeResult, Er
         std::time::Duration::from_secs(10),
         |_| {},
     )?;
-    Ok(ProbeResult {
-        ready: result
-            .get("ready")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        notes: result
-            .get("notes")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| result.to_string()),
-        running_version: result
-            .get("running_version")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        expected_tag: result
-            .get("expected_tag")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-    })
+    let prepared = PluginPreparedStatus {
+        docker_required: result
+            .pointer("/docker/required")
+            .and_then(serde_json::Value::as_bool),
+        environment_lock: string_at(&result, "/environment_lock"),
+        image_digest: string_at(&result, "/image_digest"),
+        topology: string_at(&result, "/backbone/topology"),
+        backbone_ownership: string_at(&result, "/backbone/ownership"),
+    };
+    Ok((
+        ProbeResult {
+            ready: result
+                .get("ready")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            notes: result
+                .get("notes")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| result.to_string()),
+            running_version: result
+                .get("running_version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            expected_tag: result
+                .get("expected_tag")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        },
+        prepared,
+    ))
+}
+
+fn string_at(value: &serde_json::Value, pointer: &str) -> Option<String> {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// One source repo a project's plugin mounts, with its selectable revs —

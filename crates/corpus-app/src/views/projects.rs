@@ -47,6 +47,8 @@ pub struct ProjectsView {
     /// Schedule a fresh plugin probe aggregation next frame (probe state
     /// is fetched on demand, not continuously).
     needs_probe: bool,
+    show_install: bool,
+    install_path: String,
 }
 
 impl Default for ProjectsView {
@@ -62,6 +64,8 @@ impl Default for ProjectsView {
             rename_name: String::new(),
             confirm_delete: false,
             needs_probe: false,
+            show_install: false,
+            install_path: String::new(),
         }
     }
 }
@@ -132,6 +136,7 @@ impl ProjectsView {
         self.rename_window(ui, state, toasts, &slug);
         self.delete_confirm_window(ui, state, toasts, &slug, &name);
         self.wipe_confirm_window(ui, state, toasts, &slug);
+        self.install_window(ui, state, toasts);
     }
 
     fn status_band(&self, ui: &mut Ui, state: &AppState, slug: &str) {
@@ -241,24 +246,67 @@ impl ProjectsView {
                 &mut self.needs_probe,
             );
             ui.add_space(8.0);
+            let selected_status = state
+                .plugins()
+                .iter()
+                .find(|plugin| plugin.name == self.edit_plugin)
+                .cloned();
+            if let Some(status) = selected_status.as_ref() {
+                plugin_identity(ui, status);
+                ui.add_space(8.0);
+            }
             ui.horizontal_wrapped(|ui| {
-                for (label, operation) in
-                    [("Setup", "setup"), ("Doctor", "doctor"), ("Stop", "stop")]
-                {
-                    if ui.button(label).clicked() {
+                let plugin_busy = state.plugin_work_active();
+                let setup_label = match state.plugin_operation() {
+                    Some(ref operation)
+                        if operation.operation == "setup"
+                            && matches!(
+                                operation.state,
+                                crate::state::PluginOperationState::Failed
+                                    | crate::state::PluginOperationState::Cancelled
+                            ) =>
+                    {
+                        "Retry setup"
+                    }
+                    _ => "Setup",
+                };
+                for (label, operation) in [(setup_label, "setup"), ("Doctor", "doctor")] {
+                    let enabled = !plugin_busy;
+                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
                         match state.start_plugin_lifecycle(&self.edit_plugin, operation) {
                             Ok(true) => toast(
                                 toasts,
                                 ToastKind::Info,
                                 format!("{} {operation} started", self.edit_plugin),
                             ),
-                            Ok(false) => toast(
-                                toasts,
-                                ToastKind::Warning,
-                                format!("{} {operation} is already running", self.edit_plugin),
+                        Ok(false) => toast(
+                            toasts,
+                            ToastKind::Warning,
+                            "another plugin operation is already running",
                             ),
                             Err(error) => toast(toasts, ToastKind::Error, error),
                         }
+                    }
+                }
+                let leases_live = !state.plugin_leases().is_empty();
+                let stop = ui
+                    .add_enabled(!leases_live && !plugin_busy, egui::Button::new("Stop"))
+                    .on_disabled_hover_text(
+                        "Stop or retry cleanup for the live mission leases shown below first.",
+                    );
+                if stop.clicked() {
+                    match state.start_plugin_lifecycle(&self.edit_plugin, "stop") {
+                        Ok(true) => toast(
+                            toasts,
+                            ToastKind::Info,
+                            format!("{} stop started", self.edit_plugin),
+                        ),
+                    Ok(false) => toast(
+                        toasts,
+                        ToastKind::Warning,
+                        "another plugin operation is already running",
+                        ),
+                        Err(error) => toast(toasts, ToastKind::Error, error),
                     }
                 }
                 if state.plugin_lifecycle_active("setup")
@@ -267,7 +315,19 @@ impl ProjectsView {
                 {
                     toast(toasts, ToastKind::Info, "cancelling plugin setup");
                 }
+                if ui
+                    .add_enabled(!plugin_busy, egui::Button::new("Install bundle…"))
+                    .clicked()
+                {
+                    self.show_install = true;
+                }
             });
+            if let Some(operation) = state.plugin_operation() {
+                ui.add_space(8.0);
+                plugin_operation(ui, &operation);
+            }
+            ui.add_space(12.0);
+            plugin_leases(ui, state.plugin_leases());
             ui.add_space(16.0);
             components::soft_rule(ui);
             ui.add_space(12.0);
@@ -720,6 +780,58 @@ impl ProjectsView {
             });
         self.show_clone = open && !cloned;
     }
+
+    fn install_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
+        if !self.show_install {
+            return;
+        }
+        let mut open = self.show_install;
+        let mut started = false;
+        egui::Window::new("Install environment plugin")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
+            .show(ui.ctx(), |ui| {
+                ui.label("Unpacked plugin bundle directory");
+                let entry = ui.add(
+                    egui::TextEdit::singleline(&mut self.install_path)
+                        .desired_width(500.0)
+                        .hint_text("/path/to/corpus-plugin-nutshell"),
+                );
+                ui.label(
+                    RichText::new(
+                        "Corpus validates manifest v1, executable shape and immutable bundle identity, then selects the installed version.",
+                    )
+                    .size(12.0)
+                    .color(theme::TEXT_FAINT),
+                );
+                ui.add_space(8.0);
+                let submit = entry.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                let enabled = !self.install_path.trim().is_empty();
+                let clicked = ui
+                    .add_enabled_ui(enabled, |ui| theme::house_button(ui, "Install"))
+                    .inner
+                    .clicked();
+                if clicked || (submit && enabled) {
+                    match state.start_plugin_install(&self.install_path) {
+                        Ok(true) => {
+                            toast(toasts, ToastKind::Info, "plugin installation started");
+                            started = true;
+                        }
+                        Ok(false) => toast(
+                            toasts,
+                            ToastKind::Warning,
+                            "another plugin operation is already running",
+                        ),
+                        Err(error) => toast(toasts, ToastKind::Error, error),
+                    }
+                }
+            });
+        self.show_install = open && !started;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -870,6 +982,189 @@ fn command_label(text: &str) -> RichText {
 
 fn empty_hint(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(theme::TEXT_FAINT));
+}
+
+fn plugin_identity(ui: &mut Ui, status: &corpus_core::PluginStatus) {
+    let origin = match status.origin {
+        corpus_core::PluginOrigin::Direct => "development override",
+        corpus_core::PluginOrigin::Installed => "selected install",
+        corpus_core::PluginOrigin::Bundled => "bundled transition",
+    };
+    ui.horizontal_wrapped(|ui| {
+        components::status_badge(
+            ui,
+            if status.ready { "ready" } else { "not ready" },
+            if status.ready {
+                components::StatusTone::Healthy
+            } else {
+                components::StatusTone::Danger
+            },
+        )
+        .on_hover_text(&status.notes);
+        ui.label(
+            RichText::new(format!(
+                "{} · {} · {}",
+                status.protocol.as_deref().unwrap_or("legacy protocol"),
+                status.version.as_deref().unwrap_or("unversioned"),
+                origin
+            ))
+            .size(12.0)
+            .color(theme::TEXT_MUTED),
+        );
+    });
+    if let Some(digest) = status.bundle_digest.as_deref() {
+        identity_line(ui, "bundle", digest);
+    }
+    if status.prepared.docker_required == Some(true) {
+        identity_line(ui, "runtime", "Docker required");
+    }
+    if let Some(topology) = status.prepared.topology.as_deref() {
+        identity_line(ui, "topology", topology);
+    }
+    if let Some(ownership) = status.prepared.backbone_ownership.as_deref() {
+        identity_line(ui, "backbone", ownership);
+    }
+    if let Some(lock) = status.prepared.environment_lock.as_deref() {
+        identity_line(ui, "environment", lock);
+    }
+    if let Some(image) = status.prepared.image_digest.as_deref() {
+        identity_line(ui, "prepared image", image);
+    }
+    if !status.capabilities.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(command_label("Capabilities"));
+            for capability in &status.capabilities {
+                ui.label(
+                    RichText::new(capability)
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::TEXT_MUTED),
+                );
+            }
+        });
+    }
+    if !status.notes.is_empty() {
+        empty_hint(ui, &status.notes);
+    }
+}
+
+fn identity_line(ui: &mut Ui, label: &str, value: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(command_label(label));
+        ui.label(
+            RichText::new(short_identity(value))
+                .monospace()
+                .size(11.0)
+                .color(theme::TEXT_MUTED),
+        )
+        .on_hover_text(value);
+    });
+}
+
+fn short_identity(value: &str) -> String {
+    const MAX: usize = 28;
+    if value.chars().count() <= MAX {
+        return value.to_string();
+    }
+    let head: String = value.chars().take(16).collect();
+    let tail: String = value
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
+}
+
+fn plugin_operation(ui: &mut Ui, operation: &crate::state::PluginOperationView) {
+    let (label, tone) = match operation.state {
+        crate::state::PluginOperationState::Running => {
+            ui.spinner();
+            ("running", components::StatusTone::Interaction)
+        }
+        crate::state::PluginOperationState::Succeeded => {
+            ("complete", components::StatusTone::Healthy)
+        }
+        crate::state::PluginOperationState::Failed => ("failed", components::StatusTone::Danger),
+        crate::state::PluginOperationState::Cancelled => {
+            ("cancelled", components::StatusTone::Warning)
+        }
+    };
+    ui.horizontal_wrapped(|ui| {
+        components::status_badge(ui, label, tone);
+        ui.label(
+            RichText::new(format!("{} {}", operation.plugin, operation.operation))
+                .monospace()
+                .size(12.0)
+                .color(theme::TEXT),
+        );
+        if let Some(phase) = operation.phase.as_deref() {
+            ui.label(RichText::new(phase).size(12.0).color(theme::TEXT_MUTED));
+        }
+    });
+    if !operation.detail.is_empty() {
+        empty_hint(ui, &operation.detail);
+    }
+    if let Some(recovery) = operation.recovery.as_deref() {
+        ui.label(RichText::new(recovery).size(12.0).color(theme::WARN));
+    }
+}
+
+fn plugin_leases(ui: &mut Ui, leases: &[crate::state::PluginLeaseView]) {
+    ui.label(command_label("Live environment leases"));
+    ui.add_space(4.0);
+    if leases.is_empty() {
+        empty_hint(ui, "no target or sandbox session is active");
+        return;
+    }
+    for lease in leases {
+        let healthy = lease.state == corpus_core::EnvironmentSessionState::Ready
+            && lease.error.is_none()
+            && lease.drift.is_empty();
+        ui.horizontal_wrapped(|ui| {
+            components::status_badge(
+                ui,
+                if healthy { "aligned" } else { "attention" },
+                if healthy {
+                    components::StatusTone::Healthy
+                } else {
+                    components::StatusTone::Danger
+                },
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{} · {:?} · plugin {}",
+                    lease.mission, lease.state, lease.plugin_version
+                ))
+                .monospace()
+                .size(12.0)
+                .color(theme::TEXT),
+            );
+        });
+        identity_line(ui, "bundle", &lease.plugin_digest);
+        if let Some(lock) = lease.environment_lock.as_deref() {
+            identity_line(ui, "environment", lock);
+        }
+        if let Some(image) = lease.image_digest.as_deref() {
+            identity_line(ui, "target image", image);
+        }
+        for (source, sha) in &lease.source_shas {
+            identity_line(ui, &format!("source {source}"), sha);
+        }
+        for drift in &lease.drift {
+            ui.label(
+                RichText::new(format!("pin drift: {drift}"))
+                    .size(12.0)
+                    .color(theme::WARN),
+            );
+        }
+        if let Some(error) = lease.error.as_deref() {
+            ui.label(RichText::new(error).size(12.0).color(theme::SIGNAL_RED));
+        }
+        ui.add_space(8.0);
+    }
 }
 
 /// Dense, full-width navigation row used by the Team and Missions cards.
