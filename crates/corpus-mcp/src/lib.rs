@@ -8,5 +8,7 @@
 #![recursion_limit = "256"]
 
 pub mod admin;
-pub mod error;
+pub mod error {
+    pub use corpus_admin::error::*;
+}
 pub mod tools;

@@ -21,21 +21,7 @@ pub struct PluginDir {
     pub manifest: PluginManifest,
 }
 
-/// Environment variable overriding the plugins directory.
-pub const PLUGINS_DIR_ENV: &str = "CORPUS_PLUGINS_DIR";
-
-/// Resolve the plugins directory: env override, else `plugins/` under the
-/// resource root. The old fallback was the RELATIVE `plugins`, so which
-/// plugins existed depended on the process's cwd — a launcher started from
-/// anywhere but the repo silently saw none.
-pub fn plugins_dir() -> PathBuf {
-    if let Some(dir) = std::env::var(PLUGINS_DIR_ENV).ok().filter(|s| !s.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    crate::paths::resource_root_opt()
-        .map(|root| root.join("plugins"))
-        .unwrap_or_else(|| PathBuf::from("plugins"))
-}
+pub use corpus_store::paths::plugins_dir;
 
 /// Discover all plugins under a directory (invalid entries are skipped
 /// with a warning on stderr, so one bad plugin can't break the registry).

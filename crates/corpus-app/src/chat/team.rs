@@ -138,7 +138,7 @@ pub fn needs_approval(tool: &str) -> bool {
     true
 }
 
-/// The bare corpus-admin tool names (the `corpus-mcp --admin` catalog).
+/// The bare corpus-admin tool names (the `corpus-admin-mcp` catalog).
 pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "project_list",
     "project_new",
@@ -405,7 +405,7 @@ mod tests {
     /// is wrong.
     #[test]
     fn admin_tool_table_matches_the_server_catalog() {
-        let mut server: Vec<String> = corpus_mcp::admin::catalog()
+        let mut server: Vec<String> = corpus_admin::catalog()
             .as_array()
             .expect("catalog is an array")
             .iter()
@@ -418,7 +418,7 @@ mod tests {
         let extra: Vec<_> = ours.iter().filter(|t| !server.contains(t)).collect();
         assert!(
             missing.is_empty() && extra.is_empty(),
-            "team.rs drifted from the corpus-mcp --admin catalog.\n\
+            "team.rs drifted from the corpus-admin-mcp catalog.\n\
              in the server but unclassified here: {missing:?}\n\
              listed here but not in the server: {extra:?}"
         );
@@ -491,7 +491,7 @@ mod tests {
     fn destructive_classification_matches_the_server_gate() {
         let mut app = DESTRUCTIVE_TOOLS.to_vec();
         app.sort_unstable();
-        let mut server = corpus_mcp::admin::DESTRUCTIVE_OPS.to_vec();
+        let mut server = corpus_admin::DESTRUCTIVE_OPS.to_vec();
         server.sort_unstable();
         assert_eq!(app, server);
     }

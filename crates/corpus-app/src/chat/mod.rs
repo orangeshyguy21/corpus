@@ -13,7 +13,7 @@
 //! The runtime is the **embedded goose Agent** (operator decision 2026-08-14;
 //! dev/decisions.md): `crates/corpus-app/src/chat/embedded.rs` compiles
 //! goose's `Agent` in-process and drives it on a background thread, spinning up
-//! `corpus-mcp --admin` as its (our) tool extension. `scripts/goose-chat` is
+//! `corpus-admin-mcp` as its (our) tool extension. `scripts/goose-chat` is
 //! NOT used by the app — it stays the headless debug fallback.
 //!
 //! Event semantics mirror goose's `AgentEvent` stream faithfully (message

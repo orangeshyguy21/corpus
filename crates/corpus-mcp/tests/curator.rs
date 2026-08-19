@@ -2,7 +2,7 @@
 //! agent, scoped to the project the server already proved.
 //!
 //! The property under test throughout is that the project is NOT the
-//! caller's to choose. The `--admin` profile resolves it from a tool
+//! caller's to choose. The host-admin artifact resolves it from a tool
 //! argument at 17 separate sites; this route overwrites that argument from
 //! `CORPUS_PROJECT` before any of them run, so naming another project is
 //! not refused so much as impossible.

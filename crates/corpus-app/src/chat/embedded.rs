@@ -11,7 +11,7 @@
 //! this transport swapped. Git history keeps acp.rs; the fallback story lives
 //! in dev/decisions.md's record.
 //!
-//! Tool source: `corpus-mcp --admin` is spawned DIRECTLY as a stdio MCP
+//! Tool source: `corpus-admin-mcp` is spawned DIRECTLY as a stdio MCP
 //! extension (a CORPUS subprocess, our own protocol — not a goose subprocess).
 //! The confirm ritual is in-process and STRONGER than the ACP round-trip: a
 //! tool call that needs approval surfaces as [`ChatEvent::PermissionRequest`]
@@ -440,7 +440,7 @@ mod live {
     /// stdio extension — the chunk-1 setup sequence, mirroring goose's own
     /// example (Agent::with_config not Agent::new, to avoid config-file
     /// construction). Team shape (chunk 2): a specialist registers the
-    /// `corpus-mcp --admin` extension with `available_tools` = its scoped
+    /// `corpus-admin-mcp` extension with `available_tools` = its scoped
     /// domain (goose refuses anything else BY CONSTRUCTION); the Orchestrator
     /// registers NO admin extension (no tools to call).
     async fn setup(project: &str, model: &str, role: TeamRole) -> anyhow::Result<(Arc<Agent>, String)> {
@@ -657,7 +657,7 @@ Use Markdown formatting for all responses.
         s
     }
 
-    /// The `corpus-mcp --admin` stdio extension. `Operator` passes an empty
+    /// The `corpus-admin-mcp` stdio extension. `Operator` passes an empty
     /// `available_tools` (= all tools, still approval-gated); a specialist
     /// passes exactly its scoped domain from [`crate::chat::team::TeamRole`],
     /// so goose's `is_tool_available` refuses every out-of-domain / destructive
@@ -667,8 +667,8 @@ Use Markdown formatting for all responses.
         Ok(goose::agents::ExtensionConfig::Stdio {
             name: "corpus-admin".into(),
             description: DEFAULT_EXTENSION_DESCRIPTION.into(),
-            cmd: corpus_mcp_path(),
-            args: vec!["--admin".into()],
+            cmd: corpus_admin_mcp_path(),
+            args: Vec::new(),
             envs: Default::default(),
             env_keys: Vec::new(),
             timeout: Some(DEFAULT_EXTENSION_TIMEOUT),
@@ -678,16 +678,12 @@ Use Markdown formatting for all responses.
         })
     }
 
-    /// Locate the corpus-mcp binary. The resolution itself lives in
-    /// corpus-core ([`corpus_core::corpus_mcp_bin`]) because the run-dir
-    /// provisioner writes the same path into every generated opencode
-    /// config — two copies of this search would drift, and the chat and a
-    /// mission would then talk to different binaries. An unresolved path
+    /// Locate the dedicated host-side admin artifact. An unresolved path
     /// degrades to the bare name so the extension's own error names it.
-    fn corpus_mcp_path() -> String {
-        corpus_core::corpus_mcp_bin()
+    fn corpus_admin_mcp_path() -> String {
+        corpus_core::corpus_admin_mcp_bin()
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "corpus-mcp".to_string())
+            .unwrap_or_else(|_| "corpus-admin-mcp".to_string())
     }
 
     /// Run one turn: `agent.reply(...)` then translate the streamed
@@ -1243,7 +1239,7 @@ mod injection_probe {
     #[test]
     fn inspector_extension_withholds_project_delete() {
         std::env::set_var("CARGO_MANIFEST_DIR", "/nonexistent");
-        std::env::set_var("CORPUS_MCP", "/nonexistent/corpus-mcp");
+        std::env::set_var("CORPUS_ADMIN_MCP", "/nonexistent/corpus-admin-mcp");
         let ext = build_corpus_admin_extension(TeamRole::CorpusInspector)
             .expect("inspector extension builds");
         // The chain-destroying tool is withheld by construction.
@@ -1341,7 +1337,7 @@ mod injection_probe {
     }
 
     /// Serializes the live probes: they mutate PROCESS-GLOBAL env
-    /// (CORPUS_STORE, CORPUS_MCP, GOOSE_PATH_ROOT) and would stomp each
+    /// (CORPUS_STORE, CORPUS_ADMIN_MCP, GOOSE_PATH_ROOT) and would stomp each
     /// other under cargo's parallel test threads.
     static LIVE_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1368,21 +1364,21 @@ mod injection_probe {
         panic!("no preferred probe model pulled; set CORPUS_PROBE_MODEL to one of: {available:?}");
     }
 
-    /// END-TO-END LIVE PROBE (opt-in; needs Ollama + a built corpus-mcp):
+    /// END-TO-END LIVE PROBE (opt-in; needs Ollama + a built corpus-admin-mcp):
     /// drives the REAL embedded backend against a small local model through
     /// the public ChatHandle seam — identity, tool use, the approval gate,
     /// and a real store mutation — the repeatable "use the harness to create
     /// projects and agents" check the operator asked for. Run:
     ///
     /// ```sh
-    /// cargo build -p corpus-mcp -p corpus-app &&
+    /// cargo build -p corpus-admin-mcp -p corpus-app &&
     /// cargo test -p corpus-app --bin corpus-app live_end_to_end -- --ignored --nocapture
     /// ```
     ///
     /// Uses a throwaway CORPUS_STORE in the temp dir (never the real store)
     /// and the fast qwen3.5:9b chat model.
     #[test]
-    #[ignore = "live probe: needs Ollama (qwen3.5:9b) and a built corpus-mcp"]
+    #[ignore = "live probe: needs Ollama (qwen3.5:9b) and a built corpus-admin-mcp"]
     fn live_end_to_end_operator_creates_project() {
         use crate::chat::{Chat, ChatEvent, ChatHandle, ChatPhase};
 
@@ -1395,14 +1391,14 @@ mod injection_probe {
         super::init_goose_env();
         let mcp = {
             let exe = std::env::current_exe().expect("current exe");
-            let candidate = exe.parent().unwrap().join("../corpus-mcp");
+            let candidate = exe.parent().unwrap().join("../corpus-admin-mcp");
             if candidate.exists() {
                 candidate
             } else {
-                panic!("corpus-mcp not built (expected at {candidate:?}) — cargo build -p corpus-mcp first");
+                panic!("corpus-admin-mcp not built (expected at {candidate:?}) — cargo build -p corpus-admin-mcp first");
             }
         };
-        std::env::set_var("CORPUS_MCP", &mcp);
+        std::env::set_var("CORPUS_ADMIN_MCP", &mcp);
         // Ollama reachable + model pulled?
         let model = probe_model();
 
@@ -1507,7 +1503,7 @@ mod injection_probe {
     /// its scoped corpus-admin tools (the thing summon could never do), and
     /// the mutation must land. Same preconditions as probe 1.
     #[test]
-    #[ignore = "live probe: needs Ollama (qwen3.5:9b) and a built corpus-mcp"]
+    #[ignore = "live probe: needs Ollama (qwen3.5:9b) and a built corpus-admin-mcp"]
     fn live_end_to_end_orchestrator_delegates() {
         use crate::chat::{Chat, ChatEvent, ChatHandle};
 
@@ -1518,9 +1514,9 @@ mod injection_probe {
         std::env::set_var("CORPUS_STORE", &store);
         super::init_goose_env();
         let exe = std::env::current_exe().expect("current exe");
-        let mcp = exe.parent().unwrap().join("../corpus-mcp");
-        assert!(mcp.exists(), "corpus-mcp not built — cargo build -p corpus-mcp first");
-        std::env::set_var("CORPUS_MCP", &mcp);
+        let mcp = exe.parent().unwrap().join("../corpus-admin-mcp");
+        assert!(mcp.exists(), "corpus-admin-mcp not built — cargo build -p corpus-admin-mcp first");
+        std::env::set_var("CORPUS_ADMIN_MCP", &mcp);
         let model = probe_model();
 
         let mut chat = ChatHandle::start_scoped(
@@ -1604,7 +1600,7 @@ mod injection_probe {
     /// burned ~10 calls and three failures on clone-then-save + JSON-in-
     /// JSON). Budget: ≤ 4 tool calls, 0 errors, doc on disk.
     #[test]
-    #[ignore = "live probe: needs Ollama (qwen3.5:9b) and a built corpus-mcp"]
+    #[ignore = "live probe: needs Ollama (qwen3.5:9b) and a built corpus-admin-mcp"]
     fn live_regression_depbot_agent_creation() {
         use crate::chat::{Chat, ChatEvent, ChatHandle};
 
@@ -1615,9 +1611,9 @@ mod injection_probe {
         std::env::set_var("CORPUS_STORE", &store);
         super::init_goose_env();
         let exe = std::env::current_exe().expect("current exe");
-        let mcp = exe.parent().unwrap().join("../corpus-mcp");
-        assert!(mcp.exists(), "corpus-mcp not built — cargo build -p corpus-mcp first");
-        std::env::set_var("CORPUS_MCP", &mcp);
+        let mcp = exe.parent().unwrap().join("../corpus-admin-mcp");
+        assert!(mcp.exists(), "corpus-admin-mcp not built — cargo build -p corpus-admin-mcp first");
+        std::env::set_var("CORPUS_ADMIN_MCP", &mcp);
         let model = probe_model();
 
         // Seed the project so a "researcher" base exists to model on.

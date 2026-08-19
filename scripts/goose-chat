@@ -19,12 +19,12 @@
 #
 # USAGE
 #   scripts/goose-chat [goose args...]
-#     The project scope is CORPUS_PROJECT (defaults to "default"; the app and
-#     CLI use the same knob). ALL positional args pass through to goose, so
+#     The project scope is required in CORPUS_PROJECT; there is no implicit
+#     default. ALL positional args pass through to goose, so
 #     the normal goose CLI/run flags work unchanged.
 #   Examples:
-#     scripts/goose-chat                        # session on project "default"
-#     scripts/goose-chat -n ops                 # session named ops
+#     CORPUS_PROJECT=default scripts/goose-chat # session on project "default"
+#     CORPUS_PROJECT=default scripts/goose-chat -n ops
 #     CORPUS_PROJECT=pentest scripts/goose-chat run -t "list projects"
 #     scripts/goose-chat info -v                # verify the scope wiring
 #
@@ -51,7 +51,8 @@ mkdir -p "$scope/config"
 # sessions.db lives under $scope/data/sessions (created by goose on first run)
 
 # --- provision the scope's own config.yaml (deterministic) ------------------
-corpus_mcp="${CORPUS_MCP:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/corpus-mcp}"
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+corpus_admin_mcp="${CORPUS_ADMIN_MCP:-$repo_root/target/debug/corpus-admin-mcp}"
 cat > "$scope/config/config.yaml" <<YAML
 GOOSE_INPUT_LIMIT: 32768
 active_provider: ollama
@@ -62,16 +63,16 @@ providers:
     configured: true
 
 # corpus-admin: the host-side store-admin MCP profile (dev/decisions.md,
-# chunk 1): the SAME corpus-mcp binary behind --admin. The sandbox-facing
-# profile never enables this. `developer` (bash + file edit) is disabled so
+# chunk 1): the dedicated host-side admin artifact. `developer` (bash + file
+# edit) is disabled so
 # the chat admin can only reach the store through the typed admin tools.
 extensions:
   corpus-admin:
     type: stdio
     name: corpus-admin
     enabled: true
-    cmd: $corpus_mcp
-    args: ["--admin"]
+    cmd: $corpus_admin_mcp
+    args: []
     envs: {}
     timeout: 300
   developer:
@@ -80,4 +81,5 @@ extensions:
     name: developer
 YAML
 
+cd "$repo_root"
 GOOSE_PATH_ROOT="$scope" exec goose "$@"

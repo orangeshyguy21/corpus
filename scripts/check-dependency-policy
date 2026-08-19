@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+metadata_file="$(mktemp)"
+tree_file="$(mktemp)"
+trap 'rm -f "$metadata_file" "$tree_file"' EXIT
+
+cd "$repo_dir"
+cargo metadata --no-deps --format-version 1 >"$metadata_file"
+
+python3 - "$metadata_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    metadata = json.load(stream)
+
+packages = {package["name"]: package for package in metadata["packages"]}
+admin = packages.get("corpus-admin-mcp")
+if admin is None:
+    raise SystemExit(
+        "dependency policy: corpus-admin-mcp is not a separate package yet "
+        "(P3.1 migration gate remains red)"
+    )
+
+binary_targets = [
+    target for target in admin["targets"] if "bin" in target.get("kind", [])
+]
+if [target["name"] for target in binary_targets] != ["corpus-admin-mcp"]:
+    raise SystemExit(
+        "dependency policy: corpus-admin-mcp must expose exactly its own binary target"
+    )
+PY
+
+cargo tree -p corpus-admin-mcp --edges normal --prefix none >"$tree_file"
+
+python3 - "$tree_file" <<'PY'
+import re
+import sys
+
+forbidden = {
+    "corpus-app": "desktop UI",
+    "corpus-core": "the all-capabilities facade",
+    "corpus-env": "source/environment orchestration",
+    "corpus-launch": "run/process launch",
+    "corpus-mcp": "research MCP and sandbox handlers",
+    "corpus-plugin": "plugin process execution",
+    "goose": "embedded chat runtime",
+}
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    packages = {
+        match.group(1)
+        for line in stream
+        if (match := re.match(r"([^ ]+) v[^ ]+", line.strip()))
+    }
+
+violations = [
+    f"{package} ({reason})"
+    for package, reason in sorted(forbidden.items())
+    if package in packages
+]
+if violations:
+    raise SystemExit(
+        "dependency policy: corpus-admin-mcp reaches forbidden packages:\n  "
+        + "\n  ".join(violations)
+    )
+
+print("dependency policy: corpus-admin-mcp boundary is clean")
+PY

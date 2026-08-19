@@ -29,13 +29,12 @@ fn rig(tag: &str) -> (Ctx, Store, PathBuf, String) {
         .expect("agent");
     // The admin profile has no agent identity — the role is irrelevant to
     // it by design (see the orthogonality test below).
-    let mut ctx = Ctx::for_test(
+    let ctx = Ctx::for_test(
         corpus_core::Plugin::spawn(&echo_plugin()).expect("spawn echo plugin"),
         store.clone(),
         Scope::new("proj"),
         corpus_core::AgentRole::Super,
     );
-    ctx.admin = true;
     (ctx, store, root, "proj".to_string())
 }
 
@@ -326,8 +325,8 @@ fn wrong_token_is_refused() {
 }
 
 #[test]
-fn admin_tools_absent_without_admin_flag() {
-    // The sandbox-facing profile (no --admin) advertises NO admin tools.
+fn host_admin_tools_are_absent_from_the_research_catalog() {
+    // The research artifact advertises no host-global admin tools.
     let names: Vec<String> = corpus_mcp::tools::catalog()
         .as_array()
         .unwrap()

@@ -3642,12 +3642,7 @@ impl AppState {
     /// tool-use default (an explicit arg — the engine never falls back
     /// to opencode's ambient model). None when the registry is empty.
     pub fn suggested_model(&self) -> Option<String> {
-        let path = std::env::var("CORPUS_MODELS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("benchmarks/models.yaml"));
-        corpus_core::ModelRegistry::load(&path)
-            .ok()?
-            .launch_default()
+        corpus_core::ModelRegistry::load_default().ok()?.launch_default()
     }
 
     /// The launch pre-fill for an agent: primary entry model → registry

@@ -399,7 +399,7 @@ impl ProjectsView {
             if logs.files == 0 {
                 empty_hint(ui, "no runs yet — missions write their transcripts here");
             } else {
-                mission_log_list(ui, state.mission_logs(), logs.bytes);
+                mission_log_list(ui, state, logs.bytes);
             }
         });
     }
@@ -970,10 +970,11 @@ fn corpus_visual(ui: &mut Ui, categories: &[corpus_core::CategoryStat]) {
 const MISSION_LOG_ROWS: usize = 12;
 
 /// The Mission Logs list: one row per transcript (newest first) — mission
-/// name, run stamp, file name, size, and a bar sized to its share of the
+/// agent label, run stamp, file name, size, and a bar sized to its share of the
 /// logs total, so a runaway run is obvious at a glance.
-fn mission_log_list(ui: &mut Ui, logs: &[corpus_core::MissionLog], total: u64) {
+fn mission_log_list(ui: &mut Ui, state: &AppState, total: u64) {
     let width = ui.available_width().min(760.0);
+    let logs = state.mission_logs();
     for log in logs.iter().take(MISSION_LOG_ROWS) {
         // Fixed row width so the right-aligned file name tracks the strip
         // above it instead of the window edge.
@@ -988,7 +989,12 @@ fn mission_log_list(ui: &mut Ui, logs: &[corpus_core::MissionLog], total: u64) {
                     egui::vec2((bar.width() * share).max(1.0), bar.height()),
                 );
                 painter.rect_filled(filled, 1.0, theme::MISSION_LOG);
-                ui.label(RichText::new(&log.mission).size(12.0).color(theme::TEXT));
+                let agent = log
+                    .agent
+                    .as_deref()
+                    .map(|slug| state.agent_label(slug))
+                    .unwrap_or_else(|| "unknown agent".to_string());
+                ui.label(RichText::new(agent).size(12.0).color(theme::TEXT));
                 ui.label(
                     RichText::new(fmt_bytes(log.bytes))
                         .size(12.0)

@@ -14,6 +14,7 @@ use corpus_core::{
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
+use corpus_admin::PendingConfirm;
 
 /// Output cap fed back to the model.
 const OUTPUT_CAP_BYTES: usize = 8 * 1024;
@@ -24,9 +25,8 @@ const OUTPUT_CAP_BYTES: usize = 8 * 1024;
 #[derive(Debug)]
 pub struct Ctx {
     /// The environment plugin driving the harness, when one could be
-    /// resolved. `None` for the store-only admin profile (which has no
-    /// project, hence no plugin binding) and whenever resolution failed —
-    /// `probe_notes` then carries the reason and every sandbox tool refuses.
+    /// resolved. `None` whenever resolution failed; `probe_notes` then carries
+    /// the reason and every sandbox tool refuses.
     pub plugin: Option<Plugin>,
     /// Corpus store root (projects/).
     pub store: Store,
@@ -51,9 +51,6 @@ pub struct Ctx {
     /// When the probe last ran — re-probes while gated are rate-limited
     /// so a polling model cannot hammer docker/curl in a tight loop.
     pub last_probe: std::time::Instant,
-    /// Admin profile on: the corpus-admin tool group is exposed and the
-    /// probe-required gate is bypassed (admin is store-only, host-side).
-    pub admin: bool,
     /// The capability ceiling of the agent this server is serving, resolved
     /// from the run's identity (`CORPUS_OPENCODE_AGENT`) at startup.
     ///
@@ -81,17 +78,6 @@ pub struct Ctx {
     pub run_log: Option<String>,
 }
 
-/// A pending destructive-op confirmation: a single-use, short-TTL token
-/// minted by a dry-run call and consumed by the token-bearing re-call that
-/// actually mutates the store. `key` is the token (hash of op+target+nonce).
-#[derive(Debug)]
-pub struct PendingConfirm {
-    pub op: String,
-    pub target: String,
-    /// Epoch seconds at which the token expires.
-    pub expires_at: u64,
-}
-
 /// Minimum interval between re-probes while the gate is closed.
 const REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -111,9 +97,9 @@ impl Ctx {
         // the project, so a server that cannot say which project it serves
         // cannot say which environment it drives either.
         let scope = Scope::from_env_strict(&store);
-        // A missing plugin is NOT fatal: the admin profile is store-only and
-        // has no project scope by design, so it must still start. The
-        // sandbox tools refuse through the probe gate instead.
+        // A missing plugin is NOT process-fatal: management-only roles still
+        // need their scoped store tools, while sandbox tools refuse through
+        // the probe gate.
         let mut plugin = match resolve_plugin_dir(&store, &scope) {
             Ok(dir) => match Plugin::spawn(&dir) {
                 Ok(plugin) => Ok(plugin),
@@ -167,7 +153,6 @@ impl Ctx {
             probe_ready: probe.ready,
             probe_notes: probe.notes,
             last_probe: std::time::Instant::now(),
-            admin: false,
             role,
             pending_confirms: HashMap::new(),
             source_pins,
@@ -189,7 +174,6 @@ impl Ctx {
             probe_ready: true,
             probe_notes: String::new(),
             last_probe: std::time::Instant::now(),
-            admin: false,
             role: Ok(role),
             pending_confirms: HashMap::new(),
             source_pins: None,
@@ -595,7 +579,7 @@ fn enforce_curator_agent_ceiling(
 
 /// Project-management tools served to an IN-PROJECT agent.
 ///
-/// Three things separate this from the `corpus-mcp --admin` operator
+/// Three things separate this from the `corpus-admin-mcp` operator
 /// profile, which is untouched:
 ///   1. the ROLE decides the catalog, not an argv flag;
 ///   2. the project is INJECTED from the proven scope and never read from
@@ -853,7 +837,7 @@ fn resilient<T>(
                     let _ = plugin.restart();
                 }
             }
-            Err(Error::Plugin(error))
+            Err(Error::Plugin(error.to_string()))
         }
     }
 }

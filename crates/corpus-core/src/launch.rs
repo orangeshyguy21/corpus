@@ -666,12 +666,7 @@ fn primary_agent_model(doc: &serde_json::Value) -> Option<String> {
 /// model). This IS an explicit model id; it replaces the old template
 /// default (templates are gone).
 fn registry_default() -> Option<String> {
-    let path = std::env::var("CORPUS_MODELS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("benchmarks/models.yaml"));
-    ModelRegistry::load(&path)
-        .ok()?
-        .launch_default()
+    ModelRegistry::load_default().ok()?.launch_default()
 }
 
 /// First non-empty of two ordered options (primary -> arg).
@@ -851,24 +846,7 @@ pub fn tui_attach_command(session: &str) -> Option<Vec<String>> {
 /// by design, so a reopened app offers these for in-pane attach.
 /// Empty on any failure (no tmux, no server running).
 pub fn live_tui_sessions() -> Vec<String> {
-    let Some(tmux) = resolve_tmux() else {
-        return Vec::new();
-    };
-    let Ok(output) = Command::new(tmux)
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new(); // no server up — no live runs
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|name| name.starts_with("corpus-"))
-        .map(str::to_string)
-        .collect()
+    corpus_observe::live_tui_sessions()
 }
 
 /// The opencode conversation a LIVE tmux session is hosting, discovered
@@ -910,14 +888,7 @@ fn session_stamp(session: &str) -> Option<u64> {
 /// find the log of a run it does NOT own (re-attached after a relaunch)
 /// without a handle. None when the name isn't ours or carries no stamp.
 pub fn session_raw_log(store: &Store, project: &str, session: &str) -> Option<PathBuf> {
-    let ts = session_stamp(session)?;
-    let (agent, _) = session.strip_prefix("corpus-")?.rsplit_once('-')?;
-    Some(
-        store
-            .project_corpus_dir(project)
-            .join(crate::store::RUNS)
-            .join(format!("{ts}-{agent}.raw")),
-    )
+    corpus_observe::session_raw_log(store, project, session)
 }
 
 /// How long a run's TUI has been producing NOTHING, in seconds — the
@@ -934,9 +905,7 @@ pub fn session_raw_log(store: &Store, project: &str, session: &str) -> Option<Pa
 /// printed) or the mtime is unreadable — callers treat that as "not
 /// working" rather than guessing.
 pub fn run_idle_secs(log: &Path) -> Option<u64> {
-    let modified = fs::metadata(log).ok()?.modified().ok()?;
-    // A capture written a hair in the future (clock skew) reads as 0.
-    Some(modified.elapsed().map(|d| d.as_secs()).unwrap_or(0))
+    corpus_observe::run_idle_secs(log)
 }
 
 /// How recently a run's TUI must have painted for the agent to count as
@@ -944,23 +913,11 @@ pub fn run_idle_secs(log: &Path) -> Option<u64> {
 /// stream, tool output), so a live-but-quiet capture for this long means
 /// the turn is over and it's waiting. Long enough to ride out a slow frame,
 /// short enough that the state settles as soon as the answer lands.
-pub const WORKING_WINDOW_SECS: u64 = 3;
+pub use corpus_observe::{MissionActivity, MissionRunState, WORKING_WINDOW_SECS};
 
 /// What a mission is actually doing right now — the signal behind the app's
 /// sidebar dots, and what the curator polls to pace a team. Derived live
 /// from tmux + the raw capture; never persisted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MissionActivity {
-    /// No live session — the mission is not up.
-    Idle,
-    /// The session is live but quiet: the turn is finished and it is
-    /// waiting on the operator (or on a reply). Not work.
-    Waiting,
-    /// The agent is producing right now — streaming, spinning, running
-    /// tools.
-    Working,
-}
-
 /// The pure activity rule, split out so it is testable and SHARED by the
 /// app (which feeds an aged in-memory reading) and the one-shot
 /// `mission_run_state` (which stats the capture fresh): a live session is
@@ -968,21 +925,7 @@ pub enum MissionActivity {
 /// No reading at all (`None`) is NOT evidence of work — it falls through to
 /// `Waiting`, never `Working` (the case that used to pulse forever).
 pub fn activity_from_idle(live: bool, idle_secs: Option<u64>) -> MissionActivity {
-    if !live {
-        return MissionActivity::Idle;
-    }
-    match idle_secs {
-        Some(secs) if secs < WORKING_WINDOW_SECS => MissionActivity::Working,
-        _ => MissionActivity::Waiting,
-    }
-}
-
-/// A mission's live run state: its activity plus how long since its TUI
-/// last painted (`None` = no live capture to read).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MissionRunState {
-    pub activity: MissionActivity,
-    pub idle_secs: Option<u64>,
+    corpus_observe::activity_from_idle(live, idle_secs)
 }
 
 /// Compute a mission's live run state ONE-SHOT — the same answer the app's
@@ -997,20 +940,7 @@ pub fn mission_run_state(
     mission: &crate::store::Mission,
     live: &[String],
 ) -> MissionRunState {
-    let is_live = mission
-        .session
-        .as_deref()
-        .is_some_and(|s| live.iter().any(|l| l == s));
-    let idle_secs = mission
-        .session
-        .as_deref()
-        .filter(|_| is_live)
-        .and_then(|s| session_raw_log(store, project, s))
-        .and_then(|log| run_idle_secs(&log));
-    MissionRunState {
-        activity: activity_from_idle(is_live, idle_secs),
-        idle_secs,
-    }
+    corpus_observe::mission_run_state(store, project, mission, live)
 }
 
 /// Kill a corpus tmux session (Stop for a re-attached run). No-op when
@@ -1462,8 +1392,8 @@ mod tests {
     }
 
     /// Integration test (env-locked): the spawn/stop machinery
-    /// runs against a temp store seeded with the core agent pair,
-    /// exercising the v2 teamless paths.
+    /// runs against a temp store with agents created explicitly by role,
+    /// exercising the teamless paths.
     #[test]
     fn spawn_stop_and_piped_headless() {
         let _guard = env_lock();

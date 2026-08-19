@@ -5,20 +5,40 @@
 //! top of it. See dev/architecture.md and dev/data-model-plan.md for the
 //! design.
 
-mod agents;
-pub mod audit;
-mod error;
-mod findings;
-pub mod frontmatter;
+mod agents {
+    pub use corpus_store::agents::*;
+}
+pub mod audit {
+    pub use corpus_store::audit::*;
+}
+mod error {
+    pub use corpus_store::error::*;
+}
+mod findings {
+    pub use corpus_store::findings::*;
+}
+pub mod frontmatter {
+    pub use corpus_store::frontmatter::*;
+}
 pub mod launch;
-mod models;
-pub mod paths;
+mod models {
+    pub use corpus_observe::models::*;
+}
+pub mod paths {
+    pub use corpus_store::paths::*;
+}
 mod plugin;
-pub mod refusal;
+pub mod refusal {
+    pub use corpus_store::refusal::*;
+}
 mod registry;
-mod sensitivity;
+mod sensitivity {
+    pub use corpus_store::sensitivity::*;
+}
 mod srcrev;
-mod store;
+mod store {
+    pub use corpus_store::store::*;
+}
 #[cfg(test)]
 mod test_support;
 
@@ -41,8 +61,8 @@ pub use models::{
     ModelProviderGroup, ModelRegistry,
 };
 pub use paths::{
-    corpus_mcp_bin, data_root, resource_root, resource_root_opt, sources_dir,
-    store_root, HOME_ENV, RESOURCES_ENV,
+    corpus_admin_mcp_bin, corpus_mcp_bin, data_root, models_manifest, resource_root,
+    resource_root_opt, sources_dir, store_root, HOME_ENV, MODELS_ENV, RESOURCES_ENV,
 };
 pub use plugin::{
     FaucetCall, FaucetResult, OracleInfo, OracleResult, Plugin, PluginManifest, ProbeResult,

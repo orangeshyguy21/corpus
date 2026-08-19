@@ -1,6 +1,6 @@
 //! Step-3 assertion: round-trip through the project corpus (teamless).
 //!
-//! Create a project (seeded with the core agent pair), write a technique +
+//! Create a project, add its agents explicitly, write a technique +
 //! finding via the MCP tools into the project corpus, wipe the corpus
 //! (generation bumps, agents survive), and verify the run_log gate still
 //! holds within the project scope.

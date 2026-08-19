@@ -65,8 +65,9 @@ concept (2026-08-10) so corpus is self-contained: a sandboxed agent, an
 oracle suite, a regtest Lightning faucet, and no external harness
 dependency.
 
-In this repo: Rust workspace (`crates/corpus-core`, `crates/corpus-mcp`
-MCP server, `crates/corpus-cli` with the ratatui TUI), the plugin
+In this repo: Rust workspace (`crates/corpus-core`, the separate research and
+admin MCP servers, the headless `crates/corpus-cli`, and `crates/corpus-app`
+desktop UI), the plugin
 protocol, the reference environment plugin (`plugins/cdk-regtest`),
 and the model registry (`benchmarks/models.yaml`).
 

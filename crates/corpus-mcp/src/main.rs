@@ -8,24 +8,20 @@ use std::io::{BufRead, Write};
 use serde_json::{json, Value};
 
 use corpus_mcp::{
-    admin,
     error::{Error, Result},
-    tools, tools::Ctx,
+    tools,
+    tools::Ctx,
 };
 
 fn main() {
-    // `--admin` selects the corpus-admin profile: the same binary, a second
-    // trust profile. The sandbox-facing profile never enables it.
-    let admin = std::env::args().any(|a| a == "--admin");
-    if let Err(error) = serve(admin) {
+    if let Err(error) = serve() {
         eprintln!("corpus-mcp: fatal: {error}");
         std::process::exit(1);
     }
 }
 
-fn serve(admin: bool) -> Result<()> {
+fn serve() -> Result<()> {
     let mut ctx = Ctx::from_env()?;
-    ctx.admin = admin;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 
@@ -64,17 +60,13 @@ fn serve(admin: bool) -> Result<()> {
             }
             "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
             "tools/list" => {
-                // The sandbox profile advertises only what this run's role
-                // can actually call; the admin profile has no agent
-                // identity and is gated by its own confirm-token rules.
-                let tools = if admin {
-                    admin::catalog()
-                } else {
-                    tools::catalog_for(&ctx.role)
-                };
+                // The research server advertises only what this run's role
+                // can actually call. Host-global administration is a
+                // different artifact (`corpus-admin-mcp`).
+                let tools = tools::catalog_for(&ctx.role);
                 json!({"jsonrpc": "2.0", "id": id, "result": { "tools": tools }})
             }
-            "tools/call" => handle_call(&mut ctx, id, &request, admin),
+            "tools/call" => handle_call(&mut ctx, id, &request),
             other => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -91,7 +83,7 @@ fn serve(admin: bool) -> Result<()> {
 }
 
 /// tools/call dispatch.
-fn handle_call(ctx: &mut Ctx, id: Value, request: &Value, admin: bool) -> Value {
+fn handle_call(ctx: &mut Ctx, id: Value, request: &Value) -> Value {
     let name = request
         .pointer("/params/name")
         .and_then(Value::as_str)
@@ -100,11 +92,7 @@ fn handle_call(ctx: &mut Ctx, id: Value, request: &Value, admin: bool) -> Value 
     let empty = json!({});
     let args = request.pointer("/params/arguments").unwrap_or(&empty);
 
-    let result = if admin {
-        admin::dispatch(ctx, &name, args)
-    } else {
-        tools::dispatch(ctx, &name, args)
-    };
+    let result = tools::dispatch(ctx, &name, args);
     match result {
         Ok(text) => json!({
             "jsonrpc": "2.0",
