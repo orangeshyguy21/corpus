@@ -631,6 +631,9 @@ impl Sidebar {
     // --- create flows (modal windows) ---
 
     fn create_project_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
+        if !self.create_project {
+            return;
+        }
         let mut open = self.create_project;
         let mut done = false;
         theme::dialog(ui.ctx(), "sidebar_new_project", "New project")
@@ -675,6 +678,9 @@ impl Sidebar {
     }
 
     fn new_agent_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
+        if !self.new_agent {
+            return;
+        }
         let mut open = self.new_agent;
         let mut done = false;
         theme::dialog(ui.ctx(), "sidebar_new_agent", "New agent")
@@ -737,6 +743,9 @@ impl Sidebar {
     }
 
     fn clone_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
+        if !self.show_clone {
+            return;
+        }
         let Some(from) = self.clone_from.clone() else {
             self.show_clone = false;
             return;

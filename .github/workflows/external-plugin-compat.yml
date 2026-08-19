@@ -24,8 +24,8 @@ jobs:
           - id: nutshell-regtest
             repo: orangeshyguy21/corpus-plugin-nutshell
             archive: corpus-plugin-nutshell
-            version: 0.3.0
-            sha256: 2ac77e231c447da918f746055482f657617e2b22c562f96c2b9fd946addbc33e
+            version: 0.3.2
+            sha256: 255e4de06d372e5b16ba6e6349a8a8938510cb9af0d6f649d15c0cfbf38814f4
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain

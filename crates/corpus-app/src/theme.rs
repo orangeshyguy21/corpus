@@ -120,12 +120,7 @@ pub const CARD_GUTTER: f32 = 12.0;
 /// Form controls use hard square corners throughout the app. Cards and
 /// conversational surfaces own their shape separately.
 pub const CONTROL_RADIUS: egui::CornerRadius = egui::CornerRadius::ZERO;
-const DIALOG_SHADOW: egui::epaint::Shadow = egui::epaint::Shadow {
-    offset: [0, 10],
-    blur: 40,
-    spread: 6,
-    color: Color32::from_black_alpha(190),
-};
+const DIALOG_SCRIM: Color32 = Color32::from_black_alpha(96);
 
 const DISPLAY_MEDIUM_FAMILY: &str = "display-medium";
 const DISPLAY_BOLD_FAMILY: &str = "display-bold";
@@ -387,12 +382,20 @@ pub fn flat_field_frame() -> egui::Frame {
 }
 
 /// House dialog chrome: the same square smoked card and bracketed title used
-/// by the main views, lifted above the unchanged workspace by its own shadow.
+/// by the main views, above a paint-only full-screen dimming scrim. The scrim
+/// is not an `Area`, so it cannot enter the interaction stack or cover the
+/// foreground dialog (the bug in the first modal-backdrop implementation).
 pub fn dialog(
-    _ctx: &egui::Context,
+    ctx: &egui::Context,
     id_salt: &'static str,
     title: impl Into<String>,
 ) -> egui::Window<'static> {
+    ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new(("dialog_scrim", id_salt)),
+    ))
+    .rect_filled(ctx.screen_rect(), egui::CornerRadius::ZERO, DIALOG_SCRIM);
+
     egui::Window::new(section_heading(title.into()))
         .id(egui::Id::new(("house_dialog", id_salt)))
         .order(egui::Order::Foreground)
@@ -407,7 +410,7 @@ fn dialog_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(1.0_f32, CARD_BORDER))
         .corner_radius(egui::CornerRadius::ZERO)
         .inner_margin(egui::Margin::same(14))
-        .shadow(DIALOG_SHADOW)
+        .shadow(egui::epaint::Shadow::NONE)
 }
 
 /// A phosphor glyph followed by text in ONE laid-out line — needed wherever
@@ -685,13 +688,13 @@ mod tests {
     }
 
     #[test]
-    fn dialogs_use_opaque_square_cards_with_a_real_shadow() {
+    fn dialogs_use_opaque_square_cards_without_a_local_shadow() {
         let frame = dialog_frame();
         assert_eq!(frame.fill, PANEL_RAISED);
         assert_eq!(frame.stroke.color, CARD_BORDER);
         assert_eq!(frame.corner_radius, egui::CornerRadius::ZERO);
-        assert!(frame.shadow.blur > 0);
-        assert!(frame.shadow.color.a() > 0);
+        assert_eq!(frame.shadow, egui::epaint::Shadow::NONE);
+        assert!(DIALOG_SCRIM.a() > 0);
     }
 
     fn linear(channel: u8) -> f32 {
