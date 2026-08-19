@@ -1,0 +1,7 @@
+manifest_version = 1
+id = "v1-echo-plugin"
+version = "0.1.0"
+description = "Protocol v1 lifecycle fixture"
+protocol = "corpus.environment/1"
+exec = "plugin.sh"
+capabilities = ["lifecycle.setup"]

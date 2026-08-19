@@ -65,8 +65,13 @@ pub use paths::{
     resource_root_opt, sources_dir, store_root, HOME_ENV, MODELS_ENV, RESOURCES_ENV,
 };
 pub use plugin::{
-    FaucetCall, FaucetResult, OracleInfo, OracleResult, Plugin, PluginManifest, ProbeResult,
-    SandboxExecResult, SourceInfo,
+    FaucetCall, FaucetResult, HelloResult, LifecycleLine, LifecycleProgress, OperationState,
+    OperationStatus, OracleInfo, OracleResult, Plugin, PluginManifest, ProbeResult, ProtocolError,
+    ProtocolV1Reply, SandboxExecResult, SourceInfo,
+};
+pub use corpus_observe::{
+    EnvironmentDependency, PluginManifestVersion, PluginSource, ENVIRONMENT_PROTOCOL_V1,
+    SUPPORTED_CAPABILITIES,
 };
 pub use agents::{
     infer_role, primary_handles, AgentRole, RoleMigration, CORPUS_TOOLS, CURATOR_TOOLS,

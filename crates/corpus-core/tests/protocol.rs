@@ -10,6 +10,11 @@ fn spawn_echo() -> Plugin {
     Plugin::spawn(&dir).expect("spawn echo plugin")
 }
 
+fn spawn_v1_echo() -> Plugin {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/v1-echo-plugin");
+    Plugin::spawn(&dir).expect("spawn v1 echo plugin")
+}
+
 #[test]
 fn probe_reports_ready() {
     let mut plugin = spawn_echo();
@@ -133,4 +138,135 @@ fn protocol_error_round_trips_as_plugin_error() {
     };
     assert_eq!(name, "echo-plugin");
     assert!(message.contains("unknown method"));
+}
+
+#[test]
+fn v1_hello_negotiates_the_declared_protocol() {
+    let mut plugin = spawn_v1_echo();
+    let hello = plugin.hello().expect("hello");
+    assert_eq!(hello.protocol, corpus_core::ENVIRONMENT_PROTOCOL_V1);
+    assert_eq!(hello.capabilities, vec!["lifecycle.setup"]);
+}
+
+#[test]
+fn v1_hello_refuses_manifest_executable_capability_drift() {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/v1-echo-plugin");
+    let dir = std::env::temp_dir().join(format!(
+        "corpus-v1-hello-drift-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_exec = source.join("plugin.sh");
+    let exec = dir.join("plugin.sh");
+    std::fs::copy(&source_exec, &exec).unwrap();
+    std::fs::set_permissions(&exec, std::fs::metadata(&source_exec).unwrap().permissions()).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        r#"
+manifest_version = 1
+id = "v1-drift"
+protocol = "corpus.environment/1"
+exec = "plugin.sh"
+capabilities = ["sessions"]
+"#,
+    )
+    .unwrap();
+
+    let mut plugin = Plugin::spawn(&dir).unwrap();
+    let error = plugin.hello().unwrap_err().to_string();
+    assert!(error.contains("do not match manifest"), "{error}");
+    drop(plugin);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn v1_setup_streams_progress_then_one_terminal_result() {
+    let mut plugin = spawn_v1_echo();
+    let mut phases = Vec::new();
+    let result = plugin
+        .lifecycle_call(
+            "setup",
+            None,
+            std::time::Duration::from_secs(2),
+            |progress| phases.push(progress.phase.clone()),
+        )
+        .expect("setup");
+    assert_eq!(phases, vec!["dependency_fetch", "verification"]);
+    assert_eq!(result, serde_json::json!({"ready": true}));
+}
+
+#[test]
+fn v1_lifecycle_errors_keep_stable_code_and_retryability() {
+    let mut plugin = spawn_v1_echo();
+    let error = plugin
+        .lifecycle_call(
+            "doctor",
+            None,
+            std::time::Duration::from_secs(2),
+            |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("docker_unavailable"), "{error}");
+    assert!(error.contains("retryable: true"), "{error}");
+}
+
+#[test]
+fn v1_operation_status_makes_retry_decisions_explicit() {
+    let mut plugin = spawn_v1_echo();
+    let status = plugin.operation_status("setup:project:mission:1").unwrap();
+    assert_eq!(status.idempotency_key, "setup:project:mission:1");
+    assert_eq!(status.state, corpus_core::OperationState::Succeeded);
+    assert_eq!(status.result, Some(serde_json::json!({"ready": true})));
+}
+
+#[test]
+fn v1_lifecycle_rejects_a_mismatched_reply_id() {
+    let mut plugin = spawn_v1_echo();
+    let error = plugin
+        .lifecycle_call(
+            "status",
+            None,
+            std::time::Duration::from_secs(2),
+            |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not match request id"), "{error}");
+}
+
+#[test]
+fn v1_lifecycle_cancellation_kills_a_silent_child_promptly() {
+    let mut plugin = spawn_v1_echo();
+    let started = std::time::Instant::now();
+    let error = plugin
+        .lifecycle_call_cancellable(
+            "stop",
+            None,
+            std::time::Duration::from_secs(2),
+            || started.elapsed() >= std::time::Duration::from_millis(50),
+            |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cancelled"), "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn v1_lifecycle_outer_deadline_kills_a_silent_child() {
+    let mut plugin = spawn_v1_echo();
+    let started = std::time::Instant::now();
+    let error = plugin
+        .lifecycle_call(
+            "stop",
+            None,
+            std::time::Duration::from_millis(50),
+            |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("timed out"), "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }

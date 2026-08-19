@@ -4,50 +4,21 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Deserialize;
 
 use crate::error::Error;
-use crate::plugin::{Plugin, PluginManifest, ProbeResult};
+use crate::plugin::{Plugin, ProbeResult};
 use crate::store::Store;
-
-/// A discovered plugin directory with a valid manifest.
-#[derive(Debug, Clone)]
-pub struct PluginDir {
-    /// Directory containing the plugin.
-    pub dir: PathBuf,
-    /// Parsed manifest.
-    pub manifest: PluginManifest,
-}
+pub use corpus_observe::PluginDir;
 
 pub use corpus_store::paths::plugins_dir;
 
 /// Discover all plugins under a directory (invalid entries are skipped
 /// with a warning on stderr, so one bad plugin can't break the registry).
 pub fn discover(dir: &Path) -> Result<Vec<PluginDir>, Error> {
-    let mut found = Vec::new();
-    if !dir.is_dir() {
-        return Ok(found);
-    }
-    let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    entries.sort();
-    for entry in entries {
-        match PluginManifest::load(&entry) {
-            Ok(manifest) => found.push(PluginDir {
-                dir: entry,
-                manifest,
-            }),
-            Err(error) => {
-                eprintln!("corpus: skipping {}: {error}", entry.display());
-            }
-        }
-    }
-    Ok(found)
+    corpus_observe::discover_plugins(dir)
 }
 
 /// A discovered plugin plus its live probe status — the aggregation the

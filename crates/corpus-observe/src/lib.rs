@@ -6,6 +6,7 @@
 //! call an oracle, or touch a sandbox.
 
 pub mod models;
+pub mod plugins;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,10 @@ use corpus_store::{Error, Mission, Store};
 pub use models::{
     model_list, ollama_models, ollama_models_refresh, ModelEntry, ModelList, ModelOption,
     ModelProviderGroup, ModelRegistry,
+};
+pub use plugins::{
+    discover_plugins, plugin_by_name, EnvironmentDependency, PluginDir, PluginManifest,
+    PluginManifestVersion, PluginSource, ENVIRONMENT_PROTOCOL_V1, SUPPORTED_CAPABILITIES,
 };
 
 pub const WORKING_WINDOW_SECS: u64 = 3;
@@ -115,25 +120,10 @@ pub fn run_idle_secs(log: &Path) -> Option<u64> {
 /// Installed plugin names from manifests only. No plugin process is started.
 pub fn plugin_names() -> Result<Vec<String>, Error> {
     let root = corpus_store::paths::plugins_dir();
-    let mut names = Vec::new();
-    if !root.is_dir() {
-        return Ok(names);
-    }
-    for entry in fs::read_dir(root)? {
-        let path = entry?.path().join("plugin.toml");
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
-            continue;
-        };
-        if let Some(name) = value.get("name").and_then(toml::Value::as_str) {
-            names.push(name.to_string());
-        }
-    }
+    let mut names: Vec<String> = discover_plugins(&root)?
+        .into_iter()
+        .map(|plugin| plugin.manifest.name)
+        .collect();
     names.sort();
     names.dedup();
     Ok(names)
@@ -148,7 +138,9 @@ pub fn validate_pin(store: &Store, project: &str, source: &str, rev: &str) -> Re
         return Err(Error::Store(format!("pin {source}: rev is empty")));
     }
     let project = corpus_store::Project::load(store, project)?;
-    let Some(plugin_dir) = plugin_dir_by_name(&project.plugin)? else {
+    let Some(plugin_dir) = plugin_by_name(&corpus_store::paths::plugins_dir(), &project.plugin)?
+        .map(|plugin| plugin.dir)
+    else {
         return Ok(());
     };
     let config = match fs::read_to_string(plugin_dir.join("config.toml")) {
@@ -192,27 +184,6 @@ pub fn validate_pin(store: &Store, project: &str, source: &str, rev: &str) -> Re
             known.join(", ")
         )))
     }
-}
-
-fn plugin_dir_by_name(name: &str) -> Result<Option<PathBuf>, Error> {
-    let root = corpus_store::paths::plugins_dir();
-    if !root.is_dir() {
-        return Ok(None);
-    }
-    for entry in fs::read_dir(root)? {
-        let dir = entry?.path();
-        let manifest = dir.join("plugin.toml");
-        let Ok(raw) = fs::read_to_string(&manifest) else {
-            continue;
-        };
-        let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
-            continue;
-        };
-        if value.get("name").and_then(toml::Value::as_str) == Some(name) {
-            return Ok(Some(dir));
-        }
-    }
-    Ok(None)
 }
 
 fn source_manifest_tag(path: &Path, source: &str) -> Option<String> {
