@@ -15,8 +15,17 @@ while IFS= read -r line; do
       fi ;;
     session_probe) printf '{"id":%s,"ok":true,"result":{"ready":true}}\n' "$id" ;;
     sandbox_exec) printf '{"id":%s,"ok":true,"result":{"output":"fixture sandbox","exit_code":0}}\n' "$id" ;;
-    faucet) printf '{"id":%s,"ok":true,"result":{"text":"fixture faucet","paid_sats":null}}\n' "$id" ;;
-    wallet_fund) printf '{"id":%s,"ok":true,"result":{"funded":true,"amount_sat":10}}\n' "$id" ;;
+    faucet)
+      key="$(jq -r '.params.call.idempotency_key // ""' <<<"$line")"
+      if [[ "$key" == "pay-replay" ]]; then
+        printf '{"id":%s,"ok":true,"result":{"text":"fixture faucet","paid_sats":null,"payment_hash":"abc","amount_sat":7,"status":"replayed","idempotent_replay":true}}\n' "$id"
+      else
+        printf '{"id":%s,"ok":true,"result":{"text":"fixture faucet","paid_sats":7,"payment_hash":"abc","amount_sat":7,"status":"succeeded","idempotent_replay":false}}\n' "$id"
+      fi ;;
+    wallet_fund)
+      key="$(jq -r '.params.idempotency_key // ""' <<<"$line")"
+      charged=10; [[ "$key" == "fund-replay" ]] && charged=0
+      printf '{"id":%s,"ok":true,"result":{"funded":true,"amount_sat":10,"charged_sats":%s}}\n' "$id" "$charged" ;;
     oracles) printf '{"id":%s,"ok":true,"result":[{"name":"fixture-invariant","description":"fixture"}]}\n' "$id" ;;
     call_oracle) printf '{"id":%s,"ok":true,"result":{"verdict":"hold","log":"fixture holds"}}\n' "$id" ;;
     *) printf '{"id":%s,"ok":false,"error":{"code":"unknown_method","message":"unknown","retryable":false}}\n' "$id" ;;

@@ -69,8 +69,40 @@ fn generic_tools_forward_the_durable_v1_session_and_typed_description() {
             .unwrap()
             .contains("fixture sandbox")
     );
-    let funded = tools::dispatch(&mut ctx, "wallet_fund", &json!({"amount_sat":10})).unwrap();
+    let funded = tools::dispatch(
+        &mut ctx,
+        "wallet_fund",
+        &json!({"amount_sat":10,"idempotency_key":"fund-1"}),
+    )
+    .unwrap();
     assert!(funded.contains("\"funded\": true"), "{funded}");
+    assert_eq!(ctx.faucet_spent_sats, 10);
+
+    let paid = tools::dispatch(
+        &mut ctx,
+        "faucet",
+        &json!({"op":"pay","invoice":"lnbcrt-fixture","idempotency_key":"pay-first"}),
+    )
+    .unwrap();
+    assert!(paid.contains("Payment succeeded (7 sat"), "{paid}");
+    assert_eq!(ctx.faucet_spent_sats, 17);
+
+    let replay = tools::dispatch(
+        &mut ctx,
+        "faucet",
+        &json!({"op":"pay","invoice":"lnbcrt-fixture","idempotency_key":"pay-replay"}),
+    )
+    .unwrap();
+    assert!(replay.contains("no additional session charge"), "{replay}");
+    assert_eq!(ctx.faucet_spent_sats, 17);
+
+    tools::dispatch(
+        &mut ctx,
+        "wallet_fund",
+        &json!({"amount_sat":10,"idempotency_key":"fund-replay"}),
+    )
+    .unwrap();
+    assert_eq!(ctx.faucet_spent_sats, 17);
     let _ = std::fs::remove_dir_all(root);
 }
 

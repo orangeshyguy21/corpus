@@ -386,7 +386,8 @@ pub fn catalog() -> Value {
                     "op": {"type": "string", "enum": ["pay", "invoice", "balance"]},
                     "invoice": {"type": "string"},
                     "amount_sat": {"type": "integer"},
-                    "memo": {"type": "string"}
+                    "memo": {"type": "string"},
+                    "idempotency_key": {"type": "string", "description": "required for pay/invoice; reuse exactly when retrying the same intended mutation"}
                 },
                 "required": ["op"]
             }
@@ -399,9 +400,10 @@ pub fn catalog() -> Value {
                 "properties": {
                     "work_dir": {"type": "string", "description": "optional plugin-defined sandbox wallet directory"},
                     "amount_sat": {"type": "integer"},
-                    "target_id": {"type": "string", "description": "typed target id returned by target_info; omit for the plugin default"}
+                    "target_id": {"type": "string", "description": "typed target id returned by target_info; omit for the plugin default"},
+                    "idempotency_key": {"type": "string", "description": "unique per intended funding; reuse exactly on retry"}
                 },
-                "required": ["amount_sat"]
+                "required": ["amount_sat", "idempotency_key"]
             }
         },
         {
@@ -1036,10 +1038,18 @@ fn oracle_run(ctx: &mut Ctx, name: &str) -> Result<String> {
 
 fn faucet(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let op = require_str(args, "op")?;
+    let idempotency_key = match op.as_str() {
+        "pay" | "invoice" => Some(require_str(args, "idempotency_key")?),
+        _ => args
+            .get("idempotency_key")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
     let call = FaucetCall {
         invoice: args.get("invoice").and_then(Value::as_str).map(str::to_string),
         amount_sat: args.get("amount_sat").and_then(Value::as_u64),
         memo: args.get("memo").and_then(Value::as_str).map(str::to_string),
+        idempotency_key,
     };
     match op.as_str() {
         "pay" => {
@@ -1067,10 +1077,18 @@ fn faucet(ctx: &mut Ctx, args: &Value) -> Result<String> {
         resilient(ctx, |p| p.faucet(&op, &call))?
     };
     if let Some(paid) = result.paid_sats {
-        ctx.faucet_spent_sats += paid;
+        ctx.faucet_spent_sats = ctx.faucet_spent_sats.saturating_add(paid);
         return Ok(format!(
-            "Payment succeeded ({paid} sat). Session spend: {} sat.",
+            "Payment succeeded ({paid} sat, hash {}). Session spend: {} sat.",
+            result.payment_hash.as_deref().unwrap_or("unreported"),
             ctx.faucet_spent_sats
+        ));
+    }
+    if result.idempotent_replay {
+        return Ok(format!(
+            "Payment already succeeded ({} sat, hash {}); no additional session charge.",
+            result.amount_sat.unwrap_or_default(),
+            result.payment_hash.as_deref().unwrap_or("unreported")
         ));
     }
     if op == "invoice" {
@@ -1085,6 +1103,7 @@ fn faucet(ctx: &mut Ctx, args: &Value) -> Result<String> {
 /// claim mechanics and output parsing are environment implementation details.
 fn wallet_fund(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let amount = require_u64(args, "amount_sat")?;
+    let _idempotency_key = require_str(args, "idempotency_key")?;
     if ctx.faucet_spent_sats.saturating_add(amount) > ctx.faucet_budget_sats {
         return Ok(format!(
             "[faucet refused] session budget of {} sat exhausted",
@@ -1098,9 +1117,17 @@ fn wallet_fund(ctx: &mut Ctx, args: &Value) -> Result<String> {
     {
         let (_, params) = v1_call_params(ctx, args.clone())?;
         let result = resilient(ctx, |plugin| plugin.call_v1("wallet_fund", Some(params)))?;
-        if result.get("funded").and_then(Value::as_bool) == Some(true) {
-            ctx.faucet_spent_sats = ctx.faucet_spent_sats.saturating_add(amount);
-        }
+        let charged = result
+            .get("charged_sats")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                if result.get("funded").and_then(Value::as_bool) == Some(true) {
+                    amount
+                } else {
+                    0
+                }
+            });
+        ctx.faucet_spent_sats = ctx.faucet_spent_sats.saturating_add(charged);
         return Ok(serde_json::to_string_pretty(&result)?);
     }
     let params = args.as_object().cloned().unwrap_or_default();

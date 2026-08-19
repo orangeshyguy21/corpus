@@ -384,7 +384,10 @@ fn researcher_role_is_refused_execution_and_publication_tools() {
         ("sandbox_exec", json!({"command": "echo hi"})),
         ("oracle_run", json!({"name": "double-spend"})),
         ("faucet", json!({"op": "balance"})),
-        ("wallet_fund", json!({"work_dir": "/tmp/w", "amount_sat": 10})),
+        (
+            "wallet_fund",
+            json!({"work_dir": "/tmp/w", "amount_sat": 10, "idempotency_key": "fund-1"}),
+        ),
         ("attack_save", json!({"name": "a", "description": "d", "script": "s"})),
         (
             "finding_write",

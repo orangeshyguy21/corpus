@@ -102,6 +102,18 @@ pub struct FaucetResult {
     /// Sats paid by this op, if it was a successful payment.
     #[serde(default)]
     pub paid_sats: Option<u64>,
+    /// Invoice/payment identity, when the operation has one.
+    #[serde(default)]
+    pub payment_hash: Option<String>,
+    /// The invoice amount even when this reply is an idempotent replay.
+    #[serde(default)]
+    pub amount_sat: Option<u64>,
+    /// Stable implementation status (`created`, `succeeded`, `replayed`).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// True when no new mutation or budget charge occurred.
+    #[serde(default)]
+    pub idempotent_replay: bool,
 }
 
 /// Parameters for `faucet`: op is required, the rest are op-dependent.
@@ -113,6 +125,8 @@ pub struct FaucetCall {
     pub amount_sat: Option<u64>,
     /// Optional memo (`invoice`).
     pub memo: Option<String>,
+    /// Caller-owned retry identity. Required by mutating v1 faucet operations.
+    pub idempotency_key: Option<String>,
 }
 
 /// Successful `hello` result for protocol v1.
