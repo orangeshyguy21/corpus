@@ -55,6 +55,13 @@ fn generic_tools_forward_the_durable_v1_session_and_typed_description() {
         json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
     )]));
 
+    // A v1 target may still be starting when the MCP process takes its
+    // startup snapshot. The closed gate must recover through the scoped
+    // session probe, never the legacy unscoped `probe` method.
+    ctx.probe_ready = false;
+    ctx.probe_notes = "target is still starting".into();
+    ctx.last_probe = std::time::Instant::now() - std::time::Duration::from_secs(6);
+
     let info: serde_json::Value =
         serde_json::from_str(&tools::dispatch(&mut ctx, "target_info", &json!({})).unwrap())
             .unwrap();

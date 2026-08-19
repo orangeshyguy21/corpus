@@ -13,7 +13,13 @@ while IFS= read -r line; do
       else
         printf '{"id":%s,"ok":true,"result":{"targets":[{"id":"target","kind":"fixture-service","url":"http://target:8080","source_id":"target","source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"tools":[{"id":"fixture-cli","description":"fixture tool","path":"/opt/tools/fixture"}],"limits":{"max_payment_sats":100},"provenance":{"image_digest":"sha256:fixture"}}}\n' "$id"
       fi ;;
-    session_probe) printf '{"id":%s,"ok":true,"result":{"ready":true}}\n' "$id" ;;
+    session_probe)
+      state_dir="$(jq -r '.params.state_dir // ""' <<<"$line")"
+      if [[ "$state_dir" = /* ]]; then
+        printf '{"id":%s,"ok":true,"result":{"ready":true}}\n' "$id"
+      else
+        printf '{"id":%s,"ok":false,"error":{"code":"missing_context","message":"session probe needs absolute state_dir","retryable":false}}\n' "$id"
+      fi ;;
     sandbox_exec) printf '{"id":%s,"ok":true,"result":{"output":"fixture sandbox","exit_code":0}}\n' "$id" ;;
     faucet)
       key="$(jq -r '.params.call.idempotency_key // ""' <<<"$line")"

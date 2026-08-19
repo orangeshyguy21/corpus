@@ -195,8 +195,38 @@ impl Ctx {
                                 "environment session record does not match project, ready state, or selected plugin bytes".into(),
                             ));
                         }
+                        let plugin_id = plugin.manifest().name.clone();
+                        let state_dir = store
+                            .plugin_runtime_dir(&plugin_id)?
+                            .join("state")
+                            .join(session);
+                        let source_cache = store.source_cache_dir();
+                        let sources: Vec<Value> = plugin
+                            .manifest()
+                            .sources
+                            .iter()
+                            .filter_map(|source| {
+                                record.source_shas.get(&source.id).map(|sha| {
+                                    json!({
+                                        "id": source.id,
+                                        "sha": sha,
+                                        "host_path": source_cache.join(&source.id).join(sha),
+                                        "mount": source.mount,
+                                    })
+                                })
+                            })
+                            .collect();
+                        let params = json!({
+                            "session_id": session,
+                            "state_dir": state_dir,
+                            "source_cache": source_cache,
+                            "sources": sources,
+                            "project": record.id.project,
+                            "mission": record.id.mission,
+                            "run": record.id.generation,
+                        });
                         plugin.hello()?;
-                        plugin.session_probe_v1(session)
+                        plugin.call_v1("session_probe", Some(params))
                     });
                 match result {
                     Ok(value) => ProbeResult {
@@ -868,7 +898,41 @@ fn dispatch_inner(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     // refusing: a closed gate must heal itself.
     if !ctx.probe_ready && ctx.last_probe.elapsed() >= REPROBE_INTERVAL {
         ctx.last_probe = std::time::Instant::now();
-        match resilient(ctx, |p| p.probe()) {
+        let v1 = ctx.plugin.as_ref().is_some_and(|plugin| {
+            plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1
+        });
+        let reprobe = if v1 {
+            match v1_call_params(ctx, json!({})) {
+                Ok((_, params)) => resilient(ctx, |plugin| {
+                    plugin.hello()?;
+                    plugin
+                        .call_v1("session_probe", Some(params))
+                        .map(|value| ProbeResult {
+                            ready: value
+                                .get("ready")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            notes: value
+                                .get("notes")
+                                .and_then(Value::as_str)
+                                .unwrap_or("session probed")
+                                .to_string(),
+                            running_version: value
+                                .get("running_version")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            expected_tag: value
+                                .get("expected_tag")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        })
+                }),
+                Err(error) => Err(error),
+            }
+        } else {
+            resilient(ctx, |plugin| plugin.probe())
+        };
+        match reprobe {
             Ok(probe) => {
                 ctx.probe_ready = probe.ready;
                 ctx.probe_notes = probe.notes;
