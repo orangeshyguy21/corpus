@@ -30,6 +30,11 @@ corpus — local-first vulnerability research platform
                                degrades to a piped spawn (no attach).
                                Transcript: project corpus runs/.
   corpus plugin list           List discovered environment plugins
+  corpus plugin install <dir>  Atomically install and select a local v1 bundle
+  corpus plugin select <id> <version>
+                               Select an installed version (upgrade/rollback)
+  corpus plugin setup|doctor|status|stop <id>
+                               Manage plugin readiness and shared resources
   corpus plugin probe <name>   Probe one plugin (environment health)
   corpus plugin call <name> <method> [params-json]
                                Raw protocol call (debugging)
@@ -74,10 +79,9 @@ Environment:
                                run dirs, chat scopes, app prefs
   CORPUS_STORE                 Store root (default: <CORPUS_HOME>/store).
                                Moves run dirs and chat scopes with it.
-  CORPUS_RESOURCES             Install root: the directory holding plugins/
-                               and sources.toml (default: found from the
-                               running executable)
-  CORPUS_PLUGINS_DIR           Plugins directory (default: <CORPUS_RESOURCES>/plugins)
+  CORPUS_RESOURCES             Shipped resource root (default: found from the executable)
+  CORPUS_PLUGINS_DIR           Complete development/test catalog override
+  CORPUS_SOURCES_DIR           Pinned-source cache override
   CORPUS_MODELS                models.yaml override (default:
                                <CORPUS_RESOURCES>/benchmarks/models.yaml)
   CORPUS_PROJECT               Write scope. NO DEFAULT — every command that
@@ -120,7 +124,8 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod usage_tests {
-    use super::usage;
+    use super::{effective_headless_pins, usage};
+    use std::collections::BTreeMap;
 
     #[test]
     fn bare_cli_help_documents_headless_surface_only() {
@@ -128,6 +133,32 @@ mod usage_tests {
         assert!(help.contains("corpus run <agent>"));
         assert!(help.contains("corpus plugin probe <name>"));
         assert!(!help.contains("corpus [tui]"));
+    }
+
+    #[test]
+    fn headless_run_fills_manifest_defaults_without_overwriting_project_pins() {
+        let selected = BTreeMap::from([("nutshell".into(), "custom".into())]);
+        let sources = vec![
+            corpus_core::SourceRevs {
+                name: "nutshell".into(),
+                pinned: "0.20.3".into(),
+                revs: vec!["main".into(), "0.20.3".into()],
+                refs_fetched: None,
+            },
+            corpus_core::SourceRevs {
+                name: "nuts".into(),
+                pinned: "main".into(),
+                revs: vec!["main".into()],
+                refs_fetched: None,
+            },
+        ];
+        assert_eq!(
+            effective_headless_pins(selected, sources),
+            BTreeMap::from([
+                ("nutshell".into(), "custom".into()),
+                ("nuts".into(), "main".into()),
+            ])
+        );
     }
 }
 
@@ -175,7 +206,9 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
 
     // Check the agent exists on the project.
     if store.load_agent(&scope.project, &agent).is_err() {
-        let agents = store.list_agents(&scope.project).map_err(|e| e.to_string())?;
+        let agents = store
+            .list_agents(&scope.project)
+            .map_err(|e| e.to_string())?;
         let have: Vec<String> = agents.iter().map(|(s, _)| s.clone()).collect();
         return Err(format!(
             "project {} has no agent named {:?} (agents: {})",
@@ -187,28 +220,59 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
 
     // Materialize the project's agents (clear + render to .opencode/agent/):
     // the agent list opencode shows is scoped to the project.
-    let written = store.render_project_agents(&scope.project)
+    let written = store
+        .render_project_agents(&scope.project)
         .map_err(|e| e.to_string())?;
     for path in &written {
         println!("materialized {}", path.display());
     }
 
-    let mut session = corpus_core::RunSession::spawn_headless(
-        &scope.project,
-        &agent,
-        model.as_deref(),
-        &mission,
-    )
-    .map_err(|e| e.to_string())?;
-    println!("logging to {}", session.transcript.display());
-    let status = drain_session(&mut session)?;
-    if !status.success() {
-        return Err(format!("opencode exited with {status}"));
-    }
+    let project_record =
+        corpus_core::Project::load(&store, &scope.project).map_err(|error| error.to_string())?;
+    // The app stamps every visible source selection into a mission. The
+    // headless command has no mission record, so fill only missing entries
+    // from the plugin manifest defaults; an empty project pin map must not
+    // open a v1 session with no source trees.
+    let sources =
+        corpus_core::plugin_sources(&store, &scope.project).map_err(|error| error.to_string())?;
+    let pins = effective_headless_pins(project_record.pins.clone(), sources);
+    let resolved = corpus_core::prepare_source_pins(&store, &scope.project, &pins)
+        .map_err(|error| error.to_string())?;
+    let pins_json = (!resolved.is_empty())
+        .then(|| serde_json::to_string(&resolved))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let environment_id = corpus_core::EnvironmentSessionId {
+        project: scope.project.clone(),
+        mission: format!("headless-{stamp}"),
+        generation: stamp,
+    };
+    let mut environment = corpus_core::open_environment_session(&store, environment_id, resolved)
+        .map_err(|error| error.to_string())?;
+    let environment_key = environment.as_ref().map(|record| record.id.storage_key());
+    let run_result = (|| {
+        let mut session = corpus_core::RunSession::spawn_headless_with_environment(
+            &scope.project,
+            &agent,
+            model.as_deref(),
+            &mission,
+            pins_json.as_deref(),
+            environment_key.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
+        println!("logging to {}", session.transcript.display());
+        let status = drain_session(&mut session)?;
+        if !status.success() {
+            return Err(format!("opencode exited with {status}"));
+        }
 
-    if research {
-        let prompt = format!(
-            "Read the operator run transcript at {}. Curate and distill it \
+        if research {
+            let prompt = format!(
+                "Read the operator run transcript at {}. Curate and distill it \
              into the corpus: (1) technique card(s) under the project corpus \
              techniques/ for every attack surface analyzed or attempted — \
              mechanics, preconditions, the oracle that would catch it, and \
@@ -220,33 +284,59 @@ fn run_cmd(args: &[String]) -> Result<(), String> {
              under the project corpus hypotheses/ (target surface, rationale, \
              suggested mission text, source citations). Remember the \
              contamination rule: never read benchmarks/** or plugins/**.",
-            session.transcript.display()
-        );
-        println!("researching {} ...", session.transcript.display());
-        let mut log = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&session.transcript)
+                session.transcript.display()
+            );
+            println!("researching {} ...", session.transcript.display());
+            let mut log = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&session.transcript)
+                .map_err(|e| e.to_string())?;
+            log.write_all(b"\n\n# --- researcher pass ---\n\n")
+                .map_err(|e| e.to_string())?;
+            drop(log);
+            // Materialize the researcher agent for the follow-up.
+            let _ = store
+                .render_agent(&scope.project, "researcher")
+                .map_err(|e| e.to_string())?;
+            let mut session = corpus_core::RunSession::spawn_headless_append_with_environment(
+                &scope.project,
+                "researcher",
+                model.as_deref(),
+                &prompt,
+                &session.transcript,
+                pins_json.as_deref(),
+                environment_key.as_deref(),
+            )
             .map_err(|e| e.to_string())?;
-        log.write_all(b"\n\n# --- researcher pass ---\n\n")
-            .map_err(|e| e.to_string())?;
-        drop(log);
-        // Materialize the researcher agent for the follow-up.
-        let _ = store.render_agent(&scope.project, "researcher")
-            .map_err(|e| e.to_string())?;
-        let mut session = corpus_core::RunSession::spawn_headless_append(
-            &scope.project,
-            "researcher",
-            model.as_deref(),
-            &prompt,
-            &session.transcript,
-        )
-        .map_err(|e| e.to_string())?;
-        let status = drain_session(&mut session)?;
-        if !status.success() {
-            return Err(format!("researcher exited with {status}"));
+            let status = drain_session(&mut session)?;
+            if !status.success() {
+                return Err(format!("researcher exited with {status}"));
+            }
+        }
+        Ok(())
+    })();
+    let close_result = environment.as_mut().map(|environment| {
+        corpus_core::close_environment_session(&store, environment)
+            .map_err(|error| error.to_string())
+    });
+    match (run_result, close_result) {
+        (Ok(()), None | Some(Ok(()))) => Ok(()),
+        (Ok(()), Some(Err(cleanup))) => Err(cleanup),
+        (Err(run), None | Some(Ok(()))) => Err(run),
+        (Err(run), Some(Err(cleanup))) => {
+            Err(format!("{run}; environment cleanup also failed: {cleanup}"))
         }
     }
-    Ok(())
+}
+
+fn effective_headless_pins(
+    mut selected: std::collections::BTreeMap<String, String>,
+    sources: Vec<corpus_core::SourceRevs>,
+) -> std::collections::BTreeMap<String, String> {
+    for source in sources {
+        selected.entry(source.name).or_insert(source.pinned);
+    }
+    selected
 }
 
 /// Pump a session's lines to the terminal until it exits, then flush
@@ -279,29 +369,108 @@ fn drain_session(
 
 /// `corpus plugin ...` subcommands.
 fn plugin_cmd(args: &[String]) -> Result<(), String> {
-    let dir = plugins_dir();
-    let plugins = discover(&dir).map_err(|e| e.to_string())?;
+    let plugins = corpus_core::plugin_catalog().map_err(|e| e.to_string())?;
     match args.first().map(String::as_str) {
         Some("list") => {
             for plugin in &plugins {
+                let origin = match plugin.origin {
+                    corpus_core::PluginOrigin::Direct => "override",
+                    corpus_core::PluginOrigin::Installed => "installed",
+                };
                 println!(
-                    "{:<20} {:<8} {}",
+                    "{:<20} {:<8} {:<9} {}\n  {}",
                     plugin.manifest.name,
                     plugin.manifest.version.as_deref().unwrap_or("-"),
+                    origin,
+                    plugin.dir.display(),
                     plugin.manifest.description.as_deref().unwrap_or("")
                 );
             }
             if plugins.is_empty() {
-                println!("no plugins found in {}", dir.display());
+                println!(
+                    "no plugins found (install root: {})",
+                    corpus_core::plugin_install_root().display()
+                );
             }
+            Ok(())
+        }
+        Some("install") => {
+            let bundle = args
+                .get(1)
+                .ok_or("usage: corpus plugin install <bundle-dir>")?;
+            let receipt = corpus_core::install_plugin_bundle(std::path::Path::new(bundle))
+                .map_err(|error| error.to_string())?;
+            println!(
+                "installed {}@{}\ndigest: {}\npath: {}\nprevious: {}",
+                receipt.id,
+                receipt.version,
+                receipt.digest,
+                receipt.path.display(),
+                receipt.previous.as_deref().unwrap_or("none")
+            );
+            Ok(())
+        }
+        Some("select") => {
+            let id = args
+                .get(1)
+                .ok_or("usage: corpus plugin select <id> <version>")?;
+            let version = args
+                .get(2)
+                .ok_or("usage: corpus plugin select <id> <version>")?;
+            corpus_core::select_plugin_version(id, version).map_err(|error| error.to_string())?;
+            println!("selected {id}@{version}");
+            Ok(())
+        }
+        Some(method @ ("setup" | "doctor" | "status" | "stop")) => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| format!("usage: corpus plugin {method} <id>"))?;
+            let plugin_dir = find(&plugins, name)?;
+            let deadline = if method == "setup" {
+                std::time::Duration::from_secs(30 * 60)
+            } else {
+                std::time::Duration::from_secs(120)
+            };
+            let result = corpus_core::call_plugin_lifecycle_cancellable(
+                plugin_dir,
+                method,
+                deadline,
+                || false,
+                |progress| {
+                    eprintln!("[{}] {}", progress.phase, progress.message);
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?
+            );
             Ok(())
         }
         Some("probe") => {
             let name = args.get(1).ok_or("usage: corpus plugin probe <name>")?;
             let plugin_dir = find(&plugins, name)?;
             let mut plugin = Plugin::spawn(&plugin_dir.dir).map_err(|e| e.to_string())?;
-            let result = plugin.probe().map_err(|e| e.to_string())?;
-            println!("ready: {}\nnotes: {}", result.ready, result.notes);
+            if plugin_dir.manifest.manifest_version == corpus_core::PluginManifestVersion::V1 {
+                plugin.hello().map_err(|error| error.to_string())?;
+                let params = corpus_core::plugin_lifecycle_params(plugin_dir)
+                    .map_err(|error| error.to_string())?;
+                let result = plugin
+                    .lifecycle_call(
+                        "status",
+                        Some(params),
+                        std::time::Duration::from_secs(10),
+                        |_| {},
+                    )
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?
+                );
+            } else {
+                let result = plugin.probe().map_err(|e| e.to_string())?;
+                println!("ready: {}\nnotes: {}", result.ready, result.notes);
+            }
             Ok(())
         }
         Some("call") => {
@@ -319,14 +488,23 @@ fn plugin_cmd(args: &[String]) -> Result<(), String> {
             };
             let plugin_dir = find(&plugins, name)?;
             let mut plugin = Plugin::spawn(&plugin_dir.dir).map_err(|e| e.to_string())?;
-            let result = plugin.call(method, params).map_err(|e| e.to_string())?;
+            let result =
+                if plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1 {
+                    plugin.call_v1(method, params)
+                } else {
+                    plugin.call(method, params)
+                }
+                .map_err(|e| e.to_string())?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
             );
             Ok(())
         }
-        _ => Err("usage: corpus plugin list|probe|call ...".to_string()),
+        _ => Err(
+            "usage: corpus plugin list|install|select|setup|doctor|status|stop|probe|call ..."
+                .to_string(),
+        ),
     }
 }
 
@@ -361,10 +539,10 @@ fn find<'a>(
     plugins: &'a [corpus_core::PluginDir],
     name: &str,
 ) -> Result<&'a corpus_core::PluginDir, String> {
-    plugins
+    let plugin = plugins
         .iter()
         .find(|p| p.manifest.name == name)
-        .ok_or_else(|| format!("plugin not found: {name}"))
+        .ok_or_else(|| format!("plugin not found: {name}"))?;
+    corpus_core::verify_plugin_installation(plugin).map_err(|error| error.to_string())?;
+    Ok(plugin)
 }
-
-use corpus_core::{discover, plugins_dir};

@@ -1,0 +1,13 @@
+manifest_version = 1
+id = "v1-session-fixture-alt"
+version = "1.0.0"
+protocol = "corpus.environment/1"
+exec = "plugin"
+capabilities = ["sessions", "sandbox.exec"]
+
+[[sources]]
+id = "service"
+repo = "fixture/service"
+default_rev = "v2"
+default_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+mount = "/srv/source"

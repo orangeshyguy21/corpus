@@ -12,8 +12,6 @@
 //! are therefore trusted code; the protocol's job is not sandboxing but a
 //! stable, language-agnostic contract — a plugin can be a bash script.
 
-use std::collections::HashMap;
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -23,34 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::Error;
-
-/// Plugin manifest (`plugin.toml` inside a plugin directory).
-#[derive(Debug, Clone, Deserialize)]
-pub struct PluginManifest {
-    /// Plugin name (unique within the registry).
-    pub name: String,
-    /// Plugin version.
-    pub version: Option<String>,
-    /// Human-readable description.
-    pub description: Option<String>,
-    /// Executable entry point, relative to the manifest's directory.
-    pub exec: String,
-    /// Environment variables passed to the plugin process.
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-}
-
-impl PluginManifest {
-    /// Load a manifest from a plugin directory.
-    pub fn load(dir: &Path) -> Result<Self, Error> {
-        let path = dir.join("plugin.toml");
-        let raw =
-            fs::read_to_string(&path).map_err(|e| Error::Manifest(path.clone(), e.to_string()))?;
-        let manifest: Self =
-            toml::from_str(&raw).map_err(|e| Error::Manifest(path.clone(), e.to_string()))?;
-        Ok(manifest)
-    }
-}
+pub use corpus_observe::PluginManifest;
 
 /// Result of a `probe` call: is the environment usable right now?
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,8 +39,8 @@ pub struct ProbeResult {
     /// deserializes.
     #[serde(default)]
     pub running_version: Option<String>,
-    /// The rev name the manifest EXPECTS to be running (the `sources.toml`
-    /// tag), for a "runs X, pins Y" readout without re-reading the manifest.
+    /// The rev name the plugin manifest expects to be running, for a "runs X,
+    /// pins Y" readout without re-reading the manifest.
     /// `None` when the plugin does not report one.
     #[serde(default)]
     pub expected_tag: Option<String>,
@@ -131,10 +102,22 @@ pub struct FaucetResult {
     /// Sats paid by this op, if it was a successful payment.
     #[serde(default)]
     pub paid_sats: Option<u64>,
+    /// Invoice/payment identity, when the operation has one.
+    #[serde(default)]
+    pub payment_hash: Option<String>,
+    /// The invoice amount even when this reply is an idempotent replay.
+    #[serde(default)]
+    pub amount_sat: Option<u64>,
+    /// Stable implementation status (`created`, `succeeded`, `replayed`).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// True when no new mutation or budget charge occurred.
+    #[serde(default)]
+    pub idempotent_replay: bool,
 }
 
 /// Parameters for `faucet`: op is required, the rest are op-dependent.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FaucetCall {
     /// Paid BOLT11 invoice (`pay`).
     pub invoice: Option<String>,
@@ -142,6 +125,114 @@ pub struct FaucetCall {
     pub amount_sat: Option<u64>,
     /// Optional memo (`invoice`).
     pub memo: Option<String>,
+    /// Caller-owned retry identity. Required by mutating v1 faucet operations.
+    pub idempotency_key: Option<String>,
+}
+
+/// Successful `hello` result for protocol v1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HelloResult {
+    pub protocol: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TargetRecord {
+    pub id: String,
+    pub kind: String,
+    pub url: String,
+    pub source_id: String,
+    pub source_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolRecord {
+    pub id: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnvironmentDescription {
+    #[serde(default)]
+    pub targets: Vec<TargetRecord>,
+    #[serde(default)]
+    pub tools: Vec<ToolRecord>,
+    #[serde(default)]
+    pub limits: Value,
+    #[serde(default)]
+    pub provenance: Value,
+}
+
+/// A stable, machine-readable protocol v1 error.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProtocolError {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+/// One non-terminal line from a long-running lifecycle call such as `setup`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecycleProgress {
+    pub id: u64,
+    pub event: String,
+    pub phase: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProtocolV1Reply {
+    pub id: u64,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ProtocolError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationState {
+    Unknown,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+/// Recorded state for a mutating request. A caller checks this before retrying
+/// after timeout or process loss, so successful work is not performed twice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperationStatus {
+    pub idempotency_key: String,
+    pub state: OperationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ProtocolError>,
+}
+
+/// Lifecycle stdout is NDJSON: zero or more progress lines followed by exactly
+/// one terminal reply. Progress does not extend the caller's outer deadline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum LifecycleLine {
+    Progress(LifecycleProgress),
+    Reply(ProtocolV1Reply),
 }
 
 /// A running plugin process speaking the protocol.
@@ -222,10 +313,10 @@ impl Plugin {
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
-                    Ok(0) => break,                    // EOF: plugin exited
+                    Ok(0) => break, // EOF: plugin exited
                     Ok(_) => {
                         if tx.send(line).is_err() {
-                            break;                     // receiver gone
+                            break; // receiver gone
                         }
                     }
                     Err(_) => break,
@@ -260,17 +351,7 @@ impl Plugin {
 
     /// Call a protocol method; returns the raw `result` value.
     pub fn call(&mut self, method: &str, params: Option<Value>) -> Result<Value, Error> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let request = Request { id, method, params };
-        let mut line = serde_json::to_string(&request)?;
-        line.push('\n');
-        self.stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| self.stdin.flush())
-            .map_err(|e| Error::Plugin {
-                plugin: self.manifest.name.clone(),
-                message: format!("write failed: {e}"),
-            })?;
+        let id = self.send_request(method, params)?;
 
         let reply_line = match self.replies.recv_timeout(self.call_timeout) {
             Ok(line) => line,
@@ -310,6 +391,321 @@ impl Plugin {
             });
         }
         Ok(reply.result.unwrap_or(Value::Null))
+    }
+
+    /// Run a protocol-v1 lifecycle method with progress and one hard outer
+    /// deadline. This is intentionally separate from the legacy one-reply
+    /// client: setup may take minutes and must remain observable/cancellable.
+    pub fn lifecycle_call<F>(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        deadline: std::time::Duration,
+        on_progress: F,
+    ) -> Result<Value, Error>
+    where
+        F: FnMut(&LifecycleProgress),
+    {
+        self.lifecycle_call_cancellable(method, params, deadline, || false, on_progress)
+    }
+
+    /// Cancellable form used by typed app jobs. The cancellation predicate is
+    /// checked at least every 100ms even when a plugin emits no progress.
+    pub fn lifecycle_call_cancellable<C, F>(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        deadline: std::time::Duration,
+        mut is_cancelled: C,
+        mut on_progress: F,
+    ) -> Result<Value, Error>
+    where
+        C: FnMut() -> bool,
+        F: FnMut(&LifecycleProgress),
+    {
+        if !matches!(method, "setup" | "doctor" | "status" | "stop") {
+            return Err(Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: format!("{method} is not a lifecycle method"),
+            });
+        }
+        let id = self.send_request(method, params)?;
+        let started = std::time::Instant::now();
+        loop {
+            if is_cancelled() {
+                self.kill_tree();
+                return Err(Error::Plugin {
+                    plugin: self.manifest.name.clone(),
+                    message: format!("lifecycle call {method} cancelled — plugin process tree killed"),
+                });
+            }
+            let Some(remaining) = deadline.checked_sub(started.elapsed()) else {
+                self.kill_tree();
+                return Err(Error::Plugin {
+                    plugin: self.manifest.name.clone(),
+                    message: format!(
+                        "lifecycle call {method} timed out after {}s — plugin process tree killed",
+                        deadline.as_secs()
+                    ),
+                });
+            };
+            let poll = remaining.min(std::time::Duration::from_millis(100));
+            let line = match self.replies.recv_timeout(poll) {
+                Ok(line) => line,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if poll < remaining {
+                        continue;
+                    }
+                    self.kill_tree();
+                    return Err(Error::Plugin {
+                        plugin: self.manifest.name.clone(),
+                        message: format!(
+                            "lifecycle call {method} timed out after {}s — plugin process tree killed",
+                            deadline.as_secs()
+                        ),
+                    });
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(Error::PluginClosed(self.manifest.name.clone()));
+                }
+            };
+            let parsed: LifecycleLine =
+                serde_json::from_str(line.trim()).map_err(|error| Error::Plugin {
+                    plugin: self.manifest.name.clone(),
+                    message: format!("malformed lifecycle reply {:?}: {error}", line.trim()),
+                })?;
+            match parsed {
+                LifecycleLine::Progress(progress) => {
+                    if progress.id != id || progress.event != "progress" {
+                        return Err(Error::Plugin {
+                            plugin: self.manifest.name.clone(),
+                            message: format!(
+                                "invalid lifecycle progress id/event: expected id {id} and event progress"
+                            ),
+                        });
+                    }
+                    on_progress(&progress);
+                }
+                LifecycleLine::Reply(reply) => {
+                    if reply.id != id {
+                        return Err(Error::Plugin {
+                            plugin: self.manifest.name.clone(),
+                            message: format!(
+                                "reply id {} does not match request id {id}",
+                                reply.id
+                            ),
+                        });
+                    }
+                    if reply.ok {
+                        if reply.error.is_some() {
+                            return Err(Error::Plugin {
+                                plugin: self.manifest.name.clone(),
+                                message: "successful lifecycle reply carried an error".to_string(),
+                            });
+                        }
+                        return Ok(reply.result.unwrap_or(Value::Null));
+                    }
+                    if reply.result.is_some() {
+                        return Err(Error::Plugin {
+                            plugin: self.manifest.name.clone(),
+                            message: "failed lifecycle reply carried a result".to_string(),
+                        });
+                    }
+                    let error = reply.error.unwrap_or(ProtocolError {
+                        code: "unknown".to_string(),
+                        message: "unknown plugin error".to_string(),
+                        retryable: false,
+                        details: None,
+                    });
+                    return Err(Error::Plugin {
+                        plugin: self.manifest.name.clone(),
+                        message: format!(
+                            "{}: {} (retryable: {})",
+                            error.code, error.message, error.retryable
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    /// One-reply protocol-v1 call with structured errors.
+    pub fn call_v1(&mut self, method: &str, params: Option<Value>) -> Result<Value, Error> {
+        let id = self.send_request(method, params)?;
+        let line = match self.replies.recv_timeout(self.call_timeout) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.kill_tree();
+                return Err(Error::Plugin {
+                    plugin: self.manifest.name.clone(),
+                    message: format!(
+                        "call {method} timed out after {}s — plugin process tree killed",
+                        self.call_timeout.as_secs()
+                    ),
+                });
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::PluginClosed(self.manifest.name.clone()));
+            }
+        };
+        let reply: ProtocolV1Reply =
+            serde_json::from_str(line.trim()).map_err(|error| Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: format!("malformed v1 reply {:?}: {error}", line.trim()),
+            })?;
+        self.finish_v1_reply(id, reply)
+    }
+
+    /// Look up a mutating request before deciding whether it is safe to retry.
+    pub fn operation_status(&mut self, idempotency_key: &str) -> Result<OperationStatus, Error> {
+        self.operation_status_with_params(idempotency_key, serde_json::Map::new())
+    }
+
+    /// Context-bearing status lookup for independently installed plugins.
+    /// Corpus supplies state/cache paths explicitly; the executable never has
+    /// to infer `CORPUS_HOME` or its install layout.
+    pub fn operation_status_with_params(
+        &mut self,
+        idempotency_key: &str,
+        mut params: serde_json::Map<String, Value>,
+    ) -> Result<OperationStatus, Error> {
+        params.insert(
+            "idempotency_key".to_string(),
+            Value::String(idempotency_key.to_string()),
+        );
+        let value = self.call_v1(
+            "operation_status",
+            Some(Value::Object(params)),
+        )?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Negotiate the executable protocol after manifest validation.
+    pub fn hello(&mut self) -> Result<HelloResult, Error> {
+        let value = self.call_v1("hello", None)?;
+        let hello: HelloResult = serde_json::from_value(value)?;
+        let expected_protocol = self.manifest.protocol.as_deref().ok_or_else(|| Error::Plugin {
+            plugin: self.manifest.name.clone(),
+            message: "hello requires a protocol-v1 manifest".to_string(),
+        })?;
+        if hello.protocol != expected_protocol {
+            return Err(Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: format!(
+                    "hello protocol {:?} does not match manifest {:?}",
+                    hello.protocol, expected_protocol
+                ),
+            });
+        }
+        let mut declared = self.manifest.capabilities.clone();
+        let mut reported = hello.capabilities.clone();
+        declared.sort();
+        reported.sort();
+        if reported != declared {
+            return Err(Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: format!(
+                    "hello capabilities {reported:?} do not match manifest {declared:?}"
+                ),
+            });
+        }
+        Ok(hello)
+    }
+
+    pub fn describe_v1(&mut self, session_id: &str) -> Result<EnvironmentDescription, Error> {
+        let value = self.call_v1("describe", Some(serde_json::json!({"session_id": session_id})))?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub fn session_probe_v1(&mut self, session_id: &str) -> Result<Value, Error> {
+        self.call_v1("session_probe", Some(serde_json::json!({"session_id": session_id})))
+    }
+
+    pub fn sandbox_exec_v1(&mut self, session_id: &str, command: &str) -> Result<SandboxExecResult, Error> {
+        let value = self.call_v1(
+            "sandbox_exec",
+            Some(serde_json::json!({"session_id": session_id, "command": command})),
+        )?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub fn faucet_v1(&mut self, session_id: &str, op: &str, call: &FaucetCall) -> Result<FaucetResult, Error> {
+        let value = self.call_v1(
+            "faucet",
+            Some(serde_json::json!({"session_id": session_id, "op": op, "call": call})),
+        )?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub fn wallet_fund_v1(&mut self, session_id: &str, params: Value) -> Result<Value, Error> {
+        let mut params = params.as_object().cloned().unwrap_or_default();
+        params.insert("session_id".into(), Value::String(session_id.to_string()));
+        self.call_v1("wallet_fund", Some(Value::Object(params)))
+    }
+
+    pub fn oracles_v1(&mut self, session_id: &str) -> Result<Vec<OracleInfo>, Error> {
+        let value = self.call_v1("oracles", Some(serde_json::json!({"session_id": session_id})))?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub fn call_oracle_v1(&mut self, session_id: &str, name: &str) -> Result<OracleResult, Error> {
+        let value = self.call_v1(
+            "call_oracle",
+            Some(serde_json::json!({"session_id": session_id, "name": name})),
+        )?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    fn finish_v1_reply(&self, id: u64, reply: ProtocolV1Reply) -> Result<Value, Error> {
+        if reply.id != id {
+            return Err(Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: format!("reply id {} does not match request id {id}", reply.id),
+            });
+        }
+        if reply.ok {
+            if reply.error.is_some() {
+                return Err(Error::Plugin {
+                    plugin: self.manifest.name.clone(),
+                    message: "successful v1 reply carried an error".to_string(),
+                });
+            }
+            return Ok(reply.result.unwrap_or(Value::Null));
+        }
+        if reply.result.is_some() {
+            return Err(Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: "failed v1 reply carried a result".to_string(),
+            });
+        }
+        let error = reply.error.unwrap_or(ProtocolError {
+            code: "unknown".to_string(),
+            message: "unknown plugin error".to_string(),
+            retryable: false,
+            details: None,
+        });
+        Err(Error::Plugin {
+            plugin: self.manifest.name.clone(),
+            message: format!(
+                "{}: {} (retryable: {})",
+                error.code, error.message, error.retryable
+            ),
+        })
+    }
+
+    fn send_request(&mut self, method: &str, params: Option<Value>) -> Result<u64, Error> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let request = Request { id, method, params };
+        let mut line = serde_json::to_string(&request)?;
+        line.push('\n');
+        self.stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| self.stdin.flush())
+            .map_err(|error| Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: format!("write failed: {error}"),
+            })?;
+        Ok(id)
     }
 
     /// `probe`: is the environment usable right now?
@@ -418,10 +814,24 @@ impl Plugin {
         Ok(serde_json::from_value(value)?)
     }
 
+    pub fn wallet_fund_legacy(
+        &mut self,
+        mut params: serde_json::Map<String, Value>,
+        sources: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<Value, Error> {
+        if let Some(sources) = sources {
+            params.insert("sources".into(), Value::Object(sources.clone()));
+        }
+        self.call("wallet_fund", Some(Value::Object(params)))
+    }
+
     /// Kill the plugin and its whole process group (unix): scripts the
     /// plugin spawned — oracle runs, nix re-execs, docker execs — must
     /// not outlive a timed-out call.
     fn kill_tree(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
         #[cfg(unix)]
         {
             let pgid = self.child.id().to_string();

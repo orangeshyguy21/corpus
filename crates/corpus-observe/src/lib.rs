@@ -6,6 +6,7 @@
 //! call an oracle, or touch a sandbox.
 
 pub mod models;
+pub mod plugins;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,11 @@ use corpus_store::{Error, Mission, Store};
 pub use models::{
     model_list, ollama_models, ollama_models_refresh, ModelEntry, ModelList, ModelOption,
     ModelProviderGroup, ModelRegistry,
+};
+pub use plugins::{
+    catalog_plugin, discover_plugins, plugin_by_name, plugin_catalog, EnvironmentDependency,
+    PluginDir, PluginManifest, PluginManifestVersion, PluginOrigin, PluginSource,
+    ENVIRONMENT_PROTOCOL_V1, SUPPORTED_CAPABILITIES,
 };
 
 pub const WORKING_WINDOW_SECS: u64 = 3;
@@ -114,26 +120,10 @@ pub fn run_idle_secs(log: &Path) -> Option<u64> {
 
 /// Installed plugin names from manifests only. No plugin process is started.
 pub fn plugin_names() -> Result<Vec<String>, Error> {
-    let root = corpus_store::paths::plugins_dir();
-    let mut names = Vec::new();
-    if !root.is_dir() {
-        return Ok(names);
-    }
-    for entry in fs::read_dir(root)? {
-        let path = entry?.path().join("plugin.toml");
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
-            continue;
-        };
-        if let Some(name) = value.get("name").and_then(toml::Value::as_str) {
-            names.push(name.to_string());
-        }
-    }
+    let mut names: Vec<String> = plugin_catalog()?
+        .into_iter()
+        .map(|plugin| plugin.manifest.name)
+        .collect();
     names.sort();
     names.dedup();
     Ok(names)
@@ -148,82 +138,39 @@ pub fn validate_pin(store: &Store, project: &str, source: &str, rev: &str) -> Re
         return Err(Error::Store(format!("pin {source}: rev is empty")));
     }
     let project = corpus_store::Project::load(store, project)?;
-    let Some(plugin_dir) = plugin_dir_by_name(&project.plugin)? else {
+    let Some(plugin) = catalog_plugin(&project.plugin)?
+    else {
         return Ok(());
     };
-    let config = match fs::read_to_string(plugin_dir.join("config.toml")) {
-        Ok(raw) => match toml::from_str::<toml::Value>(&raw) {
-            Ok(config) => config,
-            Err(_) => return Ok(()),
-        },
-        Err(_) => return Ok(()),
-    };
-    let declared = config
-        .get("sources")
-        .and_then(toml::Value::as_table)
-        .is_some_and(|table| table.contains_key(&format!("{source}_sha")));
-    if !declared {
-        return Ok(());
-    }
-    let Ok(resources) = corpus_store::paths::resources_for_plugins() else {
-        return Ok(());
-    };
-    let manifest_tag = source_manifest_tag(&resources.join("sources.toml"), source);
-    let cached = cached_revs(
-        &resources
-            .join("sources/.rev-cache")
-            .join(format!("{source}.json")),
-    );
-    let accepted = manifest_tag.as_deref() == Some(rev)
-        || cached.iter().any(|candidate| candidate == rev)
-        || matches!(rev, "main" | "master")
-        || is_commit_sha(rev);
-    if accepted {
-        Ok(())
-    } else {
-        let mut known = cached;
-        if let Some(tag) = manifest_tag {
-            known.push(tag);
-        }
-        known.sort();
-        known.dedup();
-        Err(Error::Store(format!(
-            "pin {source}={rev:?} is not a known rev, tag, main/master, or a 40-hex commit sha — known: {}",
-            known.join(", ")
-        )))
-    }
-}
-
-fn plugin_dir_by_name(name: &str) -> Result<Option<PathBuf>, Error> {
-    let root = corpus_store::paths::plugins_dir();
-    if !root.is_dir() {
-        return Ok(None);
-    }
-    for entry in fs::read_dir(root)? {
-        let dir = entry?.path();
-        let manifest = dir.join("plugin.toml");
-        let Ok(raw) = fs::read_to_string(&manifest) else {
-            continue;
+    if plugin.manifest.manifest_version == PluginManifestVersion::V1 {
+        let Some(declared) = plugin
+            .manifest
+            .sources
+            .iter()
+            .find(|candidate| candidate.id == source)
+        else {
+            return Ok(());
         };
-        let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
-            continue;
-        };
-        if value.get("name").and_then(toml::Value::as_str) == Some(name) {
-            return Ok(Some(dir));
-        }
+        let cached = cached_revs(
+            &store
+                .source_cache_dir()
+                .join(".rev-cache")
+                .join(format!("{source}.json")),
+        );
+        let accepted = rev == declared.default_rev
+            || cached.iter().any(|candidate| candidate == rev)
+            || matches!(rev, "main" | "master")
+            || is_commit_sha(rev);
+        return accepted.then_some(()).ok_or_else(|| {
+            Error::Store(format!(
+                "pin {source}={rev:?} is not the manifest default, a cached rev, main/master, or a 40-hex commit sha"
+            ))
+        });
     }
-    Ok(None)
-}
-
-fn source_manifest_tag(path: &Path, source: &str) -> Option<String> {
-    let raw = fs::read_to_string(path).ok()?;
-    let value = toml::from_str::<toml::Value>(&raw).ok()?;
-    value
-        .get("sources")?
-        .get(source)?
-        .get("tag")?
-        .as_str()
-        .map(str::to_string)
+    // Legacy-v0 manifests have no portable source declaration. They remain
+    // inspectable, but author-time source validation is intentionally absent;
+    // production installs require manifest v1.
+    Ok(())
 }
 
 fn cached_revs(path: &Path) -> Vec<String> {

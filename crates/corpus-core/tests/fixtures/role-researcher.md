@@ -126,7 +126,7 @@ the one inside YOUR project corpus.
 
 Call `target_info` before you read any source. It names the exact
 `sources/<name>/<sha>/` trees THIS run is pinned to — read those
-literal paths. Do NOT derive source paths from `sources.toml`: it
-records only the DEFAULT pin and may name a different (usually older)
+literal paths. Do NOT derive source paths from an ambient plugin manifest:
+it records only the DEFAULT pin and may name a different (usually older)
 tree. Verify every claim against the pinned trees; treat anything not
 traced in them as unverified.

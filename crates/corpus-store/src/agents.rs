@@ -1686,8 +1686,8 @@ fn pinned_sources_section(role: AgentRole) -> &'static str {
     "\n---\n\n## Pinned sources\n\n\
      Call `target_info` before you read any source. It names the exact\n\
      `sources/<name>/<sha>/` trees THIS run is pinned to — read those\n\
-     literal paths. Do NOT derive source paths from `sources.toml`: it\n\
-     records only the DEFAULT pin and may name a different (usually older)\n\
+     literal paths. Do NOT derive source paths from an ambient plugin manifest:\n\
+     it records only the DEFAULT pin and may name a different (usually older)\n\
      tree. Verify every claim against the pinned trees; treat anything not\n\
      traced in them as unverified.\n"
 }

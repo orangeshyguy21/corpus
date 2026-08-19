@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -uo pipefail
+while IFS= read -r line; do
+  id="$(jq -r '.id' <<<"$line")"
+  method="$(jq -r '.method' <<<"$line")"
+  case "$method" in
+    hello) printf '{"id":%s,"ok":true,"result":{"protocol":"corpus.environment/1","capabilities":["sessions","sandbox.exec"]}}\n' "$id" ;;
+    describe) printf '{"id":%s,"ok":true,"result":{"targets":[{"id":"service","kind":"alternate-service","url":"http://service:9090","source_id":"service","source_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],"tools":[{"id":"service-tool","description":"alternate tool","path":"/usr/local/bin/service-tool"}],"limits":{},"provenance":{"image_digest":"sha256:alternate"}}}\n' "$id" ;;
+    session_probe) printf '{"id":%s,"ok":true,"result":{"ready":true}}\n' "$id" ;;
+    sandbox_exec) printf '{"id":%s,"ok":true,"result":{"output":"alternate sandbox","exit_code":0}}\n' "$id" ;;
+    *) printf '{"id":%s,"ok":false,"error":{"code":"unknown_method","message":"unknown","retryable":false}}\n' "$id" ;;
+  esac
+done

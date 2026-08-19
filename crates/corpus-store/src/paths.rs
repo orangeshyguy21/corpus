@@ -5,9 +5,10 @@
 //! - the **data root** (`~/.corpus`) — everything the operator produces:
 //!   projects, corpora, missions, run dirs, chat scopes, app prefs. Owned
 //!   by the user, survives a reinstall, never checked into a repo.
-//! - the **resource root** — everything shipped WITH the app: `plugins/`,
-//!   `sources/`, `sources.toml`, `.opencode/skills`. Read-only at runtime,
-//!   replaced wholesale by an upgrade.
+//! - the **resource root** — optional assets shipped WITH the app: model
+//!   metadata and skills. Production plugins
+//!   and fetched sources live under the data root instead. Read-only at
+//!   runtime, replaced wholesale by an upgrade.
 //!
 //! They used to be one: the store lived at `<repo>/store`, and four call
 //! sites recovered "the repo" as `store.root().parent()`. That coupling is
@@ -30,10 +31,12 @@ pub const HOME_ENV: &str = "CORPUS_HOME";
 /// relocates the run and chat roots with it — one variable moves a whole
 /// world, which is what the tests rely on.
 pub const STORE_ENV: &str = "CORPUS_STORE";
-/// Override for the resource root (plugins/, sources/, sources.toml).
+/// Override for the optional shipped-asset root.
 pub const RESOURCES_ENV: &str = "CORPUS_RESOURCES";
 /// Environment variable overriding the installed plugin catalog directory.
 pub const PLUGINS_DIR_ENV: &str = "CORPUS_PLUGINS_DIR";
+/// Override for the corpus-owned pinned source cache.
+pub const SOURCES_DIR_ENV: &str = "CORPUS_SOURCES_DIR";
 /// Override for the optional benchmark/model metadata registry.
 pub const MODELS_ENV: &str = "CORPUS_MODELS";
 
@@ -61,11 +64,12 @@ pub fn store_root() -> PathBuf {
 // over a temp dir must keep its runs there, and an env-derived answer sent
 // every test's run dir into the real `~/.corpus`.
 
-/// A directory is the resource root if it carries the things only the
-/// shipped tree has. Checked rather than guessed: a wrong resource root
-/// silently starves runs of `sources/` and the plugin registry.
+/// A directory is the resource root if it carries a shipped resource.
+/// Installed plugins and fetched sources deliberately are not markers: a
+/// clean corpus build must resolve its optional assets before either exists.
 fn is_resource_root(dir: &Path) -> bool {
-    dir.join("plugins").is_dir() && dir.join("sources.toml").is_file()
+    dir.join("benchmarks/models.yaml").is_file()
+        || dir.join(".opencode/skills").is_dir()
 }
 
 static RESOURCE_ROOT: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
@@ -111,7 +115,7 @@ fn resolve_resource_root() -> std::result::Result<PathBuf, String> {
             // Explicit and wrong: say so instead of quietly resolving
             // somewhere else, which is how you debug the wrong tree.
             false => Err(format!(
-                "{RESOURCES_ENV}={} is not a corpus resource root (needs plugins/ and sources.toml)",
+                "{RESOURCES_ENV}={} is not a corpus resource root (no shipped corpus assets found)",
                 dir.display()
             )),
         };
@@ -154,31 +158,24 @@ fn resolve_resource_root() -> std::result::Result<PathBuf, String> {
 
     Err(format!(
         "corpus resources not found — tried: {}. Set {RESOURCES_ENV} to the directory holding \
-         plugins/ and sources.toml.",
+         shipped corpus assets.",
         tried.join(", ")
     ))
 }
 
-/// The resource tree a plugin's sources belong to.
-///
-/// `CORPUS_PLUGINS_DIR` names that tree by implication — `sources.toml` and
-/// `sources/` are the plugins dir's siblings — and it is deliberately NOT
-/// cached: the plugin fixtures point it at a temp tree per test, and a
-/// process-lifetime answer would freeze the first one. Without the
-/// override this is just [`resource_root`].
-pub fn resources_for_plugins() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var(PLUGINS_DIR_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        if let Some(parent) = PathBuf::from(dir).parent() {
-            return Ok(parent.to_path_buf());
-        }
-    }
-    resource_root()
+/// Writable root for versioned plugin installations.
+pub fn plugin_install_root() -> PathBuf {
+    data_root().join("plugins")
 }
 
-/// Resolve the installed plugin catalog directory without executing a plugin.
+/// Writable runtime state root. Installed bundles remain read-only.
+pub fn plugin_runtime_root() -> PathBuf {
+    data_root().join("var/plugins")
+}
+
+/// Resolve the primary plugin catalog directory. An explicit override is a
+/// complete development/test catalog; otherwise this is the writable install
+/// root.
 pub fn plugins_dir() -> PathBuf {
     if let Some(dir) = std::env::var(PLUGINS_DIR_ENV)
         .ok()
@@ -186,19 +183,18 @@ pub fn plugins_dir() -> PathBuf {
     {
         return PathBuf::from(dir);
     }
-    resource_root_opt()
-        .map(|root| root.join("plugins"))
-        .unwrap_or_else(|| PathBuf::from("plugins"))
+    plugin_install_root()
 }
 
-/// The pinned-source tree root (`sources/<name>/<sha>/`).
+/// The corpus-owned pinned-source cache (`cache/sources/<name>/<sha>/`).
 pub fn sources_dir() -> Result<PathBuf> {
-    Ok(resources_for_plugins()?.join("sources"))
-}
-
-/// The pinned-source manifest.
-pub fn sources_manifest() -> Result<PathBuf> {
-    Ok(resource_root()?.join("sources.toml"))
+    if let Some(dir) = std::env::var(SOURCES_DIR_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(data_root().join("cache/sources"))
 }
 
 /// The optional model metadata registry shipped under the resource root.
@@ -280,6 +276,13 @@ mod tests {
         assert!(is_resource_root(
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
         ));
+        let clean = dir.join("clean-install");
+        std::fs::create_dir_all(clean.join("benchmarks")).unwrap();
+        std::fs::write(clean.join("benchmarks/models.yaml"), "models: []\n").unwrap();
+        assert!(
+            is_resource_root(&clean),
+            "resource discovery must not require plugins/ or sources.toml"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

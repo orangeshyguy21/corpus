@@ -125,9 +125,10 @@ pub fn project_cmd(args: &[String]) -> Result<(), String> {
 /// `corpus agent ...`
 pub fn agent_cmd(args: &[String]) -> Result<(), String> {
     let store = Store::from_env();
-    let sub = args.first().map(String::as_str).ok_or_else(|| {
-        "usage: corpus agent list|new|clone|delete <project> ...".to_string()
-    })?;
+    let sub = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| "usage: corpus agent list|new|clone|delete <project> ...".to_string())?;
     let project = args.get(1).ok_or("missing project slug")?;
 
     match sub {
@@ -175,37 +176,50 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "clone" => {
-            let from = args.get(2).ok_or("usage: corpus agent clone <project> <from> --to <new-slug>")?;
+            let from = args
+                .get(2)
+                .ok_or("usage: corpus agent clone <project> <from> --to <new-slug>")?;
             let to = args
                 .iter()
                 .position(|a| a == "--to")
                 .and_then(|i| args.get(i + 1))
                 .ok_or("missing --to <new-slug>")?
                 .clone();
-            store.clone_agent(project, from, &to).map_err(|e| e.to_string())?;
+            store
+                .clone_agent(project, from, &to)
+                .map_err(|e| e.to_string())?;
             println!("cloned agent {project}/{from} -> {to}");
             Ok(())
         }
         "delete" => {
-            let slug = args.get(2).ok_or("usage: corpus agent delete <project> <slug>")?;
-            store.delete_agent(project, slug).map_err(|e| e.to_string())?;
+            let slug = args
+                .get(2)
+                .ok_or("usage: corpus agent delete <project> <slug>")?;
+            store
+                .delete_agent(project, slug)
+                .map_err(|e| e.to_string())?;
             println!("deleted agent {project}/{slug}");
             Ok(())
         }
         "role" => {
-            let slug = args
-                .get(2)
-                .ok_or_else(|| {
-                    format!(
-                        "usage: corpus agent role <project> <slug> [<{}>]",
-                        corpus_core::AgentRole::names()
-                    )
-                })?;
+            let slug = args.get(2).ok_or_else(|| {
+                format!(
+                    "usage: corpus agent role <project> <slug> [<{}>]",
+                    corpus_core::AgentRole::names()
+                )
+            })?;
             match args.get(3) {
                 None => {
                     let config = store.load_agent(project, slug).map_err(|e| e.to_string())?;
-                    let assigned = if config.meta.has_role() { "" } else { " (unassigned — defaults)" };
-                    println!("{project}/{slug}: {}{assigned}", config.meta.role().as_str());
+                    let assigned = if config.meta.has_role() {
+                        ""
+                    } else {
+                        " (unassigned — defaults)"
+                    };
+                    println!(
+                        "{project}/{slug}: {}{assigned}",
+                        config.meta.role().as_str()
+                    );
                 }
                 Some(raw) => {
                     let role = corpus_core::AgentRole::parse(raw).ok_or_else(|| {
@@ -214,7 +228,9 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
                             corpus_core::AgentRole::names()
                         )
                     })?;
-                    store.set_agent_role(project, slug, role).map_err(|e| e.to_string())?;
+                    store
+                        .set_agent_role(project, slug, role)
+                        .map_err(|e| e.to_string())?;
                     println!("{project}/{slug}: role -> {}", role.as_str());
                 }
             }
@@ -232,7 +248,10 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
                 println!("no agents in project {project}");
                 return Ok(());
             }
-            println!("{:<24} {:<14} {:<10} {}", "AGENT", "CURRENT", "INFERRED", "ACTION");
+            println!(
+                "{:<24} {:<14} {:<10} {}",
+                "AGENT", "CURRENT", "INFERRED", "ACTION"
+            );
             for row in &rows {
                 let current = match row.current {
                     Some(r) => r.as_str().to_string(),
@@ -245,7 +264,11 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
                 } else {
                     "would assign"
                 };
-                let flag = if row.needs_review { "  ⚠ no permission block — verify" } else { "" };
+                let flag = if row.needs_review {
+                    "  ⚠ no permission block — verify"
+                } else {
+                    ""
+                };
                 println!(
                     "{:<24} {:<14} {:<10} {action}{flag}",
                     row.agent,
@@ -268,9 +291,10 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
 /// `corpus mission ...`
 pub fn mission_cmd(args: &[String]) -> Result<(), String> {
     let store = Store::from_env();
-    let sub = args.first().map(String::as_str).ok_or_else(|| {
-        "usage: corpus mission list|new|delete <project> ...".to_string()
-    })?;
+    let sub = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| "usage: corpus mission list|new|delete <project> ...".to_string())?;
     let project = args.get(1).ok_or("missing project slug")?;
 
     match sub {
@@ -297,11 +321,19 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--agent" => {
-                        agent = Some(args.get(i + 1).ok_or("missing value after --agent")?.clone());
+                        agent = Some(
+                            args.get(i + 1)
+                                .ok_or("missing value after --agent")?
+                                .clone(),
+                        );
                         i += 2;
                     }
                     "--budget" => {
-                        budget = Some(args.get(i + 1).ok_or("missing value after --budget")?.clone());
+                        budget = Some(
+                            args.get(i + 1)
+                                .ok_or("missing value after --budget")?
+                                .clone(),
+                        );
                         i += 2;
                     }
                     "--pin" => {
@@ -336,6 +368,7 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
                 name: None,
                 session: None,
                 opencode_session: None,
+                environment_session: None,
                 launch_requested: None,
             };
             store
@@ -345,14 +378,16 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "delete" => {
-            let slug = args.get(2).ok_or("usage: corpus mission delete <project> <slug>")?;
-            store.delete_mission(project, slug).map_err(|e| e.to_string())?;
+            let slug = args
+                .get(2)
+                .ok_or("usage: corpus mission delete <project> <slug>")?;
+            store
+                .delete_mission(project, slug)
+                .map_err(|e| e.to_string())?;
             println!("deleted mission {project}/{slug}");
             Ok(())
         }
-        _ => Err(
-            "usage: corpus mission list|new|delete <project> [<slug>] ...".to_string(),
-        ),
+        _ => Err("usage: corpus mission list|new|delete <project> [<slug>] ...".to_string()),
     }
 }
 
@@ -481,8 +516,17 @@ mod finding_query_tests {
     #[test]
     fn parses_repeatable_and_comma_separated_filters() {
         let args = [
-            "--severity", "critical,high", "--severity", "medium", "--exclude-unrated",
-            "--sort", "severity", "--limit", "5", "--text", "mint",
+            "--severity",
+            "critical,high",
+            "--severity",
+            "medium",
+            "--exclude-unrated",
+            "--sort",
+            "severity",
+            "--limit",
+            "5",
+            "--text",
+            "mint",
         ]
         .into_iter()
         .map(str::to_string)
@@ -619,7 +663,9 @@ pub fn refusals_cmd(args: &[String]) -> Result<(), String> {
         // is no.
         println!(
             "no refusals recorded for {project}{} ({})",
-            gate.as_ref().map(|g| format!(" at gate {g}")).unwrap_or_default(),
+            gate.as_ref()
+                .map(|g| format!(" at gate {g}"))
+                .unwrap_or_default(),
             refusal::log_path(&store, project).display()
         );
         println!("nothing the corpus server refused — a run that still misbehaved was stopped somewhere else.");

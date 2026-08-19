@@ -1,9 +1,9 @@
 //! Source revision discovery, resolution, and on-demand fetch — the
 //! multi-rev wiring behind the top-bar `repo: rev` dropdowns.
 //!
-//! `sources.toml` is the manifest of record for the DEFAULT pin per repo
-//! (repo URL, tag, sha). Every rev the dropdown offers beyond the pin is
-//! discovered live from the remote: `git ls-remote` for tags + the
+//! A protocol-v1 plugin manifest is the source of record for each repo's
+//! default pin (repo URL, rev, sha). Every rev the dropdown offers beyond the
+//! pin is discovered live from the remote: `git ls-remote` for tags + the
 //! `main`/`master` head, disk-cached under `sources/.rev-cache/` (a
 //! derived, git-ignored cache — never trusted past its TTL unless the
 //! network is gone, in which case a stale cache beats no list).

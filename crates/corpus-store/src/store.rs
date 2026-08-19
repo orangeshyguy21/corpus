@@ -39,6 +39,7 @@ pub const PROJECT_ENV: &str = "CORPUS_PROJECT";
 /// JSON) — corpus-mcp forwards these to the plugin so the sandbox mounts
 /// the revs the mission recorded, not config.toml's defaults.
 pub const SOURCE_PINS_ENV: &str = "CORPUS_SOURCE_PINS";
+pub const ENVIRONMENT_SESSION_ENV: &str = "CORPUS_ENVIRONMENT_SESSION";
 
 /// The basename of the current run's transcript file in the project
 /// corpus `runs/` (e.g. `1786891368-verify.raw`). Set by the launcher
@@ -133,6 +134,23 @@ impl Store {
         &self.root
     }
 
+    /// Corpus-owned source cache paired with this store instance. Tests and
+    /// alternate stores stay in their own world instead of touching the
+    /// operator's default home.
+    pub fn source_cache_dir(&self) -> PathBuf {
+        if let Some(explicit) = std::env::var(crate::paths::SOURCES_DIR_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            return PathBuf::from(explicit);
+        }
+        self.root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.root.clone())
+            .join("cache/sources")
+    }
+
     pub fn projects_dir(&self) -> PathBuf {
         self.root.join("projects")
     }
@@ -196,7 +214,7 @@ impl Store {
     /// Idempotent; safe to call on every launch.
     pub fn provision_run_dir(&self, slug: &str) -> Result<PathBuf> {
         // A run dir is a project's, so the project must exist.
-        let project = Project::load(self, slug)?;
+        Project::load(self, slug)?;
         let run_dir = self.project_run_dir(slug);
         let opencode = run_dir.join(".opencode");
         fs::create_dir_all(opencode.join("agent"))?;
@@ -208,25 +226,25 @@ impl Store {
         )?;
 
         // Pinned source trees: REQUIRED. A run without them reads nothing
-        // and quietly falls back to whatever the prompt says about
-        // sources.toml, auditing a tree nobody chose. The directory itself
+        // and quietly falls back to whatever the prompt says about source
+        // paths, auditing a tree nobody chose. The directory itself
         // is a fetch cache (`srcrev` fills it), so create it rather than
         // refusing a machine that simply hasn't fetched yet — but the
-        // RESOURCE ROOT must resolve, because not knowing where sources go
-        // is a different problem from not having fetched them.
-        let resources = crate::paths::resource_root()?;
-        let sources = resources.join("sources");
+        // Source custody is corpus data, not a shipped-resource concern.
+        let sources = self.source_cache_dir();
         fs::create_dir_all(&sources)?;
         relink(&sources, &run_dir.join("sources"))?;
         // Skills are optional — not every install ships them.
-        let skills = resources.join(".opencode").join("skills");
-        if skills.exists() {
-            relink(&skills, &opencode.join("skills"))?;
+        if let Some(resources) = crate::paths::resource_root_opt() {
+            let skills = resources.join(".opencode").join("skills");
+            if skills.exists() {
+                relink(&skills, &opencode.join("skills"))?;
+            }
         }
         // NOT node_modules: opencode creates its own in the run dir at
         // runtime, and a symlink placed first would win and then rot.
 
-        self.write_run_opencode_config(slug, &project, &opencode)?;
+        self.write_run_opencode_config(slug, &opencode)?;
         Ok(run_dir)
     }
 
@@ -246,11 +264,9 @@ impl Store {
     fn write_run_opencode_config(
         &self,
         slug: &str,
-        project: &Project,
         opencode: &Path,
     ) -> Result<()> {
         let mcp_bin = crate::paths::corpus_mcp_bin()?;
-        let plugins = crate::paths::plugins_dir();
         let config = serde_json::json!({
             "$schema": "https://opencode.ai/config.json",
             "mcp": {
@@ -262,8 +278,6 @@ impl Store {
                     "environment": {
                         STORE_ENV: self.root().to_string_lossy(),
                         PROJECT_ENV: slug,
-                        crate::paths::PLUGINS_DIR_ENV: plugins.to_string_lossy(),
-                        "CORPUS_PLUGIN_DIR": plugins.join(&project.plugin).to_string_lossy(),
                     }
                 }
             }
@@ -830,6 +844,9 @@ pub struct Mission {
     /// The opencode session id (transcript of record) — export-on-stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_session: Option<String>,
+    /// Durable plugin environment session bound to this mission launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_session: Option<String>,
     /// A launch the CURATOR requested but the app has not yet honored
     /// (epoch seconds of the request). The curator (an MCP client) cannot
     /// spawn a run itself — run spawning is the app's alone — so it flags
@@ -1751,6 +1768,7 @@ mod tests {
             name: None,
             session: None,
             opencode_session: Some("ses_abc".into()),
+            environment_session: None,
             launch_requested: None,
         };
         store.write_mission("p", "probe", &mission, "brief").unwrap();

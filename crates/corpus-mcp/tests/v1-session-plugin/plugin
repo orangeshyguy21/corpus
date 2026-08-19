@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -uo pipefail
+while IFS= read -r line; do
+  id="$(jq -r '.id' <<<"$line")"
+  method="$(jq -r '.method' <<<"$line")"
+  case "$method" in
+    hello) printf '{"id":%s,"ok":true,"result":{"protocol":"corpus.environment/1","capabilities":["sessions","sandbox.exec","faucet.bolt11","wallet.fund","oracle.run"]}}\n' "$id" ;;
+    describe)
+      state_dir="$(jq -r '.params.state_dir // ""' <<<"$line")"
+      source_path="$(jq -r '.params.sources[0].host_path // ""' <<<"$line")"
+      if [[ -z "$state_dir" || -z "$source_path" ]]; then
+        printf '{"id":%s,"ok":false,"error":{"code":"missing_context","message":"state/source context missing","retryable":false}}\n' "$id"
+      else
+        printf '{"id":%s,"ok":true,"result":{"targets":[{"id":"target","kind":"fixture-service","url":"http://target:8080","source_id":"target","source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"tools":[{"id":"fixture-cli","description":"fixture tool","path":"/opt/tools/fixture"}],"limits":{"max_payment_sats":100},"provenance":{"image_digest":"sha256:fixture"}}}\n' "$id"
+      fi ;;
+    session_probe)
+      state_dir="$(jq -r '.params.state_dir // ""' <<<"$line")"
+      if [[ "$state_dir" = /* ]]; then
+        printf '{"id":%s,"ok":true,"result":{"ready":true}}\n' "$id"
+      else
+        printf '{"id":%s,"ok":false,"error":{"code":"missing_context","message":"session probe needs absolute state_dir","retryable":false}}\n' "$id"
+      fi ;;
+    sandbox_exec) printf '{"id":%s,"ok":true,"result":{"output":"fixture sandbox","exit_code":0}}\n' "$id" ;;
+    faucet)
+      key="$(jq -r '.params.call.idempotency_key // ""' <<<"$line")"
+      if [[ "$key" == "pay-replay" ]]; then
+        printf '{"id":%s,"ok":true,"result":{"text":"fixture faucet","paid_sats":null,"payment_hash":"abc","amount_sat":7,"status":"replayed","idempotent_replay":true}}\n' "$id"
+      else
+        printf '{"id":%s,"ok":true,"result":{"text":"fixture faucet","paid_sats":7,"payment_hash":"abc","amount_sat":7,"status":"succeeded","idempotent_replay":false}}\n' "$id"
+      fi ;;
+    wallet_fund)
+      key="$(jq -r '.params.idempotency_key // ""' <<<"$line")"
+      charged=10; [[ "$key" == "fund-replay" ]] && charged=0
+      printf '{"id":%s,"ok":true,"result":{"funded":true,"amount_sat":10,"charged_sats":%s}}\n' "$id" "$charged" ;;
+    oracles) printf '{"id":%s,"ok":true,"result":[{"name":"fixture-invariant","description":"fixture"}]}\n' "$id" ;;
+    call_oracle)
+      name="$(jq -r '.params.name // ""' <<<"$line")"
+      if [[ "$name" == "invalid-verdict" ]]; then
+        printf '{"id":%s,"ok":true,"result":{"verdict":"maybe","log":"invalid fixture"}}\n' "$id"
+      elif [[ "$name" == "large-evidence" ]]; then
+        log="$(awk 'BEGIN { for (i=0; i<20000; i++) printf "x" }')"
+        jq -nc --argjson id "$id" --arg log "$log" '{id:$id,ok:true,result:{verdict:"hold",log:$log}}'
+      else
+        printf '{"id":%s,"ok":true,"result":{"verdict":"hold","log":"{\\"oracle\\":\\"fixture-invariant\\",\\"count\\":1}"}}\n' "$id"
+      fi ;;
+    *) printf '{"id":%s,"ok":false,"error":{"code":"unknown_method","message":"unknown","retryable":false}}\n' "$id" ;;
+  esac
+done

@@ -1,0 +1,13 @@
+manifest_version = 1
+id = "v1-session-fixture"
+version = "1.0.0"
+protocol = "corpus.environment/1"
+exec = "plugin"
+capabilities = ["sessions", "sandbox.exec", "faucet.bolt11", "wallet.fund", "oracle.run"]
+
+[[sources]]
+id = "target"
+repo = "fixture/target"
+default_rev = "v1"
+default_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+mount = "/opt/src/target"

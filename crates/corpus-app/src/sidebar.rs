@@ -102,10 +102,8 @@ impl Sidebar {
             });
 
         // Bottom-fixed corpus summary + manual refresh.
-        let footer_rect = egui::Rect::from_min_max(
-            egui::pos2(max.min.x, max.max.y - footer_h),
-            max.max,
-        );
+        let footer_rect =
+            egui::Rect::from_min_max(egui::pos2(max.min.x, max.max.y - footer_h), max.max);
         let mut footer_ui = ui.new_child(egui::UiBuilder::new().max_rect(footer_rect));
         self.footer(&mut footer_ui, state);
 
@@ -172,7 +170,12 @@ impl Sidebar {
         is_sel: bool,
     ) {
         // Only the selected PROJECT row carries the Clone/Delete kebab.
-        let Row { ui: mut rui, rect, click, .. } = row_ui(ui, is_sel, is_sel, slug);
+        let Row {
+            ui: mut rui,
+            rect,
+            click,
+            ..
+        } = row_ui(ui, is_sel, is_sel, slug);
         // Row label is the display NAME only (slug falls back when the
         // name is empty); the slug moves to the hover text (defect 1a).
         let name = if project.name.is_empty() {
@@ -188,33 +191,32 @@ impl Sidebar {
             // Render the right-aligned kebab zone FIRST, then the
             // truncated label so truncation measures the remaining width
             // and never collides with the icon (defect 1d).
-            let kebab =
-                rui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    egui::menu::menu_custom_button(
-                        ui,
-                        egui::Button::new(theme::icon_text(
-                            ph::DOTS_THREE_VERTICAL,
-                            16.0,
-                            theme::TEXT_MUTED,
-                        ))
-                        .frame(false),
-                        |ui| {
-                            if ui.button("Rename…").clicked() {
-                                self.rename_project = Some(slug.to_string());
-                                self.rename_project_name = name.clone();
-                                ui.close_menu();
-                            }
-                            if ui.button("Clone…").clicked() {
-                                self.prep_clone(slug.to_string());
-                                ui.close_menu();
-                            }
-                            if ui.button("Delete").clicked() {
-                                delete_project(state, toasts, slug);
-                                ui.close_menu();
-                            }
-                        },
-                    );
-                });
+            let kebab = rui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::menu::menu_custom_button(
+                    ui,
+                    egui::Button::new(theme::icon_text(
+                        ph::DOTS_THREE_VERTICAL,
+                        16.0,
+                        theme::TEXT_MUTED,
+                    ))
+                    .frame(false),
+                    |ui| {
+                        if ui.button("Rename…").clicked() {
+                            self.rename_project = Some(slug.to_string());
+                            self.rename_project_name = name.clone();
+                            ui.close_menu();
+                        }
+                        if ui.button("Clone…").clicked() {
+                            self.prep_clone(slug.to_string());
+                            ui.close_menu();
+                        }
+                        if ui.button("Delete").clicked() {
+                            delete_project(state, toasts, slug);
+                            ui.close_menu();
+                        }
+                    },
+                );
+            });
             let kebab_w = kebab.response.rect.width();
             let fill = rect.width() - 8.0 - kebab_w - 8.0;
             let label_rect = egui::Rect::from_min_size(
@@ -229,7 +231,9 @@ impl Sidebar {
                     |ui| {
                         ui.add_space(8.0); // left text inset
                         ui.add(
-                            egui::Label::new(text).sense(egui::Sense::click()).truncate(),
+                            egui::Label::new(text)
+                                .sense(egui::Sense::click())
+                                .truncate(),
                         )
                     },
                 )
@@ -238,7 +242,9 @@ impl Sidebar {
         } else {
             rui.add_space(8.0); // left text inset
             let resp = rui.add(
-                egui::Label::new(text).sense(egui::Sense::click()).truncate(),
+                egui::Label::new(text)
+                    .sense(egui::Sense::click())
+                    .truncate(),
             );
             (resp, 0.0)
         };
@@ -277,7 +283,9 @@ impl Sidebar {
         let on_screen = project_selected && state.current_screen == Screen::Agents;
         for (slug, agent) in &tree.agents {
             let is_sel = on_screen && state.selected_agent.as_deref() == Some(slug.as_str());
-            let Row { ui: mut rui, click, .. } = row_ui(ui, is_sel, false, ("agent", project, slug));
+            let Row {
+                ui: mut rui, click, ..
+            } = row_ui(ui, is_sel, false, ("agent", project, slug));
             rui.add_space(24.0);
             // Row label is the display NAME, never the opaque slug (a UUID);
             // the slug moves to the hover text for identity.
@@ -325,8 +333,12 @@ impl Sidebar {
             let activity = state.mission_activity(project, slug);
             // A mission row always reserves the kebab strip (⋮ shown on
             // the selected row and on row hover).
-            let Row { ui: mut rui, rect, click, hovered } =
-                row_ui(ui, is_sel, true, ("mission", project, slug));
+            let Row {
+                ui: mut rui,
+                rect,
+                click,
+                hovered,
+            } = row_ui(ui, is_sel, true, ("mission", project, slug));
             let (label_resp, _menu_w) = if is_sel || hovered {
                 let menu_w = rui
                     .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -358,10 +370,8 @@ impl Sidebar {
                             // Status dot inside the 24px tree indent:
                             // the label's x is unchanged.
                             ui.add_space(12.0);
-                            let (dot_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(12.0, ROW_H),
-                                egui::Sense::hover(),
-                            );
+                            let (dot_rect, _) = ui
+                                .allocate_exact_size(egui::vec2(12.0, ROW_H), egui::Sense::hover());
                             status_dot(ui, dot_rect, activity);
                             ui.add(
                                 egui::Label::new(
@@ -432,7 +442,11 @@ impl Sidebar {
             })
             .or_else(|| state.agents.first().map(|(s, _)| s.clone()));
         let Some(agent) = agent else {
-            toast(toasts, ToastKind::Warning, "no agents on this project — create one first");
+            toast(
+                toasts,
+                ToastKind::Warning,
+                "no agents on this project — create one first",
+            );
             return;
         };
         match state.create_mission(&project, &agent, "") {
@@ -490,7 +504,11 @@ impl Sidebar {
                     resume_mission(state, toasts, project, slug);
                     ui.close_menu();
                 }
-                let stop = ui.add_enabled(live, egui::Button::new("Stop run"));
+                let environment_cleanup = state.mission_environment_needs_cleanup(project, slug);
+                let stop = ui.add_enabled(
+                    live || environment_cleanup,
+                    egui::Button::new(if live { "Stop run" } else { "Retry cleanup" }),
+                );
                 if stop.clicked() {
                     stop_mission(state, toasts, project, slug);
                     ui.close_menu();
@@ -502,7 +520,13 @@ impl Sidebar {
                     ui.close_menu();
                 }
                 if ui.button("Delete").clicked() {
-                    delete_mission(state, toasts, project, slug, state.selected_mission.as_deref() == Some(slug));
+                    delete_mission(
+                        state,
+                        toasts,
+                        project,
+                        slug,
+                        state.selected_mission.as_deref() == Some(slug),
+                    );
                     ui.close_menu();
                 }
             },
@@ -635,11 +659,15 @@ impl Sidebar {
             ui.label(RichText::new("Corpus").size(12.0).color(theme::TEXT_MUTED));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new(fmt_bytes(bytes)).size(11.0).color(theme::TEXT_FAINT),
+                    RichText::new(fmt_bytes(bytes))
+                        .size(11.0)
+                        .color(theme::TEXT_FAINT),
                 );
                 ui.label(RichText::new("·").size(11.0).color(theme::TEXT_FAINT));
                 ui.label(
-                    RichText::new(format!("{files} files")).size(11.5).color(theme::TEXT_MUTED),
+                    RichText::new(format!("{files} files"))
+                        .size(11.5)
+                        .color(theme::TEXT_MUTED),
                 );
             });
         });
@@ -661,7 +689,12 @@ impl Sidebar {
                 ui.label("Display name (the id is generated)");
                 let entry = ui.text_edit_singleline(&mut self.create_name);
                 ui.label("Environment plugin");
-                plugin_picker(ui, &mut self.create_plugin, state.plugins(), &mut self.needs_probe);
+                plugin_picker(
+                    ui,
+                    &mut self.create_plugin,
+                    state.plugins(),
+                    &mut self.needs_probe,
+                );
                 ui.add_space(8.0);
                 let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if theme::house_button(ui, "Create").clicked() || submit {
@@ -736,7 +769,11 @@ impl Sidebar {
                     }
                     match state.create_agent_with_role(&project, self.agent_role) {
                         Ok(slug) => {
-                            toast(toasts, ToastKind::Success, format!("created agent {project}/{slug}"));
+                            toast(
+                                toasts,
+                                ToastKind::Success,
+                                format!("created agent {project}/{slug}"),
+                            );
                             state.refresh_agents(&project);
                             done = true;
                         }
@@ -780,7 +817,11 @@ impl Sidebar {
                     };
                     match state.clone_project(&from, name, self.clone_corpus) {
                         Ok((to, _)) => {
-                            toast(toasts, ToastKind::Success, format!("cloned project {from} -> {to}"));
+                            toast(
+                                toasts,
+                                ToastKind::Success,
+                                format!("cloned project {from} -> {to}"),
+                            );
                             state.refresh();
                             state.select_project(&to);
                             done = true;
@@ -817,14 +858,17 @@ const KEBAB_STRIP: f32 = 28.0;
 /// `id_seed` is the row's unique slug/title — stable across scrolling.
 fn row_ui(ui: &mut Ui, selected: bool, has_kebab: bool, id_seed: impl std::hash::Hash) -> Row {
     let full = ui.available_width();
-    let (rect, band) =
-        ui.allocate_exact_size(egui::vec2(full, ROW_H), egui::Sense::hover());
+    let (rect, band) = ui.allocate_exact_size(egui::vec2(full, ROW_H), egui::Sense::hover());
     let hovered = band.hovered();
     if selected || hovered {
         // Edge-to-edge fill: expand past the panel margin so the band runs to
         // the panel's actual edges. Painted on the PARENT painter (clip
         // widened to the band) before the child exists.
-        let fill = if selected { theme::ROW_HL } else { theme::ROW_HOVER };
+        let fill = if selected {
+            theme::ROW_HL
+        } else {
+            theme::ROW_HOVER
+        };
         let band_rect = rect.expand2(egui::vec2(theme::PANEL_MARGIN, 0.0));
         let mut painter = ui.painter().clone();
         painter.set_clip_rect(band_rect);
@@ -838,7 +882,11 @@ fn row_ui(ui: &mut Ui, selected: bool, has_kebab: bool, id_seed: impl std::hash:
     } else {
         rect
     };
-    let click = ui.interact(click_rect, ui.id().with(("row", id_seed)), egui::Sense::click());
+    let click = ui.interact(
+        click_rect,
+        ui.id().with(("row", id_seed)),
+        egui::Sense::click(),
+    );
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect)
@@ -847,7 +895,12 @@ fn row_ui(ui: &mut Ui, selected: bool, has_kebab: bool, id_seed: impl std::hash:
     // Clip the row's child so nothing it paints can ever overlap a
     // neighbouring row (defect 1c).
     child.set_clip_rect(rect);
-    Row { ui: child, rect, click, hovered }
+    Row {
+        ui: child,
+        rect,
+        click,
+        hovered,
+    }
 }
 
 /// A mission row's status dot, one glyph per activity state:
@@ -902,13 +955,24 @@ fn corpus_strip(ui: &mut Ui, categories: &[corpus_core::CategoryStat], total: u6
         } else {
             (rect.width() * share).max(2.0)
         };
-        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height()));
+        let seg =
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height()));
         let color = theme::CORPUS_PALETTE[i % theme::CORPUS_PALETTE.len()];
         // Round only the outer ends so the strip reads as one pill.
         let rounding = if i == 0 {
-            egui::CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 }
+            egui::CornerRadius {
+                nw: 2,
+                sw: 2,
+                ne: 0,
+                se: 0,
+            }
         } else if i == categories.len() - 1 {
-            egui::CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 }
+            egui::CornerRadius {
+                nw: 0,
+                sw: 0,
+                ne: 2,
+                se: 2,
+            }
         } else {
             egui::CornerRadius::ZERO
         };
@@ -920,12 +984,13 @@ fn corpus_strip(ui: &mut Ui, categories: &[corpus_core::CategoryStat], total: u6
             egui::Stroke::new(1.0_f32, theme::BG),
             egui::StrokeKind::Inside,
         );
-        ui.allocate_rect(seg, egui::Sense::hover()).on_hover_text(format!(
-            "{} — {} files, {}",
-            category.name,
-            category.files,
-            fmt_bytes(category.bytes)
-        ));
+        ui.allocate_rect(seg, egui::Sense::hover())
+            .on_hover_text(format!(
+                "{} — {} files, {}",
+                category.name,
+                category.files,
+                fmt_bytes(category.bytes)
+            ));
         x += w;
     }
 }
@@ -934,9 +999,7 @@ fn corpus_strip(ui: &mut Ui, categories: &[corpus_core::CategoryStat], total: u6
 fn row_hint(ui: &mut Ui, indent: f32, text: &str) {
     let Row { ui: mut rui, .. } = row_ui(ui, false, false, ("hint", text));
     rui.add_space(indent);
-    rui.add(
-        egui::Label::new(RichText::new(text).size(12.0).color(theme::TEXT_FAINT)).truncate(),
-    );
+    rui.add(egui::Label::new(RichText::new(text).size(12.0).color(theme::TEXT_FAINT)).truncate());
 }
 
 /// A tree group's mini-header: the dim label (11px, faint) — clickable,
@@ -944,9 +1007,18 @@ fn row_hint(ui: &mut Ui, indent: f32, text: &str) {
 /// Returns `(header_clicked, plus_clicked)`.
 fn mini_header(ui: &mut Ui, id: &str, title: &str) -> (bool, bool) {
     let mut plus = false;
-    let Row { ui: mut rui, click, hovered, .. } = row_ui(ui, false, false, ("mini", id));
+    let Row {
+        ui: mut rui,
+        click,
+        hovered,
+        ..
+    } = row_ui(ui, false, false, ("mini", id));
     rui.add_space(24.0);
-    let color = if hovered { theme::TEXT_MUTED } else { theme::TEXT_FAINT };
+    let color = if hovered {
+        theme::TEXT_MUTED
+    } else {
+        theme::TEXT_FAINT
+    };
     let label = rui.add(
         egui::Label::new(RichText::new(title).size(11.0).color(color))
             .sense(egui::Sense::click())
@@ -970,8 +1042,17 @@ fn mini_header(ui: &mut Ui, id: &str, title: &str) -> (bool, bool) {
 /// `(header_clicked, plus_clicked)`.
 fn section_header(ui: &mut Ui, title: &str) -> (bool, bool) {
     let mut plus = false;
-    let Row { ui: mut rui, rect: row, click, hovered } = row_ui(ui, false, false, title);
-    let color = if hovered { theme::TEXT } else { theme::TEXT_MUTED };
+    let Row {
+        ui: mut rui,
+        rect: row,
+        click,
+        hovered,
+    } = row_ui(ui, false, false, title);
+    let color = if hovered {
+        theme::TEXT
+    } else {
+        theme::TEXT_MUTED
+    };
     rui.add_space(8.0);
     // The label senses clicks and unions with the band: title text and
     // padding route identically (a hover-only label swallows both).
@@ -1009,7 +1090,11 @@ fn section_header(ui: &mut Ui, title: &str) -> (bool, bool) {
 fn delete_project(state: &mut AppState, toasts: &mut Toasts, slug: &str) {
     match state.delete_project(slug) {
         Ok(()) => {
-            toast(toasts, ToastKind::Success, format!("deleted project {slug}"));
+            toast(
+                toasts,
+                ToastKind::Success,
+                format!("deleted project {slug}"),
+            );
             state.refresh();
             // ensure_selection re-picks a project next frame.
             state.selected_project = None;
@@ -1030,12 +1115,7 @@ fn launch_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug
 
 /// Resume is an explicit operator action. Selecting or browsing a mission
 /// never starts a process.
-fn resume_mission(
-    state: &mut AppState,
-    toasts: &mut Toasts,
-    project: &str,
-    slug: &str,
-) {
+fn resume_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
     state.select_mission(project, slug);
     if let Err(error) = state.resume_mission(project, slug) {
         toast(toasts, ToastKind::Error, error.to_string());
@@ -1063,10 +1143,20 @@ fn stop_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: 
 }
 
 /// Delete a mission record (transcripts stay in the corpus runs/).
-fn delete_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str, was_selected: bool) {
+fn delete_mission(
+    state: &mut AppState,
+    toasts: &mut Toasts,
+    project: &str,
+    slug: &str,
+    was_selected: bool,
+) {
     match state.delete_mission(project, slug) {
         Ok(()) => {
-            toast(toasts, ToastKind::Success, format!("deleted mission {slug}"));
+            toast(
+                toasts,
+                ToastKind::Success,
+                format!("deleted mission {slug}"),
+            );
             state.refresh_missions(project);
             if was_selected {
                 state.selected_mission = None; // re-defaults to the next

@@ -59,17 +59,21 @@ opt-in escape hatch, never a requirement.
 
 ## Status
 
-Pre-alpha. The reference harness is the first-party `cdk-regtest`
-environment plugin in this repo — absorbed from the vul-lab proof of
-concept (2026-08-10) so corpus is self-contained: a sandboxed agent, an
-oracle suite, a regtest Lightning faucet, and no external harness
-dependency.
+Pre-alpha. The first-party `cdk-regtest` and `nutshell-regtest` environments
+are independently versioned in the `corpus-plugin-cdk` and
+`corpus-plugin-nutshell` repositories. Both provide a sandbox, invariant
+oracles, and a bounded regtest Lightning faucet through the same portable
+protocol. Corpus installs immutable plugin versions and owns their source and
+runtime paths; the application repository carries no production adapter.
 
 In this repo: Rust workspace (`crates/corpus-core`, the separate research and
 admin MCP servers, the headless `crates/corpus-cli`, and `crates/corpus-app`
 desktop UI), the plugin
-protocol, the reference environment plugin (`plugins/cdk-regtest`),
-and the model registry (`benchmarks/models.yaml`).
+protocol and conformance fixtures, and the model registry
+(`benchmarks/models.yaml`).
+
+See [PLUGINS.md](PLUGINS.md) for installation, upgrade/rollback, release locks,
+and the environment-plugin authoring contract.
 
 (Design context — architecture, research landscape, decisions, and the
 live roadmap — lives in `dev/`, which is machine-local scratch and not

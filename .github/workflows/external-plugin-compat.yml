@@ -1,0 +1,64 @@
+name: external plugin compatibility
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: ${{ matrix.id }} release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: cdk-regtest
+            repo: orangeshyguy21/corpus-plugin-cdk
+            archive: corpus-plugin-cdk
+            version: 0.3.8
+            sha256: eaa8a9e0181e391b142198dcdddd6177d6560aa6728692326cb587a85f17eded
+          - id: nutshell-regtest
+            repo: orangeshyguy21/corpus-plugin-nutshell
+            archive: corpus-plugin-nutshell
+            version: 0.3.0
+            sha256: 2ac77e231c447da918f746055482f657617e2b22c562f96c2b9fd946addbc33e
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Download and verify pinned plugin release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CORPUS_PLUGIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN:-}" || {
+            echo 'CORPUS_PLUGIN_TOKEN is required while plugin repositories are private' >&2
+            exit 1
+          }
+          gh release download "v${{ matrix.version }}" \
+            --repo "${{ matrix.repo }}" \
+            --pattern "${{ matrix.archive }}-${{ matrix.version }}.tar.gz" \
+            --pattern "${{ matrix.archive }}-${{ matrix.version }}.tar.gz.sha256" \
+            --dir "$RUNNER_TEMP"
+          archive="$RUNNER_TEMP/${{ matrix.archive }}-${{ matrix.version }}.tar.gz"
+          (cd "$RUNNER_TEMP" && sha256sum --check --strict "${{ matrix.archive }}-${{ matrix.version }}.tar.gz.sha256")
+          printf '%s  %s\n' "${{ matrix.sha256 }}" "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+      - name: Install immutable bundle and negotiate protocol v1
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CORPUS_HOME="$RUNNER_TEMP/corpus-home"
+          plugin="$RUNNER_TEMP/${{ matrix.archive }}-${{ matrix.version }}"
+          cargo run --locked --quiet -p corpus-cli -- plugin install "$plugin"
+          cargo run --locked --quiet -p corpus-cli -- plugin list | tee "$RUNNER_TEMP/plugin-list.txt"
+          grep -F "${{ matrix.id }}" "$RUNNER_TEMP/plugin-list.txt"
+          hello="$(cargo run --locked --quiet -p corpus-cli -- plugin call "${{ matrix.id }}" hello)"
+          jq -e '.protocol == "corpus.environment/1"' <<<"$hello"
+      - name: Run language-neutral protocol conformance
+        run: cargo test --locked -p corpus-core --test protocol

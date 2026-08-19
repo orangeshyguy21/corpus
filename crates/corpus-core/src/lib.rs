@@ -28,6 +28,8 @@ pub mod paths {
     pub use corpus_store::paths::*;
 }
 mod plugin;
+mod plugin_install;
+mod environment_session;
 pub mod refusal {
     pub use corpus_store::refusal::*;
 }
@@ -44,6 +46,9 @@ mod test_support;
 
 pub use agents::{AgentConfig, AgentSidecar, DEFAULT_AGENT_NAME, OPENCODE_SCHEMA, SourcePin};
 pub use error::{Error, Result};
+pub use corpus_store::{
+    EnvironmentSessionId, EnvironmentSessionRecord, EnvironmentSessionState,
+};
 pub use findings::{
     finding_cards, query_findings, read_finding, scan_findings_cached, FindingCard, FindingIndexCache,
     FindingQuery, FindingReferenceSource, FindingScan, FindingScanStats, FindingSeverity,
@@ -61,20 +66,36 @@ pub use models::{
     ModelProviderGroup, ModelRegistry,
 };
 pub use paths::{
-    corpus_admin_mcp_bin, corpus_mcp_bin, data_root, models_manifest, resource_root,
-    resource_root_opt, sources_dir, store_root, HOME_ENV, MODELS_ENV, RESOURCES_ENV,
+    corpus_admin_mcp_bin, corpus_mcp_bin, data_root, models_manifest,
+    plugin_install_root, plugin_runtime_root, resource_root, resource_root_opt, sources_dir,
+    store_root, HOME_ENV, MODELS_ENV, RESOURCES_ENV, SOURCES_DIR_ENV,
 };
 pub use plugin::{
-    FaucetCall, FaucetResult, OracleInfo, OracleResult, Plugin, PluginManifest, ProbeResult,
-    SandboxExecResult, SourceInfo,
+    EnvironmentDescription, FaucetCall, FaucetResult, HelloResult, LifecycleLine, LifecycleProgress, OperationState,
+    OperationStatus, OracleInfo, OracleResult, Plugin, PluginManifest, ProbeResult, ProtocolError,
+    ProtocolV1Reply, SandboxExecResult, SourceInfo, TargetRecord, ToolRecord,
+};
+pub use plugin_install::{
+    call_plugin_lifecycle_cancellable, install_plugin_bundle, installed_record,
+    plugin_bundle_digest, plugin_lifecycle_params, select_plugin_version, selected_version,
+    verify_plugin_installation,
+    InstallReceipt, InstallRecord,
+};
+pub use environment_session::{
+    close_environment_session, close_environment_session_key, open_environment_session,
+};
+pub use corpus_observe::{
+    EnvironmentDependency, PluginManifestVersion, PluginOrigin, PluginSource, ENVIRONMENT_PROTOCOL_V1,
+    SUPPORTED_CAPABILITIES,
 };
 pub use agents::{
     infer_role, primary_handles, AgentRole, RoleMigration, CORPUS_TOOLS, CURATOR_TOOLS,
     SUPER_ADMIN_TOOLS,
 };
 pub use registry::{
-    discover, plugin_sources, plugin_status, plugins_dir, prepare_source_pins,
-    selected_plugin_status, validate_pin, PluginDir, PluginStatus, SourceRevs,
+    discover, find_plugin, plugin_catalog, plugin_sources, plugin_status, plugins_dir,
+    prepare_source_pins, selected_plugin_status, validate_pin, PluginDir, PluginPreparedStatus,
+    PluginStatus, SourceRevs,
 };
 pub use sensitivity::Sensitivity;
 pub use srcrev::{ensure_source_tree, is_commit_sha, resolve_rev, revs_cache_fetched, selectable_revs, REV_CACHE_TTL_SECS};
@@ -82,5 +103,5 @@ pub use store::{
     corpus_cost, corpus_cost_cached, corpus_stats, fnv1a_hex, mission_logs, project_slug_env, slugify,
     store_root_env, validate_slug, AppPrefs, CategoryStat, CorpusCostCache, CorpusStats, CostReport, CostRow,
     EntryAccess, Mission, MissionLog, Project, Scope, Store, CATEGORIES,
-    AGENT_ENV, PROJECT_ENV, RUN_LOG_ENV, RUNS, SOURCE_PINS_ENV, STORE_ENV,
+    AGENT_ENV, ENVIRONMENT_SESSION_ENV, PROJECT_ENV, RUN_LOG_ENV, RUNS, SOURCE_PINS_ENV, STORE_ENV,
 };
