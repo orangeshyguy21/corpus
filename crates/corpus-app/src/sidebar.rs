@@ -26,6 +26,7 @@ use crate::fmt::fmt_bytes;
 use crate::nav::Screen;
 use crate::state::{AppState, MissionActivity};
 use crate::theme;
+use crate::views::mission_actions::{self, Availability};
 use crate::views::plugin_picker::plugin_picker;
 
 /// Row height for a sidebar list row (15px text + 5px vertical padding).
@@ -488,29 +489,33 @@ impl Sidebar {
             .frame(false),
             |ui| {
                 let inflight = state.mission_run_inflight(project, slug);
+                let cleanup = state.mission_environment_needs_cleanup(project, slug);
+                let actions = Availability::resolve(live, resumable, inflight, cleanup);
                 // Launch an existing (never-run, or stopped) mission — the
                 // gap that made curator-created missions dead ends. Disabled
                 // while its session is already live. Selects the mission and
                 // routes to the view so the operator lands on the pane as it
                 // attaches; the brief kicks the session off.
-                let launch = ui.add_enabled(!live && !inflight, egui::Button::new("Launch"));
+                let launch = ui.add_enabled(actions.launch, egui::Button::new("Launch"));
                 if launch.clicked() {
-                    launch_mission(state, toasts, project, slug);
+                    mission_actions::launch(state, toasts, project, slug);
                     ui.close_menu();
                 }
-                let resume =
-                    ui.add_enabled(!live && resumable && !inflight, egui::Button::new("Resume"));
+                let resume = ui.add_enabled(actions.resume, egui::Button::new("Resume"));
                 if resume.clicked() {
-                    resume_mission(state, toasts, project, slug);
+                    mission_actions::resume(state, toasts, project, slug);
                     ui.close_menu();
                 }
-                let environment_cleanup = state.mission_environment_needs_cleanup(project, slug);
                 let stop = ui.add_enabled(
-                    live || environment_cleanup,
-                    egui::Button::new(if live { "Stop run" } else { "Retry cleanup" }),
+                    actions.stop || actions.retry_cleanup,
+                    egui::Button::new(if actions.stop {
+                        "Stop run"
+                    } else {
+                        "Retry cleanup"
+                    }),
                 );
                 if stop.clicked() {
-                    stop_mission(state, toasts, project, slug);
+                    mission_actions::stop(state, toasts, project, slug);
                     ui.close_menu();
                 }
                 if ui.button("Rename…").clicked() {
@@ -519,14 +524,11 @@ impl Sidebar {
                     self.rename_name = name.to_string();
                     ui.close_menu();
                 }
-                if ui.button("Delete").clicked() {
-                    delete_mission(
-                        state,
-                        toasts,
-                        project,
-                        slug,
-                        state.selected_mission.as_deref() == Some(slug),
-                    );
+                if ui
+                    .add_enabled(actions.delete, egui::Button::new("Delete"))
+                    .clicked()
+                {
+                    mission_actions::delete(state, toasts, project, slug);
                     ui.close_menu();
                 }
             },
@@ -1098,69 +1100,6 @@ fn delete_project(state: &mut AppState, toasts: &mut Toasts, slug: &str) {
             state.refresh();
             // ensure_selection re-picks a project next frame.
             state.selected_project = None;
-        }
-        Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
-    }
-}
-
-/// Launch is an explicit operator action. It selects the mission first so
-/// progress and attachment paint in the central view, then schedules launch
-/// preparation directly; no render path consumes a deferred spawn token.
-fn launch_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
-    state.select_mission(project, slug);
-    if let Err(error) = state.launch_mission(project, slug) {
-        toast(toasts, ToastKind::Error, error.to_string());
-    }
-}
-
-/// Resume is an explicit operator action. Selecting or browsing a mission
-/// never starts a process.
-fn resume_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
-    state.select_mission(project, slug);
-    if let Err(error) = state.resume_mission(project, slug) {
-        toast(toasts, ToastKind::Error, error.to_string());
-    }
-}
-
-/// Stop a mission's run (Mission ⋮ -> Stop run): report export/cleanup
-/// failures and clear the durable session only after cleanup succeeds.
-fn stop_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
-    match state.stop_mission(project, slug) {
-        Ok(crate::state::StopMissionResult::Scheduled) => {
-            toast(toasts, ToastKind::Info, format!("stopping mission {slug}…"));
-        }
-        Ok(crate::state::StopMissionResult::Completed(path)) => {
-            let detail = if path.is_empty() {
-                format!("stopped mission {slug}")
-            } else {
-                format!("stopped mission {slug} — transcript: {path}")
-            };
-            toast(toasts, ToastKind::Success, detail);
-            state.refresh_missions(project);
-        }
-        Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
-    }
-}
-
-/// Delete a mission record (transcripts stay in the corpus runs/).
-fn delete_mission(
-    state: &mut AppState,
-    toasts: &mut Toasts,
-    project: &str,
-    slug: &str,
-    was_selected: bool,
-) {
-    match state.delete_mission(project, slug) {
-        Ok(()) => {
-            toast(
-                toasts,
-                ToastKind::Success,
-                format!("deleted mission {slug}"),
-            );
-            state.refresh_missions(project);
-            if was_selected {
-                state.selected_mission = None; // re-defaults to the next
-            }
         }
         Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
     }

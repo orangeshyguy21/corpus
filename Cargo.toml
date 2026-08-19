@@ -21,5 +21,11 @@ notify = "8.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 goose = { git = "https://github.com/aaif-goose/goose", rev = "4bb968fadbb1d8fc0216adad627a1ab7837803c5" }
 
+[patch.crates-io]
+# egui_term 0.1.0 incorrectly gates keyboard events on pointer hover as well
+# as focus. Corpus owns a minimal, source-identical fork so a focused mission
+# terminal behaves like a terminal even after the pointer leaves the pane.
+egui_term = { path = "vendor/egui_term" }
+
 [profile.release]
 lto = true
