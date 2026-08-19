@@ -49,6 +49,7 @@ pub struct ProjectsView {
     needs_probe: bool,
     show_install: bool,
     install_path: String,
+    plugin_details_open: bool,
 }
 
 impl Default for ProjectsView {
@@ -66,6 +67,7 @@ impl Default for ProjectsView {
             needs_probe: false,
             show_install: false,
             install_path: String::new(),
+            plugin_details_open: false,
         }
     }
 }
@@ -96,6 +98,7 @@ impl ProjectsView {
             self.project = Some(slug.clone());
             self.edit_plugin = project.plugin.clone();
             self.confirm_wipe = false;
+            self.plugin_details_open = false;
         }
         // Drain a requested plugin re-probe before the picker renders.
         if self.needs_probe {
@@ -251,12 +254,13 @@ impl ProjectsView {
                 .iter()
                 .find(|plugin| plugin.name == self.edit_plugin)
                 .cloned();
-            if let Some(status) = selected_status.as_ref() {
-                plugin_identity(ui, status);
-                ui.add_space(8.0);
-            }
+            let leases = state.plugin_leases().to_vec();
+            let plugin_busy = state.plugin_work_active();
             ui.horizontal_wrapped(|ui| {
-                let plugin_busy = state.plugin_work_active();
+                if let Some(status) = selected_status.as_ref() {
+                    plugin_summary(ui, status);
+                }
+                ui.add_space(12.0);
                 let setup_label = match state.plugin_operation() {
                     Some(ref operation)
                         if operation.operation == "setup"
@@ -279,59 +283,63 @@ impl ProjectsView {
                                 ToastKind::Info,
                                 format!("{} {operation} started", self.edit_plugin),
                             ),
-                        Ok(false) => toast(
-                            toasts,
-                            ToastKind::Warning,
-                            "another plugin operation is already running",
+                            Ok(false) => toast(
+                                toasts,
+                                ToastKind::Warning,
+                                "another plugin operation is already running",
                             ),
                             Err(error) => toast(toasts, ToastKind::Error, error),
                         }
                     }
                 }
-                let leases_live = !state.plugin_leases().is_empty();
-                let stop = ui
-                    .add_enabled(!leases_live && !plugin_busy, egui::Button::new("Stop"))
-                    .on_disabled_hover_text(
-                        "Stop or retry cleanup for the live mission leases shown below first.",
-                    );
-                if stop.clicked() {
-                    match state.start_plugin_lifecycle(&self.edit_plugin, "stop") {
-                        Ok(true) => toast(
-                            toasts,
-                            ToastKind::Info,
-                            format!("{} stop started", self.edit_plugin),
-                        ),
-                    Ok(false) => toast(
-                        toasts,
-                        ToastKind::Warning,
-                        "another plugin operation is already running",
-                        ),
-                        Err(error) => toast(toasts, ToastKind::Error, error),
+                ui.menu_button("⋮", |ui| {
+                    let environments_live = !leases.is_empty();
+                    let stop = ui
+                        .add_enabled(
+                            !environments_live && !plugin_busy,
+                            egui::Button::new("Stop"),
+                        )
+                        .on_disabled_hover_text(
+                            "Stop active mission environments before stopping the plugin.",
+                        );
+                    if stop.clicked() {
+                        match state.start_plugin_lifecycle(&self.edit_plugin, "stop") {
+                            Ok(true) => toast(
+                                toasts,
+                                ToastKind::Info,
+                                format!("{} stop started", self.edit_plugin),
+                            ),
+                            Ok(false) => toast(
+                                toasts,
+                                ToastKind::Warning,
+                                "another plugin operation is already running",
+                            ),
+                            Err(error) => toast(toasts, ToastKind::Error, error),
+                        }
+                        ui.close_menu();
                     }
-                }
-                if state.plugin_lifecycle_active("setup")
-                    && ui.button("Cancel setup").clicked()
-                    && state.cancel_plugin_lifecycle("setup")
-                {
-                    toast(toasts, ToastKind::Info, "cancelling plugin setup");
-                }
-                if ui
-                    .add_enabled(!plugin_busy, egui::Button::new("Install bundle…"))
-                    .clicked()
-                {
-                    self.show_install = true;
-                }
+                    if state.plugin_lifecycle_active("setup") && ui.button("Cancel setup").clicked()
+                    {
+                        if state.cancel_plugin_lifecycle("setup") {
+                            toast(toasts, ToastKind::Info, "cancelling plugin setup");
+                        }
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(!plugin_busy, egui::Button::new("Install bundle…"))
+                        .clicked()
+                    {
+                        self.show_install = true;
+                        ui.close_menu();
+                    }
+                });
             });
             if let Some(operation) = state.plugin_operation() {
                 ui.add_space(8.0);
                 plugin_operation(ui, &operation);
             }
             ui.add_space(12.0);
-            plugin_leases(ui, state.plugin_leases());
-            ui.add_space(16.0);
-            components::soft_rule(ui);
-            ui.add_space(12.0);
-            ui.label(command_label("Pinned sources"));
+            ui.label(command_label("Source revisions"));
             ui.add_space(6.0);
             if state.source_revisions_loading(slug) {
                 empty_hint(ui, "loading source revisions…");
@@ -360,7 +368,17 @@ impl ProjectsView {
                     }
                 });
                 ui.add_space(6.0);
-                empty_hint(ui, "source selections persist immediately");
+                empty_hint(ui, "changes apply immediately");
+            }
+            ui.add_space(12.0);
+            details_toggle(ui, &mut self.plugin_details_open);
+            if self.plugin_details_open {
+                ui.add_space(10.0);
+                if let Some(status) = selected_status.as_ref() {
+                    plugin_identity(ui, status);
+                }
+                ui.add_space(12.0);
+                plugin_environments(ui, &leases);
             }
         });
     }
@@ -395,7 +413,14 @@ impl ProjectsView {
             for (slug, mission) in missions {
                 let name = crate::state::mission_label(mission.name.as_deref(), &slug);
                 let activity = state.mission_activity(project, &slug);
-                let (status, tone) = match activity {
+                let old_repo_revision = state.plugin_leases().iter().any(|environment| {
+                    environment.mission == slug
+                        && environment.drift.iter().any(|detail| {
+                            detail.contains(" pin resolves to ")
+                                && detail.contains(" but lease runs ")
+                        })
+                });
+                let (activity_status, activity_tone) = match activity {
                     crate::state::MissionActivity::Working => {
                         ("working", components::StatusTone::Healthy)
                     }
@@ -406,7 +431,17 @@ impl ProjectsView {
                         ("idle", components::StatusTone::Neutral)
                     }
                 };
-                if command_row(ui, ("project-mission", &slug), &name, status, tone).clicked() {
+                let status = if old_repo_revision {
+                    format!("{activity_status} · old repo revision")
+                } else {
+                    activity_status.to_string()
+                };
+                let tone = if old_repo_revision {
+                    components::StatusTone::Warning
+                } else {
+                    activity_tone
+                };
+                if command_row(ui, ("project-mission", &slug), &name, &status, tone).clicked() {
                     state.select_mission(project, &slug);
                 }
             }
@@ -961,6 +996,63 @@ fn empty_hint(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(theme::TEXT_FAINT));
 }
 
+fn plugin_summary(ui: &mut Ui, status: &corpus_core::PluginStatus) {
+    components::status_badge(
+        ui,
+        if status.ready { "ready" } else { "not ready" },
+        if status.ready {
+            components::StatusTone::Healthy
+        } else {
+            components::StatusTone::Danger
+        },
+    )
+    .on_hover_text(&status.notes);
+    ui.label(
+        RichText::new(format!(
+            "v{}",
+            status.version.as_deref().unwrap_or("unknown")
+        ))
+        .monospace()
+        .size(12.0)
+        .color(theme::TEXT_MUTED),
+    );
+}
+
+fn details_toggle(ui: &mut Ui, open: &mut bool) {
+    egui::Frame::default()
+        .stroke(egui::Stroke::new(1.0_f32, theme::KEYLINE_SOFT))
+        .corner_radius(egui::CornerRadius::same(2))
+        .inner_margin(egui::Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            let marker = if *open { "⌄" } else { "›" };
+            let state = if *open { "Expanded" } else { "Collapsed" };
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("{marker}  Details"))
+                                .monospace()
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    *open = !*open;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(state)
+                            .monospace()
+                            .size(10.5)
+                            .color(theme::TEXT_FAINT),
+                    );
+                });
+            });
+        });
+}
+
 fn plugin_identity(ui: &mut Ui, status: &corpus_core::PluginStatus) {
     let origin = match status.origin {
         corpus_core::PluginOrigin::Direct => "development override",
@@ -1088,11 +1180,11 @@ fn plugin_operation(ui: &mut Ui, operation: &crate::state::PluginOperationView) 
     }
 }
 
-fn plugin_leases(ui: &mut Ui, leases: &[crate::state::PluginLeaseView]) {
-    ui.label(command_label("Live environment leases"));
+fn plugin_environments(ui: &mut Ui, leases: &[crate::state::PluginLeaseView]) {
+    ui.label(command_label("Active mission environments"));
     ui.add_space(4.0);
     if leases.is_empty() {
-        empty_hint(ui, "no target or sandbox session is active");
+        empty_hint(ui, "no mission environment is active");
         return;
     }
     for lease in leases {

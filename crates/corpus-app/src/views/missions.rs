@@ -10,13 +10,12 @@
 use std::time::Duration;
 
 use egui::{RichText, Ui};
-use egui_phosphor::regular as ph;
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
 use crate::state::{AppState, RunPhase};
 use crate::terminal::TerminalPane;
 use crate::theme;
-use crate::views::mission_actions::{self, Availability};
+use crate::views::mission_actions;
 
 /// Widget state for the Mission view: the embedded terminal and the
 /// tail-follow flag for the piped fallback. Run bookkeeping lives on
@@ -25,16 +24,12 @@ pub struct MissionsView {
     pane: TerminalPane,
     /// Auto-follow the tail (piped-fallback runs only).
     follow: bool,
-    rename_open: bool,
-    rename_name: String,
 }
 impl Default for MissionsView {
     fn default() -> Self {
         Self {
             pane: TerminalPane::default(),
             follow: true,
-            rename_open: false,
-            rename_name: String::new(),
         }
     }
 }
@@ -114,7 +109,7 @@ impl MissionsView {
             // Piped fallback (no tmux): this mission's transcript tail.
             self.tail(ui, state);
         } else {
-            self.idle(ui, state, toasts, &project, &slug, &mission, &phase);
+            self.idle(ui, state, toasts, &project, &slug, &mission);
         }
     }
 
@@ -128,136 +123,85 @@ impl MissionsView {
         project: &str,
         slug: &str,
         mission: &corpus_core::Mission,
-        phase: &RunPhase,
     ) {
         let label = crate::state::mission_label(mission.name.as_deref(), slug);
-        let resumable = mission.opencode_session.is_some();
-        let actions = Availability::resolve(
-            false,
-            resumable,
-            state.mission_run_inflight(project, slug),
-            state.mission_environment_needs_cleanup(project, slug),
-        );
+        let agent_line = state
+            .agents
+            .iter()
+            .find(|(agent_slug, _)| agent_slug == &mission.agent)
+            .map(|(agent_slug, agent)| {
+                format_agent_line(
+                    &crate::state::agent_label(&agent.meta.name, agent_slug),
+                    agent.meta.role().as_str(),
+                )
+            })
+            .unwrap_or_else(|| format_agent_line(&state.agent_label(&mission.agent), "unknown"));
+        let delete_available = state.mission_delete_available(project, slug);
         let rect = ui.max_rect();
+        let splash_rect = egui::Rect::from_center_size(
+            rect.center(),
+            egui::vec2(rect.width(), 88.0_f32.min(rect.height())),
+        );
         ui.allocate_new_ui(
             egui::UiBuilder::new()
-                .max_rect(rect)
+                .max_rect(splash_rect)
                 .layout(egui::Layout::top_down(egui::Align::Center)),
             |ui| {
-                ui.add_space((rect.height() * 0.36).max(24.0));
                 ui.label(RichText::new(&label).size(15.0).color(theme::TEXT));
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new(format!("agent={}", mission.agent))
+                    RichText::new(agent_line)
                         .size(12.0)
-                        .color(theme::TEXT_FAINT),
+                        .color(theme::TEXT_MUTED),
                 );
-                ui.add_space(8.0);
-                match phase {
-                    RunPhase::Failed { message, .. } => {
-                        ui.label(RichText::new(message).size(11.0).color(theme::SIGNAL_RED));
-                    }
-                    _ if resumable => {
-                        ui.label(
-                            RichText::new("session stopped — resume it or start fresh")
-                                .size(11.0)
-                                .color(theme::TEXT_FAINT),
-                        );
-                    }
-                    _ => {
-                        ui.label(
-                            RichText::new("ready to launch")
-                                .size(11.0)
-                                .color(theme::TEXT_FAINT),
-                        );
-                    }
-                }
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    if actions.retry_cleanup {
-                        if theme::primary_button(ui, "Retry cleanup").clicked() {
-                            mission_actions::stop(state, toasts, project, slug);
-                        }
-                    } else if actions.resume {
-                        if theme::primary_button(ui, "Resume").clicked() {
-                            mission_actions::resume(state, toasts, project, slug);
-                        }
-                        if theme::house_button(ui, "Launch fresh").clicked() {
-                            mission_actions::launch(state, toasts, project, slug);
-                        }
-                    } else if ui
-                        .add_enabled_ui(actions.launch, |ui| theme::primary_button(ui, "Launch"))
-                        .inner
-                        .clicked()
-                    {
-                        mission_actions::launch(state, toasts, project, slug);
-                    }
+                ui.add_space(12.0);
 
-                    egui::menu::menu_custom_button(
-                        ui,
-                        egui::Button::new(theme::icon_text(
-                            ph::DOTS_THREE_VERTICAL,
-                            17.0,
-                            theme::TEXT_MUTED,
-                        ))
-                        .frame(false),
-                        |ui| {
-                            if ui.button("Rename…").clicked() {
-                                self.rename_name = label.clone();
-                                self.rename_open = true;
-                                ui.close_menu();
+                // A horizontal layout greedily takes the entire available
+                // width in egui. Give the action row an explicit compact
+                // rectangle so the parent can center it as one unit.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(184.0, 38.0),
+                    egui::Layout::left_to_right(egui::Align::Center)
+                        .with_main_align(egui::Align::Center),
+                    |ui| {
+                        let resumable = mission.opencode_session.is_some();
+                        let primary_available = !state.mission_run_inflight(project, slug)
+                            && !state.mission_environment_needs_cleanup(project, slug);
+                        if ui
+                            .add_enabled_ui(primary_available, |ui| {
+                                theme::primary_button(
+                                    ui,
+                                    if resumable { "Resume" } else { "Launch" },
+                                )
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            if resumable {
+                                state.select_mission(project, slug);
+                                match state.resume_mission(project, slug) {
+                                    Ok(()) => toast(toasts, ToastKind::Info, "mission resumed"),
+                                    Err(error) => {
+                                        toast(toasts, ToastKind::Error, error.to_string())
+                                    }
+                                }
+                            } else {
+                                mission_actions::launch(state, toasts, project, slug);
                             }
-                            if ui
-                                .add_enabled(actions.delete, egui::Button::new("Delete"))
-                                .clicked()
-                            {
-                                mission_actions::delete(state, toasts, project, slug);
-                                ui.close_menu();
-                            }
-                        },
-                    );
-                });
+                        }
+                        if ui
+                            .add_enabled_ui(delete_available, |ui| {
+                                theme::destructive_button(ui, "Delete")
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            mission_actions::delete(state, toasts, project, slug);
+                        }
+                    },
+                );
             },
         );
-        self.rename_window(ui, state, toasts, project, slug);
-    }
-
-    fn rename_window(
-        &mut self,
-        ui: &mut Ui,
-        state: &mut AppState,
-        toasts: &mut Toasts,
-        project: &str,
-        slug: &str,
-    ) {
-        if !self.rename_open {
-            return;
-        }
-        let mut open = true;
-        let mut renamed = false;
-        egui::Window::new("Rename mission")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -120.0))
-            .show(ui.ctx(), |ui| {
-                ui.label("Display name (the slug stays as the id)");
-                let entry = ui.text_edit_singleline(&mut self.rename_name);
-                ui.add_space(8.0);
-                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if theme::house_button(ui, "Rename").clicked() || submit {
-                    match state.rename_mission(project, slug, &self.rename_name) {
-                        Ok(()) => {
-                            state.refresh_missions(project);
-                            renamed = true;
-                        }
-                        Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
-                    }
-                }
-            });
-        if !open || renamed {
-            self.rename_open = false;
-        }
     }
 
     /// One faint centered line in the pane rect — the transient states
@@ -293,6 +237,10 @@ impl MissionsView {
     }
 }
 
+fn format_agent_line(name: &str, role: &str) -> String {
+    format!("{name} <{role}>")
+}
+
 /// Add a timed toast to the overlay.
 fn toast(toasts: &mut Toasts, kind: ToastKind, text: impl Into<String>) {
     toasts.add(
@@ -301,4 +249,14 @@ fn toast(toasts: &mut Toasts, kind: ToastKind, text: impl Into<String>) {
             .text(text.into())
             .options(ToastOptions::default().duration(Duration::from_secs(4))),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_agent_line;
+
+    #[test]
+    fn splash_identifies_agent_by_name_and_role() {
+        assert_eq!(format_agent_line("operator", "tester"), "operator <tester>");
+    }
 }

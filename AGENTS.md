@@ -161,8 +161,8 @@ corpus plugin call <name> <method> [params-json]
 # and the run survives attach/detach/app-close; a relaunched app lists
 # live corpus-* sessions for in-pane re-attach. `corpus run` is the
 # HEADLESS `opencode run` (automation): transcript .log in the project
-# corpus runs/. Transcript of record for TUI runs: Stop (the ONE run
-# teardown verb — the run menu is Stop / Rename… / Delete) exports
+# corpus runs/. Transcript of record for TUI runs: mission Delete (the app's
+# one run teardown verb; the row menu is Rename… / Delete) exports
 # the session to <epoch>-<agent>.json best-effort in the project corpus
 # runs/; the live tail is tmux pipe-pane raw capture
 # (ANSI-stripped), written into the SAME runs/ as <epoch>-<agent>.raw

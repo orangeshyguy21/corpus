@@ -26,7 +26,7 @@ use crate::fmt::fmt_bytes;
 use crate::nav::Screen;
 use crate::state::{AppState, MissionActivity};
 use crate::theme;
-use crate::views::mission_actions::{self, Availability};
+use crate::views::mission_actions;
 use crate::views::plugin_picker::plugin_picker;
 
 /// Row height for a sidebar list row (15px text + 5px vertical padding).
@@ -324,10 +324,6 @@ impl Sidebar {
         for (slug, mission) in &tree.missions {
             let is_sel = on_screen && state.selected_mission.as_deref() == Some(slug.as_str());
             let label_text = crate::state::mission_label(mission.name.as_deref(), slug);
-            let live = mission
-                .session
-                .as_ref()
-                .is_some_and(|s| state.live_sessions.iter().any(|l| l == s));
             // The status dot: pulses only while the agent is ACTUALLY
             // producing. A session parked at its prompt is live, not
             // busy, and shows a steady dot instead.
@@ -343,16 +339,7 @@ impl Sidebar {
             let (label_resp, _menu_w) = if is_sel || hovered {
                 let menu_w = rui
                     .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.mission_menu(
-                            ui,
-                            state,
-                            toasts,
-                            project,
-                            slug,
-                            live,
-                            mission.opencode_session.is_some(),
-                            &label_text,
-                        )
+                        self.mission_menu(ui, state, toasts, project, slug, &label_text)
                     })
                     .response
                     .rect
@@ -422,7 +409,7 @@ impl Sidebar {
     /// selected agent (when the project is already selected), else
     /// `operator` if present, else the first agent (refuses with a toast
     /// when the project has none). Pins = the project's top-bar pins.
-    /// Creates and selects without launching. A `+` on
+    /// Creates, selects, and launches. A `+` on
     /// a non-selected project's group selects that project first.
     fn new_mission(&mut self, state: &mut AppState, toasts: &mut Toasts, project: &str) {
         if state.effective_project().as_deref() != Some(project) {
@@ -453,15 +440,16 @@ impl Sidebar {
         match state.create_mission(&project, &agent, "") {
             Ok(slug) => {
                 state.refresh_missions(&project);
-                state.select_mission(&project, &slug);
-                toast(toasts, ToastKind::Success, "mission created");
+                // Launch owns the success feedback; creation and launch are
+                // one operator action.
+                let _ = mission_actions::launch(state, toasts, &project, &slug);
             }
             Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
         }
     }
 
-    /// The mission-row `⋮` menu: Stop run (gated on a live
-    /// session), Rename…, Delete. Operates on the mission record of the
+    /// The mission-row `⋮` menu: Rename…, Delete. Delete owns any live-run
+    /// teardown and transcript export. Operates on the mission record of the
     /// row's OWN project (tree rows can belong to a non-selected
     /// project), so it works regardless of the view.
     fn mission_menu(
@@ -471,8 +459,6 @@ impl Sidebar {
         toasts: &mut Toasts,
         project: &str,
         slug: &str,
-        live: bool,
-        resumable: bool,
         name: &str,
     ) -> egui::Response {
         egui::menu::menu_custom_button(
@@ -484,36 +470,6 @@ impl Sidebar {
             ))
             .frame(false),
             |ui| {
-                let inflight = state.mission_run_inflight(project, slug);
-                let cleanup = state.mission_environment_needs_cleanup(project, slug);
-                let actions = Availability::resolve(live, resumable, inflight, cleanup);
-                // Launch an existing (never-run, or stopped) mission — the
-                // gap that made curator-created missions dead ends. Disabled
-                // while its session is already live. Selects the mission and
-                // routes to the view so the operator lands on the pane as it
-                // attaches; the brief kicks the session off.
-                let launch = ui.add_enabled(actions.launch, egui::Button::new("Launch"));
-                if launch.clicked() {
-                    mission_actions::launch(state, toasts, project, slug);
-                    ui.close_menu();
-                }
-                let resume = ui.add_enabled(actions.resume, egui::Button::new("Resume"));
-                if resume.clicked() {
-                    mission_actions::resume(state, toasts, project, slug);
-                    ui.close_menu();
-                }
-                let stop = ui.add_enabled(
-                    actions.stop || actions.retry_cleanup,
-                    egui::Button::new(if actions.stop {
-                        "Stop run"
-                    } else {
-                        "Retry cleanup"
-                    }),
-                );
-                if stop.clicked() {
-                    mission_actions::stop(state, toasts, project, slug);
-                    ui.close_menu();
-                }
                 if ui.button("Rename…").clicked() {
                     self.rename_mission_project = Some(project.to_string());
                     self.rename_mission = Some(slug.to_string());
@@ -521,7 +477,10 @@ impl Sidebar {
                     ui.close_menu();
                 }
                 if ui
-                    .add_enabled(actions.delete, egui::Button::new("Delete"))
+                    .add_enabled(
+                        state.mission_delete_available(project, slug),
+                        egui::Button::new("Delete"),
+                    )
                     .clicked()
                 {
                     mission_actions::delete(state, toasts, project, slug);

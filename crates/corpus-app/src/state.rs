@@ -421,6 +421,10 @@ pub struct AppState {
     /// Per `(project, mission)` launch generation. Relaunching the same
     /// mission gets a new identity, so late work cannot attach to its successor.
     run_generations: BTreeMap<(String, String), u64>,
+    /// Missions whose Delete action is waiting for run/environment teardown.
+    /// The record is removed only after cleanup succeeds; failures retain
+    /// both the record and this intent so Delete can be retried safely.
+    pending_mission_deletes: BTreeSet<(String, String)>,
     /// Transcript lines drained so far (the run view renders these).
     pub run_lines: Vec<RunLine>,
     /// A run that ended ON ITS OWN, held for exactly one report to the
@@ -594,6 +598,12 @@ pub enum StopMissionResult {
     Completed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteMissionResult {
+    Scheduled,
+    Completed,
+}
+
 /// The activity signal (Idle / Waiting / Working) is owned by corpus-core
 /// now, so the app's dots and the curator's `mission_status` tool read the
 /// SAME rule and window. Re-exported here so `crate::state::MissionActivity`
@@ -695,6 +705,13 @@ impl RunPhase {
                     cleanup_pending: true,
                     ..
                 }
+        )
+    }
+
+    fn allows_delete_action(&self) -> bool {
+        !matches!(
+            self,
+            Self::Preparing | Self::Starting | Self::Stopping | Self::Exporting
         )
     }
 }
@@ -1318,6 +1335,7 @@ impl AppState {
             run_phases: BTreeMap::new(),
             run_cancellations: BTreeMap::new(),
             run_generations: BTreeMap::new(),
+            pending_mission_deletes: BTreeSet::new(),
             run_lines: Vec::new(),
             run_exit: None,
             live_sessions: Vec::new(),
@@ -2284,21 +2302,62 @@ impl AppState {
         Ok(id)
     }
 
-    /// Delete a mission record (the transcripts stay in the corpus runs/).
-    pub fn delete_mission(&self, project: &str, slug: &str) -> Result<(), Error> {
-        let inflight = self.run_phases.iter().any(|(id, phase)| {
-            id.project == project && id.mission == slug && phase.blocks_deletion()
-        });
-        let live_session = self
-            .store
-            .load_mission(project, slug)
-            .ok()
-            .and_then(|mission| mission.session)
-            .is_some_and(|session| self.live_sessions.contains(&session));
-        if inflight || live_session || self.mission_environment_needs_cleanup(project, slug) {
-            return Err(Error::Store("Stop the run first.".into()));
+    /// Delete is the mission's single teardown verb. A live run is exported
+    /// and cleaned up first; its mission record is removed only after that
+    /// succeeds. Durable transcripts remain in `corpus/runs/`.
+    pub fn delete_mission(
+        &mut self,
+        project: &str,
+        slug: &str,
+    ) -> Result<DeleteMissionResult, Error> {
+        let mission = self.store.load_mission(project, slug)?;
+        let needs_teardown =
+            mission.session.is_some() || self.mission_environment_needs_cleanup(project, slug);
+        if needs_teardown {
+            match self.stop_mission(project, slug)? {
+                StopMissionResult::Scheduled => {
+                    self.pending_mission_deletes
+                        .insert((project.to_string(), slug.to_string()));
+                    Ok(DeleteMissionResult::Scheduled)
+                }
+                StopMissionResult::Completed(path) => {
+                    drop(path);
+                    self.store.delete_mission(project, slug)?;
+                    Ok(DeleteMissionResult::Completed)
+                }
+            }
+        } else {
+            // A previous cleanup attempt may have failed in-process while an
+            // external/plugin recovery subsequently closed the durable
+            // environment. Once both durable handles are verified absent,
+            // that failed phase is stale and must not require a UI-only
+            // "Retry cleanup" command forever.
+            let reconciled = self
+                .run_phases
+                .iter()
+                .filter(|(id, _)| id.project == project && id.mission == slug)
+                .max_by_key(|(id, _)| id.generation)
+                .and_then(|(id, phase)| {
+                    matches!(
+                        phase,
+                        RunPhase::Failed {
+                            cleanup_pending: true,
+                            ..
+                        }
+                    )
+                    .then(|| id.clone())
+                });
+            if let Some(run_id) = reconciled {
+                self.finish_run(&run_id);
+            }
+            if self.mission_run_inflight(project, slug) {
+                return Err(Error::Store(
+                    "mission launch or teardown is still in progress".into(),
+                ));
+            }
+            self.store.delete_mission(project, slug)?;
+            Ok(DeleteMissionResult::Completed)
         }
-        self.store.delete_mission(project, slug)
     }
 
     fn project_has_inflight_run(&self, project: &str) -> bool {
@@ -2426,6 +2485,15 @@ impl AppState {
     /// state as well as reflected by disabled UI actions.
     pub fn mission_run_inflight(&self, project: &str, mission: &str) -> bool {
         self.latest_run_phase(project, mission).blocks_deletion()
+    }
+
+    /// User-facing Delete availability. Preparation and an active teardown
+    /// are indivisible background operations, so a second Delete is held
+    /// until they settle. Running and failed-cleanup states deliberately stay
+    /// actionable: Delete is the command that starts or retries teardown.
+    pub fn mission_delete_available(&self, project: &str, mission: &str) -> bool {
+        self.latest_run_phase(project, mission)
+            .allows_delete_action()
     }
 
     /// A mission may outlive the app between environment creation and agent
@@ -3401,8 +3469,8 @@ impl AppState {
                     .map_err(|error| error.to_string())?;
                 if environment_runtime
                     .open(&store, environment_id.clone(), prepared.clone())
-                .map_err(|error| error.to_string())?
-                .is_none()
+                    .map_err(|error| error.to_string())?
+                    .is_none()
                 {
                     mission.environment_session = None;
                     store
@@ -4173,6 +4241,8 @@ impl AppState {
     }
 
     fn apply_teardown_ready(&mut self, run_id: &RunId, ready: TeardownReady) -> (bool, String) {
+        let delete_key = (run_id.project.clone(), run_id.mission.clone());
+        let delete_requested = self.pending_mission_deletes.contains(&delete_key);
         if ready.cleanup_complete {
             if let Err(error) = self.set_tmux_session(&run_id.project, &run_id.mission, None) {
                 self.fail_run(run_id, RunPhaseKind::Stopping, &error, true, false);
@@ -4180,6 +4250,16 @@ impl AppState {
             }
             self.finish_run(run_id);
             self.run_meta = None;
+            if delete_requested {
+                if let Err(error) = self.store.delete_mission(&run_id.project, &run_id.mission) {
+                    self.pending_mission_deletes.remove(&delete_key);
+                    return (true, error.to_string());
+                }
+                self.pending_mission_deletes.remove(&delete_key);
+                if self.selected_mission.as_deref() == Some(run_id.mission.as_str()) {
+                    self.selected_mission = None;
+                }
+            }
         } else if let Some(session) = ready.retained {
             self.run = Some(session);
             self.owned_run_id = Some(run_id.clone());
@@ -4194,12 +4274,24 @@ impl AppState {
         self.refresh_live_sessions();
         self.refresh_missions(&run_id.project);
         if let Some(error) = ready.error {
-            (true, error)
+            if delete_requested && ready.cleanup_complete {
+                (true, format!("mission deleted; {error}"))
+            } else {
+                (true, error)
+            }
         } else {
             // Export still happens; the path belongs in the run store, not a
             // routine success notification.
             drop(ready.transcript);
-            (false, "mission stopped".into())
+            (
+                false,
+                if delete_requested {
+                    "mission deleted"
+                } else {
+                    "mission stopped"
+                }
+                .into(),
+            )
         }
     }
 
@@ -4419,7 +4511,7 @@ fn prepared_plugin_leases(
 fn plugin_recovery_hint(error: &str) -> Option<&'static str> {
     let error = error.to_ascii_lowercase();
     if error.contains("sessions_active") || error.contains("session(s) are active") {
-        Some("Stop or retry cleanup for every live mission lease, then retry environment Stop.")
+        Some("Delete every live mission lease, then retry environment Stop.")
     } else if error.contains("source_missing")
         || error.contains("source identity mismatch")
         || error.contains("target identity")
@@ -4429,7 +4521,7 @@ fn plugin_recovery_hint(error: &str) -> Option<&'static str> {
     } else if error.contains("isolation") || error.contains("cross_session") {
         Some("Stop the affected mission lease; retry only after Doctor confirms isolation.")
     } else if error.contains("cleanup") || error.contains("could not stop") {
-        Some("Retry Stop. If a mission lease remains, use that mission's Retry cleanup action first.")
+        Some("Retry Stop. If a mission lease remains, delete that mission to retry its cleanup.")
     } else if error.contains("docker") {
         Some("Start Docker and retry Setup or Doctor.")
     } else if error.contains("immutable") || error.contains("already installed with digest") {
@@ -4722,7 +4814,6 @@ mod tests {
             None
         }
     }
-
 
     #[test]
     fn generated_ids_are_formatted_uuids_and_valid_slugs() {
@@ -5335,7 +5426,7 @@ mod tests {
                 .delete_mission("p", "mission")
                 .unwrap_err()
                 .to_string(),
-            "store error: Stop the run first."
+            "store error: mission launch or teardown is still in progress"
         );
         assert_eq!(
             state.delete_project("p").unwrap_err().to_string(),
@@ -5429,7 +5520,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_job_runtime_tears_down_without_blocking_the_action() {
+    fn installed_job_runtime_deletes_only_after_teardown_completes() {
         let root = std::env::temp_dir().join(format!(
             "corpus-app-async-stop-{}-{}",
             std::process::id(),
@@ -5468,8 +5559,8 @@ mod tests {
             .unwrap();
         state.install_job_runtime(eframe::egui::Context::default());
         assert!(matches!(
-            state.stop_mission("p", "mission").unwrap(),
-            StopMissionResult::Scheduled
+            state.delete_mission("p", "mission").unwrap(),
+            DeleteMissionResult::Scheduled
         ));
         assert_eq!(state.run_phase(&run_id), RunPhase::Stopping);
         for _ in 0..200 {
@@ -5480,11 +5571,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(state.run_phase(&run_id), RunPhase::Idle);
-        assert!(store
-            .load_mission("p", "mission")
-            .unwrap()
-            .session
-            .is_none());
+        assert!(store.load_mission("p", "mission").is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5720,20 +5807,19 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(
-            state
-                .delete_mission("p", "mission")
-                .unwrap_err()
-                .to_string(),
-            "store error: Stop the run first."
+        let delete_error = state.delete_mission("p", "mission").unwrap_err();
+        assert!(
+            delete_error.to_string().contains("tmux cleanup failure"),
+            "{delete_error}"
         );
+        assert!(store.load_mission("p", "mission").is_ok());
 
         backend.fail_kill.store(false, Ordering::Relaxed);
         let export_error = state.stop_mission("p", "mission").unwrap_err();
         assert!(export_error.to_string().contains("detached export failure"));
         assert_eq!(store.load_mission("p", "mission").unwrap().session, None);
         let second = RunId {
-            generation: 2,
+            generation: 3,
             ..first
         };
         assert!(matches!(
@@ -5797,6 +5883,16 @@ mod tests {
             assert!(phase.blocks_deletion(), "{phase:?}");
         }
         assert!(!RunPhase::Idle.blocks_deletion());
+        assert!(RunPhase::Idle.allows_delete_action());
+        assert!(RunPhase::Running.allows_delete_action());
+        for phase in [
+            RunPhase::Preparing,
+            RunPhase::Starting,
+            RunPhase::Stopping,
+            RunPhase::Exporting,
+        ] {
+            assert!(!phase.allows_delete_action(), "{phase:?}");
+        }
         for at in [
             RunPhaseKind::Preparing,
             RunPhaseKind::Starting,
@@ -5804,13 +5900,14 @@ mod tests {
             RunPhaseKind::Stopping,
             RunPhaseKind::Exporting,
         ] {
-            assert!(!RunPhase::Failed {
+            let failed = RunPhase::Failed {
                 at,
                 message: "visible failure".into(),
                 recoverable: true,
                 cleanup_pending: false,
-            }
-            .blocks_deletion());
+            };
+            assert!(!failed.blocks_deletion());
+            assert!(failed.allows_delete_action());
         }
     }
 
@@ -5998,7 +6095,7 @@ mod tests {
         };
         store.save_environment_session(&environment).unwrap();
 
-        let state = AppState::with_runtime(
+        let mut state = AppState::with_runtime(
             store.clone(),
             Arc::new(ManualClock::new(0)),
             Arc::new(FakeRunBackend::default()),
@@ -6010,13 +6107,12 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requiring cleanup"));
-        assert_eq!(
-            state
-                .delete_mission("p", "mission")
-                .unwrap_err()
-                .to_string(),
-            "store error: Stop the run first."
+        let cleanup_error = state.delete_mission("p", "mission").unwrap_err();
+        assert!(
+            cleanup_error.to_string().contains("cleanup_failed"),
+            "{cleanup_error}"
         );
+        assert!(store.load_mission("p", "mission").is_ok());
 
         environment.state = corpus_core::EnvironmentSessionState::Closed;
         store.save_environment_session(&environment).unwrap();

@@ -1,0 +1,501 @@
+<title>NERV UI Directions</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Oswald:wght@300;400;500;600;700&family=Chakra+Petch:wght@300;400;500;600;700&family=Saira+Condensed:wght@400;500;600;700;800&family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Noto+Sans+JP:wght@300;400;500;700&family=Noto+Serif+JP:wght@600;900&display=swap">
+<style>
+  :root{
+    --bg:#070809;
+    --board-panel:#0d0e0f;
+    --board-line:#211f1c;
+    --board-line-soft:#181715;
+    --text:#e4e0d8;
+    --muted:#9b9890;
+    --faint:#6c6962;
+    --amber:#e39a3b;
+    --amber-hi:#f0af55;
+    --green:#91cf58;
+    --red:#e5442c;
+    --red-hi:#ed5941;
+    --mono:"JetBrains Mono",ui-monospace,monospace;
+    --jp:"Noto Sans JP",sans-serif;
+    --jp-serif:"Noto Serif JP",serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--mono);
+    -webkit-font-smoothing:antialiased;
+    line-height:1.5;
+    overflow-x:hidden;
+  }
+  @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+
+  .wrap{max-width:1120px;margin:0 auto;padding:0 28px}
+
+  /* ===================== board header ===================== */
+  .masthead{
+    position:relative;
+    padding:64px 0 40px;
+    border-bottom:1px solid var(--board-line);
+    overflow:hidden;
+  }
+  .masthead .hazbar{
+    position:absolute;left:0;top:0;width:100%;height:6px;
+    background:repeating-linear-gradient(-45deg,var(--amber) 0 11px,#0a0a09 11px 22px);
+    opacity:.85;
+  }
+  .eyebrow{
+    display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+    font-size:11px;letter-spacing:3px;text-transform:uppercase;color:var(--amber);
+    margin-bottom:20px;
+  }
+  .eyebrow .jp{font-family:var(--jp);letter-spacing:2px;color:var(--muted);font-weight:400}
+  .eyebrow .tick{color:var(--faint)}
+  h1.title{
+    font-family:"Oswald",sans-serif;font-weight:600;
+    font-size:clamp(38px,6vw,74px);line-height:.98;letter-spacing:-.5px;
+    text-transform:uppercase;color:var(--text);text-wrap:balance;
+  }
+  h1.title b{color:var(--amber);font-weight:700}
+  .lede{
+    max-width:60ch;margin-top:22px;color:var(--muted);font-size:14.5px;line-height:1.65;
+  }
+  .lede b{color:var(--text);font-weight:500}
+  .legend{
+    display:flex;gap:26px;flex-wrap:wrap;margin-top:26px;
+    font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--faint);
+  }
+  .legend span{display:inline-flex;align-items:center;gap:8px}
+  .legend i{width:8px;height:8px;border-radius:50%}
+
+  /* ===================== concept scaffold ===================== */
+  .concept{padding:56px 0;border-bottom:1px solid var(--board-line)}
+  .c-head{display:flex;align-items:flex-start;gap:22px;margin-bottom:30px}
+  .c-idx{
+    font-family:"Oswald",sans-serif;font-weight:700;font-size:52px;line-height:.8;
+    color:transparent;-webkit-text-stroke:1px var(--faint);flex:none;
+    font-variant-numeric:tabular-nums;
+  }
+  .c-titles{flex:1;min-width:0}
+  .c-name{
+    font-family:"Oswald",sans-serif;font-weight:600;font-size:26px;letter-spacing:1px;
+    text-transform:uppercase;line-height:1;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+  }
+  .c-name .kana{font-family:var(--jp);font-weight:400;font-size:15px;letter-spacing:3px;color:var(--amber)}
+  .c-tag{margin-top:10px;color:var(--muted);font-size:13.5px;max-width:66ch;line-height:1.6}
+  .c-grid{display:grid;grid-template-columns:0.82fr 1.18fr;gap:34px;align-items:start}
+  @media (max-width:840px){.c-grid{grid-template-columns:1fr;gap:26px}.c-idx{font-size:40px}}
+
+  /* spec column */
+  .spec h4{
+    font-family:var(--mono);font-size:10.5px;font-weight:500;letter-spacing:2.5px;
+    text-transform:uppercase;color:var(--faint);margin:22px 0 11px;
+  }
+  .spec h4:first-child{margin-top:0}
+  .swatches{display:flex;flex-wrap:wrap;gap:9px}
+  .sw{
+    display:flex;flex-direction:column;gap:6px;width:64px;
+  }
+  .sw i{height:38px;border:1px solid rgba(255,255,255,.08)}
+  .sw span{font-size:9.5px;letter-spacing:.5px;color:var(--faint);font-family:var(--mono)}
+  .chips{display:flex;flex-wrap:wrap;gap:7px}
+  .chip{
+    font-size:10.5px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);
+    border:1px solid var(--board-line);padding:5px 9px;background:#0c0d0e;
+  }
+  .typenote{font-size:12.5px;color:var(--muted);line-height:1.6}
+  .typenote b{color:var(--text);font-weight:500}
+  .typenote .disp{font-size:15px}
+
+  /* ============ shared mockup shell (each concept overrides accents) ============ */
+  .demo{position:relative}
+  .demo-cap{
+    font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--faint);
+    margin-bottom:10px;display:flex;justify-content:space-between;
+  }
+
+  /* ==================================================================== */
+  /* CONCEPT 01 — NERV COMMAND                                            */
+  /* ==================================================================== */
+  .c1{
+    --panel:#0e0f10;--line:#2a2823;--keyline:#6a4722;
+    --acc:#e39a3b;--acc-hi:#f0af55;--ok:#91cf58;--alert:#e5442c;
+    --txt:#e6e2da;--dim:#7d7a72;--ink:#191208;
+  }
+  .c1 .mini{
+    position:relative;background:var(--panel);border:1px solid var(--keyline);
+    padding:0;
+    clip-path:polygon(0 16px,16px 0,100% 0,100% calc(100% - 16px),calc(100% - 16px) 100%,0 100%);
+  }
+  .c1 .mini::before,.c1 .mini::after{
+    content:"";position:absolute;width:12px;height:12px;pointer-events:none;
+  }
+  .c1 .mini::before{right:9px;top:9px;border-top:1px solid var(--acc);border-right:1px solid var(--acc)}
+  .c1 .mini::after{left:9px;bottom:9px;border-bottom:1px solid var(--acc);border-left:1px solid var(--acc)}
+  .c1 .haz{
+    height:22px;
+    background:repeating-linear-gradient(-45deg,var(--acc) 0 9px,#0b0a08 9px 18px);
+    display:flex;align-items:center;
+  }
+  .c1 .haz .plate{
+    background:var(--panel);height:100%;display:flex;align-items:center;gap:10px;
+    padding:0 14px 0 18px;margin-right:auto;
+  }
+  .c1 .haz .plate b{font-family:"Oswald",sans-serif;font-weight:600;font-size:12px;letter-spacing:2px;color:var(--acc);text-transform:uppercase}
+  .c1 .haz .plate .kana{font-family:var(--jp);font-size:11px;color:var(--dim)}
+  .c1 .haz .stat{
+    background:var(--panel);height:100%;display:flex;align-items:center;gap:8px;padding:0 16px 0 12px;
+    font-size:10.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--ok);
+  }
+  .c1 .haz .stat i{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
+  .c1 .body{padding:22px 22px 20px}
+  .c1 .sect{font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--dim);margin-bottom:12px}
+  .c1 .sect b{color:var(--acc);font-weight:400}
+  .c1 .mname{font-family:"Oswald",sans-serif;font-weight:500;font-size:40px;line-height:1;letter-spacing:.5px;text-transform:uppercase;color:var(--txt)}
+  .c1 .mid{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:9px}
+  .c1 .mid b{color:var(--muted);font-weight:500}
+  .c1 .readout{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin:18px 0}
+  .c1 .cell{background:var(--panel);padding:9px 11px}
+  .c1 .cell .k{font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim)}
+  .c1 .cell .v{font-family:"Oswald",sans-serif;font-weight:600;font-size:18px;color:var(--acc);margin-top:3px;font-variant-numeric:tabular-nums}
+  .c1 .cell .v.ok{color:var(--ok)}
+  .c1 .agent{display:flex;align-items:center;gap:13px;padding:13px 0;border-top:1px solid var(--line)}
+  .c1 .av{width:36px;height:36px;flex:none;display:grid;place-items:center;background:#161512;border:1px solid var(--line);color:var(--acc);font-family:"Oswald",sans-serif;font-weight:700;font-size:15px}
+  .c1 .agent .lab{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--dim)}
+  .c1 .agent .who{display:flex;align-items:center;gap:9px;margin-top:3px}
+  .c1 .agent .who b{font-family:var(--mono);font-size:14px;font-weight:500;color:var(--txt)}
+  .c1 .role{font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--acc);border:1px solid var(--keyline);background:#251e13;padding:3px 8px}
+  .c1 .acts{display:flex;gap:10px;margin-top:16px}
+  .c1 .btn{font-family:"Oswald",sans-serif;font-weight:500;font-size:14px;letter-spacing:1.5px;text-transform:uppercase;padding:9px 20px;border:1px solid transparent;cursor:pointer;display:inline-flex;align-items:center;gap:9px;background:none;color:var(--txt);transition:.12s}
+  .c1 .btn .kana{font-family:var(--jp);font-size:11px;letter-spacing:1px}
+  .c1 .bL{background:var(--acc);color:var(--ink);border-color:#a86d2d}
+  .c1 .bL:hover{background:var(--acc-hi)}
+  .c1 .bD{border-color:#5c352c;color:var(--red-hi)}
+  .c1 .bD:hover{background:var(--alert);color:#1c0b06;border-color:var(--alert)}
+
+  /* ==================================================================== */
+  /* CONCEPT 02 — AT FIELD                                                */
+  /* ==================================================================== */
+  .c2{
+    --panel:#0a0f10;--line:#17201f;--line-hi:#243230;
+    --struct:#cfe7e2;--acc:#e39a3b;--acc-hi:#f0af55;
+    --txt:#e8eeec;--dim:#74807d;--cool:#7fc7bb;
+  }
+  .c2 .mini{
+    position:relative;background:linear-gradient(180deg,#0b1112,#080d0e);
+    border:1px solid var(--line);padding:0;
+  }
+  .c2 .hexfield{position:absolute;inset:0;opacity:.5;pointer-events:none}
+  .c2 .frame{position:absolute;inset:7px;border:1px solid var(--line);pointer-events:none}
+  .c2 .tick{position:absolute;width:14px;height:14px;pointer-events:none;opacity:.6}
+  .c2 .tick.tl{left:2px;top:2px;border-top:1px solid var(--cool);border-left:1px solid var(--cool)}
+  .c2 .tick.tr{right:2px;top:2px;border-top:1px solid var(--cool);border-right:1px solid var(--cool)}
+  .c2 .tick.bl{left:2px;bottom:2px;border-bottom:1px solid var(--cool);border-left:1px solid var(--cool)}
+  .c2 .tick.br{right:2px;bottom:2px;border-bottom:1px solid var(--cool);border-right:1px solid var(--cool)}
+  .c2 .body{position:relative;padding:30px 30px 26px}
+  .c2 .topline{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px}
+  .c2 .sect{font-family:"Chakra Petch",sans-serif;font-weight:500;font-size:11px;letter-spacing:4px;text-transform:uppercase;color:var(--cool)}
+  .c2 .sect .kana{font-family:var(--jp);font-weight:300;color:var(--dim);margin-left:8px;letter-spacing:2px}
+  .c2 .status{display:inline-flex;align-items:center;gap:9px;font-family:"Chakra Petch",sans-serif;font-size:10.5px;letter-spacing:2px;text-transform:uppercase;color:var(--acc)}
+  .c2 .status .ring{width:11px;height:11px;border-radius:50%;border:1px solid var(--acc);position:relative}
+  .c2 .status .ring::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--acc)}
+  .c2 .namewrap{display:flex;align-items:center;gap:20px}
+  .c2 .reticle{width:56px;height:56px;flex:none;opacity:.85}
+  .c2 .mname{font-family:"Chakra Petch",sans-serif;font-weight:300;font-size:46px;line-height:1;letter-spacing:1px;color:var(--txt)}
+  .c2 .mid{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:8px;letter-spacing:.5px}
+  .c2 .mid b{color:var(--cool);font-weight:400}
+  .c2 .rule{height:1px;background:linear-gradient(90deg,var(--line-hi),transparent);margin:24px 0}
+  .c2 .kv{display:flex;gap:36px;flex-wrap:wrap}
+  .c2 .kv>div .k{font-family:"Chakra Petch",sans-serif;font-size:9.5px;letter-spacing:2px;text-transform:uppercase;color:var(--dim)}
+  .c2 .kv>div .v{font-family:"Chakra Petch",sans-serif;font-weight:500;font-size:15px;color:var(--txt);margin-top:4px;display:flex;align-items:center;gap:9px}
+  .c2 .role{font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--acc);border:1px solid #3a3220;padding:2px 7px}
+  .c2 .acts{display:flex;gap:12px;margin-top:30px}
+  .c2 .btn{font-family:"Chakra Petch",sans-serif;font-weight:500;font-size:13px;letter-spacing:2px;text-transform:uppercase;padding:10px 24px;cursor:pointer;background:none;border:1px solid var(--line-hi);color:var(--txt);transition:.14s;clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px)}
+  .c2 .bL{border-color:var(--acc);color:var(--acc)}
+  .c2 .bL:hover{background:var(--acc);color:#0b0d0d}
+  .c2 .bD{color:var(--dim)}
+  .c2 .bD:hover{border-color:var(--red);color:var(--red-hi)}
+
+  /* ==================================================================== */
+  /* CONCEPT 03 — EMERGENCY PROTOCOL                                      */
+  /* ==================================================================== */
+  .c3{
+    --panel:#0b0605;--line:#2b1512;--red:#e5442c;--red-hi:#ed5941;
+    --bone:#efe7df;--txt:#efe7df;--dim:#8a726b;--amber:#e39a3b;
+  }
+  .c3 .mini{position:relative;background:var(--panel);border:1px solid var(--line);padding:0;overflow:hidden}
+  .c3 .scan{position:absolute;inset:0;pointer-events:none;opacity:.5;
+    background:repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.35) 2px 4px)}
+  .c3 .haz{height:26px;background:repeating-linear-gradient(-45deg,var(--red) 0 10px,#120705 10px 20px);
+    display:flex;align-items:center;justify-content:space-between;padding:0 14px}
+  .c3 .haz b{font-family:"Saira Condensed",sans-serif;font-weight:700;font-size:13px;letter-spacing:3px;text-transform:uppercase;color:var(--bone);text-shadow:0 1px 2px #000}
+  .c3 .haz .kana{font-family:var(--jp-serif);font-weight:900;font-size:13px;color:var(--bone);text-shadow:0 1px 2px #000}
+  .c3 .body{position:relative;padding:22px 22px 20px}
+  .c3 .warn{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+  .c3 .warn .kj{font-family:var(--jp-serif);font-weight:900;font-size:30px;line-height:1;color:var(--red)}
+  .c3 .warn .en .l1{font-family:"Saira Condensed",sans-serif;font-weight:700;font-size:13px;letter-spacing:3px;text-transform:uppercase;color:var(--red-hi)}
+  .c3 .warn .en .l2{font-size:10px;letter-spacing:1px;color:var(--dim);margin-top:2px}
+  .c3 .mname{font-family:"Saira Condensed",sans-serif;font-weight:800;font-size:56px;line-height:.9;letter-spacing:1px;text-transform:uppercase;color:var(--bone)}
+  .c3 .mid{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:8px}
+  .c3 .mid b{color:var(--red-hi);font-weight:500}
+  .c3 .bar{display:flex;align-items:center;gap:10px;margin:18px 0;padding:8px 12px;background:#160a08;border-left:3px solid var(--red)}
+  .c3 .bar .dot{width:8px;height:8px;border-radius:50%;background:var(--red);animation:blink 1.3s steps(1) infinite}
+  @keyframes blink{50%{opacity:.25}}
+  .c3 .bar .t{font-family:"Saira Condensed",sans-serif;font-weight:600;font-size:13px;letter-spacing:2px;text-transform:uppercase;color:var(--bone)}
+  .c3 .bar .k{margin-left:auto;font-family:var(--jp);font-size:11px;color:var(--dim)}
+  .c3 .agent{display:flex;align-items:center;gap:12px;padding:6px 0 16px}
+  .c3 .av{width:36px;height:36px;flex:none;display:grid;place-items:center;background:#1a0c09;border:1px solid var(--line);color:var(--red-hi);font-family:"Saira Condensed",sans-serif;font-weight:800;font-size:17px}
+  .c3 .agent .lab{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--dim)}
+  .c3 .agent .who{display:flex;align-items:center;gap:9px;margin-top:3px}
+  .c3 .agent .who b{font-family:var(--mono);font-size:14px;font-weight:500;color:var(--bone)}
+  .c3 .role{font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--amber);border:1px solid #4a3320;padding:3px 8px}
+  .c3 .acts{display:flex;gap:0;margin-top:8px;border:1px solid var(--line)}
+  .c3 .btn{flex:1;font-family:"Saira Condensed",sans-serif;font-weight:700;font-size:15px;letter-spacing:2px;text-transform:uppercase;padding:12px;cursor:pointer;background:none;border:none;color:var(--txt);transition:.12s;display:inline-flex;align-items:center;justify-content:center;gap:10px}
+  .c3 .btn .kana{font-family:var(--jp);font-weight:400;font-size:12px}
+  .c3 .bL{background:var(--bone);color:#160a08}
+  .c3 .bL:hover{background:#fff}
+  .c3 .bD{border-left:1px solid var(--line);color:var(--red-hi)}
+  .c3 .bD:hover{background:var(--red);color:var(--bone)}
+
+  /* ===================== closing / recommendation ===================== */
+  .close{padding:56px 0 90px}
+  .close h3{font-family:"Oswald",sans-serif;font-weight:600;font-size:22px;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px}
+  .close h3 .kana{font-family:var(--jp);font-weight:400;font-size:14px;color:var(--amber);margin-left:10px;letter-spacing:2px}
+  .close p{max-width:64ch;color:var(--muted);font-size:14px;line-height:1.7;margin-bottom:14px}
+  .close p b{color:var(--text);font-weight:500}
+  .close .rec{border-left:2px solid var(--amber);padding-left:16px}
+  .foot{margin-top:34px;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--faint);font-family:var(--jp)}
+</style>
+
+<header class="masthead">
+  <span class="hazbar"></span>
+  <div class="wrap">
+    <div class="eyebrow">
+      <span>特務機関 CORPUS</span><span class="tick">/</span><span>UI Direction Study</span>
+      <span class="tick">·</span><span class="jp">ネルフ式インターフェース</span>
+    </div>
+    <h1 class="title">NERV / <b>Console</b><br>Directions</h1>
+    <p class="lede">Three ways to push Corpus toward a <b>clean Evangelion</b> language, each built on the palette you already run — black ground, hazard amber, terminal mono. Same staged-mission surface rendered three ways, so the choice is about <b>tone</b>, not a repaint. Pick a lane and I'll take it to the whole app.</p>
+    <div class="legend">
+      <span><i style="background:#e39a3b"></i>Amber — action</span>
+      <span><i style="background:#91cf58"></i>Green — nominal</span>
+      <span><i style="background:#e5442c"></i>Red — alert</span>
+      <span><i style="background:#7fc7bb"></i>Cyan — structure</span>
+    </div>
+  </div>
+</header>
+
+<!-- ============ CONCEPT 01 ============ -->
+<section class="concept c1">
+  <div class="wrap">
+    <div class="c-head">
+      <div class="c-idx">01</div>
+      <div class="c-titles">
+        <div class="c-name">NERV Command <span class="kana">ナーヴ・コマンド</span></div>
+        <p class="c-tag">The MAGI console, straight. Octagonal HUD frames with registration ticks, a live hazard-tape header, a bracketed readout grid. Densest and most authoritative — your current dashboard, disciplined into a command surface.</p>
+      </div>
+    </div>
+    <div class="c-grid">
+      <div class="spec">
+        <h4>Palette</h4>
+        <div class="swatches">
+          <div class="sw"><i style="background:#0e0f10"></i><span>PANEL</span></div>
+          <div class="sw"><i style="background:#e39a3b"></i><span>AMBER</span></div>
+          <div class="sw"><i style="background:#91cf58"></i><span>NOMINAL</span></div>
+          <div class="sw"><i style="background:#e5442c"></i><span>ALERT</span></div>
+          <div class="sw"><i style="background:#6a4722"></i><span>KEYLINE</span></div>
+        </div>
+        <h4>Type</h4>
+        <p class="typenote"><b class="disp" style="font-family:Oswald">Oswald</b> condensed for headings &amp; labels · <b>JetBrains Mono</b> for readouts · <b>Noto Sans JP</b> katakana as micro-annotation.</p>
+        <h4>Motifs</h4>
+        <div class="chips">
+          <span class="chip">Hazard tape</span><span class="chip">Clipped corners</span>
+          <span class="chip">Corner ticks</span><span class="chip">[ bracket labels ]</span>
+          <span class="chip">Readout grid</span><span class="chip">Katakana</span>
+        </div>
+      </div>
+      <div class="demo">
+        <div class="demo-cap"><span>Applied · staged mission</span><span>起動待機</span></div>
+        <div class="mini">
+          <div class="haz">
+            <div class="plate"><b>Staged Mission</b><span class="kana">ミッション</span></div>
+            <div class="stat"><i></i>Standby</div>
+          </div>
+          <div class="body">
+            <div class="sect"><b>[</b> AGENT · NEW AGENT <b>]</b></div>
+            <div class="mname">new</div>
+            <div class="mid"><b>mission</b> 35d29769-37a1-4c3c-b985-25643611c1ea</div>
+            <div class="readout">
+              <div class="cell"><div class="k">Env</div><div class="v ok">READY</div></div>
+              <div class="cell"><div class="k">Pins</div><div class="v">2</div></div>
+              <div class="cell"><div class="k">Role</div><div class="v">SUPER</div></div>
+              <div class="cell"><div class="k">Model</div><div class="v" style="font-size:12px;letter-spacing:0">gpt-5.6</div></div>
+            </div>
+            <div class="agent">
+              <div class="av">N</div>
+              <div>
+                <div class="lab">Agent</div>
+                <div class="who"><b>new agent</b><span class="role">Researcher</span></div>
+              </div>
+            </div>
+            <div class="acts">
+              <button class="btn bL">▶ Launch <span class="kana">起動</span></button>
+              <button class="btn bD">Delete <span class="kana">削除</span></button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CONCEPT 02 ============ -->
+<section class="concept c2">
+  <div class="wrap">
+    <div class="c-head">
+      <div class="c-idx">02</div>
+      <div class="c-titles">
+        <div class="c-name">AT Field <span class="kana">A.T.フィールド</span></div>
+        <p class="c-tag">The clean read. Thin cyan structure lines, a faint hexagon field, a targeting reticle by the name, and a lot of black between elements. Amber survives only on the primary action. Calm, geometric, spacious — Eva by restraint rather than volume.</p>
+      </div>
+    </div>
+    <div class="c-grid">
+      <div class="spec">
+        <h4>Palette</h4>
+        <div class="swatches">
+          <div class="sw"><i style="background:#0a0f10"></i><span>PANEL</span></div>
+          <div class="sw"><i style="background:#7fc7bb"></i><span>CYAN</span></div>
+          <div class="sw"><i style="background:#cfe7e2"></i><span>STRUCT</span></div>
+          <div class="sw"><i style="background:#e39a3b"></i><span>AMBER</span></div>
+          <div class="sw"><i style="background:#17201f"></i><span>LINE</span></div>
+        </div>
+        <h4>Type</h4>
+        <p class="typenote"><b class="disp" style="font-family:'Chakra Petch'">Chakra Petch</b> light — a HUD sans with clipped terminals · <b>JetBrains Mono</b> for IDs · JP set light &amp; wide.</p>
+        <h4>Motifs</h4>
+        <div class="chips">
+          <span class="chip">Hex field</span><span class="chip">Reticle</span>
+          <span class="chip">Double hairline</span><span class="chip">Cut-corner buttons</span>
+          <span class="chip">Negative space</span><span class="chip">Cool neutrals</span>
+        </div>
+      </div>
+      <div class="demo">
+        <div class="demo-cap"><span>Applied · staged mission</span><span>準備完了</span></div>
+        <div class="mini">
+          <svg class="hexfield" viewBox="0 0 400 240" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+            <defs><pattern id="hx" width="34" height="30" patternUnits="userSpaceOnUse" patternTransform="translate(0,0)">
+              <path d="M17 0 L34 8 L34 22 L17 30 L0 22 L0 8 Z" fill="none" stroke="#14201e" stroke-width="1"/>
+            </pattern></defs>
+            <rect width="400" height="240" fill="url(#hx)"/>
+          </svg>
+          <div class="frame"></div>
+          <span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+          <div class="body">
+            <div class="topline">
+              <div class="sect">Staged Mission<span class="kana">待機中</span></div>
+              <div class="status"><span class="ring"></span>Ready</div>
+            </div>
+            <div class="namewrap">
+              <svg class="reticle" viewBox="0 0 56 56" fill="none" aria-hidden="true">
+                <circle cx="28" cy="28" r="26" stroke="#7fc7bb" stroke-width="1" opacity=".5"/>
+                <circle cx="28" cy="28" r="17" stroke="#7fc7bb" stroke-width="1" opacity=".35"/>
+                <circle cx="28" cy="28" r="4" fill="#e39a3b"/>
+                <path d="M28 0v12M28 44v12M0 28h12M44 28h12" stroke="#7fc7bb" stroke-width="1" opacity=".6"/>
+              </svg>
+              <div>
+                <div class="mname">new</div>
+                <div class="mid"><b>ID</b> 35d29769-37a1-4c3c-b985-25643611c1ea</div>
+              </div>
+            </div>
+            <div class="rule"></div>
+            <div class="kv">
+              <div><div class="k">Agent</div><div class="v">new agent <span class="role">Researcher</span></div></div>
+              <div><div class="k">Environment</div><div class="v">nutshell-regtest</div></div>
+              <div><div class="k">Source pins</div><div class="v">02</div></div>
+            </div>
+            <div class="acts">
+              <button class="btn bL">Launch</button>
+              <button class="btn bD">Delete</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CONCEPT 03 ============ -->
+<section class="concept c3">
+  <div class="wrap">
+    <div class="c-head">
+      <div class="c-idx">03</div>
+      <div class="c-titles">
+        <div class="c-name">Emergency Protocol <span class="kana">緊急プロトコル</span></div>
+        <p class="c-tag">Not a whole-app skin — a <b>state language</b>. This is what alert, destructive, and confirmation-gated moments look like: red hazard tape, serif 警告 callouts, heavy Saira condensed, a blinking status bar. Reserve it for the loud moments and the quiet lanes read louder.</p>
+      </div>
+    </div>
+    <div class="c-grid">
+      <div class="spec">
+        <h4>Palette</h4>
+        <div class="swatches">
+          <div class="sw"><i style="background:#0b0605"></i><span>PANEL</span></div>
+          <div class="sw"><i style="background:#e5442c"></i><span>SIGNAL</span></div>
+          <div class="sw"><i style="background:#efe7df"></i><span>BONE</span></div>
+          <div class="sw"><i style="background:#e39a3b"></i><span>AMBER</span></div>
+          <div class="sw"><i style="background:#2b1512"></i><span>LINE</span></div>
+        </div>
+        <h4>Type</h4>
+        <p class="typenote"><b class="disp" style="font-family:'Saira Condensed'">Saira Condensed</b> heavy display · <b>Noto Serif JP</b> black for 警告 / 緊急 callouts · mono for IDs.</p>
+        <h4>Motifs</h4>
+        <div class="chips">
+          <span class="chip">Red hazard tape</span><span class="chip">Serif kanji</span>
+          <span class="chip">Blinking bar</span><span class="chip">Scanlines</span>
+          <span class="chip">Split action bar</span><span class="chip">Inverted primary</span>
+        </div>
+      </div>
+      <div class="demo">
+        <div class="demo-cap"><span>Applied · confirmation-gated launch</span><span>警告</span></div>
+        <div class="mini">
+          <div class="scan"></div>
+          <div class="haz"><b>Mission Unlaunched</b><span class="kana">発令</span></div>
+          <div class="body">
+            <div class="warn">
+              <div class="kj">警告</div>
+              <div class="en">
+                <div class="l1">Awaiting Order</div>
+                <div class="l2">Launch commits the environment · irreversible session start</div>
+              </div>
+            </div>
+            <div class="mname">new</div>
+            <div class="mid"><b>mission</b> 35d29769-37a1-4c3c-b985-25643611c1ea</div>
+            <div class="bar"><span class="dot"></span><span class="t">Standby — no session</span><span class="k">待機</span></div>
+            <div class="agent">
+              <div class="av">N</div>
+              <div>
+                <div class="lab">Agent</div>
+                <div class="who"><b>new agent</b><span class="role">Researcher</span></div>
+              </div>
+            </div>
+            <div class="acts">
+              <button class="btn bL">▶ Launch <span class="kana">起動</span></button>
+              <button class="btn bD">Delete <span class="kana">削除</span></button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CLOSE ============ -->
+<section class="close">
+  <div class="wrap">
+    <div class="rec">
+      <h3>Where I'd take it <span class="kana">推奨</span></h3>
+      <p><b>01 NERV Command as the system, 03 Emergency as the state.</b> Run the app in the disciplined amber console of Concept 01 — it evolves what you already have rather than fighting it — and switch into Concept 03's red protocol only for destructive and confirmation-gated actions (your <b>agent_delete / corpus_wipe</b> moments). That contrast is exactly the NERV grammar: nominal is quiet, alert is unmistakable.</p>
+      <p><b>02 AT Field</b> is the move if "clean" means <b>calmer</b> — pull it in for the reading-heavy surfaces (agent prompt, mission logs) where density hurts. The three aren't mutually exclusive; they're a system and its two edge states.</p>
+    </div>
+    <div class="foot">ネルフ · 中央実験場 — pick a lane, I'll build the full screen set</div>
+  </div>
+</section>

@@ -581,11 +581,8 @@ impl AgentsView {
             }
         }
         let current = self.draft.as_ref().map(|d| d.role).unwrap_or(current);
-        let effective = crate::views::policy::effective_role(
-            current,
-            agent.meta.role(),
-            is_primary,
-        );
+        let effective =
+            crate::views::policy::effective_role(current, agent.meta.role(), is_primary);
         ui.add_space(12.0);
         policy_preview(ui, effective);
 
@@ -673,8 +670,8 @@ impl AgentsView {
                             crate::state::ModelDiscovery::Failed(error) => {
                                 ui.label(
                                     RichText::new("opencode catalog unavailable")
-                                    .size(12.0)
-                                    .color(theme::SIGNAL_RED),
+                                        .size(12.0)
+                                        .color(theme::SIGNAL_RED),
                                 )
                                 .on_hover_text(error);
                                 return;
@@ -759,11 +756,7 @@ impl AgentsView {
             self.draft = None;
         }
         ui.add_space(8.0);
-        if let Some(sub) = self
-            .entry
-            .clone()
-            .filter(|entry| subagents.contains(entry))
-        {
+        if let Some(sub) = self.entry.clone().filter(|entry| subagents.contains(entry)) {
             ui.horizontal(|ui| {
                 ui.label(field_label("Selected"));
                 ui.label(
@@ -983,14 +976,10 @@ impl AgentsView {
         project: &str,
         slug: &str,
     ) {
-        // Creation is navigation, not execution. The operator can launch the
-        // selected mission explicitly from its sidebar menu.
         match state.create_mission(project, slug, "") {
             Ok(mission) => {
-                toast(toasts, ToastKind::Success, "mission created");
                 state.refresh_missions(project);
-                // Select it on the mission view without starting opencode.
-                state.select_mission(project, &mission);
+                crate::views::mission_actions::launch(state, toasts, project, &mission);
             }
             Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
         }
@@ -1163,7 +1152,11 @@ fn capability_chip(ui: &mut Ui, capability: crate::views::policy::Capability, al
     } else {
         theme::SIGNAL_RED
     };
-    let icon = if allowed { ph::CHECK_CIRCLE } else { ph::X_CIRCLE };
+    let icon = if allowed {
+        ph::CHECK_CIRCLE
+    } else {
+        ph::X_CIRCLE
+    };
     ui.label(theme::icon_label(
         icon,
         10.0,
@@ -1270,7 +1263,11 @@ fn field_label(text: &str) -> RichText {
 }
 
 fn agent_form_columns(available_width: f32) -> usize {
-    if available_width >= AGENT_TWO_COLUMN_AT { 2 } else { 1 }
+    if available_width >= AGENT_TWO_COLUMN_AT {
+        2
+    } else {
+        1
+    }
 }
 
 fn subagent_effective_role(
