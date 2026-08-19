@@ -1,0 +1,53 @@
+name: external plugin compatibility
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CDK_PLUGIN_VERSION: 0.3.8
+  CDK_PLUGIN_SHA256: eaa8a9e0181e391b142198dcdddd6177d6560aa6728692326cb587a85f17eded
+
+jobs:
+  cdk-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Download and verify pinned CDK plugin release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CORPUS_PLUGIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN:-}" || {
+            echo 'CORPUS_PLUGIN_TOKEN is required while corpus-plugin-cdk is private' >&2
+            exit 1
+          }
+          gh release download "v${CDK_PLUGIN_VERSION}" \
+            --repo orangeshyguy21/corpus-plugin-cdk \
+            --pattern "corpus-plugin-cdk-${CDK_PLUGIN_VERSION}.tar.gz" \
+            --pattern "corpus-plugin-cdk-${CDK_PLUGIN_VERSION}.tar.gz.sha256" \
+            --dir "$RUNNER_TEMP"
+          archive="$RUNNER_TEMP/corpus-plugin-cdk-${CDK_PLUGIN_VERSION}.tar.gz"
+          (cd "$RUNNER_TEMP" && sha256sum --check --strict "corpus-plugin-cdk-${CDK_PLUGIN_VERSION}.tar.gz.sha256")
+          printf '%s  %s\n' "$CDK_PLUGIN_SHA256" "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+      - name: Install immutable bundle and negotiate protocol v1
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CORPUS_HOME="$RUNNER_TEMP/corpus-home"
+          plugin="$RUNNER_TEMP/corpus-plugin-cdk-${CDK_PLUGIN_VERSION}"
+          cargo run --locked --quiet -p corpus-cli -- plugin install "$plugin"
+          cargo run --locked --quiet -p corpus-cli -- plugin list | tee "$RUNNER_TEMP/plugin-list.txt"
+          grep -F "cdk-regtest" "$RUNNER_TEMP/plugin-list.txt"
+          hello="$(cargo run --locked --quiet -p corpus-cli -- plugin call cdk-regtest hello)"
+          jq -e '.protocol == "corpus.environment/1"' <<<"$hello"
+      - name: Run language-neutral protocol conformance
+        run: cargo test --locked -p corpus-core --test protocol

@@ -143,6 +143,11 @@ corpus plugin setup cdk-regtest
 corpus plugin doctor cdk-regtest
 ```
 
+Until the plugin repository becomes public, the external-plugin compatibility
+workflow reads its pinned GitHub release using the `CORPUS_PLUGIN_TOKEN`
+repository secret. That token needs read-only Contents access to
+`orangeshyguy21/corpus-plugin-cdk`; the workflow grants no write permission.
+
 Environment is checked via `corpus plugin probe cdk-regtest`. The CLI:
 
 ```bash
