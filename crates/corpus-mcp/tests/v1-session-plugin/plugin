@@ -27,7 +27,16 @@ while IFS= read -r line; do
       charged=10; [[ "$key" == "fund-replay" ]] && charged=0
       printf '{"id":%s,"ok":true,"result":{"funded":true,"amount_sat":10,"charged_sats":%s}}\n' "$id" "$charged" ;;
     oracles) printf '{"id":%s,"ok":true,"result":[{"name":"fixture-invariant","description":"fixture"}]}\n' "$id" ;;
-    call_oracle) printf '{"id":%s,"ok":true,"result":{"verdict":"hold","log":"fixture holds"}}\n' "$id" ;;
+    call_oracle)
+      name="$(jq -r '.params.name // ""' <<<"$line")"
+      if [[ "$name" == "invalid-verdict" ]]; then
+        printf '{"id":%s,"ok":true,"result":{"verdict":"maybe","log":"invalid fixture"}}\n' "$id"
+      elif [[ "$name" == "large-evidence" ]]; then
+        log="$(awk 'BEGIN { for (i=0; i<20000; i++) printf "x" }')"
+        jq -nc --argjson id "$id" --arg log "$log" '{id:$id,ok:true,result:{verdict:"hold",log:$log}}'
+      else
+        printf '{"id":%s,"ok":true,"result":{"verdict":"hold","log":"{\\"oracle\\":\\"fixture-invariant\\",\\"count\\":1}"}}\n' "$id"
+      fi ;;
     *) printf '{"id":%s,"ok":false,"error":{"code":"unknown_method","message":"unknown","retryable":false}}\n' "$id" ;;
   esac
 done

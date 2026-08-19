@@ -97,6 +97,12 @@ fn roundtrip_project_scoped_writes_and_wipe() {
         .map(|e| e.path())
         .collect();
     assert_eq!(finding_files.len(), 1);
+    let finding_raw = std::fs::read_to_string(&finding_files[0]).unwrap();
+    assert!(
+        finding_raw.contains("oracle_verified: true"),
+        "{finding_raw}"
+    );
+    assert!(finding_raw.contains("echo oracle log"), "{finding_raw}");
 
     // run_log gate: a nonexistent run_log is refused.
     let err = tools::dispatch(

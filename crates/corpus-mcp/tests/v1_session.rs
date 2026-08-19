@@ -103,6 +103,52 @@ fn generic_tools_forward_the_durable_v1_session_and_typed_description() {
     )
     .unwrap();
     assert_eq!(ctx.faucet_spent_sats, 17);
+
+    let runs = ctx.store.project_corpus_dir("p").join("runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    std::fs::write(runs.join("1700000000-v1.raw"), "fixture transcript\n").unwrap();
+    ctx.run_log = Some("1700000000-v1.raw".into());
+    let finding = tools::dispatch(
+        &mut ctx,
+        "finding_write",
+        &json!({"title":"v1 oracle provenance","severity":"low","detail":"fixture detail"}),
+    )
+    .unwrap();
+    assert!(finding.contains("oracle_verified: false"), "{finding}");
+    let findings = ctx.store.project_corpus_dir("p").join("findings");
+    let path = std::fs::read_dir(findings)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let stored = std::fs::read_to_string(path).unwrap();
+    assert!(stored.contains("fixture-invariant"), "{stored}");
+    assert!(
+        stored.contains(r#"{"oracle":"fixture-invariant","count":1}"#),
+        "{stored}"
+    );
+    assert!(stored.contains("run_log: 1700000000-v1.raw"), "{stored}");
+    assert!(
+        stored.contains("target: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "{stored}"
+    );
+
+    let invalid =
+        tools::dispatch(&mut ctx, "oracle_run", &json!({"name":"invalid-verdict"})).unwrap_err();
+    assert!(invalid.to_string().contains("invalid verdict"), "{invalid}");
+
+    let bounded =
+        tools::dispatch(&mut ctx, "oracle_run", &json!({"name":"large-evidence"})).unwrap();
+    assert!(
+        bounded.len() < 17_000,
+        "bounded output was {} bytes",
+        bounded.len()
+    );
+    assert!(
+        bounded.contains("evidence truncated by corpus"),
+        "{bounded}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

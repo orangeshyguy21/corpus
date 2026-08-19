@@ -4,12 +4,13 @@
 //! gates) that no prompt can talk its way around. Write tools land in the
 //! project corpus (the ONLY corpus scope).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use corpus_core::refusal::Gate;
 use corpus_core::{
-    AgentRole, FaucetCall, FindingSeverity, NewFinding, Plugin, ProbeResult, Scope, Store,
+    AgentRole, FaucetCall, FindingSeverity, NewFinding, OracleInfo, OracleResult, Plugin,
+    ProbeResult, Scope, Store,
 };
 use serde_json::{json, Value};
 
@@ -18,6 +19,70 @@ use corpus_admin::PendingConfirm;
 
 /// Output cap fed back to the model.
 const OUTPUT_CAP_BYTES: usize = 8 * 1024;
+/// Per-oracle evidence cap persisted into a finding. Seven independent
+/// bounded records are more useful than one suite-wide truncation that can
+/// silently erase the oracle which actually violated.
+const ORACLE_LOG_CAP_BYTES: usize = 16 * 1024;
+const ORACLE_SUITE_CAP: usize = 64;
+
+fn valid_oracle_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn validate_oracle_catalog(oracles: Vec<OracleInfo>) -> Result<Vec<OracleInfo>> {
+    if oracles.len() > ORACLE_SUITE_CAP {
+        return Err(Error::Plugin(format!(
+            "oracle catalog contains {} entries; maximum is {ORACLE_SUITE_CAP}",
+            oracles.len()
+        )));
+    }
+    let mut names = BTreeSet::new();
+    for oracle in &oracles {
+        if !valid_oracle_name(&oracle.name) {
+            return Err(Error::Plugin(format!(
+                "oracle catalog contains invalid name {:?}",
+                oracle.name
+            )));
+        }
+        if !names.insert(oracle.name.as_str()) {
+            return Err(Error::Plugin(format!(
+                "oracle catalog contains duplicate name {:?}",
+                oracle.name
+            )));
+        }
+    }
+    Ok(oracles)
+}
+
+fn bounded_oracle_log(mut log: String) -> String {
+    if log.len() <= ORACLE_LOG_CAP_BYTES {
+        return log;
+    }
+    let mut end = ORACLE_LOG_CAP_BYTES;
+    while !log.is_char_boundary(end) {
+        end -= 1;
+    }
+    log.truncate(end);
+    log.push_str("\n[evidence truncated by corpus]");
+    log
+}
+
+fn validate_oracle_result(name: &str, mut result: OracleResult) -> Result<OracleResult> {
+    if !matches!(
+        result.verdict.as_str(),
+        "hold" | "violated" | "inconclusive"
+    ) {
+        return Err(Error::Plugin(format!(
+            "oracle {name} returned invalid verdict {:?}",
+            result.verdict
+        )));
+    }
+    result.log = bounded_oracle_log(result.log);
+    Ok(result)
+}
 
 /// Shared server state. Corpus policy (session budget, scoped writes,
 /// verification gates) lives here; the environment policy (per-payment cap,
@@ -1014,10 +1079,7 @@ fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
 }
 
 fn oracle_run(ctx: &mut Ctx, name: &str) -> Result<String> {
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
+    if !valid_oracle_name(name) {
         return Err(Error::Args("bad oracle name".to_string()));
     }
     let result = if ctx
@@ -1033,6 +1095,7 @@ fn oracle_run(ctx: &mut Ctx, name: &str) -> Result<String> {
     } else {
         resilient(ctx, |p| p.call_oracle(name))?
     };
+    let result = validate_oracle_result(name, result)?;
     Ok(format!("verdict: {}\n{}", result.verdict, result.log))
 }
 
@@ -1233,7 +1296,7 @@ fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
     } else {
         resilient(ctx, |p| p.oracles())
     };
-    match oracle_list {
+    match oracle_list.and_then(validate_oracle_catalog) {
         Ok(oracles) => {
             for oracle in &oracles {
                 let result = if ctx
@@ -1251,12 +1314,27 @@ fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
                     resilient(ctx, |p| p.call_oracle(&oracle.name))
                 };
                 let line = match result {
-                    Ok(result) => {
-                        if result.verdict == "violated" {
-                            verified = true;
+                    Ok(result) => match validate_oracle_result(&oracle.name, result) {
+                        Ok(result) => {
+                            if result.verdict == "violated" {
+                                verified = true;
+                            }
+                            let mut evidence =
+                                format!("  {:<36} {}\n", oracle.name, result.verdict);
+                            if result.log.is_empty() {
+                                evidence.push_str("    evidence: <empty>\n");
+                            } else {
+                                evidence.push_str("    evidence:\n");
+                                for line in result.log.lines() {
+                                    evidence.push_str("      ");
+                                    evidence.push_str(line);
+                                    evidence.push('\n');
+                                }
+                            }
+                            evidence
                         }
-                        format!("  {:<36} {}\n", oracle.name, result.verdict)
-                    }
+                        Err(error) => format!("  {:<36} ERROR ({error})\n", oracle.name),
+                    },
                     Err(error) => {
                         format!("  {:<36} ERROR ({error})\n", oracle.name)
                     }
