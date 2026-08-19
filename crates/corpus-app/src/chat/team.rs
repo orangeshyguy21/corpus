@@ -13,7 +13,7 @@
 //!   tools" is NOT an empty list: the Orchestrator registers **no** admin
 //!   extension at all.
 //! - The destructive set is excluded from EVERY specialist scope: destruction
-//!   (`corpus_wipe` / `project_delete` / `agent_delete` / `mission_delete`) is
+//!   (`corpus_wipe` / project, agent, mission, and corpus-entry deletion) is
 //!   operator-only, and even there it is gated by the inline approval
 //!   (decision 5) + the corpus-mcp server-side confirm-token backstop.
 
@@ -40,9 +40,11 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "mission_list",
     "mission_get",
     "mission_status",
+    "mission_await",
     "corpus_stats",
     "corpus_list",
     "corpus_read",
+    "finding_list",
     "model_list",
 ];
 
@@ -96,8 +98,15 @@ pub fn bare_tool_name(name: &str) -> &str {
 pub fn mutated_area(tool: &str) -> Option<&'static str> {
     match bare_tool_name(tool) {
         "project_new" | "project_clone" | "project_rebind" | "project_delete" => Some("projects"),
-        "agent_new" | "agent_save" | "agent_clone" | "agent_delete" | "agent_copy"
-        | "agent_set" | "agent_set_role" | "agent_set_permission" | "agent_subagent_add"
+        "agent_new"
+        | "agent_save"
+        | "agent_clone"
+        | "agent_delete"
+        | "agent_copy"
+        | "agent_set"
+        | "agent_set_role"
+        | "agent_set_permission"
+        | "agent_subagent_add"
         | "agent_subagent_remove" => Some("agents"),
         "mission_new" | "mission_delete" | "mission_launch" | "mission_set_budget"
         | "mission_set_pins" => Some("missions"),
@@ -129,7 +138,7 @@ pub fn needs_approval(tool: &str) -> bool {
     true
 }
 
-/// The bare corpus-admin tool names (the `corpus-mcp --admin` catalog).
+/// The bare corpus-admin tool names (the `corpus-admin-mcp` catalog).
 pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "project_list",
     "project_new",
@@ -151,6 +160,7 @@ pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "mission_list",
     "mission_get",
     "mission_status",
+    "mission_await",
     "mission_new",
     "mission_delete",
     "mission_launch",
@@ -159,6 +169,7 @@ pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "corpus_stats",
     "corpus_list",
     "corpus_read",
+    "finding_list",
     "corpus_wipe",
     "entry_delete",
     "entry_move",
@@ -218,6 +229,7 @@ impl TeamRole {
                 "mission_list",
                 "mission_get",
                 "mission_status",
+                "mission_await",
                 "mission_new",
                 "mission_set_budget",
                 "mission_set_pins",
@@ -229,9 +241,11 @@ impl TeamRole {
                 "mission_list",
                 "mission_get",
                 "mission_status",
+                "mission_await",
                 "corpus_stats",
                 "corpus_list",
                 "corpus_read",
+                "finding_list",
             ],
         };
         names.iter().map(|s| s.to_string()).collect()
@@ -276,10 +290,7 @@ impl fmt::Display for TeamRole {
 
 /// Parse a role from its label (`"corpus-inspector"`, `"orchestrator"`, …).
 pub fn role_from_label(label: &str) -> Option<TeamRole> {
-    ALL_ROLES
-        .iter()
-        .copied()
-        .find(|r| r.label() == label)
+    ALL_ROLES.iter().copied().find(|r| r.label() == label)
 }
 
 /// Every specialist + orchestrator role (NOT `Operator`, which is the
@@ -372,7 +383,13 @@ mod tests {
             );
         }
         // And it does hold its read-only capabilities.
-        for required in ["project_list", "corpus_stats", "corpus_read", "agent_get"] {
+        for required in [
+            "project_list",
+            "corpus_stats",
+            "corpus_read",
+            "finding_list",
+            "agent_get",
+        ] {
             assert!(
                 tools.iter().any(|t| t == required),
                 "corpus-inspector must retain {required}"
@@ -388,7 +405,7 @@ mod tests {
     /// is wrong.
     #[test]
     fn admin_tool_table_matches_the_server_catalog() {
-        let mut server: Vec<String> = corpus_mcp::admin::catalog()
+        let mut server: Vec<String> = corpus_admin::catalog()
             .as_array()
             .expect("catalog is an array")
             .iter()
@@ -401,7 +418,7 @@ mod tests {
         let extra: Vec<_> = ours.iter().filter(|t| !server.contains(t)).collect();
         assert!(
             missing.is_empty() && extra.is_empty(),
-            "team.rs drifted from the corpus-mcp --admin catalog.\n\
+            "team.rs drifted from the corpus-admin-mcp catalog.\n\
              in the server but unclassified here: {missing:?}\n\
              listed here but not in the server: {extra:?}"
         );
@@ -466,6 +483,39 @@ mod tests {
         }
     }
 
+    /// The app's approval policy and the server's token gate are two layers of
+    /// the same destructive boundary. Drift in either direction is unsafe:
+    /// one direction skips the server backstop, the other skips inline human
+    /// approval.
+    #[test]
+    fn destructive_classification_matches_the_server_gate() {
+        let mut app = DESTRUCTIVE_TOOLS.to_vec();
+        app.sort_unstable();
+        let mut server = corpus_admin::DESTRUCTIVE_OPS.to_vec();
+        server.sort_unstable();
+        assert_eq!(app, server);
+    }
+
+    /// A successful mutating call must invalidate some app state. Adding a
+    /// write/destructive tool without classifying its refresh area otherwise
+    /// leaves the sidebar and current view silently stale.
+    #[test]
+    fn every_mutation_has_a_refresh_area() {
+        for tool in WRITE_TOOLS.iter().chain(DESTRUCTIVE_TOOLS) {
+            assert!(
+                mutated_area(tool).is_some(),
+                "{tool} mutates state but has no refresh area"
+            );
+        }
+        for tool in READ_ONLY_TOOLS {
+            assert_eq!(
+                mutated_area(tool),
+                None,
+                "read-only {tool} claims a mutation"
+            );
+        }
+    }
+
     /// The policy itself: reads never gate, writes gate (unless the
     /// kill-switch is off), destruction ALWAYS gates, unknown gates.
     #[test]
@@ -475,6 +525,7 @@ mod tests {
         assert!(!needs_approval("agent_list"));
         assert!(!needs_approval("corpus-admin__agent_list")); // prefixed form
         assert!(!needs_approval("corpus_read"));
+        assert!(!needs_approval("finding_list"));
         assert!(needs_approval("agent_save"));
         assert!(needs_approval("project_new"));
         for t in DESTRUCTIVE_TOOLS {
@@ -484,7 +535,10 @@ mod tests {
         // The kill-switch releases WRITES only.
         std::env::set_var("CORPUS_CHAT_APPROVE_WRITES", "0");
         assert!(!needs_approval("agent_save"));
-        assert!(needs_approval("corpus_wipe"), "destructive gates even with the kill-switch off");
+        assert!(
+            needs_approval("corpus_wipe"),
+            "destructive gates even with the kill-switch off"
+        );
         std::env::remove_var("CORPUS_CHAT_APPROVE_WRITES");
     }
 }

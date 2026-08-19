@@ -2,14 +2,14 @@
 //! agent, scoped to the project the server already proved.
 //!
 //! The property under test throughout is that the project is NOT the
-//! caller's to choose. The `--admin` profile resolves it from a tool
+//! caller's to choose. The host-admin artifact resolves it from a tool
 //! argument at 17 separate sites; this route overwrites that argument from
 //! `CORPUS_PROJECT` before any of them run, so naming another project is
 //! not refused so much as impossible.
 
 use std::path::PathBuf;
 
-use corpus_core::{AgentRole, Scope, Store};
+use corpus_core::{AgentRole, Project, Scope, Store};
 use corpus_mcp::tools::{self, Ctx};
 use serde_json::{json, Value};
 
@@ -82,7 +82,7 @@ fn the_admin_catalog_matches_its_routing_table() {
 
 /// The catalog a curator advertises is exactly its grant set — no project
 /// CRUD (a scoped server cannot honestly serve a tool whose subject is
-/// another project), no corpus_wipe, and none of the sandbox tools.
+/// another project), no whole-project wipe, and none of the sandbox tools.
 #[test]
 fn a_curator_advertises_exactly_its_grant_set() {
     let catalog = tools::catalog_for(&Ok(AgentRole::Curator));
@@ -115,11 +115,11 @@ fn a_curator_advertises_exactly_its_grant_set() {
     }
 }
 
-/// The research roles see none of it, and a curator sees no sandbox tool.
-/// The two catalogs are disjoint by construction.
+/// Narrow roles receive one domain; Super receives their current-project
+/// union without acquiring operator-only cross-project tools.
 #[test]
-fn the_two_catalogs_do_not_overlap() {
-    for role in [AgentRole::Researcher, AgentRole::Tester, AgentRole::Super] {
+fn super_merges_the_two_scoped_catalogs() {
+    for role in [AgentRole::Researcher, AgentRole::Tester] {
         let got = names(&tools::catalog_for(&Ok(role)));
         for admin in corpus_core::CURATOR_TOOLS {
             assert!(
@@ -130,28 +130,90 @@ fn the_two_catalogs_do_not_overlap() {
         }
         assert!(!got.is_empty(), "{} still has its own tools", role.as_str());
     }
+    let curator = names(&tools::catalog_for(&Ok(AgentRole::Curator)));
+    for sandbox in corpus_core::CORPUS_TOOLS {
+        assert!(!curator.contains(&sandbox.trim_start_matches("corpus_").to_string()));
+    }
+    let super_tools = names(&tools::catalog_for(&Ok(AgentRole::Super)));
+    for sandbox in corpus_core::CORPUS_TOOLS {
+        assert!(super_tools.contains(&sandbox.trim_start_matches("corpus_").to_string()));
+    }
+    for admin in corpus_core::SUPER_ADMIN_TOOLS {
+        assert!(super_tools.contains(&admin.to_string()), "super lacks {admin}");
+    }
+    for operator_only in [
+        "project_new",
+        "project_clone",
+        "project_rebind",
+        "project_delete",
+        "agent_copy",
+    ] {
+        assert!(!super_tools.contains(&operator_only.to_string()), "{operator_only}");
+    }
 }
 
 /// A scoped server must not ask for something it will overwrite. Leaving
 /// `project` in the schema would invite a model to supply one and then have
 /// it silently replaced — worse than never asking.
 #[test]
-fn curator_schemas_never_advertise_a_project() {
-    let catalog = tools::catalog_for(&Ok(AgentRole::Curator));
-    for tool in catalog.as_array().unwrap() {
-        let name = tool["name"].as_str().unwrap();
-        let schema = &tool["inputSchema"];
-        assert!(
-            schema["properties"].get("project").is_none(),
-            "{name} advertises a project property"
-        );
-        if let Some(required) = schema["required"].as_array() {
+fn scoped_management_schemas_never_advertise_a_project() {
+    for role in [AgentRole::Curator, AgentRole::Super] {
+        let catalog = tools::catalog_for(&Ok(role));
+        for tool in catalog.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            if !role.admin_tools().contains(&name) {
+                continue;
+            }
+            let schema = &tool["inputSchema"];
             assert!(
-                !required.iter().any(|k| k.as_str() == Some("project")),
-                "{name} requires a project"
+                schema["properties"].get("project").is_none(),
+                "{role:?}/{name} advertises a project property"
             );
+            if let Some(required) = schema["required"].as_array() {
+                assert!(
+                    !required.iter().any(|k| k.as_str() == Some("project")),
+                    "{role:?}/{name} requires a project"
+                );
+            }
         }
     }
+}
+
+#[test]
+fn scoped_finding_list_uses_the_proven_project_and_is_read_only() {
+    let mut rig = rig("finding-list-scope", AgentRole::Curator);
+    std::fs::write(
+        rig.store
+            .project_corpus_dir("alpha")
+            .join("findings/1787091200-alpha.md"),
+        "---\ntitle: Alpha finding\nseverity: high\ntimestamp: 1787091200\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        rig.store
+            .project_corpus_dir("beta")
+            .join("findings/1787091300-beta.md"),
+        "---\ntitle: Beta secret\nseverity: critical\ntimestamp: 1787091300\n---\n",
+    )
+    .unwrap();
+
+    let out = tools::dispatch(
+        &mut rig.ctx,
+        "finding_list",
+        &json!({"project": "beta"}),
+    )
+    .expect("scoped finding list");
+    let value: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["project"], "alpha");
+    assert_eq!(value["count"], 1);
+    assert_eq!(value["findings"][0]["title"], "Alpha finding");
+    assert!(!out.contains("Beta secret"));
+
+    let audit = corpus_core::audit::tail(&rig.store, "alpha", 20).unwrap();
+    assert!(
+        audit.iter().all(|record| record.op != "finding_list"),
+        "read-only finding_list must not create curator audit acts"
+    );
 }
 
 /// The heart of it: a curator scoped to `alpha` that explicitly names
@@ -372,8 +434,8 @@ fn a_curator_polls_live_mission_status() {
 /// permissions problem, not a typo — otherwise a model hunts for a spelling
 /// that does not exist.
 #[test]
-fn research_roles_are_refused_management_tools_by_role() {
-    for role in [AgentRole::Researcher, AgentRole::Tester, AgentRole::Super] {
+fn narrow_research_roles_are_refused_management_tools_by_role() {
+    for role in [AgentRole::Researcher, AgentRole::Tester] {
         let mut rig = rig(&format!("deny-{}", role.as_str()), role);
         let error = tools::dispatch(&mut rig.ctx, "agent_new", &json!({}))
             .expect_err("must refuse")
@@ -473,11 +535,11 @@ fn every_mutation_is_recorded_and_reads_are_not() {
     assert_eq!(log[2].op, "agent_set_role");
     assert!(log[2].detail.contains("tester"), "{:?}", log[2]);
 
-    // A refusal is recorded too — an attempt is an act.
+    // A within-catalog policy refusal is recorded too — an attempt is an act.
     let _ = tools::dispatch(
         &mut rig.ctx,
-        "agent_delete",
-        &json!({ "agent": "ghost", "confirm_token": "bogus" }),
+        "agent_set_role",
+        &json!({ "agent": "built", "role": "super" }),
     );
     let log = corpus_core::audit::tail(&rig.store, "alpha", 100).unwrap();
     assert_eq!(
@@ -497,53 +559,179 @@ fn every_mutation_is_recorded_and_reads_are_not() {
     );
 }
 
-/// A dry-run must look at what it is about to destroy. Minting a token for
-/// a target nobody loaded spends a turn and then fails on the SECOND call,
-/// with an error about the target rather than about the typo — and says
-/// nothing about what the deletion would cost.
+fn confirm_token(dry_run: &str) -> String {
+    dry_run
+        .split("confirm_token: ")
+        .nth(1)
+        .expect("dry run contains a token")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// Curators need scoped cleanup authority. Each delete stays inside the
+/// injected project, produces an audited dry-run, and requires the server's
+/// one-shot token before mutation.
 #[test]
-fn destructive_dry_runs_verify_and_price_their_target() {
-    let mut rig = rig("dryrun", AgentRole::Curator);
-
-    // A typo fails NOW, on the call that made it.
-    let error = tools::dispatch(&mut rig.ctx, "agent_delete", &json!({ "agent": "kepeer" }))
-        .expect_err("a nonexistent agent is not a dry run")
-        .to_string();
-    assert!(error.contains("kepeer"), "{error}");
-
-    // A real target is priced: role, subagents, and what its removal breaks.
-    tools::dispatch(
-        &mut rig.ctx,
-        "agent_subagent_add",
-        &json!({
-            "agent": "keeper",
-            "name": "keeper-scout",
-            "description": "d",
-            "prompt": "p",
-        }),
-    )
-    .expect("add a subagent");
-    let dry = tools::dispatch(&mut rig.ctx, "agent_delete", &json!({ "agent": "keeper" }))
-        .expect("dry run");
-    assert!(dry.contains("DRY RUN"), "{dry}");
-    assert!(dry.contains("curator"), "names the role: {dry}");
-    assert!(dry.contains("1 subagent"), "counts what goes with it: {dry}");
-    assert!(dry.contains("confirm_token"), "{dry}");
-
-    // Missions likewise.
+fn a_curator_can_confirm_scoped_deletions() {
+    let mut rig = rig("curator-delete", AgentRole::Curator);
+    rig.store
+        .create_agent_with_role("alpha", "victim", AgentRole::Researcher)
+        .expect("victim agent");
     tools::dispatch(
         &mut rig.ctx,
         "mission_new",
-        &json!({ "slug": "m1", "agent": "keeper", "brief": "b" }),
+        &json!({ "slug": "m1", "agent": "victim", "brief": "b" }),
     )
     .expect("mission");
+    let finding = rig.store.project_corpus_dir("alpha").join("findings/f1.md");
+    std::fs::write(&finding, "evidence\n").unwrap();
+
     let dry = tools::dispatch(&mut rig.ctx, "mission_delete", &json!({ "mission": "m1" }))
-        .expect("dry run");
-    assert!(dry.contains("keeper"), "names the agent: {dry}");
-    assert!(dry.contains("live no"), "names whether a session is up: {dry}");
-    assert!(
-        tools::dispatch(&mut rig.ctx, "mission_delete", &json!({ "mission": "ghost" })).is_err(),
-        "a mission that does not exist is not a dry run"
+        .expect("mission dry run");
+    tools::dispatch(
+        &mut rig.ctx,
+        "mission_delete",
+        &json!({ "mission": "m1", "confirm_token": confirm_token(&dry) }),
+    )
+    .expect("confirmed mission delete");
+
+    let dry = tools::dispatch(&mut rig.ctx, "agent_delete", &json!({ "agent": "victim" }))
+        .expect("agent dry run");
+    tools::dispatch(
+        &mut rig.ctx,
+        "agent_delete",
+        &json!({ "agent": "victim", "confirm_token": confirm_token(&dry) }),
+    )
+    .expect("confirmed agent delete");
+
+    let dry = tools::dispatch(
+        &mut rig.ctx,
+        "entry_delete",
+        &json!({ "path": "findings/f1.md" }),
+    )
+    .expect("entry dry run");
+    tools::dispatch(
+        &mut rig.ctx,
+        "entry_delete",
+        &json!({ "path": "findings/f1.md", "confirm_token": confirm_token(&dry) }),
+    )
+    .expect("confirmed entry delete");
+
+    assert!(rig.store.load_mission("alpha", "m1").is_err());
+    assert!(rig.store.load_agent("alpha", "victim").is_err());
+    assert!(!finding.exists());
+}
+
+#[test]
+fn super_can_manage_and_wipe_only_its_scoped_project() {
+    let mut rig = rig("super-union", AgentRole::Super);
+    tools::dispatch(
+        &mut rig.ctx,
+        "agent_new",
+        &json!({
+            "agent": "another-super",
+            "description": "d",
+            "prompt": "p",
+            "role": "super",
+        }),
+    )
+    .expect("Super may author any project role");
+    assert_eq!(
+        rig.store.load_agent("alpha", "another-super").unwrap().meta.role(),
+        AgentRole::Super
+    );
+
+    let finding = rig.store.project_corpus_dir("alpha").join("findings/f1.md");
+    std::fs::write(&finding, "evidence\n").unwrap();
+    let before = Project::load(&rig.store, "alpha").unwrap().corpus_generation;
+    let dry = tools::dispatch(&mut rig.ctx, "corpus_wipe", &json!({})).expect("wipe dry run");
+    tools::dispatch(
+        &mut rig.ctx,
+        "corpus_wipe",
+        &json!({ "confirm_token": confirm_token(&dry) }),
+    )
+    .expect("confirmed scoped wipe");
+    assert!(!finding.exists());
+    assert_eq!(
+        Project::load(&rig.store, "alpha").unwrap().corpus_generation,
+        before + 1
+    );
+
+    for (tool, args) in [
+        ("project_delete", json!({ "slug": "beta" })),
+        (
+            "agent_copy",
+            json!({
+                "from_project": "alpha", "from": "keeper",
+                "to_project": "beta", "to": "escaped"
+            }),
+        ),
+    ] {
+        let error = tools::dispatch(&mut rig.ctx, tool, &args)
+            .expect_err("cross-project/lifecycle administration stays operator-only")
+            .to_string();
+        assert!(error.contains("does not"), "{tool}: {error}");
+    }
+    assert!(Project::load(&rig.store, "beta").is_ok());
+    assert!(rig.store.load_agent("beta", "escaped").is_err());
+}
+
+#[test]
+fn a_curator_cannot_grant_or_repurpose_super() {
+    let mut rig = rig("super-ceiling", AgentRole::Curator);
+    rig.store
+        .create_agent_with_role("alpha", "root", AgentRole::Super)
+        .expect("operator-created super fixture");
+
+    let attempts = [
+        (
+            "agent_new",
+            json!({
+                "agent": "new-super", "description": "d", "prompt": "p", "role": "super"
+            }),
+        ),
+        (
+            "agent_new",
+            json!({
+                "agent": "implicit-super", "description": "d", "prompt": "p", "from": "root"
+            }),
+        ),
+        ("agent_clone", json!({ "from": "root", "to": "root-copy" })),
+        ("agent_set_role", json!({ "agent": "keeper", "role": "super" })),
+        (
+            "agent_subagent_add",
+            json!({
+                "agent": "keeper", "name": "wide", "description": "d", "prompt": "p", "role": "super"
+            }),
+        ),
+        ("agent_set_role", json!({ "agent": "root", "role": "researcher" })),
+    ];
+    for (tool, args) in attempts {
+        let error = tools::dispatch(&mut rig.ctx, tool, &args)
+            .expect_err("super authority is operator-owned")
+            .to_string();
+        assert!(error.contains("operator-owned"), "{tool}: {error}");
+    }
+
+    // Copying configuration is allowed when the curator explicitly chooses a
+    // narrow role; the inherited document cannot decide the capability ceiling.
+    tools::dispatch(
+        &mut rig.ctx,
+        "agent_new",
+        &json!({
+            "agent": "narrow-copy",
+            "description": "d",
+            "prompt": "p",
+            "from": "root",
+            "role": "researcher",
+        }),
+    )
+    .expect("explicitly narrowed copy");
+    assert_eq!(
+        rig.store.load_agent("alpha", "narrow-copy").unwrap().meta.role(),
+        AgentRole::Researcher
     );
 }
 

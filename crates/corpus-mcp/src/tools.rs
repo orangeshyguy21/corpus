@@ -4,14 +4,17 @@
 //! gates) that no prompt can talk its way around. Write tools land in the
 //! project corpus (the ONLY corpus scope).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use corpus_core::refusal::Gate;
-use corpus_core::{AgentRole, FaucetCall, Plugin, ProbeResult, Scope, Store};
+use corpus_core::{
+    AgentRole, FaucetCall, FindingSeverity, NewFinding, Plugin, ProbeResult, Scope, Store,
+};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
+use corpus_admin::PendingConfirm;
 
 /// Output cap fed back to the model.
 const OUTPUT_CAP_BYTES: usize = 8 * 1024;
@@ -22,9 +25,8 @@ const OUTPUT_CAP_BYTES: usize = 8 * 1024;
 #[derive(Debug)]
 pub struct Ctx {
     /// The environment plugin driving the harness, when one could be
-    /// resolved. `None` for the store-only admin profile (which has no
-    /// project, hence no plugin binding) and whenever resolution failed —
-    /// `probe_notes` then carries the reason and every sandbox tool refuses.
+    /// resolved. `None` whenever resolution failed; `probe_notes` then carries
+    /// the reason and every sandbox tool refuses.
     pub plugin: Option<Plugin>,
     /// Corpus store root (projects/).
     pub store: Store,
@@ -49,9 +51,6 @@ pub struct Ctx {
     /// When the probe last ran — re-probes while gated are rate-limited
     /// so a polling model cannot hammer docker/curl in a tight loop.
     pub last_probe: std::time::Instant,
-    /// Admin profile on: the corpus-admin tool group is exposed and the
-    /// probe-required gate is bypassed (admin is store-only, host-side).
-    pub admin: bool,
     /// The capability ceiling of the agent this server is serving, resolved
     /// from the run's identity (`CORPUS_OPENCODE_AGENT`) at startup.
     ///
@@ -79,17 +78,6 @@ pub struct Ctx {
     pub run_log: Option<String>,
 }
 
-/// A pending destructive-op confirmation: a single-use, short-TTL token
-/// minted by a dry-run call and consumed by the token-bearing re-call that
-/// actually mutates the store. `key` is the token (hash of op+target+nonce).
-#[derive(Debug)]
-pub struct PendingConfirm {
-    pub op: String,
-    pub target: String,
-    /// Epoch seconds at which the token expires.
-    pub expires_at: u64,
-}
-
 /// Minimum interval between re-probes while the gate is closed.
 const REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -109,9 +97,9 @@ impl Ctx {
         // the project, so a server that cannot say which project it serves
         // cannot say which environment it drives either.
         let scope = Scope::from_env_strict(&store);
-        // A missing plugin is NOT fatal: the admin profile is store-only and
-        // has no project scope by design, so it must still start. The
-        // sandbox tools refuse through the probe gate instead.
+        // A missing plugin is NOT process-fatal: management-only roles still
+        // need their scoped store tools, while sandbox tools refuse through
+        // the probe gate.
         let mut plugin = match resolve_plugin_dir(&store, &scope) {
             Ok(dir) => match Plugin::spawn(&dir) {
                 Ok(plugin) => Ok(plugin),
@@ -165,7 +153,6 @@ impl Ctx {
             probe_ready: probe.ready,
             probe_notes: probe.notes,
             last_probe: std::time::Instant::now(),
-            admin: false,
             role,
             pending_confirms: HashMap::new(),
             source_pins,
@@ -187,7 +174,6 @@ impl Ctx {
             probe_ready: true,
             probe_notes: String::new(),
             last_probe: std::time::Instant::now(),
-            admin: false,
             role: Ok(role),
             pending_confirms: HashMap::new(),
             source_pins: None,
@@ -283,9 +269,10 @@ fn resolve_role(store: &Store, scope: &Scope) -> std::result::Result<AgentRole, 
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| {
             format!(
-                "{} is unset — a mission launch always sets it; pass --role <researcher|tester|super> \
+                "{} is unset — a mission launch always sets it; pass --role <{}> \
                  to run this server by hand",
-                corpus_core::AGENT_ENV
+                corpus_core::AGENT_ENV,
+                AgentRole::names()
             )
         })?;
     let config = store.load_agent(&scope.project, &agent).map_err(|e| {
@@ -310,13 +297,8 @@ pub fn catalog_for(role: &std::result::Result<AgentRole, String>) -> Value {
     let Ok(role) = role else {
         return Value::Array(Vec::new());
     };
-    // A project-management role serves a different catalog entirely, scoped
-    // to the project this server already proved. The two sets are disjoint:
-    // a curator advertises no sandbox tools, and no research role
-    // advertises a management one.
-    if !role.admin_tools().is_empty() {
-        return crate::admin::scoped_catalog(role.admin_tools());
-    }
+    // Sandbox and management are separate namespaces, but Super receives
+    // both. Curator naturally reduces to only the scoped management half.
     let mut out = catalog();
     if let Some(list) = out.as_array_mut() {
         list.retain(|tool| {
@@ -325,6 +307,9 @@ pub fn catalog_for(role: &std::result::Result<AgentRole, String>) -> Value {
                 .map(|n| role.allows(n))
                 .unwrap_or(false)
         });
+        if let Some(admin) = crate::admin::scoped_catalog(role.admin_tools()).as_array() {
+            list.extend(admin.iter().cloned());
+        }
     }
     out
 }
@@ -390,7 +375,9 @@ pub fn catalog() -> Value {
                 "properties": {
                     "title": {"type": "string"},
                     "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
-                    "detail": {"type": "string"}
+                    "detail": {"type": "string"},
+                    "path": {"type": "string", "description": "Optional path beneath findings/. A .md path names the file; a path with no extension or a trailing slash names a containing folder. Existing files are never overwritten."},
+                    "metadata": {"type": "object", "description": "Optional project-defined frontmatter. Corpus-owned keys such as title, severity, timestamp, sensitivity, verification, and provenance are refused."}
                 },
                 "required": ["title", "severity", "detail"]
             }
@@ -460,15 +447,17 @@ fn with_project(args: &Value, project: &str) -> Value {
 
 /// Management tools that only look. Not audited: the log is a record of
 /// acts, and a line per `agent_list` would bury the ones that matter.
-const READ_ONLY_MANAGEMENT: [&str; 9] = [
+const READ_ONLY_MANAGEMENT: [&str; 11] = [
     "agent_list",
     "agent_get",
     "mission_list",
     "mission_get",
     "mission_status",
+    "mission_await",
     "corpus_stats",
     "corpus_list",
     "corpus_read",
+    "finding_list",
     "model_list",
 ];
 
@@ -514,16 +503,90 @@ const AGENT_MUTATORS: [&str; 8] = [
     "agent_delete",
 ];
 
+/// A curator manages ordinary project agents but cannot mint or repurpose a
+/// `super` identity. Super agents can reach every research capability, so
+/// authoring one is reserved to an existing Super or the host operator.
+fn enforce_curator_agent_ceiling(
+    ctx: &Ctx,
+    name: &str,
+    args: &Value,
+    project: &str,
+) -> Result<()> {
+    let requested_role = args.get("role").and_then(Value::as_str);
+    if requested_role == Some(AgentRole::Super.as_str()) {
+        return Err(Error::refused(
+            Gate::Role,
+            format!(
+                "refusing {name}: granting the super role is operator-owned; a curator may grant researcher, tester, or curator"
+            ),
+        ));
+    }
+
+    if name == "agent_new"
+        && args.get("from").and_then(Value::as_str).is_some()
+        && requested_role.is_none()
+    {
+        return Err(Error::refused(
+            Gate::Role,
+            "refusing agent_new: super authority is operator-owned; a curator cloning configuration with 'from' must choose an explicit non-super role so inherited permissions cannot infer super",
+        ));
+    }
+
+    if name == "agent_clone" {
+        let from = args.get("from").and_then(Value::as_str).unwrap_or_default();
+        if !from.is_empty()
+            && ctx
+                .store
+                .load_agent(project, from)
+                .is_ok_and(|agent| agent.meta.role() == AgentRole::Super)
+        {
+            return Err(Error::refused(
+                Gate::Role,
+                format!(
+                    "refusing agent_clone: {project}/{from} is a super agent, and copying that capability is operator-owned"
+                ),
+            ));
+        }
+    }
+
+    let mutates_existing = matches!(
+        name,
+        "agent_save"
+            | "agent_set"
+            | "agent_set_role"
+            | "agent_set_permission"
+            | "agent_subagent_add"
+            | "agent_subagent_remove"
+    );
+    if mutates_existing {
+        let agent = args.get("agent").and_then(Value::as_str).unwrap_or_default();
+        if !agent.is_empty()
+            && ctx
+                .store
+                .load_agent(project, agent)
+                .is_ok_and(|config| config.meta.role() == AgentRole::Super)
+        {
+            return Err(Error::refused(
+                Gate::Role,
+                format!(
+                    "refusing {name}: {project}/{agent} is a super agent; editing or downgrading it is operator-owned"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Project-management tools served to an IN-PROJECT agent.
 ///
-/// Three things separate this from the `corpus-mcp --admin` operator
+/// Three things separate this from the `corpus-admin-mcp` operator
 /// profile, which is untouched:
 ///   1. the ROLE decides the catalog, not an argv flag;
 ///   2. the project is INJECTED from the proven scope and never read from
 ///      the caller;
 ///   3. the agent set is re-checked afterwards, so an edit that breaks
 ///      delegation is reported now rather than at the next launch.
-fn curator_dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
+fn scoped_management_dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     let role = match &ctx.role {
         Err(why) => {
             return Err(Error::refused(
@@ -582,7 +645,12 @@ fn curator_dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         })?;
     }
 
-    let result = crate::admin::dispatch(ctx, name, &args);
+    let ceiling = if role == AgentRole::Curator {
+        enforce_curator_agent_ceiling(ctx, name, &args, &scope.project)
+    } else {
+        Ok(())
+    };
+    let result = ceiling.and_then(|()| crate::admin::dispatch(ctx, name, &args));
     if mutating {
         let (outcome, detail) = match &result {
             Ok(text) => (corpus_core::audit::Outcome::Ok, text.clone()),
@@ -653,7 +721,7 @@ fn dispatch_inner(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     // dead mint or an absent plugin must not stop it from fixing the very
     // project whose configuration is broken.
     if crate::admin::ADMIN_TOOLS.contains(&name) {
-        return curator_dispatch(ctx, name, args);
+        return scoped_management_dispatch(ctx, name, args);
     }
     // The ROLE gate runs first — before the probe — so a refused call never
     // drives a docker/curl re-probe, and so an agent outside its ceiling
@@ -769,7 +837,7 @@ fn resilient<T>(
                     let _ = plugin.restart();
                 }
             }
-            Err(Error::Plugin(error))
+            Err(Error::Plugin(error.to_string()))
         }
     }
 }
@@ -972,8 +1040,26 @@ fn wallet_fund(ctx: &mut Ctx, args: &Value) -> Result<String> {
 /// lands in the project corpus (default class: embargoed).
 fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let title = require_str(args, "title")?;
-    let severity = require_str(args, "severity")?;
+    let severity_raw = require_str(args, "severity")?;
+    let severity = FindingSeverity::parse(&severity_raw).ok_or_else(|| {
+        Error::Args(format!(
+            "invalid finding severity {severity_raw:?}; expected critical, high, medium, or low"
+        ))
+    })?;
     let detail = require_str(args, "detail")?;
+    let path = match args.get("path") {
+        None => None,
+        Some(Value::String(path)) => Some(path.clone()),
+        Some(_) => return Err(Error::Args("path must be a string".into())),
+    };
+    let metadata: BTreeMap<String, Value> = match args.get("metadata") {
+        None => BTreeMap::new(),
+        Some(Value::Object(metadata)) => metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        Some(_) => return Err(Error::Args("metadata must be an object".into())),
+    };
     let scope = ctx.write_scope(args)?;
 
     let mut verified = false;
@@ -1008,17 +1094,28 @@ fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let slug = slugify(&title);
-    let dir = category_dir(ctx, &scope, "findings")?;
-    let path = dir.join(format!("{ts}-{slug}.md"));
-    let body = format!(
-        "---\ntitle: {title}\nseverity: {severity}\noracle_verified: {verified}\nsensitivity: embargoed\ntimestamp: {ts}\n---\n\n\
-         ## Detail\n\n{detail}\n\n## Oracle output at report time\n\n```\n{oracle_out}```\n"
-    );
-    std::fs::write(&path, &body)?;
+    let finding = NewFinding {
+        title,
+        severity,
+        detail,
+        timestamp: ts,
+        oracle_verified: verified,
+        oracle_output: oracle_out,
+        path,
+        metadata,
+        run_log: ctx.run_log.clone(),
+        actor: Some(ctx.store.actor().to_string()),
+        source_pins: ctx.source_pins.clone(),
+    };
+    let written = ctx
+        .store
+        .write_finding(&scope.project, &finding)
+        .map_err(|error| Error::Args(error.to_string()))?;
     Ok(format!(
-        "finding recorded in {}: {} (oracle_verified: {verified}, sensitivity: embargoed)",
-        scope.project, path.display()
+        "finding recorded in {}: {} (reference: {}, oracle_verified: {verified}, sensitivity: embargoed)",
+        scope.project,
+        written.path.display(),
+        written.reference
     ))
 }
 

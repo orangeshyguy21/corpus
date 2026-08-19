@@ -55,6 +55,16 @@ pub struct RunLine {
     pub text: String,
 }
 
+/// Stop always attempts every cleanup step and preserves the durable
+/// transcript path. Errors are returned as data so callers can report them
+/// without abandoning the remaining cleanup work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopOutcome {
+    pub transcript: PathBuf,
+    pub export_error: Option<String>,
+    pub cleanup_errors: Vec<String>,
+}
+
 /// Where the run actually executes. The app/CLI never branch on this —
 /// only `attach_command()` / `stop()` are backend-shaped.
 enum Backend {
@@ -481,13 +491,18 @@ impl RunSession {
     /// operator's final word) and always returns the durable transcript
     /// path — the exported JSON when the export lands, else the raw
     /// capture (TUI) or .log (piped), both durable by design.
-    pub fn stop(&mut self) -> PathBuf {
+    pub fn stop_detailed(&mut self) -> StopOutcome {
         match &mut self.backend {
             Backend::Piped { child, .. } => {
-                kill_tree(child);
-                self.transcript.clone()
+                let cleanup_errors = kill_tree_checked(child);
+                StopOutcome {
+                    transcript: self.transcript.clone(),
+                    export_error: None,
+                    cleanup_errors,
+                }
             }
             Backend::Tui { .. } => {
+                let mut export_error = None;
                 let fallback = match &self.backend {
                     Backend::Tui { raw, .. } => raw.clone(),
                     Backend::Piped { .. } => self.transcript.clone(),
@@ -495,19 +510,35 @@ impl RunSession {
                 let path = match self.export_transcript() {
                     Ok(path) => path,
                     Err(error) => {
-                        // Best-effort, but not silent: a broken export
-                        // must be diagnosable, not just an empty Cost panel.
-                        eprintln!("corpus: transcript export on stop failed: {error}");
+                        export_error = Some(format!("transcript export failed: {error}"));
                         fallback
                     }
                 };
-                self.close_tui();
+                let cleanup_errors = self.close_tui_checked();
                 if let Backend::Tui { stopped, .. } = &mut self.backend {
                     *stopped = true;
                 }
-                path
+                StopOutcome {
+                    transcript: path,
+                    export_error,
+                    cleanup_errors,
+                }
             }
         }
+    }
+
+    /// Compatibility wrapper for CLI callers that still treat Stop as
+    /// best-effort. The app uses [`RunSession::stop_detailed`] and surfaces
+    /// every error to the operator.
+    pub fn stop(&mut self) -> PathBuf {
+        let outcome = self.stop_detailed();
+        if let Some(error) = &outcome.export_error {
+            eprintln!("corpus: stop cleanup failed: {error}");
+        }
+        for error in &outcome.cleanup_errors {
+            eprintln!("corpus: stop cleanup failed: {error}");
+        }
+        outcome.transcript
     }
 
     /// `opencode export <session-id>`: the newest session opened in the
@@ -558,19 +589,24 @@ impl RunSession {
     /// Kill the tmux session (the whole TUI process tree) and drop the
     /// temp script. The raw capture in the project corpus runs/ is KEPT:
     /// it is the durable run log.
-    fn close_tui(&mut self) {
+    fn close_tui_checked(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
         let Backend::Tui {
             session, script, ..
         } = &self.backend
         else {
-            return;
+            return errors;
         };
-        if let Some(tmux) = resolve_tmux() {
-            let _ = Command::new(tmux)
-                .args(["kill-session", "-t", session])
-                .status();
+        match kill_tmux_session_checked(session) {
+            Ok(()) => {}
+            Err(error) => errors.push(error.to_string()),
         }
-        let _ = fs::remove_file(script);
+        if let Err(error) = fs::remove_file(script) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                errors.push(format!("remove run script {}: {error}", script.display()));
+            }
+        }
+        errors
     }
 
     fn runs_for(store: &Store, project: &str, agent: &str, ts: u64, ext: &str) -> PathBuf {
@@ -630,12 +666,7 @@ fn primary_agent_model(doc: &serde_json::Value) -> Option<String> {
 /// model). This IS an explicit model id; it replaces the old template
 /// default (templates are gone).
 fn registry_default() -> Option<String> {
-    let path = std::env::var("CORPUS_MODELS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("benchmarks/models.yaml"));
-    ModelRegistry::load(&path)
-        .ok()?
-        .launch_default()
+    ModelRegistry::load_default().ok()?.launch_default()
 }
 
 /// First non-empty of two ordered options (primary -> arg).
@@ -815,24 +846,7 @@ pub fn tui_attach_command(session: &str) -> Option<Vec<String>> {
 /// by design, so a reopened app offers these for in-pane attach.
 /// Empty on any failure (no tmux, no server running).
 pub fn live_tui_sessions() -> Vec<String> {
-    let Some(tmux) = resolve_tmux() else {
-        return Vec::new();
-    };
-    let Ok(output) = Command::new(tmux)
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new(); // no server up — no live runs
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|name| name.starts_with("corpus-"))
-        .map(str::to_string)
-        .collect()
+    corpus_observe::live_tui_sessions()
 }
 
 /// The opencode conversation a LIVE tmux session is hosting, discovered
@@ -874,14 +888,7 @@ fn session_stamp(session: &str) -> Option<u64> {
 /// find the log of a run it does NOT own (re-attached after a relaunch)
 /// without a handle. None when the name isn't ours or carries no stamp.
 pub fn session_raw_log(store: &Store, project: &str, session: &str) -> Option<PathBuf> {
-    let ts = session_stamp(session)?;
-    let (agent, _) = session.strip_prefix("corpus-")?.rsplit_once('-')?;
-    Some(
-        store
-            .project_corpus_dir(project)
-            .join(crate::store::RUNS)
-            .join(format!("{ts}-{agent}.raw")),
-    )
+    corpus_observe::session_raw_log(store, project, session)
 }
 
 /// How long a run's TUI has been producing NOTHING, in seconds — the
@@ -898,9 +905,7 @@ pub fn session_raw_log(store: &Store, project: &str, session: &str) -> Option<Pa
 /// printed) or the mtime is unreadable — callers treat that as "not
 /// working" rather than guessing.
 pub fn run_idle_secs(log: &Path) -> Option<u64> {
-    let modified = fs::metadata(log).ok()?.modified().ok()?;
-    // A capture written a hair in the future (clock skew) reads as 0.
-    Some(modified.elapsed().map(|d| d.as_secs()).unwrap_or(0))
+    corpus_observe::run_idle_secs(log)
 }
 
 /// How recently a run's TUI must have painted for the agent to count as
@@ -908,23 +913,11 @@ pub fn run_idle_secs(log: &Path) -> Option<u64> {
 /// stream, tool output), so a live-but-quiet capture for this long means
 /// the turn is over and it's waiting. Long enough to ride out a slow frame,
 /// short enough that the state settles as soon as the answer lands.
-pub const WORKING_WINDOW_SECS: u64 = 3;
+pub use corpus_observe::{MissionActivity, MissionRunState, WORKING_WINDOW_SECS};
 
 /// What a mission is actually doing right now — the signal behind the app's
 /// sidebar dots, and what the curator polls to pace a team. Derived live
 /// from tmux + the raw capture; never persisted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MissionActivity {
-    /// No live session — the mission is not up.
-    Idle,
-    /// The session is live but quiet: the turn is finished and it is
-    /// waiting on the operator (or on a reply). Not work.
-    Waiting,
-    /// The agent is producing right now — streaming, spinning, running
-    /// tools.
-    Working,
-}
-
 /// The pure activity rule, split out so it is testable and SHARED by the
 /// app (which feeds an aged in-memory reading) and the one-shot
 /// `mission_run_state` (which stats the capture fresh): a live session is
@@ -932,21 +925,7 @@ pub enum MissionActivity {
 /// No reading at all (`None`) is NOT evidence of work — it falls through to
 /// `Waiting`, never `Working` (the case that used to pulse forever).
 pub fn activity_from_idle(live: bool, idle_secs: Option<u64>) -> MissionActivity {
-    if !live {
-        return MissionActivity::Idle;
-    }
-    match idle_secs {
-        Some(secs) if secs < WORKING_WINDOW_SECS => MissionActivity::Working,
-        _ => MissionActivity::Waiting,
-    }
-}
-
-/// A mission's live run state: its activity plus how long since its TUI
-/// last painted (`None` = no live capture to read).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MissionRunState {
-    pub activity: MissionActivity,
-    pub idle_secs: Option<u64>,
+    corpus_observe::activity_from_idle(live, idle_secs)
 }
 
 /// Compute a mission's live run state ONE-SHOT — the same answer the app's
@@ -961,30 +940,41 @@ pub fn mission_run_state(
     mission: &crate::store::Mission,
     live: &[String],
 ) -> MissionRunState {
-    let is_live = mission
-        .session
-        .as_deref()
-        .is_some_and(|s| live.iter().any(|l| l == s));
-    let idle_secs = mission
-        .session
-        .as_deref()
-        .filter(|_| is_live)
-        .and_then(|s| session_raw_log(store, project, s))
-        .and_then(|log| run_idle_secs(&log));
-    MissionRunState {
-        activity: activity_from_idle(is_live, idle_secs),
-        idle_secs,
-    }
+    corpus_observe::mission_run_state(store, project, mission, live)
 }
 
 /// Kill a corpus tmux session (Stop for a re-attached run). No-op when
 /// tmux is unavailable; the session may already be dead.
 pub fn kill_tmux_session(session: &str) {
-    if let Some(tmux) = resolve_tmux() {
-        let _ = Command::new(tmux)
-            .args(["kill-session", "-t", session])
-            .status();
+    if let Err(error) = kill_tmux_session_checked(session) {
+        eprintln!("corpus: tmux cleanup failed: {error}");
     }
+}
+
+/// Error-aware teardown used by the app lifecycle. A missing tmux binary or
+/// non-zero kill is not success: the durable mission binding must remain
+/// available for retry/recovery.
+pub fn kill_tmux_session_checked(session: &str) -> Result<()> {
+    let tmux = resolve_tmux()
+        .ok_or_else(|| Error::Store("cannot stop tmux session: tmux is unavailable".into()))?;
+    let status = Command::new(tmux)
+        .args(["kill-session", "-t", session])
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    // A session may exit between the live listing and Stop. In that race a
+    // failed kill is still successful cleanup if `has-session` proves it is
+    // gone; only a session that remains alive is retryable failure.
+    let alive = Command::new(resolve_tmux().expect("resolved above"))
+        .args(["has-session", "-t", session])
+        .status()?;
+    if !alive.success() {
+        return Ok(());
+    }
+    Err(Error::Store(format!(
+        "tmux kill-session failed for {session} with {status}; session is still alive"
+    )))
 }
 
 /// Is this tmux session still alive? Throttled: the check is a
@@ -1045,6 +1035,19 @@ fn poll_file(
     pending: &mut String,
 ) -> Option<RunLine> {
     loop {
+        // A previous read can buffer several complete lines while this API
+        // deliberately returns only one. Drain those before consulting the
+        // file length: the producer may be idle even though `pending` still
+        // has output ready for the UI.
+        if let Some(end) = pending.find(['\n', '\r']) {
+            let line = pending[..end].to_string();
+            let consumed = if pending[end..].starts_with("\r\n") { end + 2 } else { end + 1 };
+            pending.drain(..consumed);
+            return Some(RunLine {
+                stderr: false,
+                text: line,
+            });
+        }
         let Ok(meta) = fs::metadata(path) else {
             return None;
         };
@@ -1065,15 +1068,6 @@ fn poll_file(
         }
         *file_pos = len;
         pending.push_str(&String::from_utf8_lossy(&buf));
-        if let Some(end) = pending.find(['\n', '\r']) {
-            let line = pending[..end].to_string();
-            let consumed = if pending[end..].starts_with("\r\n") { end + 2 } else { end + 1 };
-            pending.drain(..consumed);
-            return Some(RunLine {
-                stderr: false,
-                text: line,
-            });
-        }
         if pending.len() > 16 * 1024 {
             let line = std::mem::take(pending);
             return Some(RunLine { stderr: false, text: line });
@@ -1302,35 +1296,38 @@ where
 }
 
 /// Kill a child and its whole process group (unix).
-fn kill_tree(child: &mut Child) {
+fn kill_tree_checked(child: &mut Child) -> Vec<String> {
+    let mut errors = Vec::new();
     #[cfg(unix)]
     {
         let pgid = child.id().to_string();
-        let _ = Command::new("kill")
+        if let Err(error) = Command::new("kill")
             .args(["-TERM", &format!("-{pgid}")])
-            .status();
+            .status()
+        {
+            errors.push(format!("signal process group {pgid}: {error}"));
+        }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Err(error) = child.kill() {
+        if error.kind() != std::io::ErrorKind::InvalidInput {
+            errors.push(format!("kill child {}: {error}", child.id()));
+        }
+    }
+    if let Err(error) = child.wait() {
+        errors.push(format!("reap child {}: {error}", child.id()));
+    }
+    errors
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agents::AgentRole;
-    use std::sync::MutexGuard;
+    use crate::test_support::{env_lock, unique_temp_path, EnvVarGuard};
 
     /// The env- and process-mutating launch tests are inherently global
     /// (CORPUS_STORE/PATH, tmux sessions, stray processes), so they run
     /// under one shared lock instead of racing the parallel test pool.
-    static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    pub fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     /// A store in its OWN world: the run dir is a sibling of the store
     /// (`<store parent>/var/run/<project>`), so temp stores that shared a
     /// parent — every one of them, when the parent was `/tmp` — collided
@@ -1363,6 +1360,20 @@ mod tests {
     }
 
     #[test]
+    fn poll_file_drains_buffered_lines_after_writer_goes_idle() {
+        let path = unique_temp_path("poll-buffered-lines");
+        fs::write(&path, "first\nsecond\n").unwrap();
+        let mut pos = 0;
+        let mut pending = String::new();
+        assert_eq!(poll_file(&path, &mut pos, &mut pending).unwrap().text, "first");
+        let consumed_len = pos;
+        assert_eq!(poll_file(&path, &mut pos, &mut pending).unwrap().text, "second");
+        assert_eq!(pos, consumed_len, "the second line came from the buffer");
+        assert!(poll_file(&path, &mut pos, &mut pending).is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn launch_model_precedence_and_loud_failure() {
         // primary wins, then arg.
         assert_eq!(
@@ -1381,13 +1392,13 @@ mod tests {
     }
 
     /// Integration test (env-locked): the spawn/stop machinery
-    /// runs against a temp store seeded with the core agent pair,
-    /// exercising the v2 teamless paths.
+    /// runs against a temp store with agents created explicitly by role,
+    /// exercising the teamless paths.
     #[test]
     fn spawn_stop_and_piped_headless() {
         let _guard = env_lock();
         let _ = Command::new("pkill").args(["-f", "sleep 90127"]).status();
-        let bin = std::env::temp_dir().join(format!("corpus-fake-bin-{}", std::process::id()));
+        let bin = unique_temp_path("corpus-fake-bin");
         let _ = fs::remove_dir_all(&bin);
         fs::create_dir_all(&bin).unwrap();
         let fake = bin.join("opencode");
@@ -1395,10 +1406,10 @@ mod tests {
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
         let mut path = std::env::var("PATH").unwrap_or_default();
         path = format!("{}:{}", bin.display(), path);
-        std::env::set_var("PATH", &path);
+        let _path = EnvVarGuard::set("PATH", &path);
 
         let (store, store_dir) = tmp_store("stop-v2");
-        std::env::set_var("CORPUS_STORE", &store_dir);
+        let _store = EnvVarGuard::set("CORPUS_STORE", &store_dir);
         core_project(&store);
 
         let mut session = RunSession::spawn_headless("default", "operator", None, "probe")
@@ -1430,8 +1441,6 @@ mod tests {
         assert!(runs_dir.join(session.transcript.file_name().unwrap()).exists(),
             "transcript in project corpus");
 
-        std::env::remove_var("CORPUS_STORE");
-        std::env::remove_var("PATH");
         let _ = fs::remove_dir_all(&bin);
         let _ = fs::remove_dir_all(&store_dir);
     }
@@ -1446,18 +1455,35 @@ mod tests {
             return; // no tmux on this host — nothing to exercise
         }
         let _ = Command::new("pkill").args(["-f", "sleep 90128"]).status();
-        let bin = std::env::temp_dir().join(format!("corpus-fake-tui-bin-{}", std::process::id()));
+        let bin = unique_temp_path("corpus-fake-tui-bin");
         let _ = fs::remove_dir_all(&bin);
         fs::create_dir_all(&bin).unwrap();
         let fake = bin.join("opencode");
-        fs::write(&fake, "#!/bin/sh\nsleep 90128\n").unwrap();
+        // The launched TUI stays alive, while Stop's discovery/export
+        // subprocesses answer immediately. A fake that sleeps for every
+        // argv makes the test itself hang inside `Command::output()` and
+        // hides which phase failed.
+        fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             if [ \"$1\" = session ]; then\n\
+               printf '[{\"directory\":\"%s\",\"created\":9999999999999,\"id\":\"fixture-session\"}]\\n' \"$PWD\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = export ]; then\n\
+               printf '{\"id\":\"fixture-session\"}\\n'\n\
+               exit 0\n\
+             fi\n\
+             sleep 90128\n",
+        )
+        .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
         let mut path = std::env::var("PATH").unwrap_or_default();
         path = format!("{}:{}", bin.display(), path);
-        std::env::set_var("PATH", &path);
+        let _path = EnvVarGuard::set("PATH", &path);
 
         let (store, store_dir) = tmp_store("tui-raw");
-        std::env::set_var("CORPUS_STORE", &store_dir);
+        let _store = EnvVarGuard::set("CORPUS_STORE", &store_dir);
         core_project(&store);
 
         let mut session =
@@ -1480,8 +1506,6 @@ mod tests {
         session.stop();
         assert!(raw.exists(), "stop keeps the durable run log");
 
-        std::env::remove_var("CORPUS_STORE");
-        std::env::remove_var("PATH");
         let _ = fs::remove_dir_all(&bin);
         let _ = fs::remove_dir_all(&store_dir);
     }
@@ -1495,7 +1519,7 @@ mod tests {
     fn both_launch_paths_export_the_agent_identity() {
         let _guard = env_lock();
         let (store, store_dir) = tmp_store("agent-env");
-        std::env::set_var("CORPUS_STORE", &store_dir);
+        let _store = EnvVarGuard::set("CORPUS_STORE", &store_dir);
         // A run dir belongs to a project, and provisioning now refuses to
         // invent one.
         store.create_project("default", "D", "cdk-regtest").unwrap();
@@ -1532,7 +1556,6 @@ mod tests {
         );
         let _ = fs::remove_file(&script);
 
-        std::env::remove_var("CORPUS_STORE");
         let _ = fs::remove_dir_all(&store_dir);
     }
 

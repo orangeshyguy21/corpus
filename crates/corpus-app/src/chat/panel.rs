@@ -12,6 +12,10 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::chat::{Chat, ChatEvent, ChatHandle, ChatPhase};
 
+/// Explicit retention bound for the on-screen conversation. The complete
+/// transcript is flushed separately; this vector exists only to paint a tail.
+const MAX_VISIBLE_MESSAGES: usize = 256;
+
 /// Panel-local render state for one conversation.
 pub struct ChatPanelView {
     /// Events still on screen (roll the tail). Kept small; the transcript is
@@ -19,6 +23,8 @@ pub struct ChatPanelView {
     messages: Vec<Rendered>,
     input: String,
     model: String,
+    ollama_models: crate::state::ModelDiscovery,
+    ollama_jobs: Option<crate::jobs::JobSet<corpus_core::ModelList>>,
     md: CommonMarkCache,
     /// Map from permission request id -> the args/tool, for the inline card.
     pending: Vec<PendingPermission>,
@@ -122,6 +128,8 @@ impl Default for ChatPanelView {
             messages: Vec::new(),
             input: String::new(),
             model: String::new(),
+            ollama_models: crate::state::ModelDiscovery::Loading,
+            ollama_jobs: None,
             md: CommonMarkCache::default(),
             pending: Vec::new(),
             activity: Activity::Idle,
@@ -182,6 +190,7 @@ pub fn human_tool_name(raw: &str) -> String {
             "corpus_stats" => "corpus stats".into(),
             "corpus_list" => "list corpus entries".into(),
             "corpus_read" => "read corpus entry".into(),
+            "finding_list" => "list findings".into(),
             "corpus_wipe" => "WIPE corpus".into(),
             "model_list" => "list available models".into(),
             other => other.replace('_', " "),
@@ -381,6 +390,9 @@ impl ChatPanelView {
                 }
             }
         }
+        if self.messages.len() > MAX_VISIBLE_MESSAGES {
+            self.messages.drain(..self.messages.len() - MAX_VISIBLE_MESSAGES);
+        }
         events
     }
 
@@ -392,7 +404,7 @@ impl ChatPanelView {
     /// its last message/tool card) — "the thought process and actions read in
     /// order" — instead of the old detached footer line. None when idle: the
     /// log shows history only. Animated: the ellipsis cycles and the elapsed
-    /// timer counts (main.rs repaints at 250 ms for the toast loop anyway).
+    /// timer owns a panel-local 400 ms repaint deadline while a turn is live.
     fn live_activity(&self, chat: &dyn Chat) -> Option<(String, egui::Color32)> {
         let busy = crate::theme::rgb(200, 150, 80);
         let dots = match (self.activity_since.elapsed().as_millis() / 400) % 4 {
@@ -654,6 +666,13 @@ impl ChatPanelView {
             // own.
             ui.ctx().request_repaint();
         }
+        // Backend events wake the UI at delivery. This timer belongs only
+        // to the elapsed-time/ellipsis animation during a live turn; an idle
+        // or closed chat schedules no frames.
+        if !matches!(self.activity, Activity::Idle) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(400));
+        }
     }
 
     /// The empty log: a quiet, vertically-centred invitation rather than a
@@ -834,6 +853,35 @@ impl ChatPanelView {
     /// status line was both a duplicate and a widget nobody could act on. The
     /// phase wording moves to the field's tooltip.
     fn model_picker(&mut self, ui: &mut egui::Ui, chat: &dyn Chat) {
+        if self.ollama_jobs.is_none() {
+            self.ollama_jobs = Some(crate::jobs::JobSet::new(std::sync::Arc::new(
+                ui.ctx().clone(),
+            )));
+        }
+        let results = self
+            .ollama_jobs
+            .as_mut()
+            .map(|jobs| jobs.drain_applicable(|_| true))
+            .unwrap_or_default();
+        for result in results {
+            self.ollama_models = match result.terminal {
+                crate::jobs::JobTerminal::Success(models) => {
+                    crate::state::ModelDiscovery::Ready(models)
+                }
+                crate::jobs::JobTerminal::Failure(error) => {
+                    crate::state::ModelDiscovery::Failed(error)
+                }
+                crate::jobs::JobTerminal::Cancelled => {
+                    crate::state::ModelDiscovery::Failed("Ollama discovery cancelled".into())
+                }
+                crate::jobs::JobTerminal::TimedOut => {
+                    crate::state::ModelDiscovery::Failed("Ollama discovery timed out".into())
+                }
+            };
+        }
+        if matches!(self.ollama_models, crate::state::ModelDiscovery::Loading) {
+            self.start_ollama_discovery(false);
+        }
         let current = self.model.clone();
         let (phase, dot) = self.status(chat);
         // The field takes what the rail's right-hand controls left it. The
@@ -862,8 +910,8 @@ impl ChatPanelView {
                 .width(field_w)
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
-                        if let Ok(list) = corpus_core::ollama_models() {
-                            for g in &list.groups {
+                        match &self.ollama_models {
+                            crate::state::ModelDiscovery::Ready(list) => for g in &list.groups {
                                 if !g.label.is_empty() {
                                     ui.label(egui::RichText::new(&g.label).weak().small());
                                 }
@@ -874,9 +922,19 @@ impl ChatPanelView {
                                         self.model = m.model.clone();
                                     }
                                 }
+                            },
+                            crate::state::ModelDiscovery::Loading => {
+                                ui.label("loading Ollama models…");
                             }
-                        } else {
-                            ui.label("ollama not available — a model is required");
+                            crate::state::ModelDiscovery::Failed(error) => {
+                                ui.label("ollama not available — a model is required")
+                                    .on_hover_text(error);
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Refresh models").clicked() {
+                            self.ollama_models = crate::state::ModelDiscovery::Loading;
+                            self.start_ollama_discovery(true);
                         }
                     });
             // The status light, painted into the gap the label reserved for
@@ -897,6 +955,23 @@ impl ChatPanelView {
                 combo.response.on_hover_text(phase)
             }
         });
+    }
+
+    fn start_ollama_discovery(&mut self, refresh: bool) {
+        let Some(jobs) = self.ollama_jobs.as_mut() else { return };
+        jobs.start(
+            crate::jobs::JobKind::ModelDiscovery,
+            crate::jobs::JobScope {
+                project: String::new(),
+                project_generation: 0,
+                corpus_revision: None,
+                run_id: None,
+            },
+            std::time::Duration::from_secs(15),
+            move |_| {
+                corpus_core::ollama_models_refresh(refresh).map_err(|error| error.to_string())
+            },
+        );
     }
 
     fn tool_cards(&self, ui: &mut egui::Ui, cards: &[ToolCard]) {
@@ -1130,7 +1205,24 @@ fn tool_cards(ui: &mut egui::Ui, cards: &[ToolCard]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_tokens, elide_middle, human_tool_name};
+    use super::{
+        compact_tokens, elide_middle, human_tool_name, BubbleKind, ChatPanelView, Rendered,
+        MAX_VISIBLE_MESSAGES,
+    };
+
+    #[test]
+    fn visible_history_has_an_explicit_bound() {
+        let mut panel = ChatPanelView::default();
+        panel.messages.extend((0..MAX_VISIBLE_MESSAGES + 5).map(|i| Rendered {
+            text: i.to_string(),
+            tools: Vec::new(),
+            kind: BubbleKind::Notice,
+            queued: false,
+        }));
+        panel.messages.drain(..panel.messages.len() - MAX_VISIBLE_MESSAGES);
+        assert_eq!(panel.messages.len(), MAX_VISIBLE_MESSAGES);
+        assert_eq!(panel.messages.first().unwrap().text, "5");
+    }
 
     #[test]
     fn model_ids_elide_in_the_middle_keeping_family_and_tag() {
@@ -1165,6 +1257,7 @@ mod tests {
             "project-manager › create project"
         );
         assert_eq!(human_tool_name("corpus_wipe"), "WIPE corpus");
+        assert_eq!(human_tool_name("finding_list"), "list findings");
         // Fallback: unknown names strip the extension prefix and underscores.
         assert_eq!(human_tool_name("corpus-admin__future_thing"), "future thing");
         // Every catalog tool has a non-empty human name.

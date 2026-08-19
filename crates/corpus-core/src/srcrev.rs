@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +27,28 @@ use crate::error::Error;
 /// Disk-cache TTL for a remote's rev list (24h: tags are append-mostly,
 /// and a stale cache only ever falls back gracefully).
 pub const REV_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+
+static NEXT_GIT_CONFIG: AtomicU64 = AtomicU64::new(1);
+
+struct EmptyGitConfig(PathBuf);
+
+impl EmptyGitConfig {
+    fn new() -> Self {
+        let id = NEXT_GIT_CONFIG.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "corpus-gitconfig-{}-{id}",
+            std::process::id()
+        ));
+        let _ = fs::write(&path, "");
+        Self(path)
+    }
+}
+
+impl Drop for EmptyGitConfig {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
 
 /// The rev→sha cache file format (`sources/.rev-cache/<name>.json`).
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,16 +84,14 @@ fn remote_url(repo: &str) -> String {
 /// a global gitconfig that cannot fetch these repos; the global config
 /// is scrubbed for the call (empty file), same as setup.sh.
 fn ls_remote(repo: &str) -> Result<BTreeMap<String, String>, Error> {
-    let empty_cfg = std::env::temp_dir().join(format!("corpus-gitconfig-{}", std::process::id()));
-    let _ = fs::write(&empty_cfg, "");
+    let empty_cfg = EmptyGitConfig::new();
     let output = Command::new("git")
         .args(["ls-remote", "--tags", "--heads"])
         .arg(remote_url(repo))
-        .env("GIT_CONFIG_GLOBAL", &empty_cfg)
+        .env("GIT_CONFIG_GLOBAL", &empty_cfg.0)
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| Error::Store(format!("git ls-remote failed to run: {e}")));
-    let _ = fs::remove_file(&empty_cfg);
     let output = output?;
     if !output.status.success() {
         return Err(Error::Store(format!(
@@ -221,12 +242,11 @@ pub fn ensure_source_tree(
     }
     let tmp = sources_dir.join(name).join(format!(".fetch-{sha}"));
     let _ = fs::remove_dir_all(&tmp);
-    let empty_cfg = std::env::temp_dir().join(format!("corpus-gitconfig-{}", std::process::id()));
-    let _ = fs::write(&empty_cfg, "");
+    let empty_cfg = EmptyGitConfig::new();
     let git = |args: &[&str]| {
         Command::new("git")
             .args(args)
-            .env("GIT_CONFIG_GLOBAL", &empty_cfg)
+            .env("GIT_CONFIG_GLOBAL", &empty_cfg.0)
             .env("GIT_TERMINAL_PROMPT", "0")
             .status()
             .map(|s| s.success())
@@ -244,7 +264,6 @@ pub fn ensure_source_tree(
             && git(&["-C", &dir, "remote", "add", "origin", &remote_url(repo)])
             && git(&["-C", &dir, "fetch", "--quiet", "--depth", "1", "origin", sha])
             && git(&["-C", &dir, "checkout", "--quiet", "--detach", sha]);
-        let _ = fs::remove_file(&empty_cfg);
         if !ok || !head_matches(&tmp, sha) {
             let _ = fs::remove_dir_all(&tmp);
             return Err(Error::Store(format!(
@@ -262,7 +281,6 @@ pub fn ensure_source_tree(
             &remote_url(repo),
             &tmp.to_string_lossy(),
         ]);
-        let _ = fs::remove_file(&empty_cfg);
         if !status {
             let _ = fs::remove_dir_all(&tmp);
             return Err(Error::Store(format!(
@@ -328,6 +346,7 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::unique_temp_path;
 
     #[test]
     fn commit_sha_is_exactly_40_lowercase_hex() {
@@ -346,10 +365,7 @@ mod tests {
     /// Build a bare fixture repo with two tags (one annotated) and a main
     /// branch; returns its path for `ls-remote`/clone over the file path.
     fn fixture_repo(tag: &str, tag2: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "corpus-srcrev-{tag}-{}",
-            std::process::id()
-        ));
+        let root = unique_temp_path(&format!("corpus-srcrev-{tag}"));
         let _ = fs::remove_dir_all(&root);
         let work = root.join("work");
         fs::create_dir_all(&work).unwrap();
@@ -387,7 +403,7 @@ mod tests {
     #[test]
     fn selectable_orders_pin_main_tags_desc() {
         let repo = fixture_repo("v9.9.9", "v0.2.0");
-        let dir = std::env::temp_dir().join(format!("corpus-srcrev-cache-{}", std::process::id()));
+        let dir = unique_temp_path("corpus-srcrev-cache");
         let _ = fs::remove_dir_all(&dir);
         let repo = repo.to_str().unwrap().to_string();
         let revs = selectable_revs(&dir, "t", &repo, "v0.1.0");

@@ -1,0 +1,11 @@
+[package]
+name = "corpus-admin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+corpus-observe = { path = "../corpus-observe" }
+corpus-store = { path = "../corpus-store" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

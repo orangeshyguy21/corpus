@@ -11,14 +11,17 @@
 
 mod chat;
 mod fmt;
+mod file_watch;
+mod jobs;
 mod nav;
+mod session_service;
 mod sidebar;
 mod state;
 mod terminal;
 mod theme;
 mod views;
 
-use std::time::Duration;
+use std::sync::Arc;
 
 use eframe::egui;
 use egui_phosphor::regular as ph;
@@ -77,7 +80,7 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        let state = AppState::from_env();
+        let state = AppState::from_env_deferred(cc.egui_ctx.clone());
         // Restore the remembered chat model (store/app.yaml). Only the
         // PICKER is restored, not a session: the backend starts on the first
         // frame the chat panel actually renders, so a launch with the panel
@@ -146,9 +149,30 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        for (is_error, message) in self.state.poll_background_jobs() {
+            self.toasts.add(
+                egui_toast::Toast::new()
+                    .kind(if is_error {
+                        egui_toast::ToastKind::Error
+                    } else {
+                        egui_toast::ToastKind::Info
+                    })
+                    .text(message),
+            );
+        }
         // Keep the selected project's scoped caches loaded (only hits disk
         // when the selection changed).
         self.state.ensure_selection();
+        // Native filesystem events only invalidate coarse cache domains;
+        // the normal readers below perform reconciliation and retain their
+        // timed backstops for startup/missed events.
+        if let Some(warning) = self.state.poll_file_invalidations() {
+            self.toasts.add(
+                egui_toast::Toast::new()
+                    .kind(egui_toast::ToastKind::Info)
+                    .text(warning),
+            );
+        }
         // Keep the sidebar's agent status dots honest: poll tmux on a
         // throttle when a live session can exist (never per frame).
         self.state.poll_live_sessions();
@@ -227,8 +251,13 @@ impl eframe::App for App {
         // Toast overlay (top-right of the whole window).
         self.toasts.show(ctx);
 
-        // Keep the toast overlay and its timers animating between clicks.
-        ctx.request_repaint_after(Duration::from_millis(250));
+        // Polling has an explicit owner. Jobs, terminal output and chat
+        // events wake egui directly; only a live run/session needs a clock
+        // for liveness and activity transitions. Toasts schedule their own
+        // expiry in egui-toast. A truly idle app schedules no next frame.
+        if let Some(after) = self.state.live_repaint_after() {
+            ctx.request_repaint_after(after);
+        }
     }
 }
 
@@ -445,7 +474,14 @@ impl App {
             }
         }
         if revs.is_empty() {
-            ui.weak("no source pins");
+            if project
+                .as_deref()
+                .is_some_and(|project| self.state.source_revisions_loading(project))
+            {
+                ui.weak("loading source revisions…");
+            } else {
+                ui.weak("no source pins");
+            }
         }
     }
 
@@ -460,7 +496,20 @@ impl App {
         let Some(project) = self.state.effective_project() else {
             return;
         };
-        let (dot, label, notes) = match self.state.env_status(&project) {
+        let (dot, label, notes) = if self.state.env_probe_loading(&project) {
+            (
+                theme::rgb(200, 150, 80),
+                "probing environment…".to_string(),
+                "environment probe is running in the background".to_string(),
+            )
+        } else if let Some(error) = self.state.env_probe_error(&project) {
+            (
+                theme::SIGNAL_RED,
+                "probe failed".to_string(),
+                format!("probe failed — {error}; click to retry"),
+            )
+        } else {
+            match self.state.env_status(&project) {
             Some(env) if env.ready => {
                 // Ready: name + the version the mint is actually running,
                 // so "what's up" is legible at a glance, not buried.
@@ -498,6 +547,7 @@ impl App {
                 "probe…".to_string(),
                 "no probe yet — click to probe".to_string(),
             ),
+            }
         };
         // A compact clickable row: dot + 13px label. FIX 2d — the whole
         // region is click-sensitive with a pointing-hand cursor, and the
@@ -590,6 +640,7 @@ impl App {
                 }
                 if corpus_touched {
                     if let Some(p) = self.state.effective_project() {
+                        self.state.note_corpus_mutation(&p);
                         self.state.refresh_corpus_stats(&p);
                     }
                 }
@@ -606,7 +657,7 @@ impl App {
                     })
                     .unwrap_or_default();
                 self.chat_panel.set_project_label(&label);
-                self.ensure_chat_started();
+                self.ensure_chat_started(ui.ctx());
                 // Juice the session with the operator's current position
                 // (re-pushed only when it changes).
                 let ctx = self.chat_context();
@@ -632,7 +683,7 @@ impl App {
 
     /// The role + model the current chat backend was launched with; a change
     /// in either (or a Finished backend) restarts the scoped session.
-    fn ensure_chat_started(&mut self) {
+    fn ensure_chat_started(&mut self, ctx: &egui::Context) {
         if self.chat_panel.model().is_empty() {
             return; // no model -> panel stays idle (refuses to start)
         }
@@ -657,7 +708,12 @@ impl App {
         }
         self.chat_role = role;
         self.chat_model = model.clone();
-        self.chat = chat::ChatHandle::start_scoped(&project, &model, role);
+        self.chat = chat::ChatHandle::start_scoped_with_wake(
+            &project,
+            &model,
+            role,
+            Arc::new(ctx.clone()),
+        );
     }
 
     /// Keep the app-owned panel widths inside their live bounds (the

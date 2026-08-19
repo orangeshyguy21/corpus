@@ -8,8 +8,6 @@ serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
 thiserror = "2"
-ratatui = "0.29"
-crossterm = "0.28"
 eframe = "0.31"
 egui = "0.31"
 egui_commonmark = "0.20"
@@ -18,14 +16,8 @@ egui-toast = "0.17"
 egui_term = "0.1"
 egui-phosphor = "0.9"
 image = "0.25"
+notify = "8.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
-# The embedded goose chat runtime (dev/gdk-embed-plan). Apache-2.0; git-dep
-# pinned at a deliberate rev — NEVER autobump (each bump is a port session
-# recorded in dev/gdk-embed-plan.md). `goose` is the embed surface; everything
-# we need is re-exported from it, so it is the only direct goose dep.
-# NOTE (this machine): the global ~/.gitconfig rewrites https://github.com →
-# git@github.com:, and the goose repo has NO SSH access here — fetch/build with
-# `GIT_CONFIG_GLOBAL=/tmp/empty-gitconfig` (or `-c url.https://github.com/.insteadof=`).
 goose = { git = "https://github.com/aaif-goose/goose", rev = "4bb968fadbb1d8fc0216adad627a1ab7837803c5" }
 
 [profile.release]

@@ -14,11 +14,17 @@ open-source project with a reproducible test environment.
 AGENTS.md            this file (read first)
 Cargo.toml           workspace root
 crates/
-  corpus-core/       core library: plugin protocol client, model registry,
-                     discovery. This is where shared protocol types live.
+  corpus-store/      filesystem data model, finding severity/discovery,
+                     agent policy/rendering, audit/refusal, and root paths
+  corpus-observe/    read-only host observation: installed plugin manifests,
+                     run activity, pin catalogs, and model discovery
+  corpus-core/       compatibility facade plus plugin protocol, source
+                     resolution/materialization, and run launch machinery
+  corpus-admin/      host/scoped management catalog and handlers, depending
+                     directly on corpus-store + corpus-observe
+  corpus-admin-mcp/  dedicated host-side administration MCP executable
   corpus-mcp/        MCP server exposing the corpus tools to agents
-  corpus-cli/        headless CLI: run / plugin / models (+ ratatui TUI,
-                     slated for removal once the deck covers M1+M2)
+  corpus-cli/        headless CLI: run / plugin / models / store administration
   corpus-app/        egui desktop app (corpus-app), the operator UI
 plugins/
   cdk-regtest/       reference environment plugin (sandbox + oracles +
@@ -30,9 +36,8 @@ benchmarks/
                      benchmarks/results/<model>/*.yaml)
   forensic/          historical-bug forensic suite (CDK-BENCH-XXXX.yaml)
   results/           per-model benchmark score results
-crates/corpus-app/assets/chat/
-                     the management-chat recipe (goose, GDK): recipe.yaml +
-                     subrecipes/. Committed code, not user data.
+scripts/goose-recipes/ optional Goose CLI fallback recipes. Script-only;
+                     corpus-app uses the embedded chat runtime.
 sources.toml         pinned target source manifest (repo → tag + sha; the
                      DEFAULT pin per repo — the PLUGIN defines the revs
                      available, the PROJECT owns the pick (persisted on
@@ -99,18 +104,20 @@ the run cwd sits outside the repo, opencode's own upward config discovery
 cannot reach this repo's `.opencode/` either.
 
 The **resource root** (`CORPUS_RESOURCES`, else found from the running
-executable — the directory holding `plugins/` and `sources.toml`) is the
-other half: shipped, read-only, replaced by an upgrade. `corpus-core/paths.rs`
+executable — the directory holding `plugins/`, `sources.toml`, and optional
+`benchmarks/models.yaml`) is the
+other half: shipped, read-only, replaced by an upgrade. `corpus-store/paths.rs`
 owns both roots. `store.root().parent()` is NOT the repo root and must never
 be used as one again.
 
 ## Build / test / run commands
 
 ```bash
-cargo build -p corpus-core -p corpus-mcp -p corpus-cli   # core + CLI
+cargo build -p corpus-store -p corpus-observe -p corpus-core -p corpus-mcp -p corpus-admin-mcp -p corpus-cli
 cargo build -p corpus-app                                # the egui app
-cargo test -p corpus-core -p corpus-mcp                   # unit + scoped-store tests
+cargo test -p corpus-store -p corpus-observe -p corpus-core -p corpus-mcp -p corpus-admin -p corpus-admin-mcp
 cargo test -p corpus-app --bin corpus-app                 # app + chat/team injection probes
+scripts/check-dependency-policy                          # admin artifact boundary
 cargo build --workspace                                   # everything
 ```
 
@@ -179,43 +186,47 @@ corpus models list
 corpus project list|new|clone|delete|rebind|wipe <slug>
 corpus agent list|new|clone|delete <project> ...   # new takes --role
 corpus mission list|new|delete <project> ...
-# corpus-admin MCP profile: the SAME corpus-mcp binary behind `--admin`
-corpus-mcp --admin                 # stdio MCP server; the 30 admin tools only
+# Host-side corpus administration MCP server
+corpus-admin-mcp                   # stdio MCP server; admin tools only
 corpus audit <project> [--tail N]  # who changed this project (curator acts)
 corpus refusals <project> [--tail N] [--gate G]  # what the server turned away
 ```
 
 ## corpus-admin MCP profile (dev/decisions.md — chat runtime closeout)
 
-`corpus-mcp --admin` is a second trust profile of the same binary —
-host-side operator tooling, thin over corpus-core, for natural-language
+`corpus-admin-mcp` is the host-side operator artifact for natural-language
 store administration via the GDK/goose chat. It sits OUTSIDE the research
 trust domains (no sandbox, no oracles, no targets) and never runs missions
 — it prepares them. It is UNSCOPED: 21 of its tools take a `project`
 argument, so it reaches every project. That is why it is the operator's
-profile and not an agent's. The tool group lives in
-`crates/corpus-mcp/src/admin.rs`; `main.rs` gates `tools/list` +
-`tools/call` on the flag and the admin profile advertises NO
-sandbox/finding tools.
+profile and not an agent's. The tool group lives in `crates/corpus-admin`; the
+dedicated binary starts store-only state and never spawns or probes a plugin.
+It reads installed manifests, revision caches, run activity, and model catalogs
+through `corpus-observe`. `crates/corpus-mcp/src/admin.rs` is only the
+project-scoped adapter used by Curator/Super. The enforced boundary lives in
+`scripts/check-dependency-policy`: the admin artifact may not depend on the
+all-capabilities core facade or the research/app executables.
 
 The same tools reach an IN-PROJECT agent through a different door: the
-`curator` role. There the ROLE decides the catalog (not an argv flag), and
+`curator` and `super` roles. There the ROLE decides the catalog (not an argv flag), and
 `tools::dispatch` injects the project from the proven `CORPUS_PROJECT`
-scope before any handler reads it — so a curator cannot name another
-project, and the seven tools that identify a project by some other key
-(`project_*`, `agent_copy`) are simply not in its grant set. Neither is
-`corpus_wipe`. See "The curator role" below.
+scope before any handler reads it — so neither role can name another
+project. Project lifecycle tools and `agent_copy` are absent from both scoped
+grant sets. `corpus_wipe` belongs to Super but not Curator. See "The curator
+role" and the trust-domain table below.
 
-Admin tools (all thin over corpus-core): `project_list/new/clone/delete/
+Admin tools (thin over corpus-store and corpus-observe): `project_list/new/clone/delete/
 rebind`, `agent_list/get/new/save/clone/delete` (`agent_new` builds the
 opencode.json from structured fields — prefer it for creation; `agent_save`
 only edits existing agents and runs the core validator, refusing invalid
 documents with the validator's message), `mission_list/
 get/new/delete/set_budget/set_pins`, `corpus_wipe`, `corpus_stats/list/read`,
-`model_list` (discover opencode model ids for agent configs).
+`model_list` (discover opencode model ids for agent configs), plus
+`entry_delete/move/write` for corpus curation.
 
-- **Confirm-token gate (server-side, all four destructive ops):**
-  `project_delete`, `agent_delete`, `mission_delete`, `corpus_wipe` first
+- **Confirm-token gate (server-side, all five destructive ops):**
+  `project_delete`, `agent_delete`, `mission_delete`, `corpus_wipe`, and
+  `entry_delete` first
   return a DRY-RUN summary + a one-shot confirm token (hash of
   op+target+nonce, 60s TTL); the mutation only lands when the tool is
   re-called with that token, which is consumed (single-use). `corpus_wipe`
@@ -226,7 +237,8 @@ get/new/delete/set_budget/set_pins`, `corpus_wipe`, `corpus_stats/list/read`,
   per-agent.
 - Tests: `crates/corpus-mcp/tests/admin_profile.rs` covers no-token
   dry-run, wrong/expired/single-use token, validator round-trip, rebind
-  registry validation, and admin tools absent without `--admin`.
+  registry validation, and research-profile catalog exclusion;
+  `crates/corpus-admin-mcp/tests/profile.rs` locks dedicated wire/catalog parity.
 
 ### GDK/goose chat wiring (chunk 1, local Ollama)
 
@@ -239,8 +251,8 @@ extensions:
     type: stdio
     name: corpus-admin
     enabled: true
-    cmd: /Users/admin/Sites/corpus/target/debug/corpus-mcp
-    args: ["--admin"]
+    cmd: /Users/admin/Sites/corpus/target/debug/corpus-admin-mcp
+    args: []
     envs: {}
     timeout: 300
   developer:
@@ -263,22 +275,22 @@ extensions:
   at root) and execs goose with `GOOSE_PATH_ROOT` set. Example:
   `scripts/goose-chat run -n ops -t "<prompt>"`. A raw `goose run` outside
   the wrapper leaks sessions to the default dir.
-- **The management chat runs the committed recipe**
-  `crates/corpus-app/assets/chat/recipe.yaml` — a FLAT single agent with the full
+- **The optional Goose CLI fallback runs the committed recipe**
+  `scripts/goose-recipes/recipe.yaml` — a FLAT single agent with the full
   corpus-admin catalog and the confirm-token gate as the sole hard control
   (D1 verdict: goose subrecipe delegation does not load a subrecipe's
   extensions into subagents, so per-subagent grants are not enforceable via
   subrecipes; `available_tools` DOES filter when a recipe runs as its own
   main recipe — see dev/decisions.md, the chat-runtime closeout). Headless drive:
-  `scripts/goose-chat run --recipe crates/corpus-app/assets/chat/recipe.yaml --params "request=<utterance>"`;
-  interactive: `scripts/goose-chat --recipe crates/corpus-app/assets/chat/recipe.yaml`.
+  `scripts/goose-chat run --recipe scripts/goose-recipes/recipe.yaml --params "request=<utterance>"`;
+  interactive: `scripts/goose-chat --recipe scripts/goose-recipes/recipe.yaml`.
 - **The app's native management chat** (dev/decisions.md, the chat-runtime
   closeout): goose's `Agent` runtime is EMBEDDED in-process as a source-level
   git dependency (pinned rev, Apache-2.0 — see dev/decisions.md for the
   deliberate-bump discipline and the ICS resolver pins). All GDK lives in `crates/corpus-app/src/chat/`
   (boundary: our own `ChatEvent`/`ChatCommand`/`Chat` trait; `embedded.rs`
   quarantines every goose type and drives the agent on a background thread,
-  spawning `corpus-mcp --admin` as its tool extension — our own protocol, not
+  spawning `corpus-admin-mcp` as its tool extension — our own protocol, not
   a goose subprocess; never via `scripts/goose-chat`). The backend is gated
   behind the cargo feature `chat-embed` (default ON). The confirm ritual is
   IN-PROCESS and stronger than the old ACP arm: a mutating tool call is
@@ -304,11 +316,11 @@ extensions:
   role-scoped session (`chat/team.rs` — a ROLE selector in the chat header,
   default **Operator**). `TeamRole` = `Operator` / `Orchestrator` /
   `AgentBuilder` / `ProjectManager` / `MissionManager` / `CorpusInspector`.
-  Each non-`Operator` role registers `corpus-mcp --admin` with
+  Each non-`Operator` role registers `corpus-admin-mcp` with
   `available_tools` = its scoped domain, so a specialist is scoped BY
   CONSTRUCTION (goose's `is_tool_available` refuses out-of-domain tools). The
   destructive set (`corpus_wipe`/`project_delete`/`agent_delete`/
-  `mission_delete`) is withheld from EVERY specialist and the orchestrator
+  `mission_delete`/`entry_delete`) is withheld from EVERY specialist and the orchestrator
   holds none (registers no admin extension); the Orchestrator delegates to
   specialists via OUR **`delegate` frontend tool** (`build_team_extension` in
   `chat/embedded.rs`): goose yields the call to the app, which spawns the
@@ -350,26 +362,30 @@ only.
 A fresh agent should answer "how do I run the oracle suite?" with: `corpus
 plugin probe cdk-regtest` (is the environment healthy) then via the MCP
 tools `oracle_run` per oracle reported by `corpus plugin call cdk-regtest
-oracles`. "Who may touch the sandbox?" → only the **operator** agent, via
+oracles`. "Who may touch the sandbox?" → the `tester` and `super` roles, via
 the `corpus_sandbox_exec` MCP tool (see Trust domains below).
 
 ## Trust domains (hard rules)
 
 | Zone | Who may do it | Egress | Never mounted into the sandbox |
 |---|---|---|---|
-| **Execution sandbox** | the `tester` ROLE, via `corpus_sandbox_exec` | DENIED by default | benchmarks/, plugins/, oracle implementations, findings of the current mission |
-| **Research zone** | the `researcher` ROLE (reads only) | open internet (webfetch/search) | executes nothing; read-denied on benchmarks/** |
-| **Project management** | the `curator` ROLE, via the scoped admin tools | NO egress, NO sandbox | manages its OWN project's agents, missions and corpus; cannot name another project; every act recorded |
+| **Execution sandbox** | `tester` or `super`, via `corpus_sandbox_exec` | DENIED by default | benchmarks/, plugins/, oracle implementations, findings of the current mission |
+| **Research zone** | `researcher` or `super` | open internet (webfetch/search) | read-denied on benchmarks/**; researcher executes nothing |
+| **Project management** | `curator` or `super`, via scoped admin tools | Curator: no egress/sandbox; Super also holds both | manages only its proven project; cannot name another project; every act recorded |
 | **Model inference** | host-side only, local by default | the model endpoint sits on the host | the sandbox has no model access |
 | **Corpus store** | write via MCP tools (`finding_write`, `attack_save`, `technique_save`), gated per artifact | — | — |
 
-Roles are `AgentRole::{Researcher, Tester, Super}` and are enforced twice:
+Roles are `AgentRole::{Super, Curator, Tester, Researcher}` and are enforced twice:
 server-side by corpus-mcp (which resolves the run's agent from
 `CORPUS_OPENCODE_AGENT` + `CORPUS_PROJECT` and refuses everything outside
 the ceiling), and in the rendered `.opencode/agent/*.md` by opencode
 permissions DERIVED from the role at render time. The stored config can
 only tighten, never widen. A tester's channel into the world is the MCP
-tool catalog; a researcher can never execute.
+tool catalog; a researcher can never execute. Super is the union of research,
+testing, and project-scoped management. It can confirmation-gated wipe its own
+corpus, but project creation/cloning/rebinding/deletion, cross-project copying,
+and access to other projects remain operator-only. Every role, including Super,
+is denied an unrestricted host shell because that would bypass project scope.
 
 The rendered block is computed as a typed `Policy` value (agents.rs) and
 serialized once, rather than assembled by mutating a JSON map. Every
@@ -381,6 +397,16 @@ survived every render. A struct field cannot be absent, which is the point.
 `tests/roles.rs` holds a byte fixture per role plus both halves of the
 merge (a stored block may tighten; it may not widen).
 
+## The super role
+
+Super is the current-project union role: Researcher + Tester + scoped Curator,
+plus confirmation-gated `corpus_wipe`. Its MCP catalog merges the sandbox and
+management catalogs; management calls still pass through project injection and
+the append-only audit log. It may create and host any project role. It is not a
+host-global operator: project lifecycle, cross-project copying, other-project
+access, unrestricted host shell, benchmark internals, and plugin internals stay
+denied.
+
 ## The curator role
 
 An agent that manages its own project rather than the target: it creates
@@ -390,20 +416,20 @@ internet — an agent that can rewrite every other agent's config is the last
 one that should be reading attacker-controlled text.
 
 - **Scoped by construction.** `tools::dispatch` routes the management tools
-  through `curator_dispatch`, which overwrites `args["project"]` from the
+  through `scoped_management_dispatch`, which overwrites `args["project"]` from the
   proven scope before dispatching. The 17 sites in `admin.rs` that read
   `project` therefore all see the same unforgeable value, and the scoped
   catalog strips `project` from every advertised schema — a tool that
   quietly ignores an argument it asked for is worse than one that never
   asked.
-- **Not comparable to the research roles.** `AgentRole` is deliberately NOT
-  `Ord`; `cap_under` spells the relation out. A subagent under a curator IS
-  a curator (one role is enforced per session, taken from the primary), and
-  a curator subagent under a research primary collapses to researcher —
-  refused at set time by `set_subagent_role` rather than silently collapsed
-  at render time.
-- **It may set roles, including its own.** That is deliberate, and the
-  audit log is what makes it survivable.
+- **Curator and Tester are different domains under Super.** `AgentRole` is
+  deliberately not `Ord`; `cap_under` spells the relation out. A subagent under
+  a Curator is Curator, narrower research roles cannot host Curator, and Super
+  may host any project role because its server catalog contains both domains.
+- **It may set non-super roles, including its own.** Creating, cloning,
+  promoting, or editing a `super` agent is operator-owned. It may delete agents,
+  missions, and corpus entries inside its injected project scope through the
+  same dry-run/token gate as admin; every attempt and outcome is audit-recorded.
 - **Every act is recorded.** `~/.corpus/var/audit/<project>.jsonl`, append
   only: intent before the call, outcome after, actor on every line. A
   failure to record REFUSES the call — an act this role cannot account for
@@ -418,8 +444,8 @@ one that should be reading attacker-controlled text.
   operator audits. Denied to `entry_delete`/`entry_move` AND write-denied
   in every rendered permission block, since the corpus is the one place an
   agent may write with opencode's own file tools.
-- **It cannot launch.** `mission_new` writes a record; running it stays an
-  operator act.
+- **It may launch.** `mission_launch` starts a prepared project mission; that
+  mutation is scoped and audit-recorded like its other management acts.
 
 ## Debugging a run: the refusal log
 
@@ -480,13 +506,13 @@ The reference plugin is `plugins/cdk-regtest`.
   subpath; out-of-category files surface in the project view's `other`
   bucket.
 - There are no seed agent documents. A new agent is created from a ROLE
-  (`corpus agent new <p> <slug> --role researcher|tester|super`), whose
-  starting prompt is compiled into corpus-core
-  (`crates/corpus-core/src/prompts/*.md`) and whose ceiling the renderer
+  (`corpus agent new <p> <slug> --role super|curator|tester|researcher`), whose
+  starting prompt is compiled into corpus-store
+  (`crates/corpus-store/src/prompts/*.md`) and whose ceiling the renderer
   derives. Seeds were data pretending to be code: they shipped in the repo,
   drifted from the renderer, and gave every agent two sources of truth about
   what it could do. Fixtures for the render live in
-  `crates/corpus-core/tests/fixtures/` — never in a directory opencode
+  role fixtures remain in `crates/corpus-core/tests/fixtures/` — never in a directory opencode
   discovers — and re-bless with `CORPUS_BLESS=1 cargo test -p corpus-core
   --test roles`.
 - Every render is **project-bound**: `store/projects/*` permission patterns

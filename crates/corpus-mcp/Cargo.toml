@@ -13,8 +13,6 @@ name = "corpus-mcp"
 path = "src/main.rs"
 
 [dependencies]
+corpus-admin = { path = "../corpus-admin" }
 corpus-core = { path = "../corpus-core" }
-serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
-thiserror = { workspace = true }

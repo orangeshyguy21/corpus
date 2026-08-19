@@ -1,0 +1,13 @@
+[package]
+name = "corpus-admin-mcp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "corpus-admin-mcp"
+path = "src/main.rs"
+
+[dependencies]
+corpus-admin = { path = "../corpus-admin" }
+serde_json = { workspace = true }

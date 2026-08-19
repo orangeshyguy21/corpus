@@ -12,7 +12,6 @@ use egui::{RichText, Ui};
 use egui_phosphor::regular as ph;
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
-use crate::nav::Screen;
 use crate::state::AppState;
 use crate::theme;
 use crate::views::{components, json_editor};
@@ -62,7 +61,7 @@ pub struct AgentsView {
     /// The new-subagent form, when open.
     new_subagent: Option<NewSubagent>,
     /// opencode's model catalog, fetched on demand (a subprocess).
-    models: Option<corpus_core::ModelList>,
+    models: crate::state::ModelDiscovery,
     /// Delete is never dispatched from the page action itself; the action
     /// opens this confirmation ritual first.
     confirm_delete: bool,
@@ -121,7 +120,7 @@ impl Default for AgentsView {
             entry: None,
             draft: None,
             new_subagent: None,
-            models: None,
+            models: crate::state::ModelDiscovery::Loading,
             confirm_delete: false,
         }
     }
@@ -662,16 +661,24 @@ impl AgentsView {
                     )
                     .show_ui(ui, |ui| {
                         // Fetched lazily: this shells out to opencode.
-                        if self.models.is_none() {
+                        if matches!(self.models, crate::state::ModelDiscovery::Loading) {
                             self.models = state.opencode_models(false);
                         }
-                        let Some(list) = &self.models else {
-                            ui.label(
-                                RichText::new("opencode catalog unavailable")
+                        let list = match &self.models {
+                            crate::state::ModelDiscovery::Ready(list) => list,
+                            crate::state::ModelDiscovery::Loading => {
+                                ui.label(RichText::new("loading opencode catalog…").size(12.0));
+                                return;
+                            }
+                            crate::state::ModelDiscovery::Failed(error) => {
+                                ui.label(
+                                    RichText::new("opencode catalog unavailable")
                                     .size(12.0)
                                     .color(theme::SIGNAL_RED),
-                            );
-                            return;
+                                )
+                                .on_hover_text(error);
+                                return;
+                            }
                         };
                         let mut picked: Option<String> = None;
                         if ui
@@ -984,8 +991,8 @@ impl AgentsView {
         project: &str,
         slug: &str,
     ) {
-        // One-click create + launch: a BARE opencode TUI at an empty prompt
-        // (the operator types the mission into the TUI).
+        // Creation is navigation, not execution. The operator can launch the
+        // selected mission explicitly from its sidebar menu.
         match state.create_mission(project, slug, "") {
             Ok(mission) => {
                 toast(
@@ -994,10 +1001,8 @@ impl AgentsView {
                     format!("mission created {project}/{mission}"),
                 );
                 state.refresh_missions(project);
-                // Select + auto-launch it on the mission view.
-                state.selected_mission = Some(mission.clone());
-                state.pending_launch = Some(mission.clone());
-                state.current_screen = Screen::Missions;
+                // Select it on the mission view without starting opencode.
+                state.select_mission(project, &mission);
             }
             Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
         }

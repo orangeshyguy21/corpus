@@ -21,21 +21,7 @@ pub struct PluginDir {
     pub manifest: PluginManifest,
 }
 
-/// Environment variable overriding the plugins directory.
-pub const PLUGINS_DIR_ENV: &str = "CORPUS_PLUGINS_DIR";
-
-/// Resolve the plugins directory: env override, else `plugins/` under the
-/// resource root. The old fallback was the RELATIVE `plugins`, so which
-/// plugins existed depended on the process's cwd — a launcher started from
-/// anywhere but the repo silently saw none.
-pub fn plugins_dir() -> PathBuf {
-    if let Some(dir) = std::env::var(PLUGINS_DIR_ENV).ok().filter(|s| !s.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    crate::paths::resource_root_opt()
-        .map(|root| root.join("plugins"))
-        .unwrap_or_else(|| PathBuf::from("plugins"))
-}
+pub use corpus_store::paths::plugins_dir;
 
 /// Discover all plugins under a directory (invalid entries are skipped
 /// with a warning on stderr, so one bad plugin can't break the registry).
@@ -75,6 +61,10 @@ pub struct PluginStatus {
     /// `running_version` for what the environment is actually running.
     pub version: Option<String>,
     pub description: Option<String>,
+    /// Whether this entry has a live probe result. Discovery and probing are
+    /// separate so the app can list every binding without spawning every
+    /// plugin process.
+    pub probed: bool,
     /// Environment readiness from a live probe.
     pub ready: bool,
     /// Human-readable detail (what is missing, versions, etc.).
@@ -91,28 +81,50 @@ pub struct PluginStatus {
 /// into `ready: false` + a note, so one broken plugin can't abort the
 /// aggregation.
 pub fn plugin_status() -> Vec<PluginStatus> {
+    plugin_status_for(None, true)
+}
+
+/// Discover every plugin but live-probe only `selected`. The app uses this
+/// path so changing projects starts one environment process, not one per
+/// installed plugin. `probe_all` is retained for operator/admin diagnostics.
+pub fn selected_plugin_status(selected: Option<&str>) -> Vec<PluginStatus> {
+    plugin_status_for(selected, false)
+}
+
+fn plugin_status_for(selected: Option<&str>, probe_all: bool) -> Vec<PluginStatus> {
     let mut out = Vec::new();
     for plugin in discover(&plugins_dir()).unwrap_or_default() {
+        let should_probe = probe_all || selected == Some(plugin.manifest.name.as_str());
         // Keep the whole ProbeResult so the version fields survive — a
         // `(ready, notes)` destructure was what dropped them before.
-        let probe = match Plugin::spawn(&plugin.dir) {
-            Ok(mut spawned) => spawned.probe().unwrap_or_else(|error| ProbeResult {
+        let probe = if should_probe {
+            match Plugin::spawn(&plugin.dir) {
+                Ok(mut spawned) => spawned.probe().unwrap_or_else(|error| ProbeResult {
+                    ready: false,
+                    notes: format!("probe failed: {error}"),
+                    running_version: None,
+                    expected_tag: None,
+                }),
+                Err(error) => ProbeResult {
+                    ready: false,
+                    notes: format!("spawn failed: {error}"),
+                    running_version: None,
+                    expected_tag: None,
+                },
+            }
+        } else {
+            ProbeResult {
                 ready: false,
-                notes: format!("probe failed: {error}"),
+                notes: "not probed".into(),
                 running_version: None,
                 expected_tag: None,
-            }),
-            Err(error) => ProbeResult {
-                ready: false,
-                notes: format!("spawn failed: {error}"),
-                running_version: None,
-                expected_tag: None,
-            },
+            }
         };
         out.push(PluginStatus {
             name: plugin.manifest.name.clone(),
             version: plugin.manifest.version.clone(),
             description: plugin.manifest.description.clone(),
+            probed: should_probe,
             ready: probe.ready,
             notes: probe.notes,
             running_version: probe.running_version,
@@ -388,17 +400,7 @@ fn load_source_entries(path: &Path) -> BTreeMap<String, SourceEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Registry tests mutate the process-global `CORPUS_PLUGINS_DIR`, so
-    /// they must not race the parallel test pool (same pattern as the
-    /// env-mutating launch tests).
-    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use crate::test_support::{env_lock, unique_temp_path, EnvVarGuard};
 
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -441,7 +443,7 @@ mod tests {
     #[test]
     fn plugin_sources_reads_config_and_tags() {
         let _guard = env_lock();
-        let root = std::env::temp_dir().join(format!("corpus-plugin-src-{}", std::process::id()));
+        let root = unique_temp_path("corpus-plugin-src");
         let _ = std::fs::remove_dir_all(&root);
 
         // A fake plugin tree: <root>/plugins/cdk-regtest/ ; repo root = <root>.
@@ -459,7 +461,7 @@ mod tests {
                  [sources.nuts]\nrepo = \"/nonexistent/corpus-nuts-fixture\"\ntag = \"main\"\nsha = \"3bc8b6d5\"\n"
             ),
         );
-        std::env::set_var("CORPUS_PLUGINS_DIR", root.join("plugins"));
+        let _plugins = EnvVarGuard::set("CORPUS_PLUGINS_DIR", root.join("plugins"));
 
         let store = Store::new(root.join("store"));
         store.create_project("p", "P", "cdk-regtest").unwrap();
@@ -520,7 +522,6 @@ mod tests {
         assert!(validate_pin(&store, "p", "cdk", "v9.9.9").is_err());
         assert!(validate_pin(&store, "p", "ghost", "anything").is_ok());
 
-        std::env::remove_var("CORPUS_PLUGINS_DIR");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -531,7 +532,7 @@ mod tests {
     #[test]
     fn branch_default_pin_resolves_live_head() {
         let _guard = env_lock();
-        let root = std::env::temp_dir().join(format!("corpus-branchpin-{}", std::process::id()));
+        let root = unique_temp_path("corpus-branchpin");
         let _ = std::fs::remove_dir_all(&root);
         let pdir = root.join("plugins").join("cdk-regtest");
         write(&pdir.join("plugin.toml"), "name = \"cdk-regtest\"\nexec = \"plugin\"\n");
@@ -553,7 +554,7 @@ mod tests {
                 "[sources.nuts]\nrepo = \"{remote}\"\ntag = \"main\"\nsha = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n"
             ),
         );
-        std::env::set_var("CORPUS_PLUGINS_DIR", root.join("plugins"));
+        let _plugins = EnvVarGuard::set("CORPUS_PLUGINS_DIR", root.join("plugins"));
         let store = Store::new(root.join("store"));
         store.create_project("p", "P", "cdk-regtest").unwrap();
 
@@ -584,7 +585,6 @@ mod tests {
         other.insert("nuts".to_string(), "push".to_string());
         assert!(prepare_source_pins(&store, "p", &other).is_err());
 
-        std::env::remove_var("CORPUS_PLUGINS_DIR");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -29,6 +29,15 @@ pub const HEALTHY: Color32 = Color32::from_rgb(0x91, 0xcf, 0x58);
 /// stale rev cache).
 pub const WARN: Color32 = Color32::from_rgb(0xf0, 0xb3, 0x46);
 
+/// Finding urgency ramp. These deliberately read louder than ordinary status
+/// chrome: the corpus summary is a compact alarm panel, ordered most urgent to
+/// least urgent. Text labels keep color from carrying meaning alone.
+pub const FINDING_CRITICAL: Color32 = SIGNAL_RED;
+pub const FINDING_HIGH: Color32 = Color32::from_rgb(0xf0, 0x6a, 0x32);
+pub const FINDING_MEDIUM: Color32 = WARN;
+pub const FINDING_LOW: Color32 = HEALTHY;
+pub const FINDING_UNRATED: Color32 = TEXT_MUTED;
+
 // --- type greys ---
 /// Primary light text.
 pub const TEXT: Color32 = Color32::from_rgb(0xe4, 0xe0, 0xd8);

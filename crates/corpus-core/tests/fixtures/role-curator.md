@@ -18,10 +18,12 @@ permission:
   corpus_corpus_list: allow
   corpus_corpus_read: allow
   corpus_corpus_stats: allow
+  corpus_corpus_wipe: deny
   corpus_entry_delete: allow
   corpus_entry_move: allow
   corpus_entry_write: allow
   corpus_faucet: deny
+  corpus_finding_list: allow
   corpus_finding_write: deny
   corpus_mission_await: allow
   corpus_mission_delete: allow
@@ -95,17 +97,17 @@ name another.
 label, and editing the wrong one is silent until something runs.
 
 When you create an agent, give it the narrowest role that can do its job.
-When you delete one, remove every `task:` rule that names its entries first:
-a rule pointing at an agent nobody declares makes the NEXT launch refuse to
-render the whole project, not just that agent.
-
-You may change roles, including your own. A role change takes effect at the
-target's next launch — it does not alter the session you are in.
+You may create, edit, and confirmation-gated delete agents inside this project,
+but you cannot create, clone, promote, or edit a `super` agent. Ask the operator
+when that is required. Before deleting an agent, remove every `task:` rule that
+names its entries. A role change takes effect at the target's next launch — it
+does not alter the session you are in.
 
 ## The corpus
 
 `corpus_list` and `corpus_read` to see it; `entry_write` to create or
-rewrite an entry; `entry_move` to reorganise; `entry_delete` to remove.
+rewrite an entry; `entry_move` to reorganise; `entry_delete` for a
+confirmation-gated removal.
 
 `entry_write` takes a corpus-relative path and the body — `entry_write
 {path: "techniques/plan.md", content: "..."}`. Reach for it, not your raw

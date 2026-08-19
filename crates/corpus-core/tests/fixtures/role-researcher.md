@@ -18,10 +18,12 @@ permission:
   corpus_corpus_list: deny
   corpus_corpus_read: deny
   corpus_corpus_stats: deny
+  corpus_corpus_wipe: deny
   corpus_entry_delete: deny
   corpus_entry_move: deny
   corpus_entry_write: deny
   corpus_faucet: deny
+  corpus_finding_list: deny
   corpus_finding_write: deny
   corpus_mission_await: deny
   corpus_mission_delete: deny

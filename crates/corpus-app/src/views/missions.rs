@@ -6,17 +6,10 @@
 //! in the sidebar mission-row menu; a mission is created AND launched by
 //! the Missions `+` in one click, landing at an empty opencode prompt.
 //!
-//! Show() = resolve selection -> consume `pending_launch` once -> auto-
-//! restore a dead-but-resumable mission -> poll the run -> aim the pane
+//! Show() = resolve selection -> aim the pane
 //! (see the attach precedence) -> show the pane filling the rect, the
-//! fallback transcript tail (piped no-tmux), a brief restoring line, or
+//! fallback transcript tail (piped no-tmux), a brief starting line, or
 //! the idle state.
-//!
-//! Auto-restore: selecting a mission whose tmux session has died silently
-//! re-opens its opencode conversation (`opencode --session <id>`) — no
-//! button, no prompt. It fires once per selection, only when nothing else
-//! is running (a live run is never torn down to restore a dead one) and
-//! only when the mission actually recorded a session to return to.
 
 use std::time::Duration;
 
@@ -34,18 +27,12 @@ pub struct MissionsView {
     pane: TerminalPane,
     /// Auto-follow the tail (piped-fallback runs only).
     follow: bool,
-    /// The mission auto-restore has already been attempted for, so a
-    /// failed restore (or one the operator then stopped) doesn't respawn
-    /// every frame. Cleared by selecting a different mission.
-    restored: Option<String>,
 }
-
 impl Default for MissionsView {
     fn default() -> Self {
         Self {
             pane: TerminalPane::default(),
             follow: true,
-            restored: None,
         }
     }
 }
@@ -71,49 +58,36 @@ impl MissionsView {
             return;
         };
 
-        // A just-created mission launches automatically (once): a BARE TUI
-        // at an empty prompt. pending_launch is consumed even on failure.
-        // launch_mission BACKGROUNDS a live run rather than replacing it,
-        // so creating a mission never disturbs the one already working.
-        if state.pending_launch.as_deref() == Some(slug.as_str()) {
-            state.pending_launch = None;
-            if let Err(error) = state.launch_mission(&project, &mission.agent, &slug) {
-                toast(toasts, ToastKind::Error, error.to_string());
-            }
+        if matches!(
+            state.latest_run_phase(&project, &slug),
+            crate::state::RunPhase::Preparing | crate::state::RunPhase::Starting
+        ) {
+            let rect = ui.max_rect();
+            ui.allocate_new_ui(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::top_down(egui::Align::Center)),
+                |ui| {
+                    ui.add_space((rect.height() * 0.4).max(24.0));
+                    ui.label(
+                        RichText::new("preparing mission…")
+                            .size(13.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                    ui.add_space(8.0);
+                    if crate::theme::house_button(ui, "Cancel").clicked() {
+                        state.cancel_preparation(&project, &slug);
+                    }
+                },
+            );
+            return;
         }
-
-        // Auto-restore: landing on a mission whose session has died just
-        // brings it back — no button. Fire ONCE per selection (the guard),
-        // and only when nothing else is running (a live run is never torn
-        // down for this) and the mission actually recorded a conversation
-        // to return to. A mission that is already live falls through to
-        // the attach below untouched.
-        let selection_changed = self.restored.as_deref() != Some(slug.as_str());
-        if selection_changed {
-            self.restored = Some(slug.clone());
-            let session_live = mission.session.as_deref().is_some_and(|name| {
-                state.live_sessions.iter().any(|l| l == name)
-                    || state.live_run_session().as_deref() == Some(name)
-            });
-            if !session_live
-                && !state.run_active()
-                && mission.opencode_session.is_some()
-            {
-                if let Err(error) = state.resume_mission(&project, &slug) {
-                    toast(toasts, ToastKind::Error, error.to_string());
-                }
-            }
-        }
-
-        // Drain whatever the session produced since the last frame.
-        state.poll_run();
 
         // Attach ONLY to the selected mission's own session: the app-owned
         // live run when it is this mission's (so a just-restored run
         // attaches immediately, before the live_sessions poll catches up),
         // else the recorded tmux session if it is live on the server.
-        let own_run =
-            state.run_active() && state.run_mission.as_deref() == Some(slug.as_str());
+        let own_run = state.run_active() && state.run_belongs_to(&project, &slug);
         let attach_name = if own_run {
             state.live_run_session()
         } else {
@@ -145,13 +119,11 @@ impl MissionsView {
             // creating a run is the sidebar `+`'s job.
             self.idle(ui, &slug, &mission);
         }
-
-        ui.ctx().request_repaint_after(Duration::from_millis(2500));
     }
 
     /// The idle state for a mission with no session to attach and none to
-    /// restore: its name + a faint reason. No actions — a mission is
-    /// launched from the sidebar, and a resumable one restores itself.
+    /// restore: its name + a faint reason. Actions live in the sidebar
+    /// mission menu; browsing this view never launches a process.
     fn idle(&mut self, ui: &mut Ui, slug: &str, mission: &corpus_core::Mission) {
         let label = crate::state::mission_label(mission.name.as_deref(), slug);
         let rect = ui.max_rect();
@@ -192,7 +164,7 @@ impl MissionsView {
     }
 
     /// The piped no-tmux fallback transcript tail: full width, follow-tail
-    /// default on, ANSI stripped.
+    /// default on. Lines were ANSI-stripped once at ingest.
     fn tail(&mut self, ui: &mut Ui, state: &mut AppState) {
         ui.checkbox(&mut self.follow, "follow tail");
         egui::ScrollArea::vertical()
@@ -201,36 +173,14 @@ impl MissionsView {
             .stick_to_bottom(self.follow)
             .show(ui, |ui| {
                 for line in &state.run_lines {
-                    let text = strip_ansi(&line.text);
                     if line.stderr {
-                        ui.colored_label(theme::SIGNAL_RED, text);
+                        ui.colored_label(theme::SIGNAL_RED, &line.text);
                     } else {
-                        ui.monospace(text);
+                        ui.monospace(&line.text);
                     }
                 }
             });
     }
-}
-
-/// Strip ANSI escape sequences (opencode streams colorized output).
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if chars.next() == Some('[') {
-                for c in chars.by_ref() {
-                    let b = c as u8;
-                    if (0x40..=0x7E).contains(&b) {
-                        break;
-                    }
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Add a timed toast to the overlay.

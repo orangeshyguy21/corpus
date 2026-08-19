@@ -1,13 +1,11 @@
-//! corpus: vulnerability research platform — CLI and TUI entry point.
+//! corpus: vulnerability research platform command-line entry point.
 //!
-//! Headless subcommands exist for scripting and debugging; with no
-//! subcommand the TUI dashboard launches.
+//! The desktop operator UI lives in `corpus-app`; this binary keeps the
+//! headless scripting and diagnostic commands.
 
 mod store_admin;
-mod tui;
 
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use corpus_core::{ModelRegistry, Plugin, Scope, Store};
@@ -21,7 +19,7 @@ fn usage() -> String {
         "\
 corpus — local-first vulnerability research platform
 
-  corpus [tui]                 Launch the TUI dashboard (default)
+  corpus                       Show this help
   corpus run <agent> [-m model] [--research] <mission...>
                                Run a mission on the CORPUS_PROJECT
                                scope: the agent materializes to
@@ -52,6 +50,11 @@ corpus — local-first vulnerability research platform
                                already grant. Dry run without --apply.
   corpus mission list|new|delete <project> ...
                                Mission CRUD
+  corpus finding list <project> [--severity <level>] [--exclude-unrated]
+                               [--text <query>] [--sort newest|severity] [--limit N]
+  corpus finding show <project> <findings/path.md>
+                               Discover or read findings through the shared
+                               tolerant metadata projection.
   corpus audit <project> [--tail N]
                                Who changed this project, and when. Every
                                mutation a `curator` agent makes is recorded
@@ -75,7 +78,8 @@ Environment:
                                and sources.toml (default: found from the
                                running executable)
   CORPUS_PLUGINS_DIR           Plugins directory (default: <CORPUS_RESOURCES>/plugins)
-  CORPUS_MODELS                models.yaml path (default: ./benchmarks/models.yaml)
+  CORPUS_MODELS                models.yaml override (default:
+                               <CORPUS_RESOURCES>/benchmarks/models.yaml)
   CORPUS_PROJECT               Write scope. NO DEFAULT — every command that
                                writes refuses without it.
   CORPUS_TERMINAL              Terminal app for `attach` (default: from $TERM_PROGRAM)
@@ -86,13 +90,17 @@ Environment:
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        None | Some("tui") => tui::run(),
+        None => {
+            println!("{}", usage());
+            Ok(())
+        }
         Some("run") => run_cmd(&args[1..]),
         Some("plugin") => plugin_cmd(&args[1..]),
         Some("models") => models_cmd(&args[1..]),
         Some("project") => store_admin::project_cmd(&args[1..]),
         Some("agent") => store_admin::agent_cmd(&args[1..]),
         Some("mission") => store_admin::mission_cmd(&args[1..]),
+        Some("finding") => store_admin::finding_cmd(&args[1..]),
         Some("audit") => store_admin::audit_cmd(&args[1..]),
         Some("refusals") => store_admin::refusals_cmd(&args[1..]),
         Some("help") | Some("--help") | Some("-h") => {
@@ -107,6 +115,19 @@ fn main() -> ExitCode {
             eprintln!("corpus: error: {message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::usage;
+
+    #[test]
+    fn bare_cli_help_documents_headless_surface_only() {
+        let help = usage();
+        assert!(help.contains("corpus run <agent>"));
+        assert!(help.contains("corpus plugin probe <name>"));
+        assert!(!help.contains("corpus [tui]"));
     }
 }
 
@@ -313,10 +334,7 @@ fn plugin_cmd(args: &[String]) -> Result<(), String> {
 fn models_cmd(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("list") => {
-            let path = std::env::var("CORPUS_MODELS")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("benchmarks/models.yaml"));
-            let registry = ModelRegistry::load(&path).map_err(|e| e.to_string())?;
+            let registry = ModelRegistry::load_default().map_err(|e| e.to_string())?;
             for model in &registry.models {
                 println!(
                     "{:<20} {:<8} {:<10} {}",
@@ -330,7 +348,7 @@ fn models_cmd(args: &[String]) -> Result<(), String> {
                 );
             }
             if registry.models.is_empty() {
-                println!("no models in {}", path.display());
+                println!("no models registered");
             }
             Ok(())
         }
