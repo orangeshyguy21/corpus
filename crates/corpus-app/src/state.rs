@@ -4196,11 +4196,10 @@ impl AppState {
         if let Some(error) = ready.error {
             (true, error)
         } else {
-            let detail = ready
-                .transcript
-                .map(|path| format!("mission stopped — transcript: {path}"))
-                .unwrap_or_else(|| "mission stopped".into());
-            (false, detail)
+            // Export still happens; the path belongs in the run store, not a
+            // routine success notification.
+            drop(ready.transcript);
+            (false, "mission stopped".into())
         }
     }
 

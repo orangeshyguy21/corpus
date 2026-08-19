@@ -32,7 +32,10 @@ impl Availability {
 pub(crate) fn launch(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) -> bool {
     state.select_mission(project, slug);
     match state.launch_mission(project, slug) {
-        Ok(()) => true,
+        Ok(()) => {
+            toast(toasts, ToastKind::Info, "mission started");
+            true
+        }
         Err(error) => {
             toast(toasts, ToastKind::Error, error.to_string());
             false
@@ -43,7 +46,10 @@ pub(crate) fn launch(state: &mut AppState, toasts: &mut Toasts, project: &str, s
 pub(crate) fn resume(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) -> bool {
     state.select_mission(project, slug);
     match state.resume_mission(project, slug) {
-        Ok(()) => true,
+        Ok(()) => {
+            toast(toasts, ToastKind::Info, "mission resumed");
+            true
+        }
         Err(error) => {
             toast(toasts, ToastKind::Error, error.to_string());
             false
@@ -54,15 +60,13 @@ pub(crate) fn resume(state: &mut AppState, toasts: &mut Toasts, project: &str, s
 pub(crate) fn stop(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
     match state.stop_mission(project, slug) {
         Ok(StopMissionResult::Scheduled) => {
-            toast(toasts, ToastKind::Info, format!("stopping mission {slug}…"));
+            toast(toasts, ToastKind::Info, "mission stopping");
         }
         Ok(StopMissionResult::Completed(path)) => {
-            let detail = if path.is_empty() {
-                format!("stopped mission {slug}")
-            } else {
-                format!("stopped mission {slug} — transcript: {path}")
-            };
-            toast(toasts, ToastKind::Success, detail);
+            // The transcript remains in the run store; routine feedback does
+            // not need to expose its full filesystem path.
+            drop(path);
+            toast(toasts, ToastKind::Success, "mission stopped");
             state.refresh_missions(project);
         }
         Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
@@ -73,11 +77,7 @@ pub(crate) fn delete(state: &mut AppState, toasts: &mut Toasts, project: &str, s
     let was_selected = state.selected_mission.as_deref() == Some(slug);
     match state.delete_mission(project, slug) {
         Ok(()) => {
-            toast(
-                toasts,
-                ToastKind::Success,
-                format!("deleted mission {slug}"),
-            );
+            toast(toasts, ToastKind::Success, "mission deleted");
             state.refresh_missions(project);
             if was_selected {
                 state.selected_mission = None;

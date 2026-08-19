@@ -943,11 +943,7 @@ impl AgentsView {
         self.draft = Some(draft);
         if errors.is_empty() {
             self.error = None;
-            toast(
-                toasts,
-                ToastKind::Success,
-                format!("saved agent {project}/{slug}"),
-            );
+            toast(toasts, ToastKind::Success, "agent saved");
         } else {
             let msg = errors.join("; ");
             self.error = Some(msg.clone());
@@ -972,11 +968,7 @@ impl AgentsView {
                 // Mirror the pretty (on-disk) config back into the buffer.
                 self.editor_text = serde_json::to_string_pretty(&doc).unwrap_or_default();
                 state.refresh_agents(project);
-                toast(
-                    toasts,
-                    ToastKind::Success,
-                    format!("saved agent {project}/{slug}"),
-                );
+                toast(toasts, ToastKind::Success, "agent saved");
             }
             Err(error) => {
                 self.error = Some(error.to_string());
@@ -995,11 +987,7 @@ impl AgentsView {
         // selected mission explicitly from its sidebar menu.
         match state.create_mission(project, slug, "") {
             Ok(mission) => {
-                toast(
-                    toasts,
-                    ToastKind::Success,
-                    format!("mission created {project}/{mission}"),
-                );
+                toast(toasts, ToastKind::Success, "mission created");
                 state.refresh_missions(project);
                 // Select it on the mission view without starting opencode.
                 state.select_mission(project, &mission);
@@ -1072,11 +1060,7 @@ impl AgentsView {
     ) -> bool {
         match state.delete_agent(project, slug) {
             Ok(()) => {
-                toast(
-                    toasts,
-                    ToastKind::Success,
-                    format!("deleted agent {project}/{slug}"),
-                );
+                toast(toasts, ToastKind::Success, "agent deleted");
                 state.refresh_agents(project);
                 // The view re-defaults to the first remaining agent.
                 state.selected_agent = None;

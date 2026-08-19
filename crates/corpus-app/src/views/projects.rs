@@ -560,12 +560,8 @@ impl ProjectsView {
             return;
         }
         match state.rebind_project(slug, self.edit_plugin.trim()) {
-            Ok(project) => {
-                toast(
-                    toasts,
-                    ToastKind::Success,
-                    format!("rebound {slug} -> plugin {}", project.plugin),
-                );
+            Ok(_) => {
+                toast(toasts, ToastKind::Success, "environment updated");
                 state.refresh();
                 // Refresh the per-source pins + env for the new binding.
                 state.select_project(slug);
@@ -579,11 +575,7 @@ impl ProjectsView {
     fn delete_project(&mut self, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
         match state.delete_project(slug) {
             Ok(()) => {
-                toast(
-                    toasts,
-                    ToastKind::Success,
-                    format!("deleted project {slug}"),
-                );
+                toast(toasts, ToastKind::Success, "project deleted");
                 state.refresh();
                 // ensure_selection re-picks a project next frame.
                 state.selected_project = None;
@@ -661,15 +653,8 @@ impl ProjectsView {
                 ui.horizontal(|ui| {
                     if theme::destructive_button(ui, "Wipe corpus").clicked() {
                         match state.wipe_project_corpus(slug) {
-                            Ok(project) => {
-                                toast(
-                                    toasts,
-                                    ToastKind::Success,
-                                    format!(
-                                        "corpus wiped (generation {})",
-                                        project.corpus_generation
-                                    ),
-                                );
+                            Ok(_) => {
+                                toast(toasts, ToastKind::Success, "corpus deleted");
                                 state.refresh();
                                 state.refresh_corpus_stats(slug);
                                 wiped = true;
@@ -722,12 +707,8 @@ impl ProjectsView {
                     .clicked();
                 if clicked || (submit && named) {
                     match state.rename_project(slug, &self.rename_name) {
-                        Ok(project) => {
-                            toast(
-                                toasts,
-                                ToastKind::Success,
-                                format!("renamed project to {}", project.name),
-                            );
+                        Ok(_) => {
+                            toast(toasts, ToastKind::Success, "project renamed");
                             state.refresh();
                             renamed = true;
                         }
@@ -765,11 +746,7 @@ impl ProjectsView {
                     };
                     match state.clone_project(from, name, self.clone_corpus) {
                         Ok((to, _)) => {
-                            toast(
-                                toasts,
-                                ToastKind::Success,
-                                format!("cloned project {from} -> {to}"),
-                            );
+                            toast(toasts, ToastKind::Success, "project cloned");
                             state.refresh();
                             state.select_project(&to);
                             cloned = true;

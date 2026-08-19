@@ -454,11 +454,7 @@ impl Sidebar {
             Ok(slug) => {
                 state.refresh_missions(&project);
                 state.select_mission(&project, &slug);
-                toast(
-                    toasts,
-                    ToastKind::Success,
-                    format!("created mission for {agent} on {project}"),
-                );
+                toast(toasts, ToastKind::Success, "mission created");
             }
             Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
         }
@@ -567,12 +563,8 @@ impl Sidebar {
                     .clicked();
                 if (clicked || (submit && named))
                     && match state.rename_project(&slug, &self.rename_project_name) {
-                        Ok(project) => {
-                            toast(
-                                toasts,
-                                ToastKind::Success,
-                                format!("renamed project to {}", project.name),
-                            );
+                        Ok(_) => {
+                            toast(toasts, ToastKind::Success, "project renamed");
                             true
                         }
                         Err(error) => {
@@ -705,12 +697,8 @@ impl Sidebar {
                         toast(toasts, ToastKind::Warning, "display name is required");
                     } else {
                         match state.create_project(name, self.create_plugin.trim()) {
-                            Ok((id, project)) => {
-                                toast(
-                                    toasts,
-                                    ToastKind::Success,
-                                    format!("created project {} ({id})", project.name),
-                                );
+                            Ok((id, _)) => {
+                                toast(toasts, ToastKind::Success, "project created");
                                 state.refresh();
                                 state.select_project(&id);
                                 // Land on the new project's page, not
@@ -770,12 +758,8 @@ impl Sidebar {
                         return;
                     }
                     match state.create_agent_with_role(&project, self.agent_role) {
-                        Ok(slug) => {
-                            toast(
-                                toasts,
-                                ToastKind::Success,
-                                format!("created agent {project}/{slug}"),
-                            );
+                        Ok(_) => {
+                            toast(toasts, ToastKind::Success, "agent created");
                             state.refresh_agents(&project);
                             done = true;
                         }
@@ -819,11 +803,7 @@ impl Sidebar {
                     };
                     match state.clone_project(&from, name, self.clone_corpus) {
                         Ok((to, _)) => {
-                            toast(
-                                toasts,
-                                ToastKind::Success,
-                                format!("cloned project {from} -> {to}"),
-                            );
+                            toast(toasts, ToastKind::Success, "project cloned");
                             state.refresh();
                             state.select_project(&to);
                             done = true;
@@ -1092,11 +1072,7 @@ fn section_header(ui: &mut Ui, title: &str) -> (bool, bool) {
 fn delete_project(state: &mut AppState, toasts: &mut Toasts, slug: &str) {
     match state.delete_project(slug) {
         Ok(()) => {
-            toast(
-                toasts,
-                ToastKind::Success,
-                format!("deleted project {slug}"),
-            );
+            toast(toasts, ToastKind::Success, "project deleted");
             state.refresh();
             // ensure_selection re-picks a project next frame.
             state.selected_project = None;
