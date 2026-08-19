@@ -21,6 +21,15 @@ pub fn discover(dir: &Path) -> Result<Vec<PluginDir>, Error> {
     corpus_observe::discover_plugins(dir)
 }
 
+/// Effective installed + transitional bundled catalog.
+pub fn plugin_catalog() -> Result<Vec<PluginDir>, Error> {
+    corpus_observe::plugin_catalog()
+}
+
+pub fn find_plugin(name: &str) -> Result<Option<PluginDir>, Error> {
+    corpus_observe::catalog_plugin(name)
+}
+
 /// A discovered plugin plus its live probe status — the aggregation the
 /// app renders. spawned/probed on the host inside corpus-core, so the
 /// UI never spawns plugins itself (trust domains).
@@ -64,18 +73,27 @@ pub fn selected_plugin_status(selected: Option<&str>) -> Vec<PluginStatus> {
 
 fn plugin_status_for(selected: Option<&str>, probe_all: bool) -> Vec<PluginStatus> {
     let mut out = Vec::new();
-    for plugin in discover(&plugins_dir()).unwrap_or_default() {
+    for plugin in plugin_catalog().unwrap_or_default() {
         let should_probe = probe_all || selected == Some(plugin.manifest.name.as_str());
         // Keep the whole ProbeResult so the version fields survive — a
         // `(ready, notes)` destructure was what dropped them before.
         let probe = if should_probe {
             match Plugin::spawn(&plugin.dir) {
-                Ok(mut spawned) => spawned.probe().unwrap_or_else(|error| ProbeResult {
-                    ready: false,
-                    notes: format!("probe failed: {error}"),
-                    running_version: None,
-                    expected_tag: None,
-                }),
+                Ok(mut spawned) => {
+                    let result = if plugin.manifest.manifest_version
+                        == corpus_observe::PluginManifestVersion::V1
+                    {
+                        v1_status(&plugin, &mut spawned)
+                    } else {
+                        spawned.probe()
+                    };
+                    result.unwrap_or_else(|error| ProbeResult {
+                        ready: false,
+                        notes: format!("probe failed: {error}"),
+                        running_version: None,
+                        expected_tag: None,
+                    })
+                }
                 Err(error) => ProbeResult {
                     ready: false,
                     notes: format!("spawn failed: {error}"),
@@ -103,6 +121,36 @@ fn plugin_status_for(selected: Option<&str>, probe_all: bool) -> Vec<PluginStatu
         });
     }
     out
+}
+
+fn v1_status(plugin: &PluginDir, spawned: &mut Plugin) -> Result<ProbeResult, Error> {
+    spawned.hello()?;
+    let params = crate::plugin_lifecycle_params(plugin)?;
+    let result = spawned.lifecycle_call(
+        "status",
+        Some(params),
+        std::time::Duration::from_secs(10),
+        |_| {},
+    )?;
+    Ok(ProbeResult {
+        ready: result
+            .get("ready")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        notes: result
+            .get("notes")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| result.to_string()),
+        running_version: result
+            .get("running_version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        expected_tag: result
+            .get("expected_tag")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 /// One source repo a project's plugin mounts, with its selectable revs —
@@ -136,8 +184,8 @@ impl SourceRevs {
     }
 }
 
-/// The source repos a project's plugin declares in its `config.toml`
-/// `[sources]` table (`<repo>_sha` keys), each with the revisions the top
+/// The source repos a project's plugin declares in its v1 manifest (legacy
+/// plugins retain their temporary `config.toml` + root-manifest adapter), with the revisions the top
 /// bar may offer: the manifest pin plus the live remote tag set (cached
 /// under `sources/.rev-cache/`). Returns an empty vec (never an error)
 /// when the project's plugin or its `config.toml`/`[sources]` can't be
@@ -145,55 +193,17 @@ impl SourceRevs {
 /// failing. A missing project is an error.
 pub fn plugin_sources(store: &Store, project: &str) -> Result<Vec<SourceRevs>, Error> {
     let spec = crate::store::Project::load(store, project)?;
-    let Some(pdir) = discover(&plugins_dir())?
-        .into_iter()
-        .find(|p| p.manifest.name == spec.plugin)
+    let Some(pdir) = find_plugin(&spec.plugin)?
     else {
         return Ok(Vec::new());
     };
-    let raw = fs::read_to_string(pdir.dir.join("config.toml"))
-        .map_err(|e| Error::Store(format!("plugin {} config.toml: {e}", spec.plugin)))?;
-    let config: toml::Value = toml::from_str(&raw)
-        .map_err(|e| Error::Store(format!("plugin {} config.toml: {e}", spec.plugin)))?;
-    let sources = config
-        .get("sources")
-        .and_then(|s| s.as_table())
-        .ok_or_else(|| Error::Store(format!("plugin {} has no [sources] table", spec.plugin)))?;
-    let mut repos: Vec<String> = sources
-        .keys()
-        .filter(|k| k.ends_with("_sha"))
-        .map(|k| k.trim_end_matches("_sha").to_string())
-        .collect();
-    repos.sort();
-
-    // sources.toml provides each source's pin identity + the clone URL;
-    // fetched trees (and the rev cache) live beside it under sources/.
-    // Both come from the RESOURCE root — the plugin dir's grandparent used
-    // to stand in for it, which made the plugin layout load-bearing for
-    // path resolution.
-    let resources = crate::paths::resources_for_plugins()?;
-    let sources_dir = resources.join("sources");
-    let entries = load_source_entries(&resources.join("sources.toml"));
+    let entries = source_entries_for_plugin(&pdir, &spec.plugin)?;
+    let sources_dir = store.source_cache_dir();
 
     let mut out = Vec::new();
-    for repo in repos {
-        let entry = entries.get(&repo);
-        let pinned = entry
-            .map(|e| e.tag.clone())
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| "main".to_string());
-        let revs = match entry {
-            Some(entry) if !entry.repo.is_empty() => {
-                crate::srcrev::selectable_revs(&sources_dir, &repo, &entry.repo, &pinned)
-            }
-            _ => {
-                let mut revs = vec![pinned.clone()];
-                if pinned != "main" {
-                    revs.push("main".to_string());
-                }
-                revs
-            }
-        };
+    for (repo, entry) in entries {
+        let pinned = entry.tag.clone();
+        let revs = crate::srcrev::selectable_revs(&sources_dir, &repo, &entry.repo, &pinned);
         let fetched = crate::srcrev::revs_cache_fetched(&sources_dir, &repo);
         out.push(SourceRevs {
             name: repo,
@@ -266,34 +276,17 @@ pub fn prepare_source_pins(
         return Ok(resolved);
     }
     let spec = crate::store::Project::load(store, project)?;
-    let Some(pdir) = discover(&plugins_dir())?
-        .into_iter()
-        .find(|p| p.manifest.name == spec.plugin)
+    let Some(pdir) = find_plugin(&spec.plugin)?
     else {
         return Err(Error::Store(format!(
             "mission carries source pins but plugin {} is not discovered",
             spec.plugin
         )));
     };
-    let raw = fs::read_to_string(pdir.dir.join("config.toml"))
-        .map_err(|e| Error::Store(format!("plugin {} config.toml: {e}", spec.plugin)))?;
-    let config: toml::Value = toml::from_str(&raw)
-        .map_err(|e| Error::Store(format!("plugin {} config.toml: {e}", spec.plugin)))?;
-    let declared: Vec<String> = config
-        .get("sources")
-        .and_then(|s| s.as_table())
-        .map(|t| {
-            t.keys()
-                .filter(|k| k.ends_with("_sha"))
-                .map(|k| k.trim_end_matches("_sha").to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    let resources = crate::paths::resources_for_plugins()?;
-    let sources_dir = resources.join("sources");
-    let entries = load_source_entries(&resources.join("sources.toml"));
+    let entries = source_entries_for_plugin(&pdir, &spec.plugin)?;
+    let sources_dir = store.source_cache_dir();
     for (name, rev) in pins {
-        if rev.trim().is_empty() || !declared.contains(name) {
+        if rev.trim().is_empty() || !entries.contains_key(name) {
             continue;
         }
         let Some(entry) = entries.get(name).filter(|e| !e.repo.is_empty()) else {
@@ -343,7 +336,7 @@ struct SourceFile {
     sources: BTreeMap<String, SourceEntry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct SourceEntry {
     #[serde(default)]
     repo: String,
@@ -351,6 +344,55 @@ struct SourceEntry {
     /// The manifest pin's sha — the offline-runnable default resolution.
     #[serde(default)]
     sha: String,
+}
+
+fn source_entries_for_plugin(
+    plugin: &PluginDir,
+    plugin_name: &str,
+) -> Result<BTreeMap<String, SourceEntry>, Error> {
+    if plugin.manifest.manifest_version == corpus_observe::PluginManifestVersion::V1 {
+        return Ok(plugin
+            .manifest
+            .sources
+            .iter()
+            .map(|source| {
+                (
+                    source.id.clone(),
+                    SourceEntry {
+                        repo: source.repo.clone(),
+                        tag: source.default_rev.clone(),
+                        sha: source.default_sha.clone(),
+                    },
+                )
+            })
+            .collect());
+    }
+
+    let raw = fs::read_to_string(plugin.dir.join("config.toml"))
+        .map_err(|error| Error::Store(format!("plugin {plugin_name} config.toml: {error}")))?;
+    let config: toml::Value = toml::from_str(&raw)
+        .map_err(|error| Error::Store(format!("plugin {plugin_name} config.toml: {error}")))?;
+    let declared: Vec<String> = config
+        .get("sources")
+        .and_then(toml::Value::as_table)
+        .map(|table| {
+            table
+                .keys()
+                .filter(|key| key.ends_with("_sha"))
+                .map(|key| key.trim_end_matches("_sha").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let manifest = std::env::var(crate::paths::PLUGINS_DIR_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .and_then(|root| Path::new(&root).parent().map(|parent| parent.join("sources.toml")))
+        .unwrap_or(crate::paths::sources_manifest()?);
+    let entries = load_source_entries(&manifest);
+    Ok(entries
+        .into_iter()
+        .filter(|(name, _)| declared.contains(name))
+        .collect())
 }
 
 /// Best-effort map of repo name → manifest entry from a repo-root
@@ -433,6 +475,7 @@ mod tests {
             ),
         );
         let _plugins = EnvVarGuard::set("CORPUS_PLUGINS_DIR", root.join("plugins"));
+        let _sources = EnvVarGuard::set("CORPUS_SOURCES_DIR", root.join("sources"));
 
         let store = Store::new(root.join("store"));
         store.create_project("p", "P", "cdk-regtest").unwrap();
@@ -526,6 +569,7 @@ mod tests {
             ),
         );
         let _plugins = EnvVarGuard::set("CORPUS_PLUGINS_DIR", root.join("plugins"));
+        let _sources = EnvVarGuard::set("CORPUS_SOURCES_DIR", root.join("sources"));
         let store = Store::new(root.join("store"));
         store.create_project("p", "P", "cdk-regtest").unwrap();
 
@@ -556,6 +600,42 @@ mod tests {
         other.insert("nuts".to_string(), "push".to_string());
         assert!(prepare_source_pins(&store, "p", &other).is_err());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v1_manifest_owns_source_declarations_and_cache_custody() {
+        let _guard = env_lock();
+        let root = unique_temp_path("corpus-v1-source");
+        let _ = std::fs::remove_dir_all(&root);
+        let (remote, sha) = fixture_remote(&root, "v1.0.0");
+        let plugin = root.join("catalog").join("fixture-regtest");
+        write(
+            &plugin.join("plugin.toml"),
+            &format!(
+                "manifest_version = 1\nid = \"fixture-regtest\"\nversion = \"1.0.0\"\nprotocol = \"corpus.environment/1\"\nexec = \"plugin\"\n\n[[sources]]\nid = \"target\"\nrepo = \"{remote}\"\ndefault_rev = \"v1.0.0\"\ndefault_sha = \"{sha}\"\nmount = \"/opt/src/target\"\n"
+            ),
+        );
+        write(&plugin.join("plugin"), "#!/bin/sh\nexit 0\n");
+        let _plugins = EnvVarGuard::set("CORPUS_PLUGINS_DIR", root.join("catalog"));
+        let store = Store::new(root.join("data/store"));
+        store.create_project("p", "P", "fixture-regtest").unwrap();
+
+        let sources = plugin_sources(&store, "p").unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "target");
+        assert_eq!(sources[0].pinned, "v1.0.0");
+        assert!(!plugin.join("config.toml").exists());
+        assert!(!root.join("sources.toml").exists());
+
+        let mut pins = BTreeMap::new();
+        pins.insert("target".to_string(), "v1.0.0".to_string());
+        let resolved = prepare_source_pins(&store, "p", &pins).unwrap();
+        assert_eq!(resolved["target"], sha);
+        assert!(store.source_cache_dir().join("target").join(&sha).join(".git").is_dir());
+
+        let run = store.provision_run_dir("p").unwrap();
+        assert_eq!(fs::read_link(run.join("sources")).unwrap(), store.source_cache_dir());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -240,6 +240,34 @@ impl ProjectsView {
                 state.plugins(),
                 &mut self.needs_probe,
             );
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                for (label, operation) in
+                    [("Setup", "setup"), ("Doctor", "doctor"), ("Stop", "stop")]
+                {
+                    if ui.button(label).clicked() {
+                        match state.start_plugin_lifecycle(&self.edit_plugin, operation) {
+                            Ok(true) => toast(
+                                toasts,
+                                ToastKind::Info,
+                                format!("{} {operation} started", self.edit_plugin),
+                            ),
+                            Ok(false) => toast(
+                                toasts,
+                                ToastKind::Warning,
+                                format!("{} {operation} is already running", self.edit_plugin),
+                            ),
+                            Err(error) => toast(toasts, ToastKind::Error, error),
+                        }
+                    }
+                }
+                if state.plugin_lifecycle_active("setup")
+                    && ui.button("Cancel setup").clicked()
+                    && state.cancel_plugin_lifecycle("setup")
+                {
+                    toast(toasts, ToastKind::Info, "cancelling plugin setup");
+                }
+            });
             ui.add_space(16.0);
             components::soft_rule(ui);
             ui.add_space(12.0);

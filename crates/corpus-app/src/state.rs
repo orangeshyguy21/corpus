@@ -20,9 +20,7 @@ use corpus_core::{
 use crate::file_watch::{FileInvalidationSource, NotifyFileInvalidationSource};
 use crate::jobs::{JobKind, JobScope, JobSet, JobTerminal, StartOutcome};
 use crate::nav::Screen;
-use crate::session_service::{
-    launch_stamp_ms, ConfiguredSessionService, SessionService,
-};
+use crate::session_service::{launch_stamp_ms, ConfiguredSessionService, SessionService};
 
 /// How often the raw captures are re-stat'd. Cheap next to the tmux
 /// listing (no subprocess), so it runs on the faster beat.
@@ -112,6 +110,7 @@ trait RunBackend: Send + Sync {
         model: Option<&str>,
         mission: &str,
         source_pins_json: Option<&str>,
+        environment_session: Option<&str>,
         cancellation: &RunCancellation,
     ) -> Result<Box<dyn ActiveRun>, Error>;
 
@@ -122,6 +121,7 @@ trait RunBackend: Send + Sync {
         model: Option<&str>,
         opencode_session_id: &str,
         source_pins_json: Option<&str>,
+        environment_session: Option<&str>,
         cancellation: &RunCancellation,
     ) -> Result<Box<dyn ActiveRun>, Error>;
 
@@ -147,13 +147,21 @@ impl RunBackend for CoreRunBackend {
         model: Option<&str>,
         mission: &str,
         source_pins_json: Option<&str>,
+        environment_session: Option<&str>,
         cancellation: &RunCancellation,
     ) -> Result<Box<dyn ActiveRun>, Error> {
         if cancellation.is_cancelled() {
             return Err(Error::Store("launch start cancelled".into()));
         }
-        RunSession::spawn(project, agent, model, mission, source_pins_json)
-            .map(|run| Box::new(run) as Box<dyn ActiveRun>)
+        RunSession::spawn_with_environment(
+            project,
+            agent,
+            model,
+            mission,
+            source_pins_json,
+            environment_session,
+        )
+        .map(|run| Box::new(run) as Box<dyn ActiveRun>)
     }
 
     fn resume(
@@ -163,13 +171,21 @@ impl RunBackend for CoreRunBackend {
         model: Option<&str>,
         opencode_session_id: &str,
         source_pins_json: Option<&str>,
+        environment_session: Option<&str>,
         cancellation: &RunCancellation,
     ) -> Result<Box<dyn ActiveRun>, Error> {
         if cancellation.is_cancelled() {
             return Err(Error::Store("launch start cancelled".into()));
         }
-        RunSession::resume(project, agent, model, opencode_session_id, source_pins_json)
-            .map(|run| Box::new(run) as Box<dyn ActiveRun>)
+        RunSession::resume_with_environment(
+            project,
+            agent,
+            model,
+            opencode_session_id,
+            source_pins_json,
+            environment_session,
+        )
+        .map(|run| Box::new(run) as Box<dyn ActiveRun>)
     }
 
     fn prepare_source_pins(
@@ -195,6 +211,46 @@ impl RunBackend for CoreRunBackend {
 trait SessionCatalog: Send + Sync {
     fn live_tui_sessions(&self) -> Vec<String>;
     fn raw_log(&self, store: &Store, project: &str, session: &str) -> Option<PathBuf>;
+}
+
+/// Host-side environment mutation used during launch. Keeping this seam next
+/// to the process/session adapters prevents app tests from consulting whatever
+/// immutable plugin version happens to be selected in the operator's home.
+trait EnvironmentRuntime: Send + Sync {
+    fn open(
+        &self,
+        store: &Store,
+        id: RunId,
+        source_shas: BTreeMap<String, String>,
+    ) -> Result<Option<corpus_core::EnvironmentSessionRecord>, Error>;
+}
+
+struct CoreEnvironmentRuntime;
+
+impl EnvironmentRuntime for CoreEnvironmentRuntime {
+    fn open(
+        &self,
+        store: &Store,
+        id: RunId,
+        source_shas: BTreeMap<String, String>,
+    ) -> Result<Option<corpus_core::EnvironmentSessionRecord>, Error> {
+        corpus_core::open_environment_session(store, id, source_shas)
+    }
+}
+
+#[cfg(test)]
+struct NoopEnvironmentRuntime;
+
+#[cfg(test)]
+impl EnvironmentRuntime for NoopEnvironmentRuntime {
+    fn open(
+        &self,
+        _store: &Store,
+        _id: RunId,
+        _source_shas: BTreeMap<String, String>,
+    ) -> Result<Option<corpus_core::EnvironmentSessionRecord>, Error> {
+        Ok(None)
+    }
 }
 
 struct CoreSessionCatalog;
@@ -223,6 +279,7 @@ pub struct AppState {
     clock: Arc<dyn Clock>,
     run_backend: Arc<dyn RunBackend>,
     session_catalog: Arc<dyn SessionCatalog>,
+    environment_runtime: Arc<dyn EnvironmentRuntime>,
     session_service: Arc<dyn SessionService>,
     file_invalidations: Option<Box<dyn FileInvalidationSource>>,
     file_watch_warning: Option<String>,
@@ -410,6 +467,7 @@ enum AppJobOutput {
         target: Option<String>,
         statuses: Vec<PluginStatus>,
     },
+    PluginLifecycle(PluginLifecycleResult),
     SourceRevisions(Vec<SourceRevs>),
     OpencodeModels(corpus_core::ModelList),
     LaunchReady(LaunchReady),
@@ -422,6 +480,13 @@ enum AppJobOutput {
     ProjectIndex(Vec<(String, Project)>, BTreeMap<String, ProjectTree>),
     Agents(Vec<(String, AgentConfig)>),
     Missions(Vec<(String, Mission)>),
+}
+
+struct PluginLifecycleResult {
+    plugin: String,
+    operation: &'static str,
+    phases: Vec<String>,
+    result: serde_json::Value,
 }
 
 #[derive(Clone, Copy)]
@@ -527,12 +592,7 @@ pub struct RunMeta {
 }
 
 /// Stable identity carried by every operation belonging to a run.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RunId {
-    pub project: String,
-    pub mission: String,
-    pub generation: u64,
-}
+pub type RunId = corpus_core::EnvironmentSessionId;
 
 /// A run that ended on its own, queued for one report to the operator.
 /// `mission` is the display label of the mission it belonged to (None for
@@ -726,6 +786,21 @@ impl AppState {
                         self.refresh_plugins(desired.as_deref());
                     }
                 }
+                JobTerminal::Success(AppJobOutput::PluginLifecycle(lifecycle)) => {
+                    let phases = if lifecycle.phases.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", lifecycle.phases.join(" → "))
+                    };
+                    notices.push((
+                        false,
+                        format!(
+                            "{} {} complete{}: {}",
+                            lifecycle.plugin, lifecycle.operation, phases, lifecycle.result
+                        ),
+                    ));
+                    self.refresh_plugins(Some(&lifecycle.plugin));
+                }
                 JobTerminal::Success(AppJobOutput::SourceRevisions(revs)) => {
                     self.apply_source_revisions(&result.scope.project, revs);
                     self.source_revs_loading = false;
@@ -793,8 +868,8 @@ impl AppState {
                     }
                     let exported = !maintenance.exported_tmux.is_empty();
                     for tmux in maintenance.exported_tmux {
-                    self.last_exported_at
-                        .insert(tmux, self.clock.monotonic_now());
+                        self.last_exported_at
+                            .insert(tmux, self.clock.monotonic_now());
                     }
                     if missions_changed {
                         self.refresh_missions(&project);
@@ -859,7 +934,11 @@ impl AppState {
                         let teardown = result.kind == JobKind::SessionTeardown;
                         self.fail_run(
                             run_id,
-                            if teardown { RunPhaseKind::Stopping } else { RunPhaseKind::Preparing },
+                            if teardown {
+                                RunPhaseKind::Stopping
+                            } else {
+                                RunPhaseKind::Preparing
+                            },
                             &wrapped,
                             true,
                             teardown,
@@ -887,7 +966,11 @@ impl AppState {
                         let teardown = result.kind == JobKind::SessionTeardown;
                         self.fail_run(
                             run_id,
-                            if teardown { RunPhaseKind::Stopping } else { RunPhaseKind::Preparing },
+                            if teardown {
+                                RunPhaseKind::Stopping
+                            } else {
+                                RunPhaseKind::Preparing
+                            },
                             &error,
                             true,
                             teardown,
@@ -945,6 +1028,7 @@ impl AppState {
                 self.plugins_loading = false;
                 self.plugins_error = Some(error.to_string());
             }
+            JobKind::PluginSetup | JobKind::PluginDoctor | JobKind::PluginStop => {}
             JobKind::SourceRevisions => {
                 // Keep the previous revision list/pins; only the refresh failed.
                 self.source_revs_loading = false;
@@ -1038,6 +1122,7 @@ impl AppState {
             Arc::new(SystemClock),
             Arc::new(CoreRunBackend),
             Arc::new(CoreSessionCatalog),
+            Arc::new(CoreEnvironmentRuntime),
             Arc::new(ConfiguredSessionService::from_env()),
             false,
         );
@@ -1058,6 +1143,7 @@ impl AppState {
             clock,
             run_backend,
             session_catalog,
+            Arc::new(NoopEnvironmentRuntime),
             Arc::new(crate::session_service::FakeSessionService),
             true,
         )
@@ -1068,6 +1154,7 @@ impl AppState {
         clock: Arc<dyn Clock>,
         run_backend: Arc<dyn RunBackend>,
         session_catalog: Arc<dyn SessionCatalog>,
+        environment_runtime: Arc<dyn EnvironmentRuntime>,
         session_service: Arc<dyn SessionService>,
         eager_refresh: bool,
     ) -> Self {
@@ -1076,6 +1163,7 @@ impl AppState {
             clock,
             run_backend,
             session_catalog,
+            environment_runtime,
             session_service,
             file_invalidations: None,
             file_watch_warning: None,
@@ -1157,9 +1245,8 @@ impl AppState {
                     let trees = projects
                         .iter()
                         .map(|(slug, _)| {
-                            let agents = store
-                                .list_agents(slug)
-                                .map_err(|error| error.to_string())?;
+                            let agents =
+                                store.list_agents(slug).map_err(|error| error.to_string())?;
                             let missions = sort_missions(
                                 store
                                     .list_missions(slug)
@@ -1232,6 +1319,91 @@ impl AppState {
     /// The last plugin probe results (empty until `refresh_plugins`).
     pub fn plugins(&self) -> &[PluginStatus] {
         &self.plugins
+    }
+
+    /// Start an installation-scoped plugin lifecycle operation. The worker
+    /// resolves the selected bundle and spawns the executable off the render
+    /// thread; cancellation is observed by the protocol client every 100ms.
+    pub(crate) fn start_plugin_lifecycle(
+        &mut self,
+        plugin_id: &str,
+        operation: &'static str,
+    ) -> Result<bool, String> {
+        let kind = match operation {
+            "setup" => JobKind::PluginSetup,
+            "doctor" | "status" => JobKind::PluginDoctor,
+            "stop" => JobKind::PluginStop,
+            _ => {
+                return Err(format!(
+                    "unsupported plugin lifecycle operation {operation:?}"
+                ))
+            }
+        };
+        let timeout = if operation == "setup" {
+            Duration::from_secs(30 * 60)
+        } else {
+            Duration::from_secs(120)
+        };
+        let plugin_id = plugin_id.to_string();
+        let scope = self
+            .effective_project()
+            .map(|project| self.job_scope(&project, None))
+            .unwrap_or(JobScope {
+                project: String::new(),
+                project_generation: 0,
+                corpus_revision: None,
+                run_id: None,
+            });
+        let Some(jobs) = self.jobs.as_mut() else {
+            return Err("plugin lifecycle requires the app background-job runtime".into());
+        };
+        Ok(matches!(
+            jobs.start(kind, scope, timeout, move |cancellation| {
+                let selected = corpus_core::find_plugin(&plugin_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("plugin not found: {plugin_id}"))?;
+                let mut phases = Vec::new();
+                let result = corpus_core::call_plugin_lifecycle_cancellable(
+                    &selected,
+                    operation,
+                    timeout.saturating_sub(Duration::from_secs(1)),
+                    || cancellation.is_cancelled(),
+                    |progress| phases.push(progress.phase.clone()),
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(AppJobOutput::PluginLifecycle(PluginLifecycleResult {
+                    plugin: plugin_id,
+                    operation,
+                    phases,
+                    result,
+                }))
+            }),
+            StartOutcome::Started(_)
+        ))
+    }
+
+    pub(crate) fn cancel_plugin_lifecycle(&self, operation: &str) -> bool {
+        let kind = match operation {
+            "setup" => JobKind::PluginSetup,
+            "doctor" | "status" => JobKind::PluginDoctor,
+            "stop" => JobKind::PluginStop,
+            _ => return false,
+        };
+        self.jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.cancel_kind(kind) > 0)
+    }
+
+    pub(crate) fn plugin_lifecycle_active(&self, operation: &str) -> bool {
+        let kind = match operation {
+            "setup" => JobKind::PluginSetup,
+            "doctor" | "status" => JobKind::PluginDoctor,
+            "stop" => JobKind::PluginStop,
+            _ => return false,
+        };
+        self.jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.is_kind_active(kind))
     }
 
     pub fn env_probe_loading(&self, project: &str) -> bool {
@@ -1905,6 +2077,7 @@ impl AppState {
             name: None,
             session: None,
             opencode_session: None,
+            environment_session: None,
             launch_requested: None,
         };
         self.store.write_mission(project, &id, &mission, brief)?;
@@ -1922,7 +2095,7 @@ impl AppState {
             .ok()
             .and_then(|mission| mission.session)
             .is_some_and(|session| self.live_sessions.contains(&session));
-        if inflight || live_session {
+        if inflight || live_session || self.mission_environment_needs_cleanup(project, slug) {
             return Err(Error::Store("Stop the run first.".into()));
         }
         self.store.delete_mission(project, slug)
@@ -1954,6 +2127,7 @@ impl AppState {
         model: Option<&str>,
         mission: &str,
         source_pins_json: Option<&str>,
+        environment_session: Option<&str>,
     ) -> Result<(), Error> {
         self.run_phases.insert(run_id.clone(), RunPhase::Starting);
         let cancellation = self
@@ -1975,6 +2149,7 @@ impl AppState {
                 model,
                 mission,
                 source_pins_json,
+                environment_session,
                 &cancellation,
             )
         })() {
@@ -2031,7 +2206,10 @@ impl AppState {
     }
 
     pub fn run_phase(&self, run_id: &RunId) -> RunPhase {
-        self.run_phases.get(run_id).cloned().unwrap_or(RunPhase::Idle)
+        self.run_phases
+            .get(run_id)
+            .cloned()
+            .unwrap_or(RunPhase::Idle)
     }
 
     pub fn latest_run_phase(&self, project: &str, mission: &str) -> RunPhase {
@@ -2050,10 +2228,34 @@ impl AppState {
         self.latest_run_phase(project, mission).blocks_deletion()
     }
 
+    /// A mission may outlive the app between environment creation and agent
+    /// spawn. Its persisted key remains the operator's cleanup handle even
+    /// when no tmux session was ever created.
+    pub fn mission_environment_needs_cleanup(&self, project: &str, mission: &str) -> bool {
+        let Ok(mission) = self.store.load_mission(project, mission) else {
+            return false;
+        };
+        let Some(key) = mission.environment_session.as_deref() else {
+            return false;
+        };
+        let Ok(project) = corpus_core::Project::load(&self.store, project) else {
+            return true;
+        };
+        self.store
+            .load_environment_session_key(&project.plugin, key)
+            .map(|record| record.state != corpus_core::EnvironmentSessionState::Closed)
+            .unwrap_or(true)
+    }
+
     fn refuse_duplicate_mission_run(&self, project: &str, mission: &str) -> Result<(), Error> {
         if self.mission_run_inflight(project, mission) {
             Err(Error::Store(
                 "this mission already has a run operation in progress".into(),
+            ))
+        } else if self.mission_environment_needs_cleanup(project, mission) {
+            Err(Error::Store(
+                "this mission has an environment requiring cleanup; stop it before launching"
+                    .into(),
             ))
         } else {
             Ok(())
@@ -2089,7 +2291,11 @@ impl AppState {
         while let Some(line) = session.poll_line() {
             // egui_term consumes the PTY directly. Keeping the parallel raw
             // capture here only duplicated an unbounded stream in memory.
-            if self.run_meta.as_ref().is_some_and(|meta| meta.pty_attach.is_none()) {
+            if self
+                .run_meta
+                .as_ref()
+                .is_some_and(|meta| meta.pty_attach.is_none())
+            {
                 self.run_lines.push(RunLine {
                     stderr: line.stderr,
                     text: strip_ansi(&line.text),
@@ -2184,7 +2390,13 @@ impl AppState {
             } else {
                 self.run = Some(session);
                 self.owned_run_id = Some(id.clone());
-                self.fail_run(id, RunPhaseKind::Stopping, error.as_ref().unwrap(), true, true);
+                self.fail_run(
+                    id,
+                    RunPhaseKind::Stopping,
+                    error.as_ref().unwrap(),
+                    true,
+                    true,
+                );
             }
         }
         Some(StopAttempt {
@@ -2266,7 +2478,9 @@ impl AppState {
         let service = self.session_service.clone();
         let backend = self.run_backend.clone();
         let project_owned = project.to_string();
-        let Some(jobs) = self.jobs.as_mut() else { return };
+        let Some(jobs) = self.jobs.as_mut() else {
+            return;
+        };
         jobs.start(
             JobKind::SessionExport,
             scope,
@@ -2292,7 +2506,10 @@ impl AppState {
                 }
                 let mut exported_tmux = Vec::new();
                 for (conversation, tmux) in pending_exports {
-                    if backend.export_session(&project_owned, &conversation).is_ok() {
+                    if backend
+                        .export_session(&project_owned, &conversation)
+                        .is_ok()
+                    {
                         exported_tmux.push(tmux);
                     }
                 }
@@ -2339,13 +2556,11 @@ impl AppState {
         // polls faster: the dot should catch a turn starting, not lag it
         // by the tmux listing's throttle.
         let now = self.clock.monotonic_now();
-        let activity_due = self
-            .session_activity_polled_at
-            .is_none_or(|t| {
-                let elapsed = now.saturating_duration_since(t);
-                elapsed >= ACTIVITY_BACKSTOP
-                    || self.session_activity_dirty && elapsed >= ACTIVITY_EVENT_MIN
-            });
+        let activity_due = self.session_activity_polled_at.is_none_or(|t| {
+            let elapsed = now.saturating_duration_since(t);
+            elapsed >= ACTIVITY_BACKSTOP
+                || self.session_activity_dirty && elapsed >= ACTIVITY_EVENT_MIN
+        });
         if activity_due {
             self.refresh_session_activity();
             // Same beat: catch the live run's opencode session id as soon
@@ -2399,7 +2614,9 @@ impl AppState {
                     let live = catalog.live_tui_sessions();
                     let mut requests = Vec::new();
                     for project in projects {
-                        let Ok(missions) = store.list_missions(&project) else { continue };
+                        let Ok(missions) = store.list_missions(&project) else {
+                            continue;
+                        };
                         for (slug, mission) in missions {
                             if mission.launch_requested.is_none() {
                                 continue;
@@ -2685,9 +2902,7 @@ impl AppState {
             MissionActivity::Idle if self.run_active() => Some(Duration::from_millis(250)),
             // A just-discovered session may precede the mission cache that
             // names it. Keep the slow ownership beat until the cache lands.
-            MissionActivity::Idle if !self.live_sessions.is_empty() => {
-                Some(Duration::from_secs(2))
-            }
+            MissionActivity::Idle if !self.live_sessions.is_empty() => Some(Duration::from_secs(2)),
             MissionActivity::Idle => None,
         }
     }
@@ -2741,6 +2956,7 @@ impl AppState {
             model.as_deref(),
             &prompt,
             pins_json.as_deref(),
+            record.environment_session.as_deref(),
         )?;
         let session = self.live_run_session();
         if let Err(error) = self.bind_fresh_run(project, slug, session) {
@@ -2804,6 +3020,7 @@ impl AppState {
                 model.as_deref(),
                 &prompt,
                 pins_json.as_deref(),
+                record.environment_session.as_deref(),
                 &cancellation,
             )
         })() {
@@ -2913,6 +3130,7 @@ impl AppState {
                 model.as_deref(),
                 &id,
                 pins_json.as_deref(),
+                record.environment_session.as_deref(),
                 &cancellation,
             )
         })() {
@@ -2945,10 +3163,12 @@ impl AppState {
         mode: LaunchMode,
     ) -> Result<(), Error> {
         let run_id = self.next_run_id(project, slug);
+        let environment_id = run_id.clone();
         self.run_phases.insert(run_id.clone(), RunPhase::Preparing);
         let scope = self.job_scope(project, Some(run_id.clone()));
         let store = self.store.clone();
         let backend = self.run_backend.clone();
+        let environment_runtime = self.environment_runtime.clone();
         let project = project.to_string();
         let slug = slug.to_string();
         let jobs = self.jobs.as_mut().expect("installed above");
@@ -2961,7 +3181,7 @@ impl AppState {
                 if cancellation.is_cancelled() {
                     return Err("launch preparation cancelled".into());
                 }
-                let mission = store
+                let mut mission = store
                     .load_mission(&project, &slug)
                     .map_err(|error| error.to_string())?;
                 let prepared = backend
@@ -2975,28 +3195,41 @@ impl AppState {
                 } else {
                     Some(serde_json::to_string(&prepared).map_err(|error| error.to_string())?)
                 };
+                mission.environment_session = Some(environment_id.storage_key());
+                store
+                    .update_mission(&project, &slug, &mission)
+                    .map_err(|error| error.to_string())?;
+                if environment_runtime
+                    .open(&store, environment_id.clone(), prepared.clone())
+                .map_err(|error| error.to_string())?
+                .is_none()
+                {
+                    mission.environment_session = None;
+                    store
+                        .update_mission(&project, &slug, &mission)
+                        .map_err(|error| error.to_string())?;
+                }
                 store
                     .load_agent(&project, &mission.agent)
                     .map_err(|error| error.to_string())?;
                 store
                     .render_project_agents(&project)
                     .map_err(|error| error.to_string())?;
-                if cancellation.is_cancelled() {
-                    return Err("launch preparation cancelled".into());
-                }
                 let model = corpus_core::agent_default_model(&store, &project, &mission.agent);
-                let session = match mode {
+                let session_result = match mode {
                     LaunchMode::Resume => {
-                        let conversation = mission.opencode_session.as_deref().ok_or_else(|| {
-                            "no opencode session recorded for this mission — nothing to resume"
-                                .to_string()
-                        })?;
+                        let conversation =
+                            mission.opencode_session.as_deref().ok_or_else(|| {
+                                "no opencode session recorded for this mission — nothing to resume"
+                                    .to_string()
+                            })?;
                         backend.resume(
                             &project,
                             &mission.agent,
                             model.as_deref(),
                             conversation,
                             pins_json.as_deref(),
+                            mission.environment_session.as_deref(),
                             &cancellation,
                         )
                     }
@@ -3011,14 +3244,34 @@ impl AppState {
                             model.as_deref(),
                             &prompt,
                             pins_json.as_deref(),
+                            mission.environment_session.as_deref(),
                             &cancellation,
                         )
                     }
-                }
-                .map_err(|error| error.to_string())?;
+                };
+                let session = match session_result {
+                    Ok(session) => session,
+                    Err(error) => {
+                        if let Some(key) = mission.environment_session.as_deref() {
+                            if let Ok(project_record) = corpus_core::Project::load(&store, &project)
+                            {
+                                let _ = corpus_core::close_environment_session_key(
+                                    &store,
+                                    &project_record.plugin,
+                                    key,
+                                );
+                            }
+                        }
+                        return Err(error.to_string());
+                    }
+                };
                 let notice = matches!(mode, LaunchMode::DetachedFresh)
                     .then(|| mission_label(mission.name.as_deref(), &slug));
-                Ok(AppJobOutput::LaunchReady(LaunchReady { session, mode, notice }))
+                Ok(AppJobOutput::LaunchReady(LaunchReady {
+                    session,
+                    mode,
+                    notice,
+                }))
             },
         );
         Ok(())
@@ -3034,32 +3287,23 @@ impl AppState {
                     .pty_attach_command()
                     .and_then(|argv| AppState::pty_attach_session(&argv));
                 if let Some(session) = tmux {
-                    if let Err(error) = self.bind_fresh_run(
-                        &run_id.project,
-                        &run_id.mission,
-                        Some(session),
-                    ) {
+                    if let Err(error) =
+                        self.bind_fresh_run(&run_id.project, &run_id.mission, Some(session))
+                    {
                         let cleanup = ready.session.stop();
                         let combined = Error::Store(format!(
                             "{error}; spawned run cleanup transcript: {}; cleanup errors: {}",
                             cleanup.transcript.display(),
                             cleanup.cleanup_errors.join("; ")
                         ));
-                        self.fail_run(
-                            run_id,
-                            RunPhaseKind::Running,
-                            &combined,
-                            false,
-                            false,
-                        );
+                        self.fail_run(run_id, RunPhaseKind::Running, &combined, false, false);
                         return Err(combined);
                     }
                     self.finish_run(run_id);
                 } else {
                     self.background_active_run()?;
                     self.adopt_run(ready.session, run_id.clone());
-                    if let Err(error) =
-                        self.bind_fresh_run(&run_id.project, &run_id.mission, None)
+                    if let Err(error) = self.bind_fresh_run(&run_id.project, &run_id.mission, None)
                     {
                         return Err(self.cleanup_failed_adoption(run_id, error));
                     }
@@ -3098,7 +3342,10 @@ impl AppState {
         self.refresh_live_sessions();
         self.refresh_missions(&run_id.project);
         if let Some(mission) = notice {
-            self.launch_notices.push(LaunchNotice { mission, result: Ok(()) });
+            self.launch_notices.push(LaunchNotice {
+                mission,
+                result: Ok(()),
+            });
         }
         Ok(())
     }
@@ -3115,7 +3362,7 @@ impl AppState {
             if cancellation.is_cancelled() {
                 return Err(Error::Store("launch preparation cancelled".into()));
             }
-            let mission_record = self.store.load_mission(&run_id.project, &run_id.mission)?;
+            let mut mission_record = self.store.load_mission(&run_id.project, &run_id.mission)?;
             let prepared = self.run_backend.prepare_source_pins(
                 &self.store,
                 &run_id.project,
@@ -3130,6 +3377,18 @@ impl AppState {
             } else {
                 Some(serde_json::to_string(&prepared)?)
             };
+            mission_record.environment_session = Some(run_id.storage_key());
+            self.store
+                .update_mission(&run_id.project, &run_id.mission, &mission_record)?;
+            if self
+                .environment_runtime
+                .open(&self.store, run_id.clone(), prepared)?
+                .is_none()
+            {
+                mission_record.environment_session = None;
+                self.store
+                    .update_mission(&run_id.project, &run_id.mission, &mission_record)?;
+            }
             Ok((mission_record, pins_json))
         })();
         if let Err(error) = &result {
@@ -3255,7 +3514,9 @@ impl AppState {
                 &self.store.project_run_dir(project),
                 launched_at_ms,
                 &claimed,
-            ) else { continue };
+            ) else {
+                continue;
+            };
             if self.set_opencode_session(project, &slug, Some(id)).is_ok() {
                 changed = true;
             }
@@ -3434,8 +3695,7 @@ impl AppState {
     /// Apply discovery only to the exact generation that requested it.
     /// Late background results from an older launch are harmless values.
     fn apply_discovered_conversation(&mut self, run_id: &RunId, id: String) -> bool {
-        if self.owned_run_id.as_ref() != Some(run_id)
-            || self.run_phase(run_id) != RunPhase::Running
+        if self.owned_run_id.as_ref() != Some(run_id) || self.run_phase(run_id) != RunPhase::Running
         {
             return false;
         }
@@ -3469,14 +3729,64 @@ impl AppState {
     /// id is what `resume_mission` re-opens.
     pub fn stop_mission(&mut self, project: &str, slug: &str) -> Result<StopMissionResult, Error> {
         let mission = self.store.load_mission(project, slug)?;
-        let session = mission.session.as_deref().ok_or_else(|| {
-            Error::Store("no live session on this mission — nothing to stop".into())
-        })?;
+        let session = mission.session.as_deref();
+        if session.is_none() && !self.mission_environment_needs_cleanup(project, slug) {
+            return Err(Error::Store(
+                "no live session or environment on this mission — nothing to stop".into(),
+            ));
+        }
+        if session.is_none() {
+            let project_record = corpus_core::Project::load(&self.store, project)?;
+            let key = mission
+                .environment_session
+                .as_deref()
+                .ok_or_else(|| Error::Store("environment cleanup identity disappeared".into()))?;
+            if matches!(
+                self.store
+                    .load_environment_session_key(&project_record.plugin, key),
+                Err(corpus_core::Error::Io(ref error))
+                    if error.kind() == std::io::ErrorKind::NotFound
+            ) {
+                // The mission key is written immediately before the durable
+                // Opening record. If the app died in that tiny interval, no
+                // plugin mutation was attempted and clearing the unmatched
+                // key is the complete recovery action.
+                let mut repaired = mission.clone();
+                repaired.environment_session = None;
+                self.store.update_mission(project, slug, &repaired)?;
+                return Ok(StopMissionResult::Completed(String::new()));
+            }
+        }
         if self.jobs.is_some() {
             self.schedule_teardown(project, slug, &mission, session)?;
             return Ok(StopMissionResult::Scheduled);
         }
-        let (path, error, cleanup_complete) = if self.live_run_session().as_deref() == Some(session)
+        if session.is_none() {
+            let run_id = self.next_run_id(project, slug);
+            self.run_phases.insert(run_id.clone(), RunPhase::Stopping);
+            let project_record = corpus_core::Project::load(&self.store, project)?;
+            let environment_session = mission
+                .environment_session
+                .as_deref()
+                .ok_or_else(|| Error::Store("environment cleanup identity disappeared".into()))?;
+            match corpus_core::close_environment_session_key(
+                &self.store,
+                &project_record.plugin,
+                environment_session,
+            ) {
+                Ok(()) => {
+                    self.finish_run(&run_id);
+                    return Ok(StopMissionResult::Completed(String::new()));
+                }
+                Err(error) => {
+                    self.fail_run(&run_id, RunPhaseKind::Stopping, &error, true, true);
+                    return Err(error);
+                }
+            }
+        }
+        let session = session.expect("checked above");
+        let (path, mut error, mut cleanup_complete) = if self.live_run_session().as_deref()
+            == Some(session)
         {
             let attempt = self.stop_run().ok_or_else(|| {
                 Error::Store("run ownership disappeared before Stop could begin".into())
@@ -3509,9 +3819,7 @@ impl AppState {
                 (None, None) => None,
                 (Some(export), None) => Some(Error::Store(export)),
                 (None, Some(cleanup)) => Some(Error::Store(cleanup)),
-                (Some(export), Some(cleanup)) => {
-                    Some(Error::Store(format!("{export}; {cleanup}")))
-                }
+                (Some(export), Some(cleanup)) => Some(Error::Store(format!("{export}; {cleanup}"))),
             };
             if cleanup_complete {
                 self.finish_run(&run_id);
@@ -3529,6 +3837,23 @@ impl AppState {
             }
             (exported, error, cleanup_complete)
         };
+        if let Some(environment_session) = mission.environment_session.as_deref() {
+            if let Ok(project_record) = corpus_core::Project::load(&self.store, project) {
+                if let Err(environment_error) = corpus_core::close_environment_session_key(
+                    &self.store,
+                    &project_record.plugin,
+                    environment_session,
+                ) {
+                    cleanup_complete = false;
+                    error = Some(Error::Store(match error {
+                        Some(existing) => {
+                            format!("{existing}; environment cleanup failed: {environment_error}")
+                        }
+                        None => format!("environment cleanup failed: {environment_error}"),
+                    }));
+                }
+            }
+        }
         // Clear the durable binding only when cleanup actually completed.
         // A failed kill keeps the identity available for a retry.
         if cleanup_complete {
@@ -3546,9 +3871,9 @@ impl AppState {
         project: &str,
         slug: &str,
         mission: &Mission,
-        tmux: &str,
+        tmux: Option<&str>,
     ) -> Result<(), Error> {
-        let owned = self.live_run_session().as_deref() == Some(tmux);
+        let owned = tmux.is_some() && self.live_run_session().as_deref() == tmux;
         let run_id = if owned {
             self.owned_run_id.take().ok_or_else(|| {
                 Error::Store("run ownership disappeared before Stop could begin".into())
@@ -3559,9 +3884,14 @@ impl AppState {
         self.run_phases.insert(run_id.clone(), RunPhase::Stopping);
         let retained = if owned { self.run.take() } else { None };
         let backend = self.run_backend.clone();
+        let store = self.store.clone();
         let project_owned = project.to_string();
         let conversation = mission.opencode_session.clone();
-        let tmux_owned = tmux.to_string();
+        let environment_session = mission.environment_session.clone();
+        let plugin_id = corpus_core::Project::load(&self.store, project)
+            .ok()
+            .map(|project| project.plugin);
+        let tmux_owned = tmux.map(str::to_string);
         let scope = self.job_scope(project, Some(run_id));
         self.jobs.as_mut().expect("installed above").start(
             JobKind::SessionTeardown,
@@ -3574,7 +3904,21 @@ impl AppState {
                     if let Some(error) = outcome.export_error {
                         errors.insert(0, error);
                     }
-                    let cleanup_complete = outcome.cleanup_errors.is_empty();
+                    let mut environment_cleanup_failed = false;
+                    if let (Some(plugin_id), Some(environment_session)) =
+                        (plugin_id.as_deref(), environment_session.as_deref())
+                    {
+                        if let Err(error) = corpus_core::close_environment_session_key(
+                            &store,
+                            plugin_id,
+                            environment_session,
+                        ) {
+                            environment_cleanup_failed = true;
+                            errors.push(format!("environment cleanup failed: {error}"));
+                        }
+                    }
+                    let cleanup_complete =
+                        outcome.cleanup_errors.is_empty() && !environment_cleanup_failed;
                     return Ok(AppJobOutput::TeardownReady(TeardownReady {
                         transcript: Some(outcome.transcript.display().to_string()),
                         error: (!errors.is_empty()).then(|| errors.join("; ")),
@@ -3583,18 +3927,37 @@ impl AppState {
                     }));
                 }
                 let (transcript, export_error) = match conversation.as_deref() {
-                    Some(conversation) => match backend.export_session(&project_owned, conversation) {
-                        Ok(path) => (Some(path.display().to_string()), None),
-                        Err(error) => (None, Some(format!("transcript export failed: {error}"))),
-                    },
+                    Some(conversation) => {
+                        match backend.export_session(&project_owned, conversation) {
+                            Ok(path) => (Some(path.display().to_string()), None),
+                            Err(error) => {
+                                (None, Some(format!("transcript export failed: {error}")))
+                            }
+                        }
+                    }
                     None => (None, None),
                 };
-                let cleanup_error = backend
-                    .kill_tmux_session(&tmux_owned)
-                    .err()
-                    .map(|error| format!("session cleanup failed: {error}"));
-                let cleanup_complete = cleanup_error.is_none();
-                let error = [export_error, cleanup_error]
+                let cleanup_error = tmux_owned.as_deref().and_then(|tmux| {
+                    backend
+                        .kill_tmux_session(tmux)
+                        .err()
+                        .map(|error| format!("session cleanup failed: {error}"))
+                });
+                let environment_error = match (plugin_id.as_deref(), environment_session.as_deref())
+                {
+                    (Some(plugin_id), Some(environment_session)) => {
+                        corpus_core::close_environment_session_key(
+                            &store,
+                            plugin_id,
+                            environment_session,
+                        )
+                        .err()
+                        .map(|error| format!("environment cleanup failed: {error}"))
+                    }
+                    _ => None,
+                };
+                let cleanup_complete = cleanup_error.is_none() && environment_error.is_none();
+                let error = [export_error, cleanup_error, environment_error]
                     .into_iter()
                     .flatten()
                     .collect::<Vec<_>>();
@@ -3621,7 +3984,10 @@ impl AppState {
             self.run = Some(session);
             self.owned_run_id = Some(run_id.clone());
             let error = Error::Store(
-                ready.error.clone().unwrap_or_else(|| "session cleanup failed".into()),
+                ready
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "session cleanup failed".into()),
             );
             self.fail_run(run_id, RunPhaseKind::Stopping, &error, true, true);
         }
@@ -3642,7 +4008,9 @@ impl AppState {
     /// tool-use default (an explicit arg — the engine never falls back
     /// to opencode's ambient model). None when the registry is empty.
     pub fn suggested_model(&self) -> Option<String> {
-        corpus_core::ModelRegistry::load_default().ok()?.launch_default()
+        corpus_core::ModelRegistry::load_default()
+            .ok()?
+            .launch_default()
     }
 
     /// The launch pre-fill for an agent: primary entry model → registry
@@ -3925,6 +4293,7 @@ mod tests {
             _model: Option<&str>,
             _mission: &str,
             _source_pins_json: Option<&str>,
+            _environment_session: Option<&str>,
             cancellation: &RunCancellation,
         ) -> Result<Box<dyn ActiveRun>, Error> {
             if self.cancel_before_spawn.load(Ordering::Relaxed) {
@@ -3958,9 +4327,18 @@ mod tests {
             model: Option<&str>,
             _opencode_session_id: &str,
             source_pins_json: Option<&str>,
+            environment_session: Option<&str>,
             cancellation: &RunCancellation,
         ) -> Result<Box<dyn ActiveRun>, Error> {
-            self.spawn(project, agent, model, "", source_pins_json, cancellation)
+            self.spawn(
+                project,
+                agent,
+                model,
+                "",
+                source_pins_json,
+                environment_session,
+                cancellation,
+            )
         }
 
         fn prepare_source_pins(
@@ -4006,8 +4384,8 @@ mod tests {
         fn raw_log(&self, _store: &Store, _project: &str, _session: &str) -> Option<PathBuf> {
             None
         }
-
     }
+
 
     #[test]
     fn generated_ids_are_formatted_uuids_and_valid_slugs() {
@@ -4082,7 +4460,11 @@ mod tests {
             description: None,
             probed,
             ready,
-            notes: if probed { "checked".into() } else { "not probed".into() },
+            notes: if probed {
+                "checked".into()
+            } else {
+                "not probed".into()
+            },
             running_version: None,
             expected_tag: None,
         };
@@ -4108,6 +4490,7 @@ mod tests {
             name: None,
             session: None,
             opencode_session: None,
+            environment_session: None,
             launch_requested: None,
         }
     }
@@ -4272,7 +4655,10 @@ mod tests {
 
         state.install_job_runtime(eframe::egui::Context::default());
         state.select_project("q");
-        assert!(matches!(state.finding_discovery(), FindingDiscovery::Loading));
+        assert!(matches!(
+            state.finding_discovery(),
+            FindingDiscovery::Loading
+        ));
         assert!(finding_titles(&state).is_empty());
         wait_for_finding_titles(&mut state, &[]);
 
@@ -4307,7 +4693,10 @@ mod tests {
             other => panic!("expected failed discovery, got {other:?}"),
         }
         state.prepare_findings_project("another");
-        assert!(matches!(state.finding_discovery(), FindingDiscovery::Loading));
+        assert!(matches!(
+            state.finding_discovery(),
+            FindingDiscovery::Loading
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4374,12 +4763,7 @@ mod tests {
         wait_for_finding_titles(&mut state, &["One", "Two"]);
 
         write_finding_fixture(&store, "p", "one.md", "One edited");
-        std::fs::remove_file(
-            store
-                .project_corpus_dir("p")
-                .join("findings/nested/two.md"),
-        )
-        .unwrap();
+        std::fs::remove_file(store.project_corpus_dir("p").join("findings/nested/two.md")).unwrap();
         state.file_invalidations = Some(Box::new(
             crate::file_watch::FakeFileInvalidationSource::new(
                 crate::file_watch::FileInvalidations {
@@ -4444,7 +4828,9 @@ mod tests {
             .unwrap();
         let mut record = mission(1);
         record.agent = "runner".into();
-        store.write_mission("p", "mission", &record, "brief").unwrap();
+        store
+            .write_mission("p", "mission", &record, "brief")
+            .unwrap();
         let backend = Arc::new(FakeRunBackend::default());
         let mut state = AppState::with_runtime(
             store,
@@ -4459,7 +4845,10 @@ mod tests {
         assert_eq!(state.current_screen, Screen::Missions);
         assert_eq!(backend.spawns.load(Ordering::Relaxed), 0);
         assert!(!state.run_active());
-        assert!(state.run_generations.is_empty(), "navigation created run identity");
+        assert!(
+            state.run_generations.is_empty(),
+            "navigation created run identity"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4494,12 +4883,23 @@ mod tests {
 
         let run_id = state.next_run_id("p", "mission");
         state
-            .launch(run_id.clone(), "p", "runner", Some("fake/model"), "brief", None)
+            .launch(
+                run_id.clone(),
+                "p",
+                "runner",
+                Some("fake/model"),
+                "brief",
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(backend.spawns.load(Ordering::Relaxed), 1);
         assert_eq!(state.run_phase(&run_id), RunPhase::Running);
         assert_eq!(
-            state.delete_mission("p", "mission").unwrap_err().to_string(),
+            state
+                .delete_mission("p", "mission")
+                .unwrap_err()
+                .to_string(),
             "store error: Stop the run first."
         );
         assert_eq!(
@@ -4548,7 +4948,9 @@ mod tests {
             .unwrap();
         let mut record = mission(1);
         record.agent = "runner".into();
-        store.write_mission("p", "mission", &record, "brief").unwrap();
+        store
+            .write_mission("p", "mission", &record, "brief")
+            .unwrap();
         let backend = Arc::new(FakeRunBackend::default());
         let mut state = AppState::with_runtime(
             store,
@@ -4561,7 +4963,9 @@ mod tests {
 
         state.launch_mission("p", "mission").unwrap();
         let duplicate = state.launch_mission("p", "mission").unwrap_err();
-        assert!(duplicate.to_string().contains("already has a run operation"));
+        assert!(duplicate
+            .to_string()
+            .contains("already has a run operation"));
         assert_eq!(
             state
                 .run_generations
@@ -4603,7 +5007,9 @@ mod tests {
             .unwrap();
         let mut record = mission(1);
         record.agent = "runner".into();
-        store.write_mission("p", "mission", &record, "brief").unwrap();
+        store
+            .write_mission("p", "mission", &record, "brief")
+            .unwrap();
         let mut state = AppState::with_runtime(
             store.clone(),
             Arc::new(ManualClock::new(0)),
@@ -4612,7 +5018,15 @@ mod tests {
         );
         let run_id = state.next_run_id("p", "mission");
         state
-            .launch(run_id.clone(), "p", "runner", Some("fake/model"), "brief", None)
+            .launch(
+                run_id.clone(),
+                "p",
+                "runner",
+                Some("fake/model"),
+                "brief",
+                None,
+                None,
+            )
             .unwrap();
         state
             .set_tmux_session("p", "mission", Some("fake-run".into()))
@@ -4631,7 +5045,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(state.run_phase(&run_id), RunPhase::Idle);
-        assert!(store.load_mission("p", "mission").unwrap().session.is_none());
+        assert!(store
+            .load_mission("p", "mission")
+            .unwrap()
+            .session
+            .is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4681,6 +5099,7 @@ mod tests {
                 Some("fake/model"),
                 "brief",
                 None,
+                None,
             )
             .unwrap_err();
         assert_eq!(error.to_string(), "store error: injected spawn failure");
@@ -4710,11 +5129,11 @@ mod tests {
             .unwrap();
         let mut record = mission(1);
         record.agent = "runner".into();
-        store.write_mission("p", "mission", &record, "brief").unwrap();
+        store
+            .write_mission("p", "mission", &record, "brief")
+            .unwrap();
         let backend = Arc::new(FakeRunBackend::default());
-        backend
-            .cancel_during_prepare
-            .store(true, Ordering::Relaxed);
+        backend.cancel_during_prepare.store(true, Ordering::Relaxed);
         let mut state = AppState::with_runtime(
             store,
             Arc::new(ManualClock::new(0)),
@@ -4723,7 +5142,10 @@ mod tests {
         );
 
         let error = state.launch_mission("p", "mission").unwrap_err();
-        assert_eq!(error.to_string(), "store error: launch preparation cancelled");
+        assert_eq!(
+            error.to_string(),
+            "store error: launch preparation cancelled"
+        );
         assert_eq!(backend.spawns.load(Ordering::Relaxed), 0);
         assert!(!state.run_active());
         let run_id = RunId {
@@ -4763,7 +5185,9 @@ mod tests {
             .unwrap();
         let mut record = mission(1);
         record.agent = "runner".into();
-        store.write_mission("p", "mission", &record, "brief").unwrap();
+        store
+            .write_mission("p", "mission", &record, "brief")
+            .unwrap();
         let backend = Arc::new(FakeRunBackend::default());
         *backend.remove_mission_on_spawn.lock().unwrap() =
             Some(store.project_missions_dir("p").join("mission.md"));
@@ -4775,7 +5199,10 @@ mod tests {
         );
 
         let error = state.launch_mission("p", "mission").unwrap_err();
-        assert!(error.to_string().contains("spawned run was stopped"), "{error}");
+        assert!(
+            error.to_string().contains("spawned run was stopped"),
+            "{error}"
+        );
         assert!(error.to_string().contains("fake-transcript.log"), "{error}");
         assert!(!state.run_active());
         let run_id = RunId {
@@ -4803,7 +5230,9 @@ mod tests {
         ));
         let store = Store::new(root.clone());
         store.create_project("p", "P", "cdk-regtest").unwrap();
-        store.create_project("other", "Other", "cdk-regtest").unwrap();
+        store
+            .create_project("other", "Other", "cdk-regtest")
+            .unwrap();
         store
             .create_agent_with_role("p", "runner", corpus_core::AgentRole::Tester)
             .unwrap();
@@ -4811,7 +5240,9 @@ mod tests {
         record.agent = "runner".into();
         record.session = Some("fake-run".into());
         record.opencode_session = Some("fake-conversation".into());
-        store.write_mission("p", "mission", &record, "brief").unwrap();
+        store
+            .write_mission("p", "mission", &record, "brief")
+            .unwrap();
         let backend = Arc::new(FakeRunBackend::default());
         backend.fail_export.store(true, Ordering::Relaxed);
         backend.fail_kill.store(true, Ordering::Relaxed);
@@ -4824,10 +5255,20 @@ mod tests {
         state.selected_project = Some("other".into());
 
         let error = state.stop_mission("p", "mission").unwrap_err();
-        assert!(error.to_string().contains("detached export failure"), "{error}");
-        assert!(error.to_string().contains("tmux cleanup failure"), "{error}");
+        assert!(
+            error.to_string().contains("detached export failure"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("tmux cleanup failure"),
+            "{error}"
+        );
         assert_eq!(
-            store.load_mission("p", "mission").unwrap().session.as_deref(),
+            store
+                .load_mission("p", "mission")
+                .unwrap()
+                .session
+                .as_deref(),
             Some("fake-run"),
             "failed cleanup keeps durable retry identity"
         );
@@ -4845,7 +5286,10 @@ mod tests {
             }
         ));
         assert_eq!(
-            state.delete_mission("p", "mission").unwrap_err().to_string(),
+            state
+                .delete_mission("p", "mission")
+                .unwrap_err()
+                .to_string(),
             "store error: Stop the run first."
         );
 
@@ -4883,7 +5327,9 @@ mod tests {
         let mut record = mission(1);
         record.agent = "runner".into();
         record.session = Some("fake-run".into());
-        store.write_mission("p", "mission", &record, "brief").unwrap();
+        store
+            .write_mission("p", "mission", &record, "brief")
+            .unwrap();
 
         // A new AppState owns no process handle; the durable record plus
         // session catalog is sufficient to recover attachment and status.
@@ -4896,7 +5342,10 @@ mod tests {
         state.refresh_live_sessions();
         assert!(!state.run_active());
         assert_eq!(state.live_sessions, ["fake-run"]);
-        assert_eq!(state.mission_activity("p", "mission"), MissionActivity::Waiting);
+        assert_eq!(
+            state.mission_activity("p", "mission"),
+            MissionActivity::Waiting
+        );
         assert!(AppState::session_attach_command("fake-run").is_some());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5015,7 +5464,9 @@ mod tests {
             .unwrap();
         let mut record = mission(1);
         record.agent = "runner".into();
-        store.write_mission("p", "mission", &record, "brief").unwrap();
+        store
+            .write_mission("p", "mission", &record, "brief")
+            .unwrap();
         let mut state = AppState::with_runtime(
             store.clone(),
             Arc::new(ManualClock::new(0)),
@@ -5028,10 +5479,17 @@ mod tests {
         state.run_phases.insert(current.clone(), RunPhase::Running);
 
         assert!(!state.apply_discovered_conversation(&old, "old-session".into()));
-        assert_eq!(store.load_mission("p", "mission").unwrap().opencode_session, None);
+        assert_eq!(
+            store.load_mission("p", "mission").unwrap().opencode_session,
+            None
+        );
         assert!(state.apply_discovered_conversation(&current, "current-session".into()));
         assert_eq!(
-            store.load_mission("p", "mission").unwrap().opencode_session.as_deref(),
+            store
+                .load_mission("p", "mission")
+                .unwrap()
+                .opencode_session
+                .as_deref(),
             Some("current-session")
         );
         let _ = std::fs::remove_dir_all(root);
@@ -5066,5 +5524,69 @@ mod tests {
         let sorted = sort_missions(list);
         let order: Vec<&str> = sorted.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(order, ["a-new", "d-tie", "c-mid", "b-old"]);
+    }
+
+    #[test]
+    fn failed_environment_survives_restart_and_blocks_relaunch_and_delete() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-environment-recovery-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.join("store"));
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "operator", corpus_core::AgentRole::Tester)
+            .unwrap();
+        let id = RunId {
+            project: "p".into(),
+            mission: "mission".into(),
+            generation: 1,
+        };
+        let mut mission = mission(1);
+        mission.environment_session = Some(id.storage_key());
+        store
+            .write_mission("p", "mission", &mission, "brief")
+            .unwrap();
+        let mut environment = corpus_core::EnvironmentSessionRecord {
+            id,
+            plugin_id: "cdk-regtest".into(),
+            plugin_version: "1.0.0".into(),
+            plugin_digest: "fixture".into(),
+            state: corpus_core::EnvironmentSessionState::Failed,
+            source_shas: Default::default(),
+            environment_lock: None,
+            image_digest: None,
+            created: 1,
+            updated: 2,
+            error: Some("cleanup failed".into()),
+        };
+        store.save_environment_session(&environment).unwrap();
+
+        let state = AppState::with_runtime(
+            store.clone(),
+            Arc::new(ManualClock::new(0)),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+        assert!(state.mission_environment_needs_cleanup("p", "mission"));
+        assert!(state
+            .refuse_duplicate_mission_run("p", "mission")
+            .unwrap_err()
+            .to_string()
+            .contains("requiring cleanup"));
+        assert_eq!(
+            state
+                .delete_mission("p", "mission")
+                .unwrap_err()
+                .to_string(),
+            "store error: Stop the run first."
+        );
+
+        environment.state = corpus_core::EnvironmentSessionState::Closed;
+        store.save_environment_session(&environment).unwrap();
+        assert!(!state.mission_environment_needs_cleanup("p", "mission"));
+        state.delete_mission("p", "mission").unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

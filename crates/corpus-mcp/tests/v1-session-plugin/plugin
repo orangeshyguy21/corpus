@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -uo pipefail
+while IFS= read -r line; do
+  id="$(jq -r '.id' <<<"$line")"
+  method="$(jq -r '.method' <<<"$line")"
+  case "$method" in
+    hello) printf '{"id":%s,"ok":true,"result":{"protocol":"corpus.environment/1","capabilities":["sessions","sandbox.exec","faucet.bolt11","wallet.fund","oracle.run"]}}\n' "$id" ;;
+    describe)
+      state_dir="$(jq -r '.params.state_dir // ""' <<<"$line")"
+      source_path="$(jq -r '.params.sources[0].host_path // ""' <<<"$line")"
+      if [[ -z "$state_dir" || -z "$source_path" ]]; then
+        printf '{"id":%s,"ok":false,"error":{"code":"missing_context","message":"state/source context missing","retryable":false}}\n' "$id"
+      else
+        printf '{"id":%s,"ok":true,"result":{"targets":[{"id":"target","kind":"fixture-service","url":"http://target:8080","source_id":"target","source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"tools":[{"id":"fixture-cli","description":"fixture tool","path":"/opt/tools/fixture"}],"limits":{"max_payment_sats":100},"provenance":{"image_digest":"sha256:fixture"}}}\n' "$id"
+      fi ;;
+    session_probe) printf '{"id":%s,"ok":true,"result":{"ready":true}}\n' "$id" ;;
+    sandbox_exec) printf '{"id":%s,"ok":true,"result":{"output":"fixture sandbox","exit_code":0}}\n' "$id" ;;
+    faucet) printf '{"id":%s,"ok":true,"result":{"text":"fixture faucet","paid_sats":null}}\n' "$id" ;;
+    wallet_fund) printf '{"id":%s,"ok":true,"result":{"funded":true,"amount_sat":10}}\n' "$id" ;;
+    oracles) printf '{"id":%s,"ok":true,"result":[{"name":"fixture-invariant","description":"fixture"}]}\n' "$id" ;;
+    call_oracle) printf '{"id":%s,"ok":true,"result":{"verdict":"hold","log":"fixture holds"}}\n' "$id" ;;
+    *) printf '{"id":%s,"ok":false,"error":{"code":"unknown_method","message":"unknown","retryable":false}}\n' "$id" ;;
+  esac
+done

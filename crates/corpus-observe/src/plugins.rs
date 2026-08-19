@@ -65,6 +65,14 @@ pub struct EnvironmentDependency {
 pub struct PluginDir {
     pub dir: PathBuf,
     pub manifest: PluginManifest,
+    pub origin: PluginOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginOrigin {
+    Direct,
+    Installed,
+    Bundled,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,18 +224,99 @@ pub fn discover_plugins(root: &Path) -> Result<Vec<PluginDir>, Error> {
     let mut entries: Vec<PathBuf> = fs::read_dir(root)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
+        .filter(|path| path.is_dir() && path.join("plugin.toml").is_file())
         .collect();
     entries.sort();
 
     let mut plugins = Vec::new();
     for dir in entries {
         match PluginManifest::load(&dir) {
-            Ok(manifest) => plugins.push(PluginDir { dir, manifest }),
+            Ok(manifest) => plugins.push(PluginDir {
+                dir,
+                manifest,
+                origin: PluginOrigin::Direct,
+            }),
             Err(error) => eprintln!("corpus: skipping {}: {error}", dir.display()),
         }
     }
     Ok(plugins)
+}
+
+/// The effective catalog. `CORPUS_PLUGINS_DIR` is a complete direct override.
+/// Otherwise selected versioned installs win by id and bundled plugins fill
+/// only missing ids during the migration window.
+pub fn plugin_catalog() -> Result<Vec<PluginDir>, Error> {
+    if let Some(root) = std::env::var(corpus_store::paths::PLUGINS_DIR_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return discover_plugins(Path::new(&root));
+    }
+
+    let mut catalog = discover_selected_installs(&corpus_store::paths::plugin_install_root())?;
+    let mut names: HashSet<String> = catalog
+        .iter()
+        .map(|plugin| plugin.manifest.name.clone())
+        .collect();
+    if let Some(root) = corpus_store::paths::bundled_plugins_dir() {
+        for mut plugin in discover_plugins(&root)? {
+            if names.insert(plugin.manifest.name.clone()) {
+                plugin.origin = PluginOrigin::Bundled;
+                catalog.push(plugin);
+            }
+        }
+    }
+    catalog.sort_by(|left, right| left.manifest.name.cmp(&right.manifest.name));
+    Ok(catalog)
+}
+
+fn discover_selected_installs(root: &Path) -> Result<Vec<PluginDir>, Error> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut ids: Vec<PathBuf> = fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    ids.sort();
+    let mut selected = Vec::new();
+    for id_dir in ids {
+        let Ok(version) = fs::read_to_string(id_dir.join("selected")) else {
+            continue;
+        };
+        let version = version.trim();
+        if version.is_empty() || version.contains('/') || version.contains("..") {
+            eprintln!("corpus: ignoring invalid selection in {}", id_dir.display());
+            continue;
+        }
+        let dir = id_dir.join("versions").join(version);
+        match PluginManifest::load(&dir) {
+            Ok(manifest)
+                if id_dir.file_name().and_then(|name| name.to_str())
+                    == Some(manifest.name.as_str())
+                    && manifest.version.as_deref() == Some(version) =>
+            {
+                selected.push(PluginDir {
+                    dir,
+                    manifest,
+                    origin: PluginOrigin::Installed,
+                });
+            }
+            Ok(_) => eprintln!(
+                "corpus: ignoring selected plugin whose id/version disagrees with {}",
+                id_dir.display()
+            ),
+            Err(error) => eprintln!("corpus: ignoring {}: {error}", dir.display()),
+        }
+    }
+    Ok(selected)
+}
+
+pub fn catalog_plugin(name: &str) -> Result<Option<PluginDir>, Error> {
+    Ok(plugin_catalog()?
+        .into_iter()
+        .find(|plugin| plugin.manifest.name == name))
 }
 
 pub fn plugin_by_name(root: &Path, name: &str) -> Result<Option<PluginDir>, Error> {

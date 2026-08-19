@@ -26,11 +26,10 @@ crates/
   corpus-mcp/        MCP server exposing the corpus tools to agents
   corpus-cli/        headless CLI: run / plugin / models / store administration
   corpus-app/        egui desktop app (corpus-app), the operator UI
-plugins/
-  cdk-regtest/       reference environment plugin (sandbox + oracles +
-                     faucet + targets) for the CDK e-cash target; the
-                     in-repo protocol fixture. Other plugins live in
-                     their own repos (see roadmap #18).
+plugins/             transitional bundled-plugin discovery root; production
+                     plugins are independently versioned and installed under
+                     CORPUS_HOME/plugins (the CDK reference lives in the
+                     sibling `corpus-plugin-cdk` repository).
 benchmarks/
   models.yaml        model registry (identity + metadata; scores live in
                      benchmarks/results/<model>/*.yaml)
@@ -134,12 +133,14 @@ Chat/embedding build ergonomics (the `goose` git-dep):
 - True cold compile of the goose tree is ~107s (1438 crates); incremental is
   sub-second. Consider `sccache` for repeated cold builds of the dep tree.
 
-The `cdk-regtest` plugin is a bash script plus a Docker-based arena; it is
-not built by cargo. One-shot setup (fetch pinned sources, build agent
-image + tools, run the doctor self-verification probes):
+The external `cdk-regtest` plugin is a bash adapter plus a Docker-based arena;
+it is not built by cargo. Install its independently versioned bundle, then let
+Corpus fetch its pinned sources, prepare tools/images/regtest, and verify it:
 
 ```bash
-plugins/cdk-regtest/setup.sh
+corpus plugin install ../corpus-plugin-cdk
+corpus plugin setup cdk-regtest
+corpus plugin doctor cdk-regtest
 ```
 
 Environment is checked via `corpus plugin probe cdk-regtest`. The CLI:
@@ -489,12 +490,12 @@ model's own prose about it. This is the same facts as values.
 
 ## Plugin protocol
 
-Any executable speaking newline-delimited JSON on stdio is a plugin
-(bash qualifies). The client lives in `crates/corpus-core/src/plugin.rs`;
-the full method table (`probe`, `up/down`, `targets`, `tools`, `sources`,
-`sandbox_exec`, `oracles`, `call_oracle`, `faucet`) is documented in
-`crates/corpus-core/src/plugin.rs` and `dev/architecture.md`.
-The reference plugin is `plugins/cdk-regtest`.
+Any executable speaking newline-delimited JSON on stdio is a plugin (bash
+qualifies). Protocol-v1 contracts, typed records, lifecycle, and session calls
+live in `crates/corpus-core/src/plugin.rs` and `dev/architecture.md`. The
+reference implementation is the separately released `corpus-plugin-cdk`
+repository; Corpus retains fake protocol fixtures, not an editable production
+adapter.
 
 ## Store conventions
 

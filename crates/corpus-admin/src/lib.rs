@@ -1408,6 +1408,7 @@ fn mission_new(ctx: &mut Ctx, args: &Value) -> Result<String> {
         name,
         session: None,
         opencode_session: None,
+        environment_session: None,
         launch_requested: None,
     };
     ctx.store

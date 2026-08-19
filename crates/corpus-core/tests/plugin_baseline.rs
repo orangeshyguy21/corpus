@@ -10,6 +10,26 @@ use corpus_core::{AgentRole, Store};
 
 const SAMPLES: usize = 5;
 
+struct SourcesGuard(Option<std::ffi::OsString>);
+
+impl SourcesGuard {
+    fn warm_workspace_cache() -> Self {
+        let previous = std::env::var_os("CORPUS_SOURCES_DIR");
+        let warm = corpus_core::resource_root().unwrap().join("sources");
+        std::env::set_var("CORPUS_SOURCES_DIR", warm);
+        Self(previous)
+    }
+}
+
+impl Drop for SourcesGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(previous) => std::env::set_var("CORPUS_SOURCES_DIR", previous),
+            None => std::env::remove_var("CORPUS_SOURCES_DIR"),
+        }
+    }
+}
+
 fn milliseconds(samples: &[Duration]) -> Vec<u128> {
     samples.iter().map(Duration::as_millis).collect()
 }
@@ -40,6 +60,7 @@ fn command_output(command: &str, args: &[&str]) -> String {
 #[test]
 #[ignore = "live: requires the installed CDK plugin, its source cache, and Docker"]
 fn selected_probe_and_warm_launch_preparation() {
+    let _sources = SourcesGuard::warm_workspace_cache();
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

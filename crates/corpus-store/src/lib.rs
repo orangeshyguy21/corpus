@@ -8,6 +8,7 @@
 pub mod agents;
 pub mod audit;
 pub mod error;
+pub mod environment;
 pub mod findings;
 pub mod frontmatter;
 pub mod paths;
@@ -20,6 +21,9 @@ pub use agents::{
     CORPUS_TOOLS, CURATOR_TOOLS, DEFAULT_AGENT_NAME, OPENCODE_SCHEMA, SUPER_ADMIN_TOOLS,
 };
 pub use error::{Error, Result};
+pub use environment::{
+    EnvironmentSessionId, EnvironmentSessionRecord, EnvironmentSessionState,
+};
 pub use findings::{
     finding_cards, query_findings, read_finding, scan_findings_cached, FindingCard,
     FindingIndexCache, FindingQuery, FindingReferenceSource, FindingScan, FindingScanStats,
@@ -31,5 +35,5 @@ pub use store::{
     corpus_cost, corpus_cost_cached, corpus_stats, fnv1a_hex, mission_logs, project_slug_env,
     slugify, store_root_env, validate_slug, AppPrefs, CategoryStat, CorpusCostCache, CorpusStats,
     CostReport, CostRow, EntryAccess, Mission, MissionLog, Project, Scope, Store, AGENT_ENV,
-    CATEGORIES, PROJECT_ENV, RUNS, RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV,
+    CATEGORIES, ENVIRONMENT_SESSION_ENV, PROJECT_ENV, RUNS, RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV,
 };

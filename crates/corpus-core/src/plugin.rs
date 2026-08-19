@@ -105,7 +105,7 @@ pub struct FaucetResult {
 }
 
 /// Parameters for `faucet`: op is required, the rest are op-dependent.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FaucetCall {
     /// Paid BOLT11 invoice (`pay`).
     pub invoice: Option<String>,
@@ -121,6 +121,39 @@ pub struct HelloResult {
     pub protocol: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TargetRecord {
+    pub id: String,
+    pub kind: String,
+    pub url: String,
+    pub source_id: String,
+    pub source_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolRecord {
+    pub id: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnvironmentDescription {
+    #[serde(default)]
+    pub targets: Vec<TargetRecord>,
+    #[serde(default)]
+    pub tools: Vec<ToolRecord>,
+    #[serde(default)]
+    pub limits: Value,
+    #[serde(default)]
+    pub provenance: Value,
 }
 
 /// A stable, machine-readable protocol v1 error.
@@ -511,9 +544,24 @@ impl Plugin {
 
     /// Look up a mutating request before deciding whether it is safe to retry.
     pub fn operation_status(&mut self, idempotency_key: &str) -> Result<OperationStatus, Error> {
+        self.operation_status_with_params(idempotency_key, serde_json::Map::new())
+    }
+
+    /// Context-bearing status lookup for independently installed plugins.
+    /// Corpus supplies state/cache paths explicitly; the executable never has
+    /// to infer `CORPUS_HOME` or its install layout.
+    pub fn operation_status_with_params(
+        &mut self,
+        idempotency_key: &str,
+        mut params: serde_json::Map<String, Value>,
+    ) -> Result<OperationStatus, Error> {
+        params.insert(
+            "idempotency_key".to_string(),
+            Value::String(idempotency_key.to_string()),
+        );
         let value = self.call_v1(
             "operation_status",
-            Some(serde_json::json!({ "idempotency_key": idempotency_key })),
+            Some(Value::Object(params)),
         )?;
         Ok(serde_json::from_value(value)?)
     }
@@ -548,6 +596,50 @@ impl Plugin {
             });
         }
         Ok(hello)
+    }
+
+    pub fn describe_v1(&mut self, session_id: &str) -> Result<EnvironmentDescription, Error> {
+        let value = self.call_v1("describe", Some(serde_json::json!({"session_id": session_id})))?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub fn session_probe_v1(&mut self, session_id: &str) -> Result<Value, Error> {
+        self.call_v1("session_probe", Some(serde_json::json!({"session_id": session_id})))
+    }
+
+    pub fn sandbox_exec_v1(&mut self, session_id: &str, command: &str) -> Result<SandboxExecResult, Error> {
+        let value = self.call_v1(
+            "sandbox_exec",
+            Some(serde_json::json!({"session_id": session_id, "command": command})),
+        )?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub fn faucet_v1(&mut self, session_id: &str, op: &str, call: &FaucetCall) -> Result<FaucetResult, Error> {
+        let value = self.call_v1(
+            "faucet",
+            Some(serde_json::json!({"session_id": session_id, "op": op, "call": call})),
+        )?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub fn wallet_fund_v1(&mut self, session_id: &str, params: Value) -> Result<Value, Error> {
+        let mut params = params.as_object().cloned().unwrap_or_default();
+        params.insert("session_id".into(), Value::String(session_id.to_string()));
+        self.call_v1("wallet_fund", Some(Value::Object(params)))
+    }
+
+    pub fn oracles_v1(&mut self, session_id: &str) -> Result<Vec<OracleInfo>, Error> {
+        let value = self.call_v1("oracles", Some(serde_json::json!({"session_id": session_id})))?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub fn call_oracle_v1(&mut self, session_id: &str, name: &str) -> Result<OracleResult, Error> {
+        let value = self.call_v1(
+            "call_oracle",
+            Some(serde_json::json!({"session_id": session_id, "name": name})),
+        )?;
+        Ok(serde_json::from_value(value)?)
     }
 
     fn finish_v1_reply(&self, id: u64, reply: ProtocolV1Reply) -> Result<Value, Error> {
@@ -706,6 +798,17 @@ impl Plugin {
         }
         let value = self.call("faucet", Some(params))?;
         Ok(serde_json::from_value(value)?)
+    }
+
+    pub fn wallet_fund_legacy(
+        &mut self,
+        mut params: serde_json::Map<String, Value>,
+        sources: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<Value, Error> {
+        if let Some(sources) = sources {
+            params.insert("sources".into(), Value::Object(sources.clone()));
+        }
+        self.call("wallet_fund", Some(Value::Object(params)))
     }
 
     /// Kill the plugin and its whole process group (unix): scripts the

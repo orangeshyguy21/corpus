@@ -70,6 +70,8 @@ pub struct Ctx {
     /// CORPUS_SOURCE_PINS at launch) — forwarded to the plugin on every
     /// sandbox_exec so the sandbox mounts the recorded revs.
     pub source_pins: Option<serde_json::Map<String, Value>>,
+    /// Durable v1 plugin session selected before the agent process spawned.
+    pub environment_session: Option<String>,
     /// The basename of the current run's transcript in the project corpus
     /// `runs/` (from CORPUS_RUN_LOG at launch). Surfaced in `target_info`
     /// and used as the default `run_log` for `technique_save` when the
@@ -107,9 +109,40 @@ impl Ctx {
             },
             Err(e) => Err(e.to_string()),
         };
+        let environment_session = std::env::var(corpus_core::ENVIRONMENT_SESSION_ENV)
+            .ok()
+            .filter(|value| !value.is_empty());
         // Probe the environment once at startup; the result gates every
         // tool call (version-pin mismatch included).
         let probe = match plugin.as_mut() {
+            Ok(plugin) if plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1 => {
+                let result = environment_session
+                    .as_deref()
+                    .ok_or_else(|| corpus_core::Error::Store("v1 plugin run has no CORPUS_ENVIRONMENT_SESSION".into()))
+                    .and_then(|session| {
+                        let record = store.load_environment_session_key(&plugin.manifest().name, session)?;
+                        let proven = scope.as_ref().map_err(|error| corpus_core::Error::Store(error.clone()))?;
+                        if record.id.project != proven.project
+                            || record.state != corpus_core::EnvironmentSessionState::Ready
+                            || record.plugin_digest != corpus_core::plugin_bundle_digest(plugin.dir())?
+                        {
+                            return Err(corpus_core::Error::Store(
+                                "environment session record does not match project, ready state, or selected plugin bytes".into(),
+                            ));
+                        }
+                        plugin.hello()?;
+                        plugin.session_probe_v1(session)
+                    });
+                match result {
+                    Ok(value) => ProbeResult {
+                        ready: value.get("ready").and_then(Value::as_bool).unwrap_or(false),
+                        notes: value.get("notes").and_then(Value::as_str).unwrap_or("session probed").to_string(),
+                        running_version: value.get("running_version").and_then(Value::as_str).map(str::to_string),
+                        expected_tag: value.get("expected_tag").and_then(Value::as_str).map(str::to_string),
+                    },
+                    Err(e) => ProbeResult { ready: false, notes: format!("session probe failed: {e}"), running_version: None, expected_tag: None },
+                }
+            }
             Ok(plugin) => plugin.probe().unwrap_or_else(|e| ProbeResult {
                 ready: false,
                 notes: format!("probe failed: {e}"),
@@ -156,6 +189,7 @@ impl Ctx {
             role,
             pending_confirms: HashMap::new(),
             source_pins,
+            environment_session,
             run_log,
         })
     }
@@ -177,6 +211,7 @@ impl Ctx {
             role: Ok(role),
             pending_confirms: HashMap::new(),
             source_pins: None,
+            environment_session: None,
             run_log: None,
         }
     }
@@ -225,20 +260,22 @@ fn resolve_plugin_dir(
     if let Some(dir) = std::env::var("CORPUS_PLUGIN_DIR").ok().filter(|s| !s.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
-    let plugins = corpus_core::plugins_dir();
     if let Ok(scope) = scope {
         let project = corpus_core::Project::load(store, &scope.project)
             .map_err(|e| Error::Scope(format!("project {:?}: {e}", scope.project)))?;
-        return Ok(plugins.join(&project.plugin));
+        return corpus_core::find_plugin(&project.plugin)
+            .map_err(|error| Error::Scope(error.to_string()))?
+            .map(|plugin| plugin.dir)
+            .ok_or_else(|| Error::Scope(format!("plugin {:?} is not installed", project.plugin)));
     }
-    let mut found = corpus_core::discover(&plugins).unwrap_or_default();
+    let mut found = corpus_core::plugin_catalog().unwrap_or_default();
     match found.len() {
         1 => Ok(found.remove(0).dir),
         _ => Err(Error::Scope(format!(
             "cannot resolve a plugin: {} names no project, and {} holds {} plugins — set \
              CORPUS_PLUGIN_DIR to run this server by hand",
             corpus_core::PROJECT_ENV,
-            plugins.display(),
+            "the effective plugin catalog",
             found.len()
         ))),
     }
@@ -319,12 +356,12 @@ pub fn catalog() -> Value {
     json!([
         {
             "name": "target_info",
-            "description": "Targets you may attack (sandbox-scoped mint URLs), available tools, and faucet limits. Call this first.",
+            "description": "Typed targets, pinned sources, sandbox tools, limits, and provenance for this environment session. Call this first.",
             "inputSchema": {"type": "object", "properties": {}, "required": []}
         },
         {
             "name": "sandbox_exec",
-            "description": "Execute a bash command inside the egress-denied sandbox. The sandbox has curl, jq, sqlite3, and cdk-cli at /opt/tools/cdk-cli. 120s timeout, output capped at 8KB.",
+            "description": "Execute a bounded command inside this environment session's egress-denied sandbox. Call target_info first for the typed tools and source mounts available in this plugin.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -356,15 +393,15 @@ pub fn catalog() -> Value {
         },
         {
             "name": "wallet_fund",
-            "description": "Fund a sandbox wallet in ONE step: creates a mint quote with cdk-cli, pays it via the faucet, claims the proofs, returns the balance. Mechanical funding is harness business — spend your steps on the attack.",
+            "description": "Ask the environment plugin to fund a session-scoped attacker wallet in one bounded, idempotent operation. Availability and limits are reported by target_info.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "work_dir": {"type": "string", "description": "wallet dir under /tmp, e.g. /tmp/w1"},
+                    "work_dir": {"type": "string", "description": "optional plugin-defined sandbox wallet directory"},
                     "amount_sat": {"type": "integer"},
-                    "target": {"type": "integer", "description": "0 = first target (default), 1 = second"}
+                    "target_id": {"type": "string", "description": "typed target id returned by target_info; omit for the plugin default"}
                 },
-                "required": ["work_dir", "amount_sat"]
+                "required": ["amount_sat"]
             }
         },
         {
@@ -891,6 +928,44 @@ fn source_paths(ctx: &Ctx, sources: &[corpus_core::SourceInfo]) -> Value {
 }
 
 fn target_info(ctx: &mut Ctx) -> Result<String> {
+    if ctx
+        .plugin
+        .as_ref()
+        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
+    {
+        let (session, params) = v1_call_params(ctx, json!({}))?;
+        let declared = ctx
+            .plugin
+            .as_ref()
+            .map(|plugin| plugin.manifest().sources.clone())
+            .unwrap_or_default();
+        let description: corpus_core::EnvironmentDescription = resilient(ctx, |plugin| {
+            let value = plugin.call_v1("describe", Some(params))?;
+            Ok(serde_json::from_value(value)?)
+        })?;
+        let sources: Vec<Value> = declared
+            .iter()
+            .filter_map(|source| {
+                let sha = ctx.source_pins.as_ref()?.get(&source.id)?.as_str()?;
+                Some(json!({
+                    "id": source.id,
+                    "sha": sha,
+                    "path": format!("sources/{}/{sha}", source.id),
+                    "path_inside_sandbox_exec": source.mount,
+                }))
+            })
+            .collect();
+        return Ok(serde_json::to_string_pretty(&json!({
+            "environment_session": session,
+            "targets": description.targets,
+            "scope": "ONLY these typed targets may be attacked",
+            "sources": sources,
+            "tools_in_sandbox": description.tools,
+            "limits": description.limits,
+            "provenance": description.provenance,
+            "run_log": ctx.run_log,
+        }))?);
+    }
     let targets = resilient(ctx, |p| p.targets())?;
     let tools = resilient(ctx, |p| p.tools())?;
     let pins = ctx.source_pins.clone();
@@ -913,8 +988,20 @@ fn target_info(ctx: &mut Ctx) -> Result<String> {
 }
 
 fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
-    let pins = ctx.source_pins.clone();
-    let result = resilient(ctx, |p| p.sandbox_exec_with_sources(command, pins.as_ref()))?;
+    let result = if ctx
+        .plugin
+        .as_ref()
+        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
+    {
+        let (_, params) = v1_call_params(ctx, json!({"command": command}))?;
+        resilient(ctx, |plugin| {
+            let value = plugin.call_v1("sandbox_exec", Some(params))?;
+            Ok(serde_json::from_value(value)?)
+        })?
+    } else {
+        let pins = ctx.source_pins.clone();
+        resilient(ctx, |p| p.sandbox_exec_with_sources(command, pins.as_ref()))?
+    };
     let mut combined = result.output;
     if combined.len() > OUTPUT_CAP_BYTES {
         combined.truncate(OUTPUT_CAP_BYTES);
@@ -931,7 +1018,19 @@ fn oracle_run(ctx: &mut Ctx, name: &str) -> Result<String> {
     {
         return Err(Error::Args("bad oracle name".to_string()));
     }
-    let result = resilient(ctx, |p| p.call_oracle(name))?;
+    let result = if ctx
+        .plugin
+        .as_ref()
+        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
+    {
+        let (_, params) = v1_call_params(ctx, json!({"name": name}))?;
+        resilient(ctx, |plugin| {
+            let value = plugin.call_v1("call_oracle", Some(params))?;
+            Ok(serde_json::from_value(value)?)
+        })?
+    } else {
+        resilient(ctx, |p| p.call_oracle(name))?
+    };
     Ok(format!("verdict: {}\n{}", result.verdict, result.log))
 }
 
@@ -954,7 +1053,19 @@ fn faucet(ctx: &mut Ctx, args: &Value) -> Result<String> {
         "invoice" | "balance" => {}
         other => return Err(Error::Args(format!("unknown faucet op: {other}"))),
     }
-    let result = resilient(ctx, |p| p.faucet(&op, &call))?;
+    let result = if ctx
+        .plugin
+        .as_ref()
+        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
+    {
+        let (_, params) = v1_call_params(ctx, json!({"op": op, "call": call}))?;
+        resilient(ctx, |plugin| {
+            let value = plugin.call_v1("faucet", Some(params))?;
+            Ok(serde_json::from_value(value)?)
+        })?
+    } else {
+        resilient(ctx, |p| p.faucet(&op, &call))?
+    };
     if let Some(paid) = result.paid_sats {
         ctx.faucet_spent_sats += paid;
         return Ok(format!(
@@ -970,68 +1081,85 @@ fn faucet(ctx: &mut Ctx, args: &Value) -> Result<String> {
     Ok(result.text)
 }
 
-/// Fund a sandbox wallet: quote -> faucet pay -> claim -> balance.
-/// Deterministic harness work; saves the model fifteen fragile steps.
+/// Ask the plugin to fund a session-scoped attacker wallet. Quote/payment/
+/// claim mechanics and output parsing are environment implementation details.
 fn wallet_fund(ctx: &mut Ctx, args: &Value) -> Result<String> {
-    let work_dir = require_str(args, "work_dir")?;
-    if !work_dir.starts_with("/tmp/")
-        || !work_dir
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-    {
-        return Err(Error::Args("work_dir must be a simple path under /tmp/".to_string()));
-    }
     let amount = require_u64(args, "amount_sat")?;
-    let targets = resilient(ctx, |p| p.targets())?;
-    let target = if targets.len() > 1 {
-        match args.get("target").and_then(Value::as_u64).unwrap_or(0) {
-            0 => targets[0].clone(),
-            _ => targets[1].clone(),
-        }
-    } else {
-        targets.first().cloned().unwrap_or_default()
-    };
-    let cli = format!("/opt/tools/cdk-cli -n -w {work_dir}");
-
-    // 1. Create the quote; cdk-cli prints the invoice then waits out its
-    //    --wait-duration and returns — that timeout is expected.
-    let quote_out = sandbox_exec(
-        ctx,
-        &format!("rm -rf {work_dir} && {cli} mint {target} {amount} --wait-duration 2"),
-    )?;
-    // BOLT11 HRP is "lnbcrt" + amount + "1" separator — match on "lnbcrt",
-    // the amount sits between the currency code and the separator.
-    let invoice = quote_out
-        .split_whitespace()
-        .find(|tok| tok.starts_with("lnbcrt"))
-        .map(str::to_string)
-        .ok_or_else(|| Error::Command(format!("no invoice in mint output: {quote_out}")))?;
-    // cdk-cli prints "Quote: id=<uuid>, state=UNPAID, ..." — the claim
-    // path is re-running mint with that quote id (`mint-pending` checks
-    // pending *proofs*, not quotes).
-    let quote_id = quote_out
-        .split_whitespace()
-        .find_map(|tok| tok.strip_prefix("id="))
-        .map(|id| id.trim_end_matches(',').to_string())
-        .ok_or_else(|| Error::Command(format!("no quote id in mint output: {quote_out}")))?;
-
-    // 2. Pay it via the faucet (session budget enforced in `faucet`).
-    let pay_out = faucet(ctx, &json!({"op": "pay", "invoice": invoice}))?;
-    if !pay_out.starts_with("Payment succeeded") {
-        return Ok(format!("funding failed at payment: {pay_out}"));
+    if ctx.faucet_spent_sats.saturating_add(amount) > ctx.faucet_budget_sats {
+        return Ok(format!(
+            "[faucet refused] session budget of {} sat exhausted",
+            ctx.faucet_budget_sats
+        ));
     }
+    if ctx
+        .plugin
+        .as_ref()
+        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
+    {
+        let (_, params) = v1_call_params(ctx, args.clone())?;
+        let result = resilient(ctx, |plugin| plugin.call_v1("wallet_fund", Some(params)))?;
+        if result.get("funded").and_then(Value::as_bool) == Some(true) {
+            ctx.faucet_spent_sats = ctx.faucet_spent_sats.saturating_add(amount);
+        }
+        return Ok(serde_json::to_string_pretty(&result)?);
+    }
+    let params = args.as_object().cloned().unwrap_or_default();
+    let pins = ctx.source_pins.clone();
+    let result = resilient(ctx, |plugin| plugin.wallet_fund_legacy(params, pins.as_ref()))?;
+    if result.get("funded").and_then(Value::as_bool) == Some(true) {
+        ctx.faucet_spent_sats = ctx.faucet_spent_sats.saturating_add(amount);
+    }
+    Ok(serde_json::to_string_pretty(&result)?)
+}
 
-    // 3. Claim by quote id (the mint may need a moment to mark the quote
-    //    PAID; --wait-duration lets the claim ride out that lag), then
-    //    read the balance.
-    let claim_out = sandbox_exec(
-        ctx,
-        &format!("{cli} mint {target} -q {quote_id} --wait-duration 15"),
-    )?;
-    let balance = sandbox_exec(ctx, &format!("{cli} balance"))?;
-    Ok(format!(
-        "wallet funded: {amount} sat on {target}\n{claim_out}\nbalance: {balance}"
-    ))
+fn require_environment_session(ctx: &Ctx) -> Result<String> {
+    ctx.environment_session
+        .clone()
+        .ok_or_else(|| Error::Scope("v1 plugin call has no durable environment session".into()))
+}
+
+/// Add corpus-owned runtime/source locations to every v1 session call. A
+/// plugin process is deliberately one-shot and cannot rediscover these paths
+/// from its immutable bundle, so the caller repeats the full explicit context.
+fn v1_call_params(ctx: &Ctx, extra: Value) -> Result<(String, Value)> {
+    let session = require_environment_session(ctx)?;
+    let mut params = extra.as_object().cloned().unwrap_or_default();
+    params.insert("session_id".into(), Value::String(session.clone()));
+    let Some(plugin) = ctx.plugin.as_ref() else {
+        return Ok((session, Value::Object(params)));
+    };
+    let plugin_id = plugin.manifest().name.clone();
+    if let Ok(record) = ctx.store.load_environment_session_key(&plugin_id, &session) {
+        let state_dir = ctx
+            .store
+            .plugin_runtime_dir(&plugin_id)
+            .map_err(|error| Error::Plugin(error.to_string()))?
+            .join("state")
+            .join(&session);
+        let source_cache = ctx.store.source_cache_dir();
+        let sources: Vec<Value> = plugin
+            .manifest()
+            .sources
+            .iter()
+            .filter_map(|source| {
+                record.source_shas.get(&source.id).map(|sha| {
+                    json!({
+                        "id": source.id,
+                        "sha": sha,
+                        "host_path": source_cache.join(&source.id).join(sha),
+                        "mount": source.mount,
+                    })
+                })
+            })
+            .collect();
+        params.insert("state_dir".into(), json!(state_dir));
+        params.insert("source_cache".into(), json!(source_cache));
+        params.insert("sources".into(), Value::Array(sources));
+        params.insert("project".into(), json!(record.id.project));
+        params.insert("mission".into(), json!(record.id.mission));
+        params.insert("run".into(), json!(record.id.generation));
+    }
+    Ok((session, Value::Object(params)))
 }
 
 /// The verification gate: the plugin's oracle suite runs server-side
@@ -1064,10 +1192,38 @@ fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
 
     let mut verified = false;
     let mut oracle_out = String::new();
-    match resilient(ctx, |p| p.oracles()) {
+    let oracle_list = if ctx
+        .plugin
+        .as_ref()
+        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
+    {
+        v1_call_params(ctx, json!({})).and_then(|(_, params)| {
+            resilient(ctx, |plugin| {
+                let value = plugin.call_v1("oracles", Some(params))?;
+                Ok(serde_json::from_value(value)?)
+            })
+        })
+    } else {
+        resilient(ctx, |p| p.oracles())
+    };
+    match oracle_list {
         Ok(oracles) => {
             for oracle in &oracles {
-                let line = match resilient(ctx, |p| p.call_oracle(&oracle.name)) {
+                let result = if ctx
+                    .plugin
+                    .as_ref()
+                    .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
+                {
+                    v1_call_params(ctx, json!({"name": oracle.name})).and_then(|(_, params)| {
+                        resilient(ctx, |plugin| {
+                            let value = plugin.call_v1("call_oracle", Some(params))?;
+                            Ok(serde_json::from_value(value)?)
+                        })
+                    })
+                } else {
+                    resilient(ctx, |p| p.call_oracle(&oracle.name))
+                };
+                let line = match result {
                     Ok(result) => {
                         if result.verdict == "violated" {
                             verified = true;

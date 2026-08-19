@@ -48,6 +48,9 @@ pub(crate) struct JobId(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum JobKind {
     PluginProbe,
+    PluginSetup,
+    PluginDoctor,
+    PluginStop,
     SourceRevisions,
     ModelDiscovery,
     LaunchPreparation,
@@ -66,6 +69,9 @@ impl JobKind {
     fn thread_name(self) -> &'static str {
         match self {
             Self::PluginProbe => "corpus-plugin-probe",
+            Self::PluginSetup => "corpus-plugin-setup",
+            Self::PluginDoctor => "corpus-plugin-doctor",
+            Self::PluginStop => "corpus-plugin-stop",
             Self::SourceRevisions => "corpus-source-revisions",
             Self::ModelDiscovery => "corpus-model-discovery",
             Self::LaunchPreparation => "corpus-launch-prepare",
@@ -84,6 +90,9 @@ impl JobKind {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::PluginProbe => "plugin probe",
+            Self::PluginSetup => "plugin setup",
+            Self::PluginDoctor => "plugin doctor",
+            Self::PluginStop => "plugin stop",
             Self::SourceRevisions => "source revision refresh",
             Self::ModelDiscovery => "model discovery",
             Self::LaunchPreparation => "launch preparation",
@@ -272,6 +281,24 @@ impl<T: Send + 'static> JobSet<T> {
                 active.cancellation.cancel();
                 true
             })
+    }
+
+    /// Cancel every active job of one operator operation kind. Plugin
+    /// lifecycle work is installation-scoped rather than run-scoped, so it
+    /// cannot use `cancel_scope`'s `RunId` key.
+    pub(crate) fn cancel_kind(&self, kind: JobKind) -> usize {
+        self.active
+            .iter()
+            .filter(|(key, _)| key.kind == kind)
+            .map(|(_, active)| {
+                active.cancellation.cancel();
+                1
+            })
+            .sum()
+    }
+
+    pub(crate) fn is_kind_active(&self, kind: JobKind) -> bool {
+        self.active.keys().any(|key| key.kind == kind)
     }
 
     /// Drain terminal results, removing their in-flight guards. Results for
@@ -549,6 +576,23 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
         assert!(jobs.drain_applicable(|_| true).is_empty());
         assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn installation_scoped_jobs_cancel_by_kind() {
+        let mut jobs = JobSet::new(Arc::new(CountingWake::default()));
+        jobs.start(
+            JobKind::PluginSetup,
+            scope(1),
+            Duration::from_secs(1),
+            |_| {
+                std::thread::sleep(Duration::from_millis(40));
+                Ok(())
+            },
+        );
+        assert_eq!(jobs.cancel_kind(JobKind::PluginSetup), 1);
+        let results = wait_for_results(&mut jobs);
+        assert!(matches!(results[0].terminal, JobTerminal::Cancelled));
     }
 
     #[test]

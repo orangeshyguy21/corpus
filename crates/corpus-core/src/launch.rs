@@ -44,7 +44,10 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::models::ModelRegistry;
-use crate::store::{Store, AGENT_ENV, HANDLE_ENV, PROJECT_ENV, RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV};
+use crate::store::{
+    Store, AGENT_ENV, ENVIRONMENT_SESSION_ENV, HANDLE_ENV, PROJECT_ENV, RUN_LOG_ENV,
+    SOURCE_PINS_ENV, STORE_ENV,
+};
 
 /// One transcript line. In the piped backend the two child streams are
 /// kept apart; in the TUI backend lines come from the raw capture, so
@@ -127,14 +130,43 @@ impl RunSession {
         mission: &str,
         source_pins_json: Option<&str>,
     ) -> Result<Self> {
+        Self::spawn_with_environment(project, agent, model, mission, source_pins_json, None)
+    }
+
+    pub fn spawn_with_environment(
+        project: &str,
+        agent: &str,
+        model: Option<&str>,
+        mission: &str,
+        source_pins_json: Option<&str>,
+        environment_session: Option<&str>,
+    ) -> Result<Self> {
         let store = Store::from_env();
         let runs_dir = store.project_corpus_dir(project).join("runs");
         let _ = fs::create_dir_all(&runs_dir);
         let model = resolve_launch_model(&store, project, agent, model)?;
         if tmux_available().is_some() {
-            Self::start_tui(&store, project, agent, &model, mission, source_pins_json, None)
+            Self::start_tui(
+                &store,
+                project,
+                agent,
+                &model,
+                mission,
+                source_pins_json,
+                environment_session,
+                None,
+            )
         } else {
-            Self::start_piped(&store, project, agent, Some(&model), mission, None, source_pins_json)
+            Self::start_piped(
+                &store,
+                project,
+                agent,
+                Some(&model),
+                mission,
+                None,
+                source_pins_json,
+                environment_session,
+            )
         }
     }
 
@@ -155,6 +187,24 @@ impl RunSession {
         opencode_session_id: &str,
         source_pins_json: Option<&str>,
     ) -> Result<Self> {
+        Self::resume_with_environment(
+            project,
+            agent,
+            model,
+            opencode_session_id,
+            source_pins_json,
+            None,
+        )
+    }
+
+    pub fn resume_with_environment(
+        project: &str,
+        agent: &str,
+        model: Option<&str>,
+        opencode_session_id: &str,
+        source_pins_json: Option<&str>,
+        environment_session: Option<&str>,
+    ) -> Result<Self> {
         if tmux_available().is_none() {
             return Err(Error::Store(
                 "resume needs tmux — the piped backend has no session to re-open".into(),
@@ -171,6 +221,7 @@ impl RunSession {
             &model,
             "",
             source_pins_json,
+            environment_session,
             Some(opencode_session_id),
         )
     }
@@ -184,8 +235,13 @@ impl RunSession {
     /// Throttled to one lookup a second — each call is an `opencode
     /// session list` subprocess, and the app asks on its poll beat.
     pub fn opencode_session_id(&mut self, claimed: &BTreeSet<String>) -> Option<String> {
-        let Backend::Tui { tui_session_id, launched_at_ms, repo, discovery, .. } =
-            &mut self.backend
+        let Backend::Tui {
+            tui_session_id,
+            launched_at_ms,
+            repo,
+            discovery,
+            ..
+        } = &mut self.backend
         else {
             return None;
         };
@@ -210,10 +266,30 @@ impl RunSession {
         model: Option<&str>,
         mission: &str,
     ) -> Result<Self> {
+        Self::spawn_headless_with_environment(project, agent, model, mission, None, None)
+    }
+
+    pub fn spawn_headless_with_environment(
+        project: &str,
+        agent: &str,
+        model: Option<&str>,
+        mission: &str,
+        source_pins: Option<&str>,
+        environment_session: Option<&str>,
+    ) -> Result<Self> {
         let store = Store::from_env();
         let runs_dir = store.project_corpus_dir(project).join("runs");
         let _ = fs::create_dir_all(&runs_dir);
-        Self::start_piped(&store, project, agent, model, mission, None, None)
+        Self::start_piped(
+            &store,
+            project,
+            agent,
+            model,
+            mission,
+            None,
+            source_pins,
+            environment_session,
+        )
     }
 
     /// CLI automation APPENDING to an existing transcript (the
@@ -225,6 +301,20 @@ impl RunSession {
         mission: &str,
         append_to: &Path,
     ) -> Result<Self> {
+        Self::spawn_headless_append_with_environment(
+            project, agent, model, mission, append_to, None, None,
+        )
+    }
+
+    pub fn spawn_headless_append_with_environment(
+        project: &str,
+        agent: &str,
+        model: Option<&str>,
+        mission: &str,
+        append_to: &Path,
+        source_pins: Option<&str>,
+        environment_session: Option<&str>,
+    ) -> Result<Self> {
         let store = Store::from_env();
         let runs_dir = store.project_corpus_dir(project).join("runs");
         let _ = fs::create_dir_all(&runs_dir);
@@ -235,7 +325,8 @@ impl RunSession {
             model,
             mission,
             Some(append_to),
-            None,
+            source_pins,
+            environment_session,
         )
     }
 
@@ -249,6 +340,7 @@ impl RunSession {
         model: &str,
         mission: &str,
         source_pins: Option<&str>,
+        environment_session: Option<&str>,
         resume: Option<&str>,
     ) -> Result<Self> {
         let opencode = resolve_opencode()?;
@@ -298,6 +390,9 @@ impl RunSession {
         if let Some(pins) = source_pins {
             env.push((SOURCE_PINS_ENV, pins));
         }
+        if let Some(session) = environment_session {
+            env.push((ENVIRONMENT_SESSION_ENV, session));
+        }
         write_tui_script(&script, &env, prompt, resume)?;
         // Stamped BEFORE the spawn: session discovery keys off "created
         // after this moment", and a stamp taken afterwards could in
@@ -307,7 +402,9 @@ impl RunSession {
         command.args(["new-session", "-d", "-s", &session]);
         command.arg("-c").arg(&repo);
         command.arg(&script);
-        let status = command.status().map_err(|e| Error::Store(format!("failed to spawn tmux: {e}")))?;
+        let status = command
+            .status()
+            .map_err(|e| Error::Store(format!("failed to spawn tmux: {e}")))?;
         if !status.success() {
             let _ = fs::remove_file(&script);
             return Err(Error::Store(format!("tmux refused the session: {status}")));
@@ -370,6 +467,7 @@ impl RunSession {
         mission: &str,
         append_to: Option<&Path>,
         source_pins: Option<&str>,
+        environment_session: Option<&str>,
     ) -> Result<Self> {
         let opencode = resolve_opencode()?;
         let runs = store.project_corpus_dir(project).join("runs");
@@ -389,12 +487,15 @@ impl RunSession {
         if let Some(pins) = source_pins {
             command.env(SOURCE_PINS_ENV, pins);
         }
+        if let Some(session) = environment_session {
+            command.env(ENVIRONMENT_SESSION_ENV, session);
+        }
         if let Some(name) = transcript.file_name() {
             command.env(RUN_LOG_ENV, name);
         }
-        let mut child = command.spawn().map_err(|e| {
-            Error::Store(format!("failed to spawn opencode (on PATH?): {e}"))
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|e| Error::Store(format!("failed to spawn opencode (on PATH?): {e}")))?;
         let (tx, rx) = mpsc::channel();
         let log = fs::OpenOptions::new().append(true).open(&transcript)?;
         let log = Arc::new(Mutex::new(log));
@@ -420,7 +521,10 @@ impl RunSession {
         match &mut self.backend {
             Backend::Piped { rx, .. } => rx.try_recv().ok(),
             Backend::Tui {
-                raw, file_pos, pending, ..
+                raw,
+                file_pos,
+                pending,
+                ..
             } => poll_file(raw, file_pos, pending),
         }
     }
@@ -565,7 +669,8 @@ impl RunSession {
         let id = match tui_session_id.clone() {
             Some(id) => id,
             None => {
-                let found = find_opencode_session(repo.as_path(), *launched_at_ms, &BTreeSet::new())?;
+                let found =
+                    find_opencode_session(repo.as_path(), *launched_at_ms, &BTreeSet::new())?;
                 *tui_session_id = Some(found.clone());
                 found
             }
@@ -610,11 +715,12 @@ impl RunSession {
     }
 
     fn runs_for(store: &Store, project: &str, agent: &str, ts: u64, ext: &str) -> PathBuf {
-        store.project_corpus_dir(project).join("runs")
+        store
+            .project_corpus_dir(project)
+            .join("runs")
             .join(format!("{ts}-{agent}.{ext}"))
     }
 }
-
 
 /// Resolve the effective launch model:
 /// primary-agent model -> launch arg -> registry tool-use default -> refuse.
@@ -646,17 +752,22 @@ fn resolve_launch_model(
 /// tool-use default); None when neither is set.
 pub fn agent_default_model(store: &Store, project: &str, agent: &str) -> Option<String> {
     let config = store.load_agent(project, agent).ok()?;
-    primary_agent_model(&config.doc)
-        .or_else(registry_default)
+    primary_agent_model(&config.doc).or_else(registry_default)
 }
 
 /// The model declared on the primary agent's entry in the `agent` map.
 fn primary_agent_model(doc: &serde_json::Value) -> Option<String> {
     let agents = doc.get("agent")?.as_object()?;
     for (_name, cfg) in agents {
-        let mode = cfg.get("mode").and_then(|v| v.as_str()).unwrap_or("primary");
+        let mode = cfg
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("primary");
         if mode == "primary" {
-            return cfg.get("model").and_then(|v| v.as_str()).map(str::to_string);
+            return cfg
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
         }
     }
     None
@@ -824,7 +935,12 @@ fn attach_argv(session: &str) -> Option<Vec<String>> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Some(vec![tmux, "attach".to_string(), "-t".to_string(), session.to_string()])
+        Some(vec![
+            tmux,
+            "attach".to_string(),
+            "-t".to_string(),
+            session.to_string(),
+        ])
     }
 }
 
@@ -1029,11 +1145,7 @@ fn stop_exit_status() -> ExitStatus {
 
 /// Tail a file from the last consumed offset, emitting one complete
 /// line per call (the app's live tail over pipe-pane raw capture).
-fn poll_file(
-    path: &Path,
-    file_pos: &mut u64,
-    pending: &mut String,
-) -> Option<RunLine> {
+fn poll_file(path: &Path, file_pos: &mut u64, pending: &mut String) -> Option<RunLine> {
     loop {
         // A previous read can buffer several complete lines while this API
         // deliberately returns only one. Drain those before consulting the
@@ -1041,7 +1153,11 @@ fn poll_file(
         // has output ready for the UI.
         if let Some(end) = pending.find(['\n', '\r']) {
             let line = pending[..end].to_string();
-            let consumed = if pending[end..].starts_with("\r\n") { end + 2 } else { end + 1 };
+            let consumed = if pending[end..].starts_with("\r\n") {
+                end + 2
+            } else {
+                end + 1
+            };
             pending.drain(..consumed);
             return Some(RunLine {
                 stderr: false,
@@ -1070,7 +1186,10 @@ fn poll_file(
         pending.push_str(&String::from_utf8_lossy(&buf));
         if pending.len() > 16 * 1024 {
             let line = std::mem::take(pending);
-            return Some(RunLine { stderr: false, text: line });
+            return Some(RunLine {
+                stderr: false,
+                text: line,
+            });
         }
     }
 }
@@ -1144,10 +1263,15 @@ fn resolve_tmux() -> Option<PathBuf> {
         if let Some(found) = on_path("tmux") {
             return Some(found);
         }
-        ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin"]
-            .iter()
-            .map(|dir| PathBuf::from(dir).join("tmux"))
-            .find(|candidate| is_executable(candidate))
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/opt/local/bin",
+            "/usr/bin",
+        ]
+        .iter()
+        .map(|dir| PathBuf::from(dir).join("tmux"))
+        .find(|candidate| is_executable(candidate))
     })
     .clone()
 }
@@ -1287,10 +1411,7 @@ where
             if let Ok(mut log) = log.lock() {
                 let _ = writeln!(log, "{line}");
             }
-            let _ = tx.send(RunLine {
-                stderr,
-                text: line,
-            });
+            let _ = tx.send(RunLine { stderr, text: line });
         }
     })
 }
@@ -1343,7 +1464,9 @@ mod tests {
     /// A project with the two agents the launch tests exercise. Projects
     /// no longer come with agents — they are created from a role.
     fn core_project(store: &Store) {
-        store.create_project("default", "Default", "cdk-regtest").unwrap();
+        store
+            .create_project("default", "Default", "cdk-regtest")
+            .unwrap();
         store
             .create_agent_with_role("default", "operator", AgentRole::Tester)
             .unwrap();
@@ -1365,9 +1488,15 @@ mod tests {
         fs::write(&path, "first\nsecond\n").unwrap();
         let mut pos = 0;
         let mut pending = String::new();
-        assert_eq!(poll_file(&path, &mut pos, &mut pending).unwrap().text, "first");
+        assert_eq!(
+            poll_file(&path, &mut pos, &mut pending).unwrap().text,
+            "first"
+        );
         let consumed_len = pos;
-        assert_eq!(poll_file(&path, &mut pos, &mut pending).unwrap().text, "second");
+        assert_eq!(
+            poll_file(&path, &mut pos, &mut pending).unwrap().text,
+            "second"
+        );
         assert_eq!(pos, consumed_len, "the second line came from the buffer");
         assert!(poll_file(&path, &mut pos, &mut pending).is_none());
         let _ = fs::remove_file(path);
@@ -1380,15 +1509,9 @@ mod tests {
             pick_model(Some("inst"), Some("arg")).as_deref(),
             Some("inst")
         );
-        assert_eq!(
-            pick_model(None, Some("arg")).as_deref(),
-            Some("arg")
-        );
+        assert_eq!(pick_model(None, Some("arg")).as_deref(), Some("arg"));
         // empty values are skipped, whitespace trimmed
-        assert_eq!(
-            pick_model(None, Some("  ")),
-            None
-        );
+        assert_eq!(pick_model(None, Some("  ")), None);
     }
 
     /// Integration test (env-locked): the spawn/stop machinery
@@ -1419,7 +1542,10 @@ mod tests {
 
         let started = std::time::Instant::now();
         let stopped_at = session.stop();
-        assert_eq!(stopped_at, session.transcript, "stop returns the transcript");
+        assert_eq!(
+            stopped_at, session.transcript,
+            "stop returns the transcript"
+        );
         let mut exited = false;
         while started.elapsed() < Duration::from_secs(5) {
             if session.try_exit().is_some() {
@@ -1438,8 +1564,12 @@ mod tests {
 
         // Transcript is in the project corpus runs/.
         let runs_dir = store.project_corpus_dir("default").join("runs");
-        assert!(runs_dir.join(session.transcript.file_name().unwrap()).exists(),
-            "transcript in project corpus");
+        assert!(
+            runs_dir
+                .join(session.transcript.file_name().unwrap())
+                .exists(),
+            "transcript in project corpus"
+        );
 
         let _ = fs::remove_dir_all(&bin);
         let _ = fs::remove_dir_all(&store_dir);
@@ -1516,7 +1646,7 @@ mod tests {
     /// the server unable to tell a researcher from an operator. The piped
     /// path used to pass `--agent` only, which is invisible to the server.
     #[test]
-    fn both_launch_paths_export_the_agent_identity() {
+    fn both_launch_paths_export_the_agent_identity_and_tui_session() {
         let _guard = env_lock();
         let (store, store_dir) = tmp_store("agent-env");
         let _store = EnvVarGuard::set("CORPUS_STORE", &store_dir);
@@ -1536,7 +1666,10 @@ mod tests {
         let exported: Vec<(String, String)> = command
             .get_envs()
             .filter_map(|(k, v)| {
-                Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned()))
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
             })
             .collect();
         let agent_env = exported.iter().find(|(k, _)| k == AGENT_ENV);
@@ -1547,12 +1680,28 @@ mod tests {
         );
 
         // TUI path: the identity is exported by the launch script.
-        let script = std::env::temp_dir().join(format!("corpus-idscript-{}.sh", std::process::id()));
-        write_tui_script(&script, &[(AGENT_ENV, "discover")], None, None).unwrap();
+        let script =
+            std::env::temp_dir().join(format!("corpus-idscript-{}.sh", std::process::id()));
+        write_tui_script(
+            &script,
+            &[
+                (AGENT_ENV, "discover"),
+                (ENVIRONMENT_SESSION_ENV, "p7-default-m5-probe-g3"),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
         let body = fs::read_to_string(&script).unwrap();
         assert!(
             body.contains(&format!("export {AGENT_ENV}='discover'")),
             "the TUI path must export {AGENT_ENV}: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "export {ENVIRONMENT_SESSION_ENV}='p7-default-m5-probe-g3'"
+            )),
+            "the TUI path must export the durable environment session: {body}"
         );
         let _ = fs::remove_file(&script);
 
@@ -1571,8 +1720,14 @@ mod tests {
         // Bare launch: no --session, no --prompt.
         write_tui_script(&script, &[], None, None).unwrap();
         let bare = read(&script);
-        assert!(bare.contains("--agent \"$CORPUS_OPENCODE_HANDLE\""), "{bare}");
-        assert!(!bare.contains("--session"), "a fresh launch resumes nothing: {bare}");
+        assert!(
+            bare.contains("--agent \"$CORPUS_OPENCODE_HANDLE\""),
+            "{bare}"
+        );
+        assert!(
+            !bare.contains("--session"),
+            "a fresh launch resumes nothing: {bare}"
+        );
         assert!(!bare.contains("--prompt"), "{bare}");
 
         // Resume: the recorded id re-opens that conversation.
@@ -1623,7 +1778,10 @@ mod tests {
         assert_eq!(activity_from_idle(false, None), Idle);
         // Live + painted within the window = Working.
         assert_eq!(activity_from_idle(true, Some(0)), Working);
-        assert_eq!(activity_from_idle(true, Some(WORKING_WINDOW_SECS - 1)), Working);
+        assert_eq!(
+            activity_from_idle(true, Some(WORKING_WINDOW_SECS - 1)),
+            Working
+        );
         // Live but quiet past the window = Waiting (not Working).
         assert_eq!(activity_from_idle(true, Some(WORKING_WINDOW_SECS)), Waiting);
         assert_eq!(activity_from_idle(true, Some(600)), Waiting);
@@ -1642,6 +1800,7 @@ mod tests {
             name: None,
             session: None,
             opencode_session: None,
+            environment_session: None,
             launch_requested: None,
         };
         // No session at all → Idle, no reading.
@@ -1664,7 +1823,10 @@ mod tests {
         let log = dir.join("run.raw");
         assert_eq!(run_idle_secs(&log), None, "no capture yet is not activity");
         fs::write(&log, "painting\n").unwrap();
-        assert!(run_idle_secs(&log).unwrap() < 2, "a just-written capture reads as fresh");
+        assert!(
+            run_idle_secs(&log).unwrap() < 2,
+            "a just-written capture reads as fresh"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

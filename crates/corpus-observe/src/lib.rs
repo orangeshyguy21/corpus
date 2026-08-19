@@ -20,8 +20,9 @@ pub use models::{
     ModelProviderGroup, ModelRegistry,
 };
 pub use plugins::{
-    discover_plugins, plugin_by_name, EnvironmentDependency, PluginDir, PluginManifest,
-    PluginManifestVersion, PluginSource, ENVIRONMENT_PROTOCOL_V1, SUPPORTED_CAPABILITIES,
+    catalog_plugin, discover_plugins, plugin_by_name, plugin_catalog, EnvironmentDependency,
+    PluginDir, PluginManifest, PluginManifestVersion, PluginOrigin, PluginSource,
+    ENVIRONMENT_PROTOCOL_V1, SUPPORTED_CAPABILITIES,
 };
 
 pub const WORKING_WINDOW_SECS: u64 = 3;
@@ -119,8 +120,7 @@ pub fn run_idle_secs(log: &Path) -> Option<u64> {
 
 /// Installed plugin names from manifests only. No plugin process is started.
 pub fn plugin_names() -> Result<Vec<String>, Error> {
-    let root = corpus_store::paths::plugins_dir();
-    let mut names: Vec<String> = discover_plugins(&root)?
+    let mut names: Vec<String> = plugin_catalog()?
         .into_iter()
         .map(|plugin| plugin.manifest.name)
         .collect();
@@ -138,11 +138,36 @@ pub fn validate_pin(store: &Store, project: &str, source: &str, rev: &str) -> Re
         return Err(Error::Store(format!("pin {source}: rev is empty")));
     }
     let project = corpus_store::Project::load(store, project)?;
-    let Some(plugin_dir) = plugin_by_name(&corpus_store::paths::plugins_dir(), &project.plugin)?
-        .map(|plugin| plugin.dir)
+    let Some(plugin) = catalog_plugin(&project.plugin)?
     else {
         return Ok(());
     };
+    if plugin.manifest.manifest_version == PluginManifestVersion::V1 {
+        let Some(declared) = plugin
+            .manifest
+            .sources
+            .iter()
+            .find(|candidate| candidate.id == source)
+        else {
+            return Ok(());
+        };
+        let cached = cached_revs(
+            &store
+                .source_cache_dir()
+                .join(".rev-cache")
+                .join(format!("{source}.json")),
+        );
+        let accepted = rev == declared.default_rev
+            || cached.iter().any(|candidate| candidate == rev)
+            || matches!(rev, "main" | "master")
+            || is_commit_sha(rev);
+        return accepted.then_some(()).ok_or_else(|| {
+            Error::Store(format!(
+                "pin {source}={rev:?} is not the manifest default, a cached rev, main/master, or a 40-hex commit sha"
+            ))
+        });
+    }
+    let plugin_dir = plugin.dir;
     let config = match fs::read_to_string(plugin_dir.join("config.toml")) {
         Ok(raw) => match toml::from_str::<toml::Value>(&raw) {
             Ok(config) => config,
@@ -157,13 +182,14 @@ pub fn validate_pin(store: &Store, project: &str, source: &str, rev: &str) -> Re
     if !declared {
         return Ok(());
     }
-    let Ok(resources) = corpus_store::paths::resources_for_plugins() else {
+    let Ok(resources) = corpus_store::paths::resource_root() else {
         return Ok(());
     };
     let manifest_tag = source_manifest_tag(&resources.join("sources.toml"), source);
     let cached = cached_revs(
-        &resources
-            .join("sources/.rev-cache")
+        &store
+            .source_cache_dir()
+            .join(".rev-cache")
             .join(format!("{source}.json")),
     );
     let accepted = manifest_tag.as_deref() == Some(rev)
