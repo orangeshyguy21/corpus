@@ -500,7 +500,7 @@ impl Sidebar {
         };
         let mut open = true;
         let mut done = false;
-        egui::Window::new("Rename project")
+        theme::dialog(ui.ctx(), "sidebar_rename_project", "Rename project")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -554,7 +554,7 @@ impl Sidebar {
             return;
         };
         let mut open = true;
-        egui::Window::new("Rename mission")
+        theme::dialog(ui.ctx(), "sidebar_rename_mission", "Rename mission")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -633,7 +633,7 @@ impl Sidebar {
     fn create_project_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
         let mut open = self.create_project;
         let mut done = false;
-        egui::Window::new("New project")
+        theme::dialog(ui.ctx(), "sidebar_new_project", "New project")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -677,7 +677,7 @@ impl Sidebar {
     fn new_agent_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
         let mut open = self.new_agent;
         let mut done = false;
-        egui::Window::new("New agent")
+        theme::dialog(ui.ctx(), "sidebar_new_agent", "New agent")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -743,7 +743,11 @@ impl Sidebar {
         };
         let mut open = self.show_clone;
         let mut done = false;
-        egui::Window::new(format!("Clone project: {from}"))
+        theme::dialog(
+            ui.ctx(),
+            "sidebar_clone_project",
+            format!("Clone project: {from}"),
+        )
             .open(&mut open)
             .collapsible(false)
             .resizable(false)

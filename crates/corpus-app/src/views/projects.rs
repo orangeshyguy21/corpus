@@ -204,19 +204,22 @@ impl ProjectsView {
         slug: &str,
     ) {
         if dashboard_columns(ui.available_width()) == 2 {
-            ui.columns(2, |columns| {
-                let (left, right) = columns.split_at_mut(1);
-                self.configuration_card(&mut left[0], state, toasts, slug);
-                card_gap(&mut left[0]);
-                self.team_card(&mut left[0], state);
-                card_gap(&mut left[0]);
-                self.corpus_card(&mut left[0], state);
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = theme::CARD_GUTTER;
+                ui.columns(2, |columns| {
+                    let (left, right) = columns.split_at_mut(1);
+                    self.configuration_card(&mut left[0], state, toasts, slug);
+                    card_gap(&mut left[0]);
+                    self.team_card(&mut left[0], state);
+                    card_gap(&mut left[0]);
+                    self.corpus_card(&mut left[0], state);
 
-                self.missions_card(&mut right[0], state, slug);
-                card_gap(&mut right[0]);
-                self.logs_card(&mut right[0], state);
-                card_gap(&mut right[0]);
-                self.cost_card(&mut right[0], state);
+                    self.missions_card(&mut right[0], state, slug);
+                    card_gap(&mut right[0]);
+                    self.logs_card(&mut right[0], state);
+                    card_gap(&mut right[0]);
+                    self.cost_card(&mut right[0], state);
+                });
             });
         } else {
             self.configuration_card(ui, state, toasts, slug);
@@ -634,7 +637,7 @@ impl ProjectsView {
         let mut open = self.confirm_delete;
         let mut deleted = false;
         let mut cancel = false;
-        egui::Window::new("Delete project")
+        theme::dialog(ui.ctx(), "project_view_delete", "Delete project")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -677,7 +680,7 @@ impl ProjectsView {
         let mut open = self.confirm_wipe;
         let mut wiped = false;
         let mut cancel = false;
-        egui::Window::new("Delete corpus")
+        theme::dialog(ui.ctx(), "project_view_wipe", "Delete corpus")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -721,7 +724,7 @@ impl ProjectsView {
         }
         let mut open = self.show_rename;
         let mut renamed = false;
-        egui::Window::new("Rename project")
+        theme::dialog(ui.ctx(), "project_view_rename", "Rename project")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -763,7 +766,11 @@ impl ProjectsView {
         }
         let mut open = self.show_clone;
         let mut cloned = false;
-        egui::Window::new(format!("Clone project: {from}"))
+        theme::dialog(
+            ui.ctx(),
+            "project_view_clone",
+            format!("Clone project: {from}"),
+        )
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -800,7 +807,11 @@ impl ProjectsView {
         }
         let mut open = self.show_install;
         let mut started = false;
-        egui::Window::new("Install environment plugin")
+        theme::dialog(
+            ui.ctx(),
+            "project_view_install_plugin",
+            "Install environment plugin",
+        )
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -918,13 +929,16 @@ fn finding_summary(ui: &mut Ui, model: &FindingSummaryModel) {
         }
     };
     let width = finding_tile_width(ui.available_width());
-    ui.horizontal_wrapped(|ui| {
-        for (label, count, color) in finding_count_entries(*counts) {
-            if count == 0 {
-                continue;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(theme::CARD_GUTTER, theme::CARD_GUTTER);
+        ui.horizontal_wrapped(|ui| {
+            for (label, count, color) in finding_count_entries(*counts) {
+                if count == 0 {
+                    continue;
+                }
+                finding_count_tile(ui, width, label, count, color);
             }
-            finding_count_tile(ui, width, label, count, color);
-        }
+        });
     });
 }
 
@@ -983,7 +997,7 @@ fn finding_count_tile(
 }
 
 fn card_gap(ui: &mut Ui) {
-    ui.add_space(12.0);
+    ui.add_space(theme::CARD_GUTTER);
 }
 
 fn command_label(text: &str) -> RichText {
@@ -1022,7 +1036,7 @@ fn plugin_summary(ui: &mut Ui, status: &corpus_core::PluginStatus) {
 fn details_toggle(ui: &mut Ui, open: &mut bool) {
     egui::Frame::default()
         .stroke(egui::Stroke::new(1.0_f32, theme::KEYLINE_SOFT))
-        .corner_radius(egui::CornerRadius::same(2))
+        .corner_radius(theme::CONTROL_RADIUS)
         .inner_margin(egui::Margin::symmetric(10, 7))
         .show(ui, |ui| {
             let marker = if *open { "⌄" } else { "›" };

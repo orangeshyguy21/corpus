@@ -665,19 +665,6 @@ impl App {
                         self.state.refresh_corpus_stats(&p);
                     }
                 }
-                // The header names the project, never a bare UUID.
-                let label = self
-                    .state
-                    .effective_project()
-                    .and_then(|slug| {
-                        self.state
-                            .projects
-                            .iter()
-                            .find(|(s, _)| s == &slug)
-                            .map(|(_, p)| p.name.clone())
-                    })
-                    .unwrap_or_default();
-                self.chat_panel.set_project_label(&label);
                 self.ensure_chat_started(ui.ctx());
                 // Juice the session with the operator's current position
                 // (re-pushed only when it changes).

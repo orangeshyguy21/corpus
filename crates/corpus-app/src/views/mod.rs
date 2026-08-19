@@ -4,10 +4,11 @@
 
 pub mod agents;
 pub mod components;
-pub mod json_editor;
 pub mod mission_actions;
 pub mod missions;
+pub mod model_picker;
 pub mod plugin_picker;
 pub mod policy;
 pub mod projects;
 pub mod source_dropdown;
+pub mod syntax_editor;

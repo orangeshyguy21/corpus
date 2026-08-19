@@ -74,10 +74,10 @@ egui_term = { workspace = true }
 alacritty_terminal = "0.25"
 egui-phosphor.workspace = true
 image.workspace = true
-# JSON syntax highlighting in the agent editor (app-flow chunk 4): a
+# JSON and Markdown syntax highlighting in editable text areas: a
 # layouter maps syntect token styles onto the theme's token colours. The
 # degrade arm (plain monospace TextEdit) stays if syntect fights egui 0.31
-# — see views/json_editor.rs.
+# — see views/syntax_editor.rs.
 syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes"] }
 # GFM table splitting for the chat log (chat/tables.rs): pinned to the SAME
 # 0.12 line egui_commonmark 0.20 parses with, so a segment boundary is exactly

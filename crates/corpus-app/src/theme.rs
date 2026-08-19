@@ -115,6 +115,17 @@ pub const PANEL_MARGIN: f32 = 10.0;
 pub const SPACING: f32 = 8.0;
 /// Vertical gap between stacked controls / rows.
 pub const PANEL_GAP: f32 = 6.0;
+/// Equal horizontal and vertical gap between peer cards in responsive grids.
+pub const CARD_GUTTER: f32 = 12.0;
+/// Form controls use hard square corners throughout the app. Cards and
+/// conversational surfaces own their shape separately.
+pub const CONTROL_RADIUS: egui::CornerRadius = egui::CornerRadius::ZERO;
+const DIALOG_SHADOW: egui::epaint::Shadow = egui::epaint::Shadow {
+    offset: [0, 10],
+    blur: 40,
+    spread: 6,
+    color: Color32::from_black_alpha(190),
+};
 
 const DISPLAY_MEDIUM_FAMILY: &str = "display-medium";
 const DISPLAY_BOLD_FAMILY: &str = "display-bold";
@@ -204,7 +215,7 @@ pub fn sc_annotation(text: impl Into<String>) -> egui::RichText {
 }
 
 // --- control helpers (spec §1c) ---
-/// A house button: fill #1c1d22, 1px HAIRLINE stroke, radius 2, padding
+/// A square house button: fill #1c1d22, 1px HAIRLINE stroke, padding
 /// (12,7), 14px TEXT. Hover fill #232429.
 pub fn house_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
     ui.scope(|ui| {
@@ -212,6 +223,26 @@ pub fn house_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
         override_button_visuals(style, HOUSE_FILL, ButtonKind::House);
         style.spacing.button_padding = egui::vec2(12.0, 7.0);
         ui.button(egui::RichText::new(text.into()).size(14.0).color(TEXT))
+    })
+    .inner
+}
+
+/// A house button with a Phosphor glyph and a regular text label. Keeping the
+/// runs separate prevents the label font from turning private-use icons into
+/// tofu after custom typography is installed.
+pub fn house_icon_button(ui: &mut Ui, icon: &str, text: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let style = ui.style_mut();
+        override_button_visuals(style, HOUSE_FILL, ButtonKind::House);
+        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        ui.add(egui::Button::new(icon_label(
+            icon,
+            14.0,
+            TEXT,
+            text,
+            FontId::proportional(14.0),
+            TEXT,
+        )))
     })
     .inner
 }
@@ -230,6 +261,24 @@ pub fn primary_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
                 .strong()
                 .color(ON_INTERACTION),
         )
+    })
+    .inner
+}
+
+/// Primary action with a Phosphor icon pinned independently from its label.
+pub fn primary_icon_button(ui: &mut Ui, icon: &str, text: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let style = ui.style_mut();
+        override_button_visuals(style, INTERACTION, ButtonKind::Primary);
+        style.spacing.button_padding = egui::vec2(16.0, 9.0);
+        ui.add(egui::Button::new(icon_label(
+            icon,
+            14.0,
+            ON_INTERACTION,
+            text,
+            FontId::proportional(14.0),
+            ON_INTERACTION,
+        )))
     })
     .inner
 }
@@ -271,7 +320,7 @@ pub fn segment_button(ui: &mut Ui, selected: bool, text: &str) -> egui::Response
                     KEYLINE_SOFT
                 },
             );
-            ws.corner_radius = egui::CornerRadius::same(2);
+            ws.corner_radius = CONTROL_RADIUS;
         }
         let color = if selected { INTERACTION } else { TEXT_MUTED };
         ui.button(egui::RichText::new(text).size(12.5).color(color))
@@ -325,7 +374,7 @@ pub fn icon_text(icon: &str, size: f32, color: Color32) -> egui::RichText {
 }
 
 /// A flat field frame for dropdown-like fields: PANEL fill, 1px HAIRLINE,
-/// radius 2, inner margin (8,4). (Non-ComboBox fields; a ComboBox must be
+/// square corners, inner margin (8,4). (Non-ComboBox fields; a ComboBox must be
 /// restyled via `combo_field`'s scoped widget-visuals — a wrapping Frame
 /// cannot reach its internal button, spec §9.)
 #[allow(dead_code)]
@@ -333,8 +382,32 @@ pub fn flat_field_frame() -> egui::Frame {
     egui::Frame::default()
         .fill(PANEL)
         .stroke(egui::Stroke::new(1.0_f32, HAIRLINE))
-        .corner_radius(egui::CornerRadius::same(2))
+        .corner_radius(CONTROL_RADIUS)
         .inner_margin(egui::Margin::symmetric(8, 4))
+}
+
+/// House dialog chrome: the same square smoked card and bracketed title used
+/// by the main views, lifted above the unchanged workspace by its own shadow.
+pub fn dialog(
+    _ctx: &egui::Context,
+    id_salt: &'static str,
+    title: impl Into<String>,
+) -> egui::Window<'static> {
+    egui::Window::new(section_heading(title.into()))
+        .id(egui::Id::new(("house_dialog", id_salt)))
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .frame(dialog_frame())
+}
+
+fn dialog_frame() -> egui::Frame {
+    egui::Frame::default()
+        .fill(PANEL_RAISED)
+        .stroke(egui::Stroke::new(1.0_f32, CARD_BORDER))
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::same(14))
+        .shadow(DIALOG_SHADOW)
 }
 
 /// A phosphor glyph followed by text in ONE laid-out line — needed wherever
@@ -389,7 +462,7 @@ pub fn hairline(ui: &mut Ui) {
 }
 
 /// Run `inner` inside a scope whose widget visuals restyle the ComboBox's
-/// internal button into a flat PANEL field — 1px HAIRLINE, radius 2,
+/// internal button into a flat PANEL field — 1px HAIRLINE, square corners,
 /// TEXT text (spec §3). A wrapping Frame cannot reach a ComboBox's button,
 /// so every flat dropdown wraps itself in this.
 pub fn combo_field<R>(ui: &mut Ui, inner: impl FnOnce(&mut Ui) -> R) -> R {
@@ -399,11 +472,12 @@ pub fn combo_field<R>(ui: &mut Ui, inner: impl FnOnce(&mut Ui) -> R) -> R {
             &mut style.visuals.widgets.inactive,
             &mut style.visuals.widgets.hovered,
             &mut style.visuals.widgets.active,
+            &mut style.visuals.widgets.open,
         ] {
             ws.bg_fill = PANEL;
             ws.weak_bg_fill = PANEL; // the ComboBox's button paints THIS one
             ws.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
-            ws.corner_radius = egui::CornerRadius::same(2);
+            ws.corner_radius = CONTROL_RADIUS;
             ws.fg_stroke.color = TEXT;
         }
         style.spacing.button_padding = egui::vec2(8.0, 4.0);
@@ -447,11 +521,11 @@ fn override_button_visuals(style: &mut egui::Style, resting: Color32, kind: Butt
         // ~10% lighter red on hover.
         ButtonKind::Destructive => Color32::from_rgb(0xed, 0x59, 0x41),
     };
-    let radius = egui::CornerRadius::same(2);
     for ws in [
         &mut style.visuals.widgets.inactive,
         &mut style.visuals.widgets.hovered,
         &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
     ] {
         ws.bg_stroke = egui::Stroke::new(
             1.0_f32,
@@ -461,7 +535,7 @@ fn override_button_visuals(style: &mut egui::Style, resting: Color32, kind: Butt
                 ButtonKind::Destructive => SIGNAL_RED,
             },
         );
-        ws.corner_radius = radius;
+        ws.corner_radius = CONTROL_RADIUS;
     }
     // A Button paints `weak_bg_fill`, NOT `bg_fill` (that one is for
     // checkbox/slider tracks). Setting only `bg_fill` left every house and
@@ -471,6 +545,7 @@ fn override_button_visuals(style: &mut egui::Style, resting: Color32, kind: Butt
         (&mut style.visuals.widgets.inactive, resting),
         (&mut style.visuals.widgets.hovered, hover_fill),
         (&mut style.visuals.widgets.active, hover_fill),
+        (&mut style.visuals.widgets.open, hover_fill),
     ] {
         ws.bg_fill = fill;
         ws.weak_bg_fill = fill;
@@ -544,21 +619,27 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.noninteractive.bg_fill = BG;
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE_SOFT);
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT_MUTED);
+    visuals.widgets.noninteractive.corner_radius = CONTROL_RADIUS;
     // Widget surfaces are one step lighter than the canvas. `weak_bg_fill` is
     // what a Button/ComboBox actually paints, so it tracks `bg_fill` here —
     // set alone, `bg_fill` left every plain button on egui's default grey.
     visuals.widgets.inactive.bg_fill = PANEL;
     visuals.widgets.inactive.weak_bg_fill = PANEL;
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE_SOFT);
-    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.inactive.corner_radius = CONTROL_RADIUS;
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x28, 0x25, 0x20);
     visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x28, 0x25, 0x20);
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE);
-    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.hovered.corner_radius = CONTROL_RADIUS;
     visuals.widgets.active.bg_fill = Color32::from_rgb(0x31, 0x29, 0x20);
     visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0x31, 0x29, 0x20);
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE_STRONG);
-    visuals.widgets.active.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.active.corner_radius = CONTROL_RADIUS;
+    visuals.widgets.open.bg_fill = PANEL;
+    visuals.widgets.open.weak_bg_fill = PANEL;
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE_STRONG);
+    visuals.widgets.open.corner_radius = CONTROL_RADIUS;
+    visuals.menu_corner_radius = CONTROL_RADIUS;
     // Selected rows stay subordinate to primary actions: a smoked amber tint
     // with amber type remains legible in every ComboBox and menu, unlike a
     // solid interaction slab. Text-edit selection uses the same quiet state.
@@ -585,6 +666,33 @@ pub fn apply(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn form_controls_and_menus_are_square() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let style = ctx.style();
+        for widget in [
+            &style.visuals.widgets.noninteractive,
+            &style.visuals.widgets.inactive,
+            &style.visuals.widgets.hovered,
+            &style.visuals.widgets.active,
+            &style.visuals.widgets.open,
+        ] {
+            assert_eq!(widget.corner_radius, CONTROL_RADIUS);
+        }
+        assert_eq!(style.visuals.menu_corner_radius, CONTROL_RADIUS);
+    }
+
+    #[test]
+    fn dialogs_use_opaque_square_cards_with_a_real_shadow() {
+        let frame = dialog_frame();
+        assert_eq!(frame.fill, PANEL_RAISED);
+        assert_eq!(frame.stroke.color, CARD_BORDER);
+        assert_eq!(frame.corner_radius, egui::CornerRadius::ZERO);
+        assert!(frame.shadow.blur > 0);
+        assert!(frame.shadow.color.a() > 0);
+    }
 
     fn linear(channel: u8) -> f32 {
         let value = channel as f32 / 255.0;
@@ -650,5 +758,27 @@ mod tests {
         assert_eq!(heading.sections[0].format.color, INTERACTION);
         assert_eq!(heading.sections[1].format.color, TEXT);
         assert_eq!(heading.sections[2].format.color, INTERACTION);
+    }
+
+    #[test]
+    fn icon_labels_keep_phosphor_separate_from_text_font() {
+        let label = icon_label(
+            egui_phosphor::regular::PLUS,
+            14.0,
+            TEXT,
+            "New Mission",
+            FontId::proportional(14.0),
+            TEXT,
+        );
+
+        assert_eq!(label.sections.len(), 2);
+        assert_eq!(
+            label.sections[0].format.font_id.family,
+            egui::FontFamily::Name("phosphor".into())
+        );
+        assert_eq!(
+            label.sections[1].format.font_id.family,
+            egui::FontFamily::Proportional
+        );
     }
 }

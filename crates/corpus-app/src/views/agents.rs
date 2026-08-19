@@ -14,7 +14,7 @@ use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
 use crate::state::AppState;
 use crate::theme;
-use crate::views::{components, json_editor};
+use crate::views::{components, model_picker, syntax_editor};
 
 const AGENT_TWO_COLUMN_AT: f32 = 940.0;
 
@@ -62,6 +62,8 @@ pub struct AgentsView {
     new_subagent: Option<NewSubagent>,
     /// opencode's model catalog, fetched on demand (a subprocess).
     models: crate::state::ModelDiscovery,
+    /// Search, collapse and keyboard state for the shared model picker.
+    model_picker: model_picker::ModelPicker,
     /// Delete is never dispatched from the page action itself; the action
     /// opens this confirmation ritual first.
     confirm_delete: bool,
@@ -121,6 +123,7 @@ impl Default for AgentsView {
             draft: None,
             new_subagent: None,
             models: crate::state::ModelDiscovery::Loading,
+            model_picker: model_picker::ModelPicker::default(),
             confirm_delete: false,
         }
     }
@@ -250,7 +253,7 @@ impl AgentsView {
                 if theme::house_button(ui, label).clicked() {
                     self.save(state, toasts, project, slug);
                 }
-                if theme::primary_button(ui, format!("{}  New Mission", ph::PLUS)).clicked() {
+                if theme::primary_icon_button(ui, ph::PLUS, "New Mission").clicked() {
                     self.new_mission(state, toasts, project, slug);
                 }
             },
@@ -285,17 +288,17 @@ impl AgentsView {
             return;
         }
 
-        // --- JSON editor (spec §6): monospace 13.5px, fills the width,
-        // min height 480, in a Frame (EDITOR_BG fill, 1px HAIRLINE, radius 2).
+        // --- JSON editor (spec §6): monospace 13px, fills the width,
+        // min height 480, in a square Frame (EDITOR_BG fill, 1px HAIRLINE).
         components::panel_card(ui, "Raw configuration", "原始配置", |ui| {
             egui::Frame::default()
                 .fill(theme::EDITOR_BG)
                 .stroke(egui::Stroke::new(1.0_f32, theme::HAIRLINE))
-                .corner_radius(egui::CornerRadius::same(2))
+                .corner_radius(theme::CONTROL_RADIUS)
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
                     ui.set_min_height(480.0);
-                    let mut layouter = json_editor::layouter;
+                    let mut layouter = syntax_editor::json_layouter;
                     ui.add(
                         egui::TextEdit::multiline(&mut self.editor_text)
                             .font(egui::TextStyle::Monospace)
@@ -438,44 +441,47 @@ impl AgentsView {
         }
 
         if agent_form_columns(ui.available_width()) == 2 {
-            ui.columns(2, |columns| {
-                let (left, right) = columns.split_at_mut(1);
-                self.identity_card(&mut left[0], state, is_primary);
-                left[0].add_space(12.0);
-                self.role_card(
-                    &mut left[0],
-                    state,
-                    toasts,
-                    project,
-                    slug,
-                    agent,
-                    cfg,
-                    is_primary,
-                );
-                left[0].add_space(12.0);
-                self.subagents_card(
-                    &mut left[0],
-                    state,
-                    toasts,
-                    project,
-                    slug,
-                    agent,
-                    &subagents,
-                );
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = theme::CARD_GUTTER;
+                ui.columns(2, |columns| {
+                    let (left, right) = columns.split_at_mut(1);
+                    self.identity_card(&mut left[0], state, is_primary);
+                    left[0].add_space(theme::CARD_GUTTER);
+                    self.role_card(
+                        &mut left[0],
+                        state,
+                        toasts,
+                        project,
+                        slug,
+                        agent,
+                        cfg,
+                        is_primary,
+                    );
+                    left[0].add_space(theme::CARD_GUTTER);
+                    self.subagents_card(
+                        &mut left[0],
+                        state,
+                        toasts,
+                        project,
+                        slug,
+                        agent,
+                        &subagents,
+                    );
 
-                self.description_card(&mut right[0]);
-                right[0].add_space(12.0);
-                self.prompt_card(&mut right[0]);
+                    self.description_card(&mut right[0]);
+                    right[0].add_space(theme::CARD_GUTTER);
+                    self.prompt_card(&mut right[0]);
+                });
             });
         } else {
             self.identity_card(ui, state, is_primary);
-            ui.add_space(12.0);
+            ui.add_space(theme::CARD_GUTTER);
             self.role_card(ui, state, toasts, project, slug, agent, cfg, is_primary);
-            ui.add_space(12.0);
+            ui.add_space(theme::CARD_GUTTER);
             self.subagents_card(ui, state, toasts, project, slug, agent, &subagents);
-            ui.add_space(12.0);
+            ui.add_space(theme::CARD_GUTTER);
             self.description_card(ui);
-            ui.add_space(12.0);
+            ui.add_space(theme::CARD_GUTTER);
             self.prompt_card(ui);
         }
     }
@@ -641,73 +647,55 @@ impl AgentsView {
         let Some(current) = self.draft.as_ref().map(|d| d.model.clone()) else {
             return;
         };
+        // Fetched lazily when the form is rendered; AppState owns the
+        // background job and the process-wide catalog cache.
+        if matches!(self.models, crate::state::ModelDiscovery::Loading) {
+            self.models = state.opencode_models(false);
+        }
         ui.label(field_label("Model"));
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            theme::combo_field(ui, |ui| {
-                egui::ComboBox::from_id_salt("agent_model")
-                    .icon(theme::combo_caret)
-                    .width((ui.available_width() - 92.0).max(220.0))
-                    .selected_text(
-                        RichText::new(if current.is_empty() {
-                            "(inherit launch default)".to_string()
-                        } else {
-                            current.clone()
-                        })
-                        .size(13.0),
-                    )
-                    .show_ui(ui, |ui| {
-                        // Fetched lazily: this shells out to opencode.
-                        if matches!(self.models, crate::state::ModelDiscovery::Loading) {
-                            self.models = state.opencode_models(false);
-                        }
-                        let list = match &self.models {
-                            crate::state::ModelDiscovery::Ready(list) => list,
-                            crate::state::ModelDiscovery::Loading => {
-                                ui.label(RichText::new("loading opencode catalog…").size(12.0));
-                                return;
-                            }
-                            crate::state::ModelDiscovery::Failed(error) => {
-                                ui.label(
-                                    RichText::new("opencode catalog unavailable")
-                                        .size(12.0)
-                                        .color(theme::SIGNAL_RED),
-                                )
-                                .on_hover_text(error);
-                                return;
-                            }
-                        };
-                        let mut picked: Option<String> = None;
-                        if ui
-                            .selectable_label(current.is_empty(), "(inherit launch default)")
-                            .clicked()
-                        {
-                            picked = Some(String::new());
-                        }
-                        for group in &list.groups {
-                            ui.label(RichText::new(&group.label).weak().size(11.0));
-                            for m in &group.models {
-                                if ui
-                                    .selectable_label(
-                                        current == m.id,
-                                        RichText::new(&m.id).size(12.5),
-                                    )
-                                    .on_hover_text(&m.name)
-                                    .clicked()
-                                {
-                                    picked = Some(m.id.clone());
-                                }
-                            }
-                        }
-                        if let (Some(id), Some(draft)) = (picked, &mut self.draft) {
-                            draft.model = id;
-                        }
-                    });
-            });
-            if theme::house_button(ui, "Refresh")
-                .on_hover_text("re-pull opencode's catalog")
-                .clicked()
-            {
+            let field_width = ui.available_width().max(220.0);
+            let catalog = match &self.models {
+                crate::state::ModelDiscovery::Ready(list) => model_picker::Catalog::Ready(list),
+                crate::state::ModelDiscovery::Loading => {
+                    model_picker::Catalog::Loading("loading opencode catalog…")
+                }
+                crate::state::ModelDiscovery::Failed(error) => model_picker::Catalog::Failed {
+                    label: "opencode catalog unavailable",
+                    detail: error,
+                },
+            };
+            let output = self.model_picker.show(
+                ui,
+                catalog,
+                model_picker::Options {
+                    id_salt: "agent_model",
+                    current_id: &current,
+                    selected_label: &current,
+                    empty_label: "(inherit launch default)",
+                    none_label: Some("(inherit launch default)"),
+                    field_width,
+                    font_size: 13.0,
+                    text_color: theme::TEXT,
+                    status_dot: None,
+                    refresh_label: "Refresh models",
+                },
+            );
+            match output.selection {
+                Some(model_picker::Selection::None) => {
+                    if let Some(draft) = &mut self.draft {
+                        draft.model.clear();
+                    }
+                }
+                Some(model_picker::Selection::Model(model)) => {
+                    if let Some(draft) = &mut self.draft {
+                        draft.model = model.id;
+                    }
+                }
+                None => {}
+            }
+            if output.refresh_requested {
                 self.models = state.opencode_models(true);
             }
         });
@@ -716,21 +704,26 @@ impl AgentsView {
     /// Description edits remain draft-only until the fixed Save action.
     fn description_section(&mut self, ui: &mut Ui) {
         let Some(draft) = &mut self.draft else { return };
+        let mut layouter = syntax_editor::markdown_layouter;
         ui.add(
             egui::TextEdit::multiline(&mut draft.description)
+                .font(egui::TextStyle::Monospace)
                 .desired_rows(4)
-                .desired_width(f32::INFINITY),
+                .desired_width(f32::INFINITY)
+                .layouter(&mut layouter),
         );
     }
 
     /// The prompt gets the largest editor surface and keeps monospace type.
     fn prompt_section(&mut self, ui: &mut Ui) {
         let Some(draft) = &mut self.draft else { return };
+        let mut layouter = syntax_editor::markdown_layouter;
         ui.add(
             egui::TextEdit::multiline(&mut draft.prompt)
                 .font(egui::TextStyle::Monospace)
                 .desired_rows(22)
-                .desired_width(f32::INFINITY),
+                .desired_width(f32::INFINITY)
+                .layouter(&mut layouter),
         );
     }
 
@@ -786,7 +779,7 @@ impl AgentsView {
         ui.add_space(8.0);
         match &mut self.new_subagent {
             None => {
-                if theme::house_button(ui, format!("{}  Add subagent", ph::PLUS)).clicked() {
+                if theme::house_icon_button(ui, ph::PLUS, "Add subagent").clicked() {
                     self.new_subagent = Some(NewSubagent {
                         // Default to the conventional `<primary>-scout`.
                         name: format!("{slug}-scout"),
@@ -800,7 +793,7 @@ impl AgentsView {
                 egui::Frame::default()
                     .fill(theme::PANEL)
                     .stroke(egui::Stroke::new(1.0_f32, theme::HAIRLINE))
-                    .corner_radius(egui::CornerRadius::same(2))
+                    .corner_radius(theme::CONTROL_RADIUS)
                     .inner_margin(egui::Margin::same(10))
                     .show(ui, |ui| {
                         ui.label(
@@ -818,11 +811,13 @@ impl AgentsView {
                         ui.text_edit_singleline(&mut form.description);
                         ui.add_space(6.0);
                         ui.label(RichText::new("prompt").size(11.5).color(theme::TEXT_MUTED));
+                        let mut layouter = syntax_editor::markdown_layouter;
                         ui.add(
                             egui::TextEdit::multiline(&mut form.prompt)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_rows(5)
-                                .desired_width(f32::INFINITY),
+                                .desired_width(f32::INFINITY)
+                                .layouter(&mut layouter),
                         );
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
@@ -1019,7 +1014,7 @@ impl AgentsView {
         let mut open = self.confirm_delete;
         let mut deleted = false;
         let mut cancel = false;
-        egui::Window::new("Delete agent")
+        theme::dialog(ui.ctx(), "agent_view_delete", "Delete agent")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)

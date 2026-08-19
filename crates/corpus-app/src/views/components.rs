@@ -264,11 +264,12 @@ pub fn action_menu<R>(
             &mut style.visuals.widgets.inactive,
             &mut style.visuals.widgets.hovered,
             &mut style.visuals.widgets.active,
+            &mut style.visuals.widgets.open,
         ] {
             widget.bg_fill = theme::PANEL;
             widget.weak_bg_fill = theme::PANEL;
             widget.bg_stroke = egui::Stroke::new(1.0_f32, theme::KEYLINE);
-            widget.corner_radius = egui::CornerRadius::same(2);
+            widget.corner_radius = theme::CONTROL_RADIUS;
         }
         ui.menu_button(
             theme::icon_text(ph::DOTS_THREE_VERTICAL, 17.0, theme::INTERACTION),

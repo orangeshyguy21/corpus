@@ -51,10 +51,10 @@ pub fn plugin_picker(
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, egui::CornerRadius::same(2), theme::PANEL);
+    painter.rect_filled(rect, theme::CONTROL_RADIUS, theme::PANEL);
     painter.rect_stroke(
         rect,
-        egui::CornerRadius::same(2),
+        theme::CONTROL_RADIUS,
         egui::Stroke::new(1.0_f32, theme::HAIRLINE),
         egui::StrokeKind::Inside,
     );
