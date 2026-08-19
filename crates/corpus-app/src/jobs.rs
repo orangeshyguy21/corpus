@@ -104,6 +104,10 @@ impl JobKind {
 pub(crate) struct JobScope {
     pub project: String,
     pub project_generation: u64,
+    /// Corpus invalidation revision captured when a corpus-reading job starts.
+    /// It is deliberately absent from `JobKey`: dirty-during-flight work is
+    /// coalesced behind the active walk, then rescheduled when that key clears.
+    pub corpus_revision: Option<u64>,
     pub run_id: Option<RunId>,
 }
 
@@ -374,6 +378,7 @@ mod tests {
         JobScope {
             project: "p".into(),
             project_generation: generation,
+            corpus_revision: None,
             run_id: None,
         }
     }

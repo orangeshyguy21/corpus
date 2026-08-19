@@ -190,6 +190,7 @@ pub fn human_tool_name(raw: &str) -> String {
             "corpus_stats" => "corpus stats".into(),
             "corpus_list" => "list corpus entries".into(),
             "corpus_read" => "read corpus entry".into(),
+            "finding_list" => "list findings".into(),
             "corpus_wipe" => "WIPE corpus".into(),
             "model_list" => "list available models".into(),
             other => other.replace('_', " "),
@@ -963,6 +964,7 @@ impl ChatPanelView {
             crate::jobs::JobScope {
                 project: String::new(),
                 project_generation: 0,
+                corpus_revision: None,
                 run_id: None,
             },
             std::time::Duration::from_secs(15),
@@ -1255,6 +1257,7 @@ mod tests {
             "project-manager › create project"
         );
         assert_eq!(human_tool_name("corpus_wipe"), "WIPE corpus");
+        assert_eq!(human_tool_name("finding_list"), "list findings");
         // Fallback: unknown names strip the extension prefix and underscores.
         assert_eq!(human_tool_name("corpus-admin__future_thing"), "future thing");
         // Every catalog tool has a non-empty human name.

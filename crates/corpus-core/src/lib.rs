@@ -8,6 +8,7 @@
 mod agents;
 pub mod audit;
 mod error;
+mod findings;
 pub mod frontmatter;
 pub mod launch;
 mod models;
@@ -23,6 +24,12 @@ mod test_support;
 
 pub use agents::{AgentConfig, AgentSidecar, DEFAULT_AGENT_NAME, OPENCODE_SCHEMA, SourcePin};
 pub use error::{Error, Result};
+pub use findings::{
+    finding_cards, query_findings, read_finding, scan_findings_cached, FindingCard, FindingIndexCache,
+    FindingQuery, FindingReferenceSource, FindingScan, FindingScanStats, FindingSeverity,
+    FindingSort, FindingTimeSource, FindingTitleSource, FindingWarning, FindingWriteResult,
+    NewFinding, FINDING_PREFIX_LIMIT, FINDING_RESERVED_KEYS,
+};
 pub use launch::{
     activity_from_idle, agent_default_model, agent_file_stem, export_session, kill_tmux_session,
     kill_tmux_session_checked, live_tui_sessions, mission_run_state, opencode_agent_handle,

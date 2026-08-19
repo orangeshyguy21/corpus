@@ -1,0 +1,157 @@
+version: 1
+
+# P1.0 consumes this recipe when its benchmark harness lands. Keeping the
+# cardinality here makes the correctness and performance fixtures one contract.
+benchmark:
+  copies_per_case: 128
+  minimum_cards: 1000
+
+cases:
+  - id: critical
+    file: 1787091224-critical-mint-overflow.md
+    modified_time: 1787091000
+    expected:
+      title: Critical mint overflow
+      title_source: title
+      severity: critical
+      timestamp: 1787091224
+      time_source: timestamp
+      reference: findings/1787091224-critical-mint-overflow.md
+      reference_source: path
+      warnings: []
+
+  - id: canonical-high
+    file: 1787091224-unauth-upload.md
+    modified_time: 1787091001
+    expected:
+      title: Unauthenticated upload bypass
+      title_source: title
+      severity: high
+      timestamp: 1787091224
+      time_source: timestamp
+      reference: findings/1787091224-unauth-upload.md
+      reference_source: path
+      warnings: []
+
+  - id: large-body
+    file: 1787091210-large-body.md
+    modified_time: 1787091002
+    append_body_bytes: 262144
+    expected:
+      title: Large narrative finding
+      title_source: title
+      severity: high
+      timestamp: 1787091210
+      time_source: timestamp
+      reference: findings/1787091210-large-body.md
+      reference_source: path
+      warnings: []
+
+  - id: nested-name-only
+    file: campaigns/august/1787091200-session-confusion.md
+    modified_time: 1787091003
+    expected:
+      title: Session confusion across mint replicas
+      title_source: name
+      severity: medium
+      timestamp: 1787091200
+      time_source: timestamp
+      reference: findings/campaigns/august/1787091200-session-confusion.md
+      reference_source: path
+      warnings: []
+
+  - id: h1-only
+    file: 1787091180-h1-only.md
+    modified_time: 1787091004
+    expected:
+      title: Unicode title — Δ proof reuse
+      title_source: h1
+      severity: null
+      timestamp: 1787091180
+      time_source: filename
+      reference: findings/1787091180-h1-only.md
+      reference_source: path
+      warnings:
+        - missing-frontmatter
+        - missing-severity
+
+  - id: invalid-severity
+    file: 1787091160-invalid-severity.md
+    modified_time: 1787091005
+    expected:
+      title: Project-defined severity cannot widen the vocabulary
+      title_source: title
+      severity: null
+      timestamp: 1787091160
+      time_source: timestamp
+      reference: findings/1787091160-invalid-severity.md
+      reference_source: path
+      warnings:
+        - invalid-severity
+
+  - id: invalid-yaml
+    file: 1787091150-invalid-yaml.md
+    modified_time: 1787091006
+    expected:
+      title: 1787091150-invalid-yaml
+      title_source: filename
+      severity: null
+      timestamp: 1787091150
+      time_source: filename
+      reference: findings/1787091150-invalid-yaml.md
+      reference_source: path
+      warnings:
+        - invalid-frontmatter
+        - missing-severity
+
+  - id: optional-fields-low
+    file: 1787091140-low-header-leak.md
+    modified_time: 1787091007
+    expected:
+      title: Header information disclosure
+      title_source: title
+      severity: low
+      timestamp: 1787091140
+      time_source: timestamp
+      reference: CDK-REG-004
+      reference_source: id
+      status: accepted
+      oracle_verified: true
+      warnings: []
+
+  - id: no-frontmatter
+    file: plain-note.md
+    modified_time: 1787091100
+    expected:
+      title: plain-note
+      title_source: filename
+      severity: null
+      timestamp: 1787091100
+      time_source: modified
+      reference: findings/plain-note.md
+      reference_source: path
+      warnings:
+        - missing-frontmatter
+        - missing-severity
+
+newest_order:
+  - critical
+  - canonical-high
+  - large-body
+  - nested-name-only
+  - h1-only
+  - invalid-severity
+  - invalid-yaml
+  - optional-fields-low
+  - no-frontmatter
+
+severity_order:
+  - critical
+  - canonical-high
+  - large-body
+  - nested-name-only
+  - optional-fields-low
+  - h1-only
+  - invalid-severity
+  - invalid-yaml
+  - no-frontmatter

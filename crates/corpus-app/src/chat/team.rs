@@ -44,6 +44,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "corpus_stats",
     "corpus_list",
     "corpus_read",
+    "finding_list",
     "model_list",
 ];
 
@@ -168,6 +169,7 @@ pub const ALL_ADMIN_TOOLS: &[&str] = &[
     "corpus_stats",
     "corpus_list",
     "corpus_read",
+    "finding_list",
     "corpus_wipe",
     "entry_delete",
     "entry_move",
@@ -243,6 +245,7 @@ impl TeamRole {
                 "corpus_stats",
                 "corpus_list",
                 "corpus_read",
+                "finding_list",
             ],
         };
         names.iter().map(|s| s.to_string()).collect()
@@ -380,7 +383,13 @@ mod tests {
             );
         }
         // And it does hold its read-only capabilities.
-        for required in ["project_list", "corpus_stats", "corpus_read", "agent_get"] {
+        for required in [
+            "project_list",
+            "corpus_stats",
+            "corpus_read",
+            "finding_list",
+            "agent_get",
+        ] {
             assert!(
                 tools.iter().any(|t| t == required),
                 "corpus-inspector must retain {required}"
@@ -516,6 +525,7 @@ mod tests {
         assert!(!needs_approval("agent_list"));
         assert!(!needs_approval("corpus-admin__agent_list")); // prefixed form
         assert!(!needs_approval("corpus_read"));
+        assert!(!needs_approval("finding_list"));
         assert!(needs_approval("agent_save"));
         assert!(needs_approval("project_new"));
         for t in DESTRUCTIVE_TOOLS {

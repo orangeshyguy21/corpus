@@ -14,11 +14,14 @@
 //! same pattern as the opencode permission files.
 
 use std::{
+    collections::BTreeSet,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use corpus_core::{fnv1a_hex, Mission, Project, Store};
+use corpus_core::{
+    fnv1a_hex, FindingQuery, FindingSeverity, FindingSort, Mission, Project, Store,
+};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -45,7 +48,7 @@ pub const DESTRUCTIVE_OPS: [&str; 5] = [
 /// Every tool name this group serves. The catalog is asserted against it,
 /// so a tool added to one and not the other fails a test rather than going
 /// quietly unroutable (or unadvertised).
-pub const ADMIN_TOOLS: [&str; 34] = [
+pub const ADMIN_TOOLS: [&str; 35] = [
     "project_list",
     "project_new",
     "project_clone",
@@ -76,6 +79,7 @@ pub const ADMIN_TOOLS: [&str; 34] = [
     "corpus_stats",
     "corpus_list",
     "corpus_read",
+    "finding_list",
     "entry_delete",
     "entry_move",
     "entry_write",
@@ -486,6 +490,28 @@ pub fn catalog() -> Value {
             }
         },
         {
+            "name": "finding_list",
+            "description": "List recursively discovered findings as structured JSON. Missing or invalid severity remains visible as unrated with metadata warnings. Filters never read full Markdown bodies.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "severity": {
+                        "description": "Optional severity or array of severities; omitted means every rated severity.",
+                        "oneOf": [
+                            {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+                            {"type": "array", "items": {"type": "string", "enum": ["critical", "high", "medium", "low"]}, "uniqueItems": true}
+                        ]
+                    },
+                    "include_unrated": {"type": "boolean", "description": "Include findings with missing/invalid severity (default true)."},
+                    "text": {"type": "string", "description": "Case-insensitive title, reference, and relative-path search."},
+                    "sort": {"type": "string", "enum": ["newest", "severity"], "description": "Default newest."},
+                    "limit": {"type": "integer", "minimum": 1}
+                },
+                "required": ["project"]
+            }
+        },
+        {
             "name": "entry_delete",
             "description": "CONFIRM-GATED. Delete ONE entry from the project's corpus by relative path (findings/x.md, attacks/<slug>/, ...). Dry-run first; returns a one-shot token bound to the entry's current state. A directory needs recursive: true. runs/ is not deletable — technique cards cite those transcripts by name and the operator audits them.",
             "inputSchema": {
@@ -586,6 +612,7 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         "corpus_stats" => corpus_stats(ctx, &project(args)?),
         "corpus_list" => corpus_list(ctx, args),
         "corpus_read" => corpus_read(ctx, args),
+        "finding_list" => finding_list(ctx, args),
         "entry_delete" => entry_delete(ctx, args),
         "entry_move" => entry_move(ctx, args),
         "entry_write" => entry_write(ctx, args),
@@ -1530,6 +1557,94 @@ fn corpus_list(ctx: &mut Ctx, args: &Value) -> Result<String> {
     } else {
         format!("{project}/{category}/:\n{}", entries.join("\n"))
     })
+}
+
+fn finding_list(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let project = require_str(args, "project")?;
+    let mut severities = BTreeSet::new();
+    let severity_values: Vec<&Value> = match args.get("severity") {
+        None => Vec::new(),
+        Some(value @ Value::String(_)) => vec![value],
+        Some(Value::Array(values)) => values.iter().collect(),
+        Some(_) => {
+            return Err(Error::Args(
+                "severity must be a string or an array of strings".into(),
+            ))
+        }
+    };
+    for value in severity_values {
+        let raw = value
+            .as_str()
+            .ok_or_else(|| Error::Args("severity array entries must be strings".into()))?;
+        severities.insert(FindingSeverity::parse(raw).ok_or_else(|| {
+            Error::Args(format!(
+                "invalid finding severity {raw:?}; expected critical, high, medium, or low"
+            ))
+        })?);
+    }
+    let sort = match args.get("sort").and_then(Value::as_str).unwrap_or("newest") {
+        "newest" => FindingSort::Newest,
+        "severity" => FindingSort::Severity,
+        value => {
+            return Err(Error::Args(format!(
+                "invalid finding sort {value:?}; expected newest or severity"
+            )))
+        }
+    };
+    let limit = match args.get("limit") {
+        None => None,
+        Some(value) => {
+            let value = value
+                .as_u64()
+                .ok_or_else(|| Error::Args("limit must be a positive integer".into()))?;
+            if value == 0 {
+                return Err(Error::Args("limit must be a positive integer".into()));
+            }
+            Some(
+                usize::try_from(value)
+                    .map_err(|_| Error::Args("limit is too large for this platform".into()))?,
+            )
+        }
+    };
+    let query = FindingQuery {
+        severities,
+        include_unrated: args
+            .get("include_unrated")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        text: args.get("text").and_then(Value::as_str).map(str::to_string),
+        sort,
+        limit,
+    };
+    let cards = corpus_core::finding_cards(&ctx.store, &project)
+        .map_err(|error| Error::Args(error.to_string()))?;
+    let cards = corpus_core::query_findings(&cards, &query);
+    let findings: Vec<Value> = cards
+        .iter()
+        .map(|card| {
+            json!({
+                "path": card.path.to_string_lossy(),
+                "title": card.title,
+                "title_source": card.title_source.as_str(),
+                "severity": card.severity.map(|severity| severity.as_str()),
+                "unrated": card.severity.is_none(),
+                "timestamp": card.timestamp,
+                "time_source": card.time_source.map(|source| source.as_str()),
+                "reference": card.reference,
+                "reference_source": card.reference_source.as_str(),
+                "status": card.status,
+                "oracle_verified": card.oracle_verified,
+                "sensitivity": card.sensitivity.map(|value| value.as_str()),
+                "warnings": card.warnings.iter().map(|warning| warning.as_str()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&json!({
+        "project": project,
+        "count": findings.len(),
+        "findings": findings,
+    }))
+    .map_err(Error::Json)
 }
 
 fn corpus_read(ctx: &mut Ctx, args: &Value) -> Result<String> {

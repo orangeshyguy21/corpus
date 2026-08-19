@@ -23,6 +23,7 @@ permission:
   corpus_entry_move: allow
   corpus_entry_write: allow
   corpus_faucet: allow
+  corpus_finding_list: allow
   corpus_finding_write: allow
   corpus_mission_await: allow
   corpus_mission_delete: allow

@@ -5,6 +5,8 @@
 //! `Ctx` against a fixture store and echo plugin without speaking the MCP
 //! wire protocol.
 
+#![recursion_limit = "256"]
+
 pub mod admin;
 pub mod error;
 pub mod tools;

@@ -122,7 +122,7 @@ const RESEARCHER_TOOLS: [&str; 2] = ["corpus_target_info", "corpus_technique_sav
 /// - project lifecycle and cross-project operations remain operator-only;
 /// - Curator may delete agents, missions, and corpus entries inside the
 ///   injected project, but only Super may wipe that project's whole corpus.
-pub const CURATOR_TOOLS: [&str; 27] = [
+pub const CURATOR_TOOLS: [&str; 28] = [
     "agent_list",
     "agent_get",
     "agent_new",
@@ -146,6 +146,7 @@ pub const CURATOR_TOOLS: [&str; 27] = [
     "corpus_stats",
     "corpus_list",
     "corpus_read",
+    "finding_list",
     "entry_delete",
     "entry_move",
     "entry_write",
@@ -155,7 +156,7 @@ pub const CURATOR_TOOLS: [&str; 27] = [
 /// Super's project-management surface: Curator plus project-local corpus wipe.
 /// Destructive calls still pass through scope injection, audit recording, and
 /// the server's dry-run/token confirmation gate.
-pub const SUPER_ADMIN_TOOLS: [&str; 28] = [
+pub const SUPER_ADMIN_TOOLS: [&str; 29] = [
     "agent_list",
     "agent_get",
     "agent_new",
@@ -180,6 +181,7 @@ pub const SUPER_ADMIN_TOOLS: [&str; 28] = [
     "corpus_stats",
     "corpus_list",
     "corpus_read",
+    "finding_list",
     "entry_delete",
     "entry_move",
     "entry_write",
@@ -189,7 +191,7 @@ pub const SUPER_ADMIN_TOOLS: [&str; 28] = [
 /// Every project-management permission on which a project role has an
 /// opinion. Alias the widest scoped catalog so render rules cannot drift from
 /// Super's server grant set.
-const PROJECT_MANAGEMENT_TOOLS: [&str; 28] = SUPER_ADMIN_TOOLS;
+const PROJECT_MANAGEMENT_TOOLS: [&str; 29] = SUPER_ADMIN_TOOLS;
 
 impl AgentRole {
     /// Parse a role name (config, CLI flag, sidecar).

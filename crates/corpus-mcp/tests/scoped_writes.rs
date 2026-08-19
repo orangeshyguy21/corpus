@@ -155,9 +155,119 @@ fn roundtrip_project_scoped_writes_and_wipe() {
 }
 
 #[test]
+fn finding_write_validates_before_persistence_and_preserves_project_agency() {
+    let rig = rig("finding-writer");
+    let TestRig { mut ctx, store, root } = rig;
+    ctx.run_log = Some("1787091000-operator.raw".to_string());
+    ctx.source_pins = Some(serde_json::Map::from_iter([(
+        "cdk".to_string(),
+        json!("0123456789abcdef"),
+    )]));
+
+    let error = tools::dispatch(
+        &mut ctx,
+        "finding_write",
+        &json!({"title": "bad", "severity": "urgent", "detail": "x"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("invalid finding severity"), "{error}");
+    assert_eq!(
+        std::fs::read_dir(proj_corpus(&store).join("findings"))
+            .unwrap()
+            .count(),
+        0
+    );
+
+    let out = tools::dispatch(
+        &mut ctx,
+        "finding_write",
+        &json!({
+            "title": "Header\nseverity: low",
+            "severity": "critical",
+            "detail": "demonstrated PoC",
+            "path": "campaigns/august/header-injection.md",
+            "metadata": {
+                "id": "CDK-REG-900",
+                "component": "mint: api",
+                "cwes": ["CWE-20", "CWE-284"]
+            }
+        }),
+    )
+    .expect("finding_write nested path");
+    assert!(
+        out.contains("findings/campaigns/august/header-injection.md"),
+        "{out}"
+    );
+    assert!(out.contains("reference: CDK-REG-900"), "{out}");
+
+    let path = proj_corpus(&store).join("findings/campaigns/august/header-injection.md");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let (frontmatter, _) = corpus_core::frontmatter::split(&raw).unwrap();
+    let frontmatter = frontmatter.unwrap();
+    assert_eq!(
+        corpus_core::frontmatter::get_str(&frontmatter, "title").as_deref(),
+        Some("Header\nseverity: low")
+    );
+    assert_eq!(
+        corpus_core::frontmatter::get_str(&frontmatter, "severity").as_deref(),
+        Some("critical")
+    );
+    assert_eq!(
+        corpus_core::frontmatter::get_str(&frontmatter, "run_log").as_deref(),
+        Some("1787091000-operator.raw")
+    );
+    assert_eq!(
+        corpus_core::frontmatter::get_str(&frontmatter, "actor").as_deref(),
+        Some("operator")
+    );
+
+    for args in [
+        json!({
+            "title": "duplicate",
+            "severity": "high",
+            "detail": "x",
+            "path": "campaigns/august/header-injection.md"
+        }),
+        json!({
+            "title": "traversal",
+            "severity": "high",
+            "detail": "x",
+            "path": "../runs/stolen.md"
+        }),
+        json!({
+            "title": "reserved",
+            "severity": "high",
+            "detail": "x",
+            "metadata": {"severity": "low"}
+        }),
+    ] {
+        assert!(tools::dispatch(&mut ctx, "finding_write", &args).is_err());
+    }
+    assert_eq!(
+        corpus_core::frontmatter::get_str(
+            &corpus_core::frontmatter::split(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .0
+                .unwrap(),
+            "severity"
+        )
+        .as_deref(),
+        Some("critical"),
+        "a refused write must not replace the existing finding"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn attack_save_project_scope() {
     let rig = rig("attack");
-    let TestRig { mut ctx, store, root } = rig;
+    let TestRig {
+        mut ctx,
+        store,
+        root,
+    } = rig;
 
     let out = tools::dispatch(
         &mut ctx,

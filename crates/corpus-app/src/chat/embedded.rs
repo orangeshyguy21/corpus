@@ -1254,6 +1254,7 @@ mod injection_probe {
         }
         // The inspector's own read tool is available.
         assert!(ext.is_tool_available("corpus_read"));
+        assert!(ext.is_tool_available("finding_list"));
         assert!(ext.is_tool_available("mission_list"));
     }
 

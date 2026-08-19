@@ -1,7 +1,7 @@
 //! `corpus project/agent/mission/store` admin commands: the scoped
 //! store (projects, agents, missions, corpus) exposed headlessly.
 
-use corpus_core::{Mission, Store};
+use corpus_core::{FindingQuery, FindingSeverity, FindingSort, Mission, Store};
 
 /// `corpus project ...`
 pub fn project_cmd(args: &[String]) -> Result<(), String> {
@@ -353,6 +353,164 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
         _ => Err(
             "usage: corpus mission list|new|delete <project> [<slug>] ...".to_string(),
         ),
+    }
+}
+
+/// `corpus finding list|show ...` — a thin CLI over the same tolerant core
+/// projection used by MCP and, later, the desktop app.
+pub fn finding_cmd(args: &[String]) -> Result<(), String> {
+    let store = Store::from_env();
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            let project = args.get(1).ok_or(
+                "usage: corpus finding list <project> [--severity <level>] [--exclude-unrated] [--text <query>] [--sort newest|severity] [--limit N]",
+            )?;
+            let query = parse_finding_query(&args[2..])?;
+            let cards = corpus_core::finding_cards(&store, project).map_err(|e| e.to_string())?;
+            let cards = corpus_core::query_findings(&cards, &query);
+            if cards.is_empty() {
+                println!("(no matching findings) {project}");
+                return Ok(());
+            }
+            println!("SEVERITY\tTIMESTAMP\tREFERENCE\tTITLE\tPATH\tWARNINGS");
+            for card in cards {
+                let severity = card
+                    .severity
+                    .map(|value| value.as_str().to_ascii_uppercase())
+                    .unwrap_or_else(|| "UNRATED".to_string());
+                let timestamp = card
+                    .timestamp
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let warnings = card
+                    .warnings
+                    .iter()
+                    .map(|warning| warning.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "{severity}\t{timestamp}\t{}\t{}\t{}\t{warnings}",
+                    card.reference,
+                    card.title.replace('\t', " ").replace('\n', " "),
+                    card.path.display(),
+                );
+            }
+            Ok(())
+        }
+        Some("show") => {
+            let project = args
+                .get(1)
+                .ok_or("usage: corpus finding show <project> <findings/path.md>")?;
+            let path = args
+                .get(2)
+                .ok_or("usage: corpus finding show <project> <findings/path.md>")?;
+            if args.len() != 3 {
+                return Err("usage: corpus finding show <project> <findings/path.md>".into());
+            }
+            let body = corpus_core::read_finding(&store, project, path)
+                .map_err(|error| error.to_string())?;
+            print!("{body}");
+            Ok(())
+        }
+        _ => Err(
+            "usage: corpus finding list <project> [filters] | show <project> <findings/path.md>"
+                .into(),
+        ),
+    }
+}
+
+fn parse_finding_query(args: &[String]) -> Result<FindingQuery, String> {
+    let mut query = FindingQuery::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--severity" => {
+                let raw = args.get(i + 1).ok_or("missing value after --severity")?;
+                for value in raw.split(',') {
+                    query.severities.insert(FindingSeverity::parse(value).ok_or_else(|| {
+                        format!(
+                            "invalid finding severity {value:?}; expected critical, high, medium, or low"
+                        )
+                    })?);
+                }
+                i += 2;
+            }
+            "--exclude-unrated" => {
+                query.include_unrated = false;
+                i += 1;
+            }
+            "--text" => {
+                query.text = Some(args.get(i + 1).ok_or("missing value after --text")?.clone());
+                i += 2;
+            }
+            "--sort" => {
+                query.sort = match args.get(i + 1).map(String::as_str) {
+                    Some("newest") => FindingSort::Newest,
+                    Some("severity") => FindingSort::Severity,
+                    Some(value) => {
+                        return Err(format!(
+                            "invalid finding sort {value:?}; expected newest or severity"
+                        ))
+                    }
+                    None => return Err("missing value after --sort".into()),
+                };
+                i += 2;
+            }
+            "--limit" => {
+                let value: usize = args
+                    .get(i + 1)
+                    .ok_or("missing value after --limit")?
+                    .parse()
+                    .map_err(|error| format!("--limit: {error}"))?;
+                if value == 0 {
+                    return Err("--limit must be positive".into());
+                }
+                query.limit = Some(value);
+                i += 2;
+            }
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+    Ok(query)
+}
+
+#[cfg(test)]
+mod finding_query_tests {
+    use super::*;
+
+    #[test]
+    fn parses_repeatable_and_comma_separated_filters() {
+        let args = [
+            "--severity", "critical,high", "--severity", "medium", "--exclude-unrated",
+            "--sort", "severity", "--limit", "5", "--text", "mint",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let query = parse_finding_query(&args).unwrap();
+        assert_eq!(
+            query.severities,
+            std::collections::BTreeSet::from([
+                FindingSeverity::Critical,
+                FindingSeverity::High,
+                FindingSeverity::Medium,
+            ])
+        );
+        assert!(!query.include_unrated);
+        assert_eq!(query.sort, FindingSort::Severity);
+        assert_eq!(query.limit, Some(5));
+        assert_eq!(query.text.as_deref(), Some("mint"));
+    }
+
+    #[test]
+    fn refuses_unknown_filter_values() {
+        for args in [
+            vec!["--severity".to_string(), "urgent".to_string()],
+            vec!["--sort".to_string(), "risk".to_string()],
+            vec!["--limit".to_string(), "0".to_string()],
+        ] {
+            assert!(parse_finding_query(&args).is_err());
+        }
     }
 }
 

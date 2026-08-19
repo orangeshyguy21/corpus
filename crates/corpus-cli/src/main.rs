@@ -52,6 +52,11 @@ corpus — local-first vulnerability research platform
                                already grant. Dry run without --apply.
   corpus mission list|new|delete <project> ...
                                Mission CRUD
+  corpus finding list <project> [--severity <level>] [--exclude-unrated]
+                               [--text <query>] [--sort newest|severity] [--limit N]
+  corpus finding show <project> <findings/path.md>
+                               Discover or read findings through the shared
+                               tolerant metadata projection.
   corpus audit <project> [--tail N]
                                Who changed this project, and when. Every
                                mutation a `curator` agent makes is recorded
@@ -93,6 +98,7 @@ fn main() -> ExitCode {
         Some("project") => store_admin::project_cmd(&args[1..]),
         Some("agent") => store_admin::agent_cmd(&args[1..]),
         Some("mission") => store_admin::mission_cmd(&args[1..]),
+        Some("finding") => store_admin::finding_cmd(&args[1..]),
         Some("audit") => store_admin::audit_cmd(&args[1..]),
         Some("refusals") => store_admin::refusals_cmd(&args[1..]),
         Some("help") | Some("--help") | Some("-h") => {

@@ -179,6 +179,43 @@ fn scoped_management_schemas_never_advertise_a_project() {
     }
 }
 
+#[test]
+fn scoped_finding_list_uses_the_proven_project_and_is_read_only() {
+    let mut rig = rig("finding-list-scope", AgentRole::Curator);
+    std::fs::write(
+        rig.store
+            .project_corpus_dir("alpha")
+            .join("findings/1787091200-alpha.md"),
+        "---\ntitle: Alpha finding\nseverity: high\ntimestamp: 1787091200\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        rig.store
+            .project_corpus_dir("beta")
+            .join("findings/1787091300-beta.md"),
+        "---\ntitle: Beta secret\nseverity: critical\ntimestamp: 1787091300\n---\n",
+    )
+    .unwrap();
+
+    let out = tools::dispatch(
+        &mut rig.ctx,
+        "finding_list",
+        &json!({"project": "beta"}),
+    )
+    .expect("scoped finding list");
+    let value: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["project"], "alpha");
+    assert_eq!(value["count"], 1);
+    assert_eq!(value["findings"][0]["title"], "Alpha finding");
+    assert!(!out.contains("Beta secret"));
+
+    let audit = corpus_core::audit::tail(&rig.store, "alpha", 20).unwrap();
+    assert!(
+        audit.iter().all(|record| record.op != "finding_list"),
+        "read-only finding_list must not create curator audit acts"
+    );
+}
+
 /// The heart of it: a curator scoped to `alpha` that explicitly names
 /// `beta` gets alpha's answer, and beta is never touched.
 /// Author-time pin validation is wired into `mission_new`, but it FAILS

@@ -43,6 +43,70 @@ fn proj_corpus(store: &Store) -> PathBuf {
     store.project_corpus_dir("proj")
 }
 
+#[test]
+fn finding_list_is_structured_recursive_and_keeps_unrated_entries_visible() {
+    let (mut ctx, store, root, project) = rig("finding-list");
+    let findings = proj_corpus(&store).join("findings");
+    std::fs::create_dir_all(findings.join("campaigns/august")).unwrap();
+    std::fs::write(
+        findings.join("1787091200-high.md"),
+        "---\ntitle: High finding\nseverity: high\ntimestamp: 1787091200\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(
+        findings.join("campaigns/august/plain-note.md"),
+        "# Unrated nested lead\n",
+    )
+    .unwrap();
+
+    let out = admin::dispatch(
+        &mut ctx,
+        "finding_list",
+        &json!({"project": project, "sort": "severity"}),
+    )
+    .expect("finding list");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["project"], "proj");
+    assert_eq!(value["count"], 2);
+    assert_eq!(value["findings"][0]["severity"], "high");
+    assert_eq!(value["findings"][1]["unrated"], true);
+    assert_eq!(
+        value["findings"][1]["path"],
+        "findings/campaigns/august/plain-note.md"
+    );
+    assert!(value["findings"][1]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning == "missing-severity"));
+
+    let filtered = admin::dispatch(
+        &mut ctx,
+        "finding_list",
+        &json!({
+            "project": "proj",
+            "severity": ["high"],
+            "include_unrated": false,
+            "text": "high",
+            "limit": 1
+        }),
+    )
+    .unwrap();
+    let filtered: serde_json::Value = serde_json::from_str(&filtered).unwrap();
+    assert_eq!(filtered["count"], 1);
+    assert_eq!(filtered["findings"][0]["title"], "High finding");
+
+    let error = admin::dispatch(
+        &mut ctx,
+        "finding_list",
+        &json!({"project": "proj", "severity": "urgent"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("invalid finding severity"), "{error}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // --- project rebind validates against discovery ---
 
 #[test]
@@ -273,7 +337,7 @@ fn admin_tools_absent_without_admin_flag() {
     for admin_tool in [
         "project_list", "project_delete", "project_rebind",
         "agent_save", "mission_new", "mission_set_budget",
-        "corpus_wipe", "corpus_stats",
+        "corpus_wipe", "corpus_stats", "finding_list",
     ] {
         assert!(!names.contains(&admin_tool.to_string()), "sandbox profile must not carry {admin_tool}");
     }

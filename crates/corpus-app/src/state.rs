@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corpus_core::{
-    AgentConfig, CorpusStats, CostReport, Error, Mission, PluginStatus, Project, RunLine,
-    RunSession, SourceRevs, StopOutcome, Store,
+    AgentConfig, CorpusStats, CostReport, Error, FindingCard, FindingIndexCache, Mission,
+    PluginStatus, Project, RunLine, RunSession, SourceRevs, StopOutcome, Store,
 };
 
 use crate::file_watch::{FileInvalidationSource, NotifyFileInvalidationSource};
@@ -265,6 +265,11 @@ pub struct AppState {
     corpus_stats: Option<CorpusStats>,
     corpus_cost: Option<CostReport>,
     corpus_cost_cache: corpus_core::CorpusCostCache,
+    finding_index_cache: FindingIndexCache,
+    findings: FindingDiscovery,
+    findings_project: Option<String>,
+    /// Per-project invalidation clocks for corpus-reading background work.
+    corpus_revisions: BTreeMap<String, u64>,
     /// The project's mission transcripts (`corpus/runs/`), newest first —
     /// refreshed on the same beat as `corpus_stats`.
     mission_logs: Vec<corpus_core::MissionLog>,
@@ -387,6 +392,19 @@ pub enum ModelDiscovery {
     Failed(String),
 }
 
+/// Render-safe finding discovery for the selected project. A failed refresh
+/// may retain that same project's last good cards, but navigation never does.
+#[derive(Debug, Clone, Default)]
+pub enum FindingDiscovery {
+    #[default]
+    Loading,
+    Ready(Vec<FindingCard>),
+    Failed {
+        message: String,
+        last_good: Vec<FindingCard>,
+    },
+}
+
 enum AppJobOutput {
     Plugins {
         target: Option<String>,
@@ -423,6 +441,12 @@ struct CorpusSnapshot {
     stats: CorpusStats,
     logs: Vec<corpus_core::MissionLog>,
     cost: Option<(CostReport, corpus_core::CorpusCostCache)>,
+    findings: FindingSnapshot,
+}
+
+struct FindingSnapshot {
+    cards: Vec<FindingCard>,
+    cache: FindingIndexCache,
 }
 
 struct SessionMaintenance {
@@ -444,6 +468,7 @@ struct ProjectScopeSnapshot {
     missions: Vec<(String, Mission)>,
     stats: CorpusStats,
     logs: Vec<corpus_core::MissionLog>,
+    findings: FindingSnapshot,
 }
 
 struct LaunchRequest {
@@ -592,13 +617,27 @@ impl AppState {
             .as_ref()
             .map(|source| source.take())
             .unwrap_or_default();
-        let warning = self.file_watch_warning.take().or(invalidations.warning.clone());
+        let warning = self
+            .file_watch_warning
+            .take()
+            .or(invalidations.warning.clone());
         if invalidations.is_empty() {
             return warning;
         }
 
         if invalidations.project_index {
             self.refresh();
+        }
+        if invalidations.all_projects {
+            let projects: Vec<String> =
+                self.projects.iter().map(|(slug, _)| slug.clone()).collect();
+            for project in projects {
+                self.note_corpus_mutation(&project);
+            }
+        } else {
+            for project in &invalidations.corpus {
+                self.note_corpus_mutation(project);
+            }
         }
         let selected = self.effective_project();
         let applies = |projects: &BTreeSet<String>| {
@@ -626,7 +665,35 @@ impl AppState {
             .find(|(slug, _)| slug == project)
             .map(|(_, project)| project.corpus_generation)
             .unwrap_or(0);
-        JobScope { project: project.to_string(), project_generation, run_id }
+        JobScope {
+            project: project.to_string(),
+            project_generation,
+            corpus_revision: None,
+            run_id,
+        }
+    }
+
+    fn corpus_revision(&self, project: &str) -> u64 {
+        self.corpus_revisions.get(project).copied().unwrap_or(0)
+    }
+
+    fn corpus_job_scope(&self, project: &str) -> JobScope {
+        let mut scope = self.job_scope(project, None);
+        scope.corpus_revision = Some(self.corpus_revision(project));
+        scope
+    }
+
+    /// Mark corpus projections dirty after a known local mutation. Filesystem
+    /// notifications call the same seam for external writes.
+    pub fn note_corpus_mutation(&mut self, project: &str) {
+        let revision = self
+            .corpus_revisions
+            .entry(project.to_string())
+            .or_default();
+        *revision = revision.saturating_add(1);
+        if self.effective_project().as_deref() == Some(project) {
+            self.corpus_polled_at = None;
+        }
     }
 
     /// Apply all completed jobs that still belong to current state. The
@@ -640,6 +707,9 @@ impl AppState {
         self.jobs = Some(jobs);
         let mut notices = Vec::new();
         for result in results {
+            if self.retry_stale_corpus_job(result.kind, &result.scope) {
+                continue;
+            }
             match result.terminal {
                 JobTerminal::Success(AppJobOutput::Plugins { target, statuses }) => {
                     self.plugin_probe_active = None;
@@ -672,13 +742,15 @@ impl AppState {
                     }
                 }
                 JobTerminal::Success(AppJobOutput::CorpusSnapshot(snapshot)) => {
+                    let project = result.scope.project;
                     self.corpus_stats = Some(snapshot.stats);
                     self.mission_logs = snapshot.logs;
                     if let Some((cost, cache)) = snapshot.cost {
                         self.corpus_cost = Some(cost);
                         self.corpus_cost_cache = cache;
                     }
-                    self.corpus_stats_project = Some(result.scope.project);
+                    self.apply_findings(project.as_str(), snapshot.findings);
+                    self.corpus_stats_project = Some(project);
                     self.corpus_polled_at = Some(self.clock.monotonic_now());
                 }
                 JobTerminal::Success(AppJobOutput::LiveSessions(sessions)) => {
@@ -721,12 +793,14 @@ impl AppState {
                     }
                     let exported = !maintenance.exported_tmux.is_empty();
                     for tmux in maintenance.exported_tmux {
-                        self.last_exported_at.insert(tmux, self.clock.monotonic_now());
+                    self.last_exported_at
+                        .insert(tmux, self.clock.monotonic_now());
                     }
                     if missions_changed {
                         self.refresh_missions(&project);
                     }
                     if exported {
+                        self.note_corpus_mutation(&project);
                         self.refresh_corpus_stats(&project);
                     }
                 }
@@ -748,6 +822,7 @@ impl AppState {
                     }
                     self.corpus_stats = Some(snapshot.stats);
                     self.mission_logs = snapshot.logs;
+                    self.apply_findings(project.as_str(), snapshot.findings);
                     self.corpus_stats_project = Some(project);
                     self.corpus_polled_at = Some(self.clock.monotonic_now());
                 }
@@ -778,7 +853,7 @@ impl AppState {
                     if self.retry_stale_plugin_probe(result.kind) {
                         continue;
                     }
-                    self.mark_job_failed(result.kind, &error);
+                    self.mark_job_failed(result.kind, &result.scope, &error);
                     if let Some(run_id) = result.scope.run_id.as_ref() {
                         let wrapped = Error::Store(error.clone());
                         let teardown = result.kind == JobKind::SessionTeardown;
@@ -796,7 +871,7 @@ impl AppState {
                     if self.retry_stale_plugin_probe(result.kind) {
                         continue;
                     }
-                    self.mark_job_failed(result.kind, "cancelled");
+                    self.mark_job_failed(result.kind, &result.scope, "cancelled");
                     if let Some(run_id) = result.scope.run_id.as_ref() {
                         self.finish_run(run_id);
                     }
@@ -806,7 +881,7 @@ impl AppState {
                     if self.retry_stale_plugin_probe(result.kind) {
                         continue;
                     }
-                    self.mark_job_failed(result.kind, "timed out");
+                    self.mark_job_failed(result.kind, &result.scope, "timed out");
                     if let Some(run_id) = result.scope.run_id.as_ref() {
                         let error = Error::Store(format!("{} timed out", result.kind.label()));
                         let teardown = result.kind == JobKind::SessionTeardown;
@@ -840,7 +915,30 @@ impl AppState {
         true
     }
 
-    fn mark_job_failed(&mut self, kind: JobKind, error: &str) {
+    fn retry_stale_corpus_job(&mut self, kind: JobKind, scope: &JobScope) -> bool {
+        let Some(captured_revision) = scope.corpus_revision else {
+            return false;
+        };
+        if !matches!(
+            kind,
+            JobKind::ProjectScope | JobKind::CorpusSummary | JobKind::CorpusCost
+        ) || captured_revision == self.corpus_revision(&scope.project)
+        {
+            return false;
+        }
+        match kind {
+            JobKind::CorpusSummary => self.schedule_corpus_refresh(&scope.project, false),
+            JobKind::CorpusCost => self.schedule_corpus_refresh(&scope.project, true),
+            JobKind::ProjectScope => {
+                self.corpus_polled_at = None;
+                self.poll_project_scope();
+            }
+            _ => unreachable!(),
+        }
+        true
+    }
+
+    fn mark_job_failed(&mut self, kind: JobKind, scope: &JobScope, error: &str) {
         match kind {
             JobKind::PluginProbe => {
                 self.plugin_probe_active = None;
@@ -855,8 +953,34 @@ impl AppState {
             JobKind::ModelDiscovery => {
                 self.opencode_models = ModelDiscovery::Failed(error.to_string());
             }
+            JobKind::ProjectScope | JobKind::CorpusSummary | JobKind::CorpusCost => {
+                self.fail_findings(&scope.project, error);
+            }
             _ => {}
         }
+    }
+
+    fn apply_findings(&mut self, project: &str, snapshot: FindingSnapshot) {
+        if self.findings_project.as_deref() != Some(project) {
+            return;
+        }
+        self.finding_index_cache = snapshot.cache;
+        self.findings = FindingDiscovery::Ready(snapshot.cards);
+    }
+
+    fn fail_findings(&mut self, project: &str, message: &str) {
+        if self.findings_project.as_deref() != Some(project) {
+            return;
+        }
+        let last_good = match std::mem::take(&mut self.findings) {
+            FindingDiscovery::Ready(cards) => cards,
+            FindingDiscovery::Failed { last_good, .. } => last_good,
+            FindingDiscovery::Loading => Vec::new(),
+        };
+        self.findings = FindingDiscovery::Failed {
+            message: message.to_string(),
+            last_good,
+        };
     }
 
     fn apply_source_revisions(&mut self, project: &str, revs: Vec<SourceRevs>) {
@@ -973,6 +1097,10 @@ impl AppState {
             mission_logs: Vec::new(),
             corpus_cost: None,
             corpus_cost_cache: corpus_core::CorpusCostCache::default(),
+            finding_index_cache: FindingIndexCache::default(),
+            findings: FindingDiscovery::Loading,
+            findings_project: None,
+            corpus_revisions: BTreeMap::new(),
             corpus_stats_project: None,
             corpus_polled_at: None,
             plugins: Vec::new(),
@@ -1016,7 +1144,12 @@ impl AppState {
             let store = self.store.clone();
             self.jobs.as_mut().expect("installed above").start(
                 JobKind::ProjectScope,
-                JobScope { project: String::new(), project_generation: 0, run_id: None },
+                JobScope {
+                    project: String::new(),
+                    project_generation: 0,
+                    corpus_revision: None,
+                    run_id: None,
+                },
                 Duration::from_secs(30),
                 move |_| {
                     let mut projects = store.list_projects().map_err(|error| error.to_string())?;
@@ -1077,7 +1210,12 @@ impl AppState {
         let work_target = target.clone();
         let outcome = jobs.start(
             JobKind::PluginProbe,
-            JobScope { project: String::new(), project_generation: 0, run_id: None },
+            JobScope {
+                project: String::new(),
+                project_generation: 0,
+                corpus_revision: None,
+                run_id: None,
+            },
             Duration::from_secs(30),
             move |_| {
                 Ok(AppJobOutput::Plugins {
@@ -1185,6 +1323,7 @@ impl AppState {
     /// transcripts, and the token/cost aggregation over run exports) for
     /// the sidebar summary and the project view.
     pub fn refresh_corpus_stats(&mut self, project: &str) {
+        self.prepare_findings_project(project);
         if self.jobs.is_some() {
             self.schedule_corpus_refresh(project, true);
             return;
@@ -1193,6 +1332,7 @@ impl AppState {
         self.mission_logs = corpus_core::mission_logs(&self.store, project).unwrap_or_default();
         self.corpus_cost =
             corpus_core::corpus_cost_cached(&self.store, project, &mut self.corpus_cost_cache).ok();
+        self.refresh_findings_sync(project);
         self.corpus_stats_project = Some(project.to_string());
         self.corpus_polled_at = Some(self.clock.monotonic_now());
     }
@@ -1201,29 +1341,37 @@ impl AppState {
     /// Cost JSON is parsed by `refresh_corpus_stats` on selection/manual
     /// refresh and reused by `(path, mtime, len)` in between.
     fn refresh_corpus_summary(&mut self, project: &str) {
+        self.prepare_findings_project(project);
         if self.jobs.is_some() {
             self.schedule_corpus_refresh(project, false);
             return;
         }
         self.corpus_stats = corpus_core::corpus_stats(&self.store, project).ok();
         self.mission_logs = corpus_core::mission_logs(&self.store, project).unwrap_or_default();
+        self.refresh_findings_sync(project);
         self.corpus_stats_project = Some(project.to_string());
         self.corpus_polled_at = Some(self.clock.monotonic_now());
     }
 
     fn schedule_corpus_refresh(&mut self, project: &str, include_cost: bool) {
-        let scope = self.job_scope(project, None);
+        self.prepare_findings_project(project);
+        let scope = self.corpus_job_scope(project);
         // Close the cadence immediately; duplicate suppression covers manual
         // refreshes that arrive while the first walk is still running.
         self.corpus_polled_at = Some(self.clock.monotonic_now());
         let store = self.store.clone();
         let project = project.to_string();
         let mut cache = self.corpus_cost_cache.clone();
+        let mut finding_cache = self.finding_index_cache.clone();
         self.jobs.as_mut().expect("installed above").start(
-            if include_cost { JobKind::CorpusCost } else { JobKind::CorpusSummary },
+            if include_cost {
+                JobKind::CorpusCost
+            } else {
+                JobKind::CorpusSummary
+            },
             scope,
             Duration::from_secs(30),
-            move |_| {
+            move |token| {
                 let stats = corpus_core::corpus_stats(&store, &project)
                     .map_err(|error| error.to_string())?;
                 let logs = corpus_core::mission_logs(&store, &project)
@@ -1237,9 +1385,43 @@ impl AppState {
                 } else {
                     None
                 };
-                Ok(AppJobOutput::CorpusSnapshot(CorpusSnapshot { stats, logs, cost }))
+                let findings =
+                    corpus_core::scan_findings_cached(&store, &project, &mut finding_cache, || {
+                        token.is_cancelled()
+                    })
+                    .map_err(|error| error.to_string())?;
+                Ok(AppJobOutput::CorpusSnapshot(CorpusSnapshot {
+                    stats,
+                    logs,
+                    cost,
+                    findings: FindingSnapshot {
+                        cards: findings.cards,
+                        cache: finding_cache,
+                    },
+                }))
             },
         );
+    }
+
+    fn prepare_findings_project(&mut self, project: &str) {
+        if self.findings_project.as_deref() == Some(project) {
+            return;
+        }
+        self.findings_project = Some(project.to_string());
+        self.findings = FindingDiscovery::Loading;
+        self.finding_index_cache = FindingIndexCache::default();
+    }
+
+    fn refresh_findings_sync(&mut self, project: &str) {
+        match corpus_core::scan_findings_cached(
+            &self.store,
+            project,
+            &mut self.finding_index_cache,
+            || false,
+        ) {
+            Ok(scan) => self.findings = FindingDiscovery::Ready(scan.cards),
+            Err(error) => self.fail_findings(project, &error.to_string()),
+        }
     }
 
     /// The sidebar's selected project — held by slug, falling back to the
@@ -1372,6 +1554,10 @@ impl AppState {
             self.corpus_stats = None;
             self.corpus_cost = None;
             self.corpus_cost_cache = corpus_core::CorpusCostCache::default();
+            self.finding_index_cache = FindingIndexCache::default();
+            self.findings = FindingDiscovery::Loading;
+            self.findings_project = None;
+            self.corpus_revisions.clear();
             self.mission_logs.clear();
             self.agents_project = None;
             self.missions_project = None;
@@ -1432,6 +1618,12 @@ impl AppState {
     /// computed yet, or no project).
     pub fn corpus_stats(&self) -> Option<&CorpusStats> {
         self.corpus_stats.as_ref()
+    }
+
+    /// Findings projection for the selected project. This state never belongs
+    /// to a project other than `effective_project()`.
+    pub fn finding_discovery(&self) -> &FindingDiscovery {
+        &self.findings
     }
 
     /// The project view's mission logs for the selected project, newest
@@ -1543,8 +1735,17 @@ impl AppState {
     /// Wipe a project's corpus (the Corpus panel's red Delete): categories
     /// are emptied and `corpus_generation` bumps; the project + agents
     /// survive. Returns the updated project.
-    pub fn wipe_project_corpus(&self, slug: &str) -> Result<Project, Error> {
-        self.store.wipe_project_corpus(slug)
+    pub fn wipe_project_corpus(&mut self, slug: &str) -> Result<Project, Error> {
+        let project = self.store.wipe_project_corpus(slug)?;
+        if let Some((_, cached)) = self.projects.iter_mut().find(|(name, _)| name == slug) {
+            *cached = project.clone();
+        }
+        self.note_corpus_mutation(slug);
+        if self.findings_project.as_deref() == Some(slug) {
+            self.finding_index_cache = FindingIndexCache::default();
+            self.findings = FindingDiscovery::Ready(Vec::new());
+        }
+        Ok(project)
     }
 
     // --- agents ---
@@ -1642,7 +1843,12 @@ impl AppState {
             };
             jobs.start(
                 JobKind::ModelDiscovery,
-                JobScope { project: String::new(), project_generation: 0, run_id: None },
+                JobScope {
+                    project: String::new(),
+                    project_generation: 0,
+                    corpus_revision: None,
+                    run_id: None,
+                },
                 Duration::from_secs(45),
                 move |_| {
                     corpus_core::model_list(refresh)
@@ -2011,7 +2217,12 @@ impl AppState {
             let catalog = self.session_catalog.clone();
             self.jobs.as_mut().expect("installed above").start(
                 JobKind::SessionDiscovery,
-                JobScope { project: String::new(), project_generation: 0, run_id: None },
+                JobScope {
+                    project: String::new(),
+                    project_generation: 0,
+                    corpus_revision: None,
+                    run_id: None,
+                },
                 Duration::from_secs(10),
                 move |_| Ok(AppJobOutput::LiveSessions(catalog.live_tui_sessions())),
             );
@@ -2177,7 +2388,12 @@ impl AppState {
             let catalog = self.session_catalog.clone();
             self.jobs.as_mut().expect("installed above").start(
                 JobKind::LaunchRequests,
-                JobScope { project: String::new(), project_generation: 0, run_id: None },
+                JobScope {
+                    project: String::new(),
+                    project_generation: 0,
+                    corpus_revision: None,
+                    run_id: None,
+                },
                 Duration::from_secs(15),
                 move |_| {
                     let live = catalog.live_tui_sessions();
@@ -2317,14 +2533,16 @@ impl AppState {
         if due {
             if self.jobs.is_some() {
                 self.corpus_polled_at = Some(now);
-                let scope = self.job_scope(&project, None);
+                self.prepare_findings_project(&project);
+                let scope = self.corpus_job_scope(&project);
                 let store = self.store.clone();
                 let project_owned = project.clone();
+                let mut finding_cache = self.finding_index_cache.clone();
                 self.jobs.as_mut().expect("installed above").start(
                     JobKind::ProjectScope,
                     scope,
                     Duration::from_secs(30),
-                    move |_| {
+                    move |token| {
                         let agents = store
                             .list_agents(&project_owned)
                             .map_err(|error| error.to_string())?;
@@ -2337,11 +2555,22 @@ impl AppState {
                             .map_err(|error| error.to_string())?;
                         let logs = corpus_core::mission_logs(&store, &project_owned)
                             .map_err(|error| error.to_string())?;
+                        let findings = corpus_core::scan_findings_cached(
+                            &store,
+                            &project_owned,
+                            &mut finding_cache,
+                            || token.is_cancelled(),
+                        )
+                        .map_err(|error| error.to_string())?;
                         Ok(AppJobOutput::ProjectScope(ProjectScopeSnapshot {
                             agents,
                             missions,
                             stats,
                             logs,
+                            findings: FindingSnapshot {
+                                cards: findings.cards,
+                                cache: finding_cache,
+                            },
                         }))
                     },
                 );
@@ -3089,6 +3318,7 @@ impl AppState {
         }
         if changed {
             // Fold the fresh exports into the Cost panel straight away.
+            self.note_corpus_mutation(project);
             self.refresh_corpus_stats(project);
         }
     }
@@ -3568,6 +3798,44 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    fn write_finding_fixture(store: &Store, project: &str, name: &str, title: &str) {
+        let path = store
+            .project_corpus_dir(project)
+            .join("findings")
+            .join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("# {title}\n")).unwrap();
+    }
+
+    fn finding_titles(state: &AppState) -> Vec<String> {
+        match state.finding_discovery() {
+            FindingDiscovery::Ready(cards) => cards.iter().map(|card| card.title.clone()).collect(),
+            FindingDiscovery::Failed { last_good, .. } => {
+                last_good.iter().map(|card| card.title.clone()).collect()
+            }
+            FindingDiscovery::Loading => Vec::new(),
+        }
+    }
+
+    fn wait_for_finding_titles(state: &mut AppState, expected: &[&str]) {
+        for _ in 0..300 {
+            state.poll_background_jobs();
+            let titles = finding_titles(state);
+            if expected
+                .iter()
+                .all(|title| titles.iter().any(|value| value == title))
+                && titles.len() == expected.len()
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!(
+            "finding projection did not converge: expected {expected:?}, got {:?}",
+            finding_titles(state)
+        );
+    }
+
     struct ManualClock {
         epoch: Instant,
         elapsed: std::sync::Mutex<Duration>,
@@ -3968,6 +4236,7 @@ mod tests {
             crate::file_watch::FakeFileInvalidationSource::new(
                 crate::file_watch::FileInvalidations {
                     metadata: BTreeSet::from(["p".into()]),
+                    corpus: BTreeSet::from(["p".into()]),
                     activity: BTreeSet::from(["p".into()]),
                     ..crate::file_watch::FileInvalidations::default()
                 },
@@ -3976,11 +4245,192 @@ mod tests {
 
         assert_eq!(state.poll_file_invalidations(), None);
         assert_eq!(state.corpus_polled_at, None);
+        assert_eq!(state.corpus_revision("p"), 1);
         assert_eq!(state.launch_requests_polled_at, None);
         assert!(state.session_activity_dirty);
         // The bounded fake drains exactly once; no unbounded event queue is
         // retained in app state.
         assert_eq!(state.poll_file_invalidations(), None);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finding_projection_never_crosses_project_navigation() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-finding-navigation-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.clone());
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store.create_project("q", "Q", "cdk-regtest").unwrap();
+        write_finding_fixture(&store, "p", "one.md", "Only P");
+        let mut state = AppState::with_runtime(
+            store,
+            Arc::new(ManualClock::new(0)),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+        state.select_project("p");
+        assert_eq!(finding_titles(&state), ["Only P"]);
+
+        state.install_job_runtime(eframe::egui::Context::default());
+        state.select_project("q");
+        assert!(matches!(state.finding_discovery(), FindingDiscovery::Loading));
+        assert!(finding_titles(&state).is_empty());
+        wait_for_finding_titles(&mut state, &[]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finding_failure_retains_only_the_same_projects_last_good_cards() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-finding-failure-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.clone());
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        write_finding_fixture(&store, "p", "one.md", "Last good");
+        let mut state = AppState::with_runtime(
+            store,
+            Arc::new(ManualClock::new(0)),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+        state.select_project("p");
+        state.fail_findings("p", "injected failure");
+
+        match state.finding_discovery() {
+            FindingDiscovery::Failed { message, last_good } => {
+                assert_eq!(message, "injected failure");
+                assert_eq!(last_good.len(), 1);
+                assert_eq!(last_good[0].title, "Last good");
+            }
+            other => panic!("expected failed discovery, got {other:?}"),
+        }
+        state.prepare_findings_project("another");
+        assert!(matches!(state.finding_discovery(), FindingDiscovery::Loading));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corpus_wipe_advances_guards_and_clears_selected_findings_immediately() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-finding-wipe-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.clone());
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        write_finding_fixture(&store, "p", "one.md", "Gone");
+        let mut state = AppState::with_runtime(
+            store,
+            Arc::new(ManualClock::new(0)),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+        state.select_project("p");
+        assert_eq!(finding_titles(&state), ["Gone"]);
+
+        let project = state.wipe_project_corpus("p").unwrap();
+        assert_eq!(project.corpus_generation, 1);
+        assert_eq!(state.projects[0].1.corpus_generation, 1);
+        assert_eq!(state.corpus_revision("p"), 1);
+        assert!(finding_titles(&state).is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finding_projection_reconciles_events_and_the_timed_backstop() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-finding-reconcile-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.clone());
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        write_finding_fixture(&store, "p", "one.md", "One");
+        let clock = Arc::new(ManualClock::new(0));
+        let mut state = AppState::with_runtime(
+            store.clone(),
+            clock.clone(),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+        state.selected_project = Some("p".into());
+        state.install_job_runtime(eframe::egui::Context::default());
+
+        write_finding_fixture(&store, "p", "nested/two.md", "Two");
+        state.file_invalidations = Some(Box::new(
+            crate::file_watch::FakeFileInvalidationSource::new(
+                crate::file_watch::FileInvalidations {
+                    corpus: BTreeSet::from(["p".into()]),
+                    ..crate::file_watch::FileInvalidations::default()
+                },
+            ),
+        ));
+        state.poll_file_invalidations();
+        state.poll_project_scope();
+        wait_for_finding_titles(&mut state, &["One", "Two"]);
+
+        write_finding_fixture(&store, "p", "one.md", "One edited");
+        std::fs::remove_file(
+            store
+                .project_corpus_dir("p")
+                .join("findings/nested/two.md"),
+        )
+        .unwrap();
+        state.file_invalidations = Some(Box::new(
+            crate::file_watch::FakeFileInvalidationSource::new(
+                crate::file_watch::FileInvalidations {
+                    corpus: BTreeSet::from(["p".into()]),
+                    ..crate::file_watch::FileInvalidations::default()
+                },
+            ),
+        ));
+        state.poll_file_invalidations();
+        state.poll_project_scope();
+        wait_for_finding_titles(&mut state, &["One edited"]);
+
+        // No event: the existing ten-second project reconciliation still
+        // discovers the change, without a findings-specific timer.
+        write_finding_fixture(&store, "p", "three.md", "Three");
+        clock.advance(STORE_BACKSTOP);
+        state.poll_project_scope();
+        wait_for_finding_titles(&mut state, &["One edited", "Three"]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_corpus_revision_is_rescheduled_after_the_active_key_clears() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-finding-revision-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.clone());
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        write_finding_fixture(&store, "p", "one.md", "Fresh");
+        let mut state = AppState::with_runtime(
+            store,
+            Arc::new(ManualClock::new(0)),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+        state.selected_project = Some("p".into());
+        state.install_job_runtime(eframe::egui::Context::default());
+        let stale_scope = state.corpus_job_scope("p");
+        state.note_corpus_mutation("p");
+
+        assert!(state.retry_stale_corpus_job(JobKind::CorpusSummary, &stale_scope));
+        wait_for_finding_titles(&mut state, &["Fresh"]);
+        assert_eq!(state.corpus_revision("p"), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4529,6 +4979,7 @@ mod tests {
         let project_scope = crate::jobs::JobScope {
             project: "p".into(),
             project_generation: 0,
+            corpus_revision: None,
             run_id: None,
         };
         assert!(state.job_scope_current(&project_scope));
@@ -4539,6 +4990,7 @@ mod tests {
         let run_scope = crate::jobs::JobScope {
             project: "p".into(),
             project_generation: 0,
+            corpus_revision: None,
             run_id: Some(run_id.clone()),
         };
         assert!(

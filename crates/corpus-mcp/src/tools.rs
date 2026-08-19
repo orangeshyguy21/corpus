@@ -4,11 +4,13 @@
 //! gates) that no prompt can talk its way around. Write tools land in the
 //! project corpus (the ONLY corpus scope).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use corpus_core::refusal::Gate;
-use corpus_core::{AgentRole, FaucetCall, Plugin, ProbeResult, Scope, Store};
+use corpus_core::{
+    AgentRole, FaucetCall, FindingSeverity, NewFinding, Plugin, ProbeResult, Scope, Store,
+};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -389,7 +391,9 @@ pub fn catalog() -> Value {
                 "properties": {
                     "title": {"type": "string"},
                     "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
-                    "detail": {"type": "string"}
+                    "detail": {"type": "string"},
+                    "path": {"type": "string", "description": "Optional path beneath findings/. A .md path names the file; a path with no extension or a trailing slash names a containing folder. Existing files are never overwritten."},
+                    "metadata": {"type": "object", "description": "Optional project-defined frontmatter. Corpus-owned keys such as title, severity, timestamp, sensitivity, verification, and provenance are refused."}
                 },
                 "required": ["title", "severity", "detail"]
             }
@@ -459,7 +463,7 @@ fn with_project(args: &Value, project: &str) -> Value {
 
 /// Management tools that only look. Not audited: the log is a record of
 /// acts, and a line per `agent_list` would bury the ones that matter.
-const READ_ONLY_MANAGEMENT: [&str; 10] = [
+const READ_ONLY_MANAGEMENT: [&str; 11] = [
     "agent_list",
     "agent_get",
     "mission_list",
@@ -469,6 +473,7 @@ const READ_ONLY_MANAGEMENT: [&str; 10] = [
     "corpus_stats",
     "corpus_list",
     "corpus_read",
+    "finding_list",
     "model_list",
 ];
 
@@ -1051,8 +1056,26 @@ fn wallet_fund(ctx: &mut Ctx, args: &Value) -> Result<String> {
 /// lands in the project corpus (default class: embargoed).
 fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let title = require_str(args, "title")?;
-    let severity = require_str(args, "severity")?;
+    let severity_raw = require_str(args, "severity")?;
+    let severity = FindingSeverity::parse(&severity_raw).ok_or_else(|| {
+        Error::Args(format!(
+            "invalid finding severity {severity_raw:?}; expected critical, high, medium, or low"
+        ))
+    })?;
     let detail = require_str(args, "detail")?;
+    let path = match args.get("path") {
+        None => None,
+        Some(Value::String(path)) => Some(path.clone()),
+        Some(_) => return Err(Error::Args("path must be a string".into())),
+    };
+    let metadata: BTreeMap<String, Value> = match args.get("metadata") {
+        None => BTreeMap::new(),
+        Some(Value::Object(metadata)) => metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        Some(_) => return Err(Error::Args("metadata must be an object".into())),
+    };
     let scope = ctx.write_scope(args)?;
 
     let mut verified = false;
@@ -1087,17 +1110,28 @@ fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let slug = slugify(&title);
-    let dir = category_dir(ctx, &scope, "findings")?;
-    let path = dir.join(format!("{ts}-{slug}.md"));
-    let body = format!(
-        "---\ntitle: {title}\nseverity: {severity}\noracle_verified: {verified}\nsensitivity: embargoed\ntimestamp: {ts}\n---\n\n\
-         ## Detail\n\n{detail}\n\n## Oracle output at report time\n\n```\n{oracle_out}```\n"
-    );
-    std::fs::write(&path, &body)?;
+    let finding = NewFinding {
+        title,
+        severity,
+        detail,
+        timestamp: ts,
+        oracle_verified: verified,
+        oracle_output: oracle_out,
+        path,
+        metadata,
+        run_log: ctx.run_log.clone(),
+        actor: Some(ctx.store.actor().to_string()),
+        source_pins: ctx.source_pins.clone(),
+    };
+    let written = ctx
+        .store
+        .write_finding(&scope.project, &finding)
+        .map_err(|error| Error::Args(error.to_string()))?;
     Ok(format!(
-        "finding recorded in {}: {} (oracle_verified: {verified}, sensitivity: embargoed)",
-        scope.project, path.display()
+        "finding recorded in {}: {} (reference: {}, oracle_verified: {verified}, sensitivity: embargoed)",
+        scope.project,
+        written.path.display(),
+        written.reference
     ))
 }
 

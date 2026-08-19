@@ -640,6 +640,7 @@ impl App {
                 }
                 if corpus_touched {
                     if let Some(p) = self.state.effective_project() {
+                        self.state.note_corpus_mutation(&p);
                         self.state.refresh_corpus_stats(&p);
                     }
                 }
