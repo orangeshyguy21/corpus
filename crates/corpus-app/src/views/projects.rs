@@ -49,6 +49,7 @@ pub struct ProjectsView {
     needs_probe: bool,
     show_install: bool,
     install_path: String,
+    plugin_details_open: bool,
 }
 
 impl Default for ProjectsView {
@@ -66,6 +67,7 @@ impl Default for ProjectsView {
             needs_probe: false,
             show_install: false,
             install_path: String::new(),
+            plugin_details_open: false,
         }
     }
 }
@@ -96,6 +98,7 @@ impl ProjectsView {
             self.project = Some(slug.clone());
             self.edit_plugin = project.plugin.clone();
             self.confirm_wipe = false;
+            self.plugin_details_open = false;
         }
         // Drain a requested plugin re-probe before the picker renders.
         if self.needs_probe {
@@ -140,53 +143,54 @@ impl ProjectsView {
     }
 
     fn status_band(&self, ui: &mut Ui, state: &AppState, slug: &str) {
-        components::panel_card(ui, "System status", |ui| {
+        components::panel_card(ui, "System status", "系统状态", |ui| {
             let env = state.env_status(slug);
-            ui.horizontal_wrapped(|ui| {
-                match env {
-                    Some(ref env) if env.ready => {
-                        components::status_badge(ui, "environment ready", components::StatusTone::Healthy)
-                            .on_hover_text(&env.notes);
-                    }
-                    Some(ref env) => {
-                        components::status_badge(ui, "environment degraded", components::StatusTone::Danger)
-                            .on_hover_text(&env.notes);
-                    }
-                    None => {
-                        components::status_badge(ui, "probe unavailable", components::StatusTone::Warning);
-                    }
+            let (status, tone, notes) = match env {
+                Some(ref env) if env.ready => (
+                    "environment ready",
+                    components::StatusTone::Healthy,
+                    Some(env.notes.as_str()),
+                ),
+                Some(ref env) => (
+                    "environment degraded",
+                    components::StatusTone::Danger,
+                    Some(env.notes.as_str()),
+                ),
+                None => (
+                    "probe unavailable",
+                    components::StatusTone::Warning,
+                    None,
+                ),
+            };
+            let metrics = [
+                ("source pins", state.source_pins.len().to_string()),
+                ("agents", state.agents.len().to_string()),
+                ("missions", state.missions.len().to_string()),
+                (
+                    "corpus files",
+                    state
+                        .corpus_stats()
+                        .map(|stats| stats.knowledge_files().to_string())
+                        .unwrap_or_else(|| "—".to_owned()),
+                ),
+            ];
+            let status_badge = |ui: &mut Ui| {
+                let response = components::status_badge(ui, status, tone);
+                if let Some(notes) = notes {
+                    response.on_hover_text(notes);
                 }
-                ui.add_space(18.0);
-                components::metric_cell(
-                    ui,
-                    "source pins",
-                    state.source_pins.len().to_string(),
-                    components::StatusTone::Interaction,
-                );
-                ui.add_space(18.0);
-                components::metric_cell(
-                    ui,
-                    "agents",
-                    state.agents.len().to_string(),
-                    components::StatusTone::Neutral,
-                );
-                ui.add_space(18.0);
-                components::metric_cell(
-                    ui,
-                    "missions",
-                    state.missions.len().to_string(),
-                    components::StatusTone::Neutral,
-                );
-                if let Some(stats) = state.corpus_stats() {
-                    ui.add_space(18.0);
-                    components::metric_cell(
-                        ui,
-                        "corpus files",
-                        stats.knowledge_files().to_string(),
-                        components::StatusTone::Neutral,
-                    );
-                }
-            });
+            };
+            if ui.available_width() >= 760.0 {
+                ui.horizontal(|ui| {
+                    status_badge(ui);
+                    ui.add_space(24.0);
+                    components::score_strip(ui, &metrics);
+                });
+            } else {
+                status_badge(ui);
+                ui.add_space(12.0);
+                components::score_strip(ui, &metrics);
+            }
         });
     }
 
@@ -200,19 +204,22 @@ impl ProjectsView {
         slug: &str,
     ) {
         if dashboard_columns(ui.available_width()) == 2 {
-            ui.columns(2, |columns| {
-                let (left, right) = columns.split_at_mut(1);
-                self.configuration_card(&mut left[0], state, toasts, slug);
-                card_gap(&mut left[0]);
-                self.team_card(&mut left[0], state);
-                card_gap(&mut left[0]);
-                self.corpus_card(&mut left[0], state);
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = theme::CARD_GUTTER;
+                ui.columns(2, |columns| {
+                    let (left, right) = columns.split_at_mut(1);
+                    self.configuration_card(&mut left[0], state, toasts, slug);
+                    card_gap(&mut left[0]);
+                    self.team_card(&mut left[0], state);
+                    card_gap(&mut left[0]);
+                    self.corpus_card(&mut left[0], state);
 
-                self.missions_card(&mut right[0], state, slug);
-                card_gap(&mut right[0]);
-                self.logs_card(&mut right[0], state);
-                card_gap(&mut right[0]);
-                self.cost_card(&mut right[0], state);
+                    self.missions_card(&mut right[0], state, slug);
+                    card_gap(&mut right[0]);
+                    self.logs_card(&mut right[0], state);
+                    card_gap(&mut right[0]);
+                    self.cost_card(&mut right[0], state);
+                });
             });
         } else {
             self.configuration_card(ui, state, toasts, slug);
@@ -236,7 +243,7 @@ impl ProjectsView {
         toasts: &mut Toasts,
         slug: &str,
     ) {
-        components::panel_card(ui, "Configuration", |ui| {
+        components::panel_card(ui, "Configuration", "配置", |ui| {
             ui.label(command_label("Environment plugin"));
             ui.add_space(6.0);
             plugin_picker(
@@ -251,12 +258,13 @@ impl ProjectsView {
                 .iter()
                 .find(|plugin| plugin.name == self.edit_plugin)
                 .cloned();
-            if let Some(status) = selected_status.as_ref() {
-                plugin_identity(ui, status);
-                ui.add_space(8.0);
-            }
+            let leases = state.plugin_leases().to_vec();
+            let plugin_busy = state.plugin_work_active();
             ui.horizontal_wrapped(|ui| {
-                let plugin_busy = state.plugin_work_active();
+                if let Some(status) = selected_status.as_ref() {
+                    plugin_summary(ui, status);
+                }
+                ui.add_space(12.0);
                 let setup_label = match state.plugin_operation() {
                     Some(ref operation)
                         if operation.operation == "setup"
@@ -279,59 +287,63 @@ impl ProjectsView {
                                 ToastKind::Info,
                                 format!("{} {operation} started", self.edit_plugin),
                             ),
-                        Ok(false) => toast(
-                            toasts,
-                            ToastKind::Warning,
-                            "another plugin operation is already running",
+                            Ok(false) => toast(
+                                toasts,
+                                ToastKind::Warning,
+                                "another plugin operation is already running",
                             ),
                             Err(error) => toast(toasts, ToastKind::Error, error),
                         }
                     }
                 }
-                let leases_live = !state.plugin_leases().is_empty();
-                let stop = ui
-                    .add_enabled(!leases_live && !plugin_busy, egui::Button::new("Stop"))
-                    .on_disabled_hover_text(
-                        "Stop or retry cleanup for the live mission leases shown below first.",
-                    );
-                if stop.clicked() {
-                    match state.start_plugin_lifecycle(&self.edit_plugin, "stop") {
-                        Ok(true) => toast(
-                            toasts,
-                            ToastKind::Info,
-                            format!("{} stop started", self.edit_plugin),
-                        ),
-                    Ok(false) => toast(
-                        toasts,
-                        ToastKind::Warning,
-                        "another plugin operation is already running",
-                        ),
-                        Err(error) => toast(toasts, ToastKind::Error, error),
+                ui.menu_button("⋮", |ui| {
+                    let environments_live = !leases.is_empty();
+                    let stop = ui
+                        .add_enabled(
+                            !environments_live && !plugin_busy,
+                            egui::Button::new("Stop"),
+                        )
+                        .on_disabled_hover_text(
+                            "Stop active mission environments before stopping the plugin.",
+                        );
+                    if stop.clicked() {
+                        match state.start_plugin_lifecycle(&self.edit_plugin, "stop") {
+                            Ok(true) => toast(
+                                toasts,
+                                ToastKind::Info,
+                                format!("{} stop started", self.edit_plugin),
+                            ),
+                            Ok(false) => toast(
+                                toasts,
+                                ToastKind::Warning,
+                                "another plugin operation is already running",
+                            ),
+                            Err(error) => toast(toasts, ToastKind::Error, error),
+                        }
+                        ui.close_menu();
                     }
-                }
-                if state.plugin_lifecycle_active("setup")
-                    && ui.button("Cancel setup").clicked()
-                    && state.cancel_plugin_lifecycle("setup")
-                {
-                    toast(toasts, ToastKind::Info, "cancelling plugin setup");
-                }
-                if ui
-                    .add_enabled(!plugin_busy, egui::Button::new("Install bundle…"))
-                    .clicked()
-                {
-                    self.show_install = true;
-                }
+                    if state.plugin_lifecycle_active("setup") && ui.button("Cancel setup").clicked()
+                    {
+                        if state.cancel_plugin_lifecycle("setup") {
+                            toast(toasts, ToastKind::Info, "cancelling plugin setup");
+                        }
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(!plugin_busy, egui::Button::new("Install bundle…"))
+                        .clicked()
+                    {
+                        self.show_install = true;
+                        ui.close_menu();
+                    }
+                });
             });
             if let Some(operation) = state.plugin_operation() {
                 ui.add_space(8.0);
                 plugin_operation(ui, &operation);
             }
             ui.add_space(12.0);
-            plugin_leases(ui, state.plugin_leases());
-            ui.add_space(16.0);
-            components::soft_rule(ui);
-            ui.add_space(12.0);
-            ui.label(command_label("Pinned sources"));
+            ui.label(command_label("Source revisions"));
             ui.add_space(6.0);
             if state.source_revisions_loading(slug) {
                 empty_hint(ui, "loading source revisions…");
@@ -360,13 +372,23 @@ impl ProjectsView {
                     }
                 });
                 ui.add_space(6.0);
-                empty_hint(ui, "source selections persist immediately");
+                empty_hint(ui, "changes apply immediately");
+            }
+            ui.add_space(12.0);
+            details_toggle(ui, &mut self.plugin_details_open);
+            if self.plugin_details_open {
+                ui.add_space(10.0);
+                if let Some(status) = selected_status.as_ref() {
+                    plugin_identity(ui, status);
+                }
+                ui.add_space(12.0);
+                plugin_environments(ui, &leases);
             }
         });
     }
 
     fn team_card(&self, ui: &mut Ui, state: &mut AppState) {
-        components::panel_card(ui, "Team", |ui| {
+        components::panel_card(ui, "Team", "团队", |ui| {
             let agents = state.agents.clone();
             if agents.is_empty() {
                 empty_hint(ui, "no agents in this project");
@@ -386,7 +408,7 @@ impl ProjectsView {
     }
 
     fn missions_card(&self, ui: &mut Ui, state: &mut AppState, project: &str) {
-        components::panel_card(ui, "Missions", |ui| {
+        components::panel_card(ui, "Missions", "任务", |ui| {
             let missions = state.missions.clone();
             if missions.is_empty() {
                 empty_hint(ui, "no missions in this project");
@@ -395,7 +417,14 @@ impl ProjectsView {
             for (slug, mission) in missions {
                 let name = crate::state::mission_label(mission.name.as_deref(), &slug);
                 let activity = state.mission_activity(project, &slug);
-                let (status, tone) = match activity {
+                let old_repo_revision = state.plugin_leases().iter().any(|environment| {
+                    environment.mission == slug
+                        && environment.drift.iter().any(|detail| {
+                            detail.contains(" pin resolves to ")
+                                && detail.contains(" but lease runs ")
+                        })
+                });
+                let (activity_status, activity_tone) = match activity {
                     crate::state::MissionActivity::Working => {
                         ("working", components::StatusTone::Healthy)
                     }
@@ -406,7 +435,17 @@ impl ProjectsView {
                         ("idle", components::StatusTone::Neutral)
                     }
                 };
-                if command_row(ui, ("project-mission", &slug), &name, status, tone).clicked() {
+                let status = if old_repo_revision {
+                    format!("{activity_status} · old repo revision")
+                } else {
+                    activity_status.to_string()
+                };
+                let tone = if old_repo_revision {
+                    components::StatusTone::Warning
+                } else {
+                    activity_tone
+                };
+                if command_row(ui, ("project-mission", &slug), &name, &status, tone).clicked() {
                     state.select_mission(project, &slug);
                 }
             }
@@ -415,7 +454,7 @@ impl ProjectsView {
 
     fn corpus_card(&mut self, ui: &mut Ui, state: &AppState) {
         let findings = finding_summary_model(state.finding_discovery());
-        components::panel_card(ui, "Corpus signal", |ui| {
+        components::panel_card(ui, "Corpus signal", "语料库信号", |ui| {
             ui.horizontal(|ui| {
                 match state.corpus_stats() {
                     Some(stats) => {
@@ -465,7 +504,7 @@ impl ProjectsView {
     }
 
     fn logs_card(&self, ui: &mut Ui, state: &AppState) {
-        components::panel_card(ui, "Mission logs", |ui| {
+        components::panel_card(ui, "Mission logs", "任务日志", |ui| {
             let logs = state
                 .corpus_stats()
                 .map(|stats| stats.logs.clone())
@@ -493,7 +532,7 @@ impl ProjectsView {
     }
 
     fn cost_card(&self, ui: &mut Ui, state: &AppState) {
-        components::panel_card(ui, "Cost", |ui| match state.corpus_cost() {
+        components::panel_card(ui, "Cost", "成本", |ui| match state.corpus_cost() {
             Some(report) if !report.rows.is_empty() => {
                 cost_headline(ui, report);
                 ui.add_space(12.0);
@@ -560,12 +599,8 @@ impl ProjectsView {
             return;
         }
         match state.rebind_project(slug, self.edit_plugin.trim()) {
-            Ok(project) => {
-                toast(
-                    toasts,
-                    ToastKind::Success,
-                    format!("rebound {slug} -> plugin {}", project.plugin),
-                );
+            Ok(_) => {
+                toast(toasts, ToastKind::Success, "environment updated");
                 state.refresh();
                 // Refresh the per-source pins + env for the new binding.
                 state.select_project(slug);
@@ -579,11 +614,7 @@ impl ProjectsView {
     fn delete_project(&mut self, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
         match state.delete_project(slug) {
             Ok(()) => {
-                toast(
-                    toasts,
-                    ToastKind::Success,
-                    format!("deleted project {slug}"),
-                );
+                toast(toasts, ToastKind::Success, "project deleted");
                 state.refresh();
                 // ensure_selection re-picks a project next frame.
                 state.selected_project = None;
@@ -606,7 +637,7 @@ impl ProjectsView {
         let mut open = self.confirm_delete;
         let mut deleted = false;
         let mut cancel = false;
-        egui::Window::new("Delete project")
+        theme::dialog(ui.ctx(), "project_view_delete", "Delete project")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -649,7 +680,7 @@ impl ProjectsView {
         let mut open = self.confirm_wipe;
         let mut wiped = false;
         let mut cancel = false;
-        egui::Window::new("Delete corpus")
+        theme::dialog(ui.ctx(), "project_view_wipe", "Delete corpus")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -661,15 +692,8 @@ impl ProjectsView {
                 ui.horizontal(|ui| {
                     if theme::destructive_button(ui, "Wipe corpus").clicked() {
                         match state.wipe_project_corpus(slug) {
-                            Ok(project) => {
-                                toast(
-                                    toasts,
-                                    ToastKind::Success,
-                                    format!(
-                                        "corpus wiped (generation {})",
-                                        project.corpus_generation
-                                    ),
-                                );
+                            Ok(_) => {
+                                toast(toasts, ToastKind::Success, "corpus deleted");
                                 state.refresh();
                                 state.refresh_corpus_stats(slug);
                                 wiped = true;
@@ -700,7 +724,7 @@ impl ProjectsView {
         }
         let mut open = self.show_rename;
         let mut renamed = false;
-        egui::Window::new("Rename project")
+        theme::dialog(ui.ctx(), "project_view_rename", "Rename project")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -722,12 +746,8 @@ impl ProjectsView {
                     .clicked();
                 if clicked || (submit && named) {
                     match state.rename_project(slug, &self.rename_name) {
-                        Ok(project) => {
-                            toast(
-                                toasts,
-                                ToastKind::Success,
-                                format!("renamed project to {}", project.name),
-                            );
+                        Ok(_) => {
+                            toast(toasts, ToastKind::Success, "project renamed");
                             state.refresh();
                             renamed = true;
                         }
@@ -746,7 +766,11 @@ impl ProjectsView {
         }
         let mut open = self.show_clone;
         let mut cloned = false;
-        egui::Window::new(format!("Clone project: {from}"))
+        theme::dialog(
+            ui.ctx(),
+            "project_view_clone",
+            format!("Clone project: {from}"),
+        )
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -765,11 +789,7 @@ impl ProjectsView {
                     };
                     match state.clone_project(from, name, self.clone_corpus) {
                         Ok((to, _)) => {
-                            toast(
-                                toasts,
-                                ToastKind::Success,
-                                format!("cloned project {from} -> {to}"),
-                            );
+                            toast(toasts, ToastKind::Success, "project cloned");
                             state.refresh();
                             state.select_project(&to);
                             cloned = true;
@@ -787,7 +807,11 @@ impl ProjectsView {
         }
         let mut open = self.show_install;
         let mut started = false;
-        egui::Window::new("Install environment plugin")
+        theme::dialog(
+            ui.ctx(),
+            "project_view_install_plugin",
+            "Install environment plugin",
+        )
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -905,13 +929,16 @@ fn finding_summary(ui: &mut Ui, model: &FindingSummaryModel) {
         }
     };
     let width = finding_tile_width(ui.available_width());
-    ui.horizontal_wrapped(|ui| {
-        for (label, count, color) in finding_count_entries(*counts) {
-            if count == 0 {
-                continue;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(theme::CARD_GUTTER, theme::CARD_GUTTER);
+        ui.horizontal_wrapped(|ui| {
+            for (label, count, color) in finding_count_entries(*counts) {
+                if count == 0 {
+                    continue;
+                }
+                finding_count_tile(ui, width, label, count, color);
             }
-            finding_count_tile(ui, width, label, count, color);
-        }
+        });
     });
 }
 
@@ -970,7 +997,7 @@ fn finding_count_tile(
 }
 
 fn card_gap(ui: &mut Ui) {
-    ui.add_space(12.0);
+    ui.add_space(theme::CARD_GUTTER);
 }
 
 fn command_label(text: &str) -> RichText {
@@ -982,6 +1009,63 @@ fn command_label(text: &str) -> RichText {
 
 fn empty_hint(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(theme::TEXT_FAINT));
+}
+
+fn plugin_summary(ui: &mut Ui, status: &corpus_core::PluginStatus) {
+    components::status_badge(
+        ui,
+        if status.ready { "ready" } else { "not ready" },
+        if status.ready {
+            components::StatusTone::Healthy
+        } else {
+            components::StatusTone::Danger
+        },
+    )
+    .on_hover_text(&status.notes);
+    ui.label(
+        RichText::new(format!(
+            "v{}",
+            status.version.as_deref().unwrap_or("unknown")
+        ))
+        .monospace()
+        .size(12.0)
+        .color(theme::TEXT_MUTED),
+    );
+}
+
+fn details_toggle(ui: &mut Ui, open: &mut bool) {
+    egui::Frame::default()
+        .stroke(egui::Stroke::new(1.0_f32, theme::KEYLINE_SOFT))
+        .corner_radius(theme::CONTROL_RADIUS)
+        .inner_margin(egui::Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            let marker = if *open { "⌄" } else { "›" };
+            let state = if *open { "Expanded" } else { "Collapsed" };
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("{marker}  Details"))
+                                .monospace()
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    *open = !*open;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(state)
+                            .monospace()
+                            .size(10.5)
+                            .color(theme::TEXT_FAINT),
+                    );
+                });
+            });
+        });
 }
 
 fn plugin_identity(ui: &mut Ui, status: &corpus_core::PluginStatus) {
@@ -1111,11 +1195,11 @@ fn plugin_operation(ui: &mut Ui, operation: &crate::state::PluginOperationView) 
     }
 }
 
-fn plugin_leases(ui: &mut Ui, leases: &[crate::state::PluginLeaseView]) {
-    ui.label(command_label("Live environment leases"));
+fn plugin_environments(ui: &mut Ui, leases: &[crate::state::PluginLeaseView]) {
+    ui.label(command_label("Active mission environments"));
     ui.add_space(4.0);
     if leases.is_empty() {
-        empty_hint(ui, "no target or sandbox session is active");
+        empty_hint(ui, "no mission environment is active");
         return;
     }
     for lease in leases {

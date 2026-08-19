@@ -35,6 +35,7 @@ permission:
   corpus_mission_set_pins: deny
   corpus_mission_status: deny
   corpus_model_list: deny
+  corpus_oracle_list: deny
   corpus_oracle_run: deny
   corpus_sandbox_exec: deny
   corpus_target_info: allow

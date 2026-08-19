@@ -161,8 +161,8 @@ corpus plugin call <name> <method> [params-json]
 # and the run survives attach/detach/app-close; a relaunched app lists
 # live corpus-* sessions for in-pane re-attach. `corpus run` is the
 # HEADLESS `opencode run` (automation): transcript .log in the project
-# corpus runs/. Transcript of record for TUI runs: Stop (the ONE run
-# teardown verb — the run menu is Stop / Rename… / Delete) exports
+# corpus runs/. Transcript of record for TUI runs: mission Delete (the app's
+# one run teardown verb; the row menu is Rename… / Delete) exports
 # the session to <epoch>-<agent>.json best-effort in the project corpus
 # runs/; the live tail is tmux pipe-pane raw capture
 # (ANSI-stripped), written into the SAME runs/ as <epoch>-<agent>.raw
@@ -358,9 +358,10 @@ the launch unit. Agent configs carry model/description/prompt/permission
 only.
 
 A fresh agent should answer "how do I run the oracle suite?" with: `corpus
-plugin probe cdk-regtest` (is the environment healthy) then via the MCP
-tools `oracle_run` per oracle reported by `corpus plugin call cdk-regtest
-oracles`. "Who may touch the sandbox?" → the `tester` and `super` roles, via
+plugin probe <plugin>` (is the environment healthy), then via the MCP tools
+call `oracle_list`, read the returned names and descriptions, and use
+`oracle_run` for the relevant exact names. "Who may touch the sandbox?" →
+the `tester` and `super` roles, via
 the `corpus_sandbox_exec` MCP tool (see Trust domains below).
 
 ## Trust domains (hard rules)

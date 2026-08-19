@@ -25,6 +25,7 @@ pub struct ChatPanelView {
     model: String,
     ollama_models: crate::state::ModelDiscovery,
     ollama_jobs: Option<crate::jobs::JobSet<corpus_core::ModelList>>,
+    model_picker: crate::views::model_picker::ModelPicker,
     md: CommonMarkCache,
     /// Map from permission request id -> the args/tool, for the inline card.
     pending: Vec<PendingPermission>,
@@ -55,9 +56,6 @@ pub struct ChatPanelView {
     /// approval-gated catalog; the Orchestrator's summon delegation is
     /// experimental until in-process specialist delegation lands).
     role: crate::chat::team::TeamRole,
-    /// The display name of the chat's project (slug fallback) — the header
-    /// names things, never bare UUIDs.
-    project_label: String,
     /// LAST FRAME's measured composer height. The footer used to be a fixed
     /// 88px reservation, so the moment the input grew past one row the box
     /// (and the status line under it) fell off the bottom of the panel — the
@@ -68,7 +66,6 @@ pub struct ChatPanelView {
     /// composer's focus ring.
     input_focused: bool,
 }
-
 struct Rendered {
     text: String,
     /// Our tool-call cards, in arrival order within this bubble.
@@ -130,6 +127,7 @@ impl Default for ChatPanelView {
             model: String::new(),
             ollama_models: crate::state::ModelDiscovery::Loading,
             ollama_jobs: None,
+            model_picker: crate::views::model_picker::ModelPicker::default(),
             md: CommonMarkCache::default(),
             pending: Vec::new(),
             activity: Activity::Idle,
@@ -141,7 +139,6 @@ impl Default for ChatPanelView {
             last_error: None,
             usage: (0, 0),
             role: crate::chat::team::TeamRole::Operator,
-            project_label: String::new(),
             footer_h: 108.0,
             input_focused: false,
         }
@@ -228,12 +225,6 @@ impl ChatPanelView {
 
     pub fn role(&self) -> crate::chat::team::TeamRole {
         self.role
-    }
-
-    /// Set the project display name shown in the header (empty = show the
-    /// backend's slug).
-    pub fn set_project_label(&mut self, label: &str) {
-        self.project_label = label.to_string();
     }
 
     /// Transition the live activity, restarting the elapsed timer when the
@@ -475,58 +466,6 @@ impl ChatPanelView {
 
     /// Render the panel; returns nothing, mutates chat/self.
     pub fn show(&mut self, ui: &mut egui::Ui, chat: &mut ChatHandle) {
-        let project = if self.project_label.is_empty() {
-            chat.project()
-        } else {
-            self.project_label.clone()
-        };
-        // The role picker is allocated FIRST (right-to-left), then the title
-        // group fills what's left. Laid out title-first, the truncating
-        // project label claims the whole row and squeezes the picker off the
-        // panel's edge.
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // The role selector (default Operator: full catalog,
-                // destructive ops gated by inline Approve/Reject). A change
-                // restarts the session (main.rs ensure_chat_started compares
-                // the role).
-                crate::theme::combo_field(ui, |ui| {
-                    egui::ComboBox::from_id_salt("chat_role")
-                        .icon(crate::theme::combo_caret)
-                        .selected_text(
-                            egui::RichText::new(self.role.label().to_string()).small(),
-                        )
-                        .show_ui(ui, |ui| {
-                            for r in crate::chat::team::ALL_ROLES {
-                                let label = if *r == crate::chat::team::TeamRole::Orchestrator {
-                                    format!("{} (experimental)", r.label())
-                                } else {
-                                    r.label().to_string()
-                                };
-                                if ui.selectable_label(self.role == *r, label).clicked() {
-                                    self.role = *r;
-                                }
-                            }
-                        });
-                });
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.label(crate::theme::section_heading("Chat"));
-                    // Truncated, never wrapped.
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!("· {project}"))
-                                .small()
-                                .color(crate::theme::TEXT_FAINT),
-                        )
-                        .truncate(),
-                    );
-                });
-            });
-        });
-        ui.add_space(2.0);
-        crate::theme::hairline(ui);
-        ui.add_space(6.0);
-
         // Message scroll with explicit height reservation, then the composer
         // below it. (NOT bottom_up layout — it inverts the ScrollArea's
         // content stacking: the "new message stacks on top" bug.) The
@@ -724,7 +663,7 @@ impl ChatPanelView {
         let mut card = egui::Frame::default()
             .fill(crate::theme::EDITOR_BG)
             .stroke(egui::Stroke::new(1.0_f32, crate::theme::HAIRLINE))
-            .corner_radius(egui::CornerRadius::same(8))
+            .corner_radius(crate::theme::CONTROL_RADIUS)
             .inner_margin(egui::Margin::symmetric(8, 8))
             .begin(ui);
 
@@ -738,6 +677,7 @@ impl ChatPanelView {
             // IS its frame — and full width, so a wrapped line is never
             // clipped by a button sitting beside it.
             let text_w = ui.available_width();
+            let mut layouter = crate::views::syntax_editor::markdown_layouter;
             let editor = egui::TextEdit::multiline(&mut self.input)
                 .hint_text(
                     egui::RichText::new("message the corpus…").color(crate::theme::TEXT_FAINT),
@@ -746,7 +686,9 @@ impl ChatPanelView {
                 .desired_rows(1)
                 .frame(false)
                 .margin(egui::Margin::symmetric(2, 2))
-                .id_salt("chat_input");
+                .id_salt("chat_input")
+                .font(egui::TextStyle::Monospace)
+                .layouter(&mut layouter);
             let response = egui::ScrollArea::vertical()
                 .max_height(150.0)
                 .auto_shrink([false, true])
@@ -884,77 +826,58 @@ impl ChatPanelView {
         }
         let current = self.model.clone();
         let (phase, dot) = self.status(chat);
-        // The field takes what the rail's right-hand controls left it. The
-        // label is elided to fit rather than allowed to widen the button:
-        // ComboBox sizes to its text, so a long `hf.co/…` id would shove the
-        // send button off the card.
         let field_w = (ui.available_width() - 2.0).max(90.0);
-        let text_color = if current.is_empty() {
-            crate::theme::TEXT_FAINT
+        let current_id = if current.is_empty() {
+            String::new()
         } else {
-            crate::theme::TEXT
+            format!("ollama/{current}")
         };
-        let label = if current.is_empty() {
-            "choose a model…"
-        } else {
-            &current
-        };
-        // ComboBox sizes to its text (`width` is only a minimum), so the
-        // label is fitted to the slot BEFORE it can widen the button and
-        // shove the send button off the card. Budget = the field minus its
-        // own furniture: two 8px margins, the caret icon and its spacing.
-        let selected = fit_picker_label(ui, label, text_color, field_w - 36.0);
-        crate::theme::combo_field(ui, |ui| {
-            let combo = egui::ComboBox::from_id_salt("chat_model")
-                .icon(crate::theme::combo_caret)
-                .width(field_w)
-                .selected_text(selected)
-                .show_ui(ui, |ui| {
-                        match &self.ollama_models {
-                            crate::state::ModelDiscovery::Ready(list) => for g in &list.groups {
-                                if !g.label.is_empty() {
-                                    ui.label(egui::RichText::new(&g.label).weak().small());
-                                }
-                                for m in &g.models {
-                                    let label =
-                                        if m.name.is_empty() { m.model.clone() } else { m.name.clone() };
-                                    if ui.selectable_label(current == m.model, &label).clicked() {
-                                        self.model = m.model.clone();
-                                    }
-                                }
-                            },
-                            crate::state::ModelDiscovery::Loading => {
-                                ui.label("loading Ollama models…");
-                            }
-                            crate::state::ModelDiscovery::Failed(error) => {
-                                ui.label("ollama not available — a model is required")
-                                    .on_hover_text(error);
-                            }
-                        }
-                        ui.separator();
-                        if ui.button("Refresh models").clicked() {
-                            self.ollama_models = crate::state::ModelDiscovery::Loading;
-                            self.start_ollama_discovery(true);
-                        }
-                    });
-            // The status light, painted into the gap the label reserved for
-            // it. A painted dot (the app's idiom — sidebar rows and the env
-            // dot are the same shape) rather than a glyph: phosphor's DOT
-            // renders at punctuation size and read as a stray period.
-            let rect = combo.response.rect;
-            ui.painter().circle_filled(
-                egui::pos2(rect.left() + DOT_INSET, rect.center().y),
-                3.5,
-                dot,
-            );
-            // The full id is never truncated away: it's the first line of the
-            // tooltip, with the phase under it.
-            if !current.is_empty() {
-                combo.response.on_hover_text(format!("{current}\n{phase}"))
-            } else {
-                combo.response.on_hover_text(phase)
+        let catalog = match &self.ollama_models {
+            crate::state::ModelDiscovery::Ready(list) => {
+                crate::views::model_picker::Catalog::Ready(list)
             }
-        });
+            crate::state::ModelDiscovery::Loading => {
+                crate::views::model_picker::Catalog::Loading("loading Ollama models…")
+            }
+            crate::state::ModelDiscovery::Failed(error) => {
+                crate::views::model_picker::Catalog::Failed {
+                    label: "ollama not available — a model is required",
+                    detail: error,
+                }
+            }
+        };
+        let output = self.model_picker.show(
+            ui,
+            catalog,
+            crate::views::model_picker::Options {
+                id_salt: "chat_model",
+                current_id: &current_id,
+                selected_label: &current,
+                empty_label: "choose a model…",
+                none_label: None,
+                field_width: field_w,
+                font_size: 12.0,
+                text_color: crate::theme::TEXT,
+                status_dot: Some(dot),
+                refresh_label: "Refresh models",
+            },
+        );
+        if let Some(crate::views::model_picker::Selection::Model(model)) = output.selection {
+            self.model = model.model;
+        }
+        if output.refresh_requested {
+            self.ollama_models = crate::state::ModelDiscovery::Loading;
+            self.start_ollama_discovery(true);
+        }
+        // The full id is never truncated away: it is the first line of the
+        // tooltip, with the backend phase below it.
+        if !current.is_empty() {
+            output
+                .response
+                .on_hover_text(format!("{current}\n{phase}"));
+        } else {
+            output.response.on_hover_text(phase);
+        }
     }
 
     fn start_ollama_discovery(&mut self, refresh: bool) {

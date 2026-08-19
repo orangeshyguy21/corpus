@@ -24,6 +24,7 @@ const OUTPUT_CAP_BYTES: usize = 8 * 1024;
 /// silently erase the oracle which actually violated.
 const ORACLE_LOG_CAP_BYTES: usize = 16 * 1024;
 const ORACLE_SUITE_CAP: usize = 64;
+const ORACLE_DESCRIPTION_CAP_BYTES: usize = 2 * 1024;
 
 fn valid_oracle_name(name: &str) -> bool {
     !name.is_empty()
@@ -51,6 +52,13 @@ fn validate_oracle_catalog(oracles: Vec<OracleInfo>) -> Result<Vec<OracleInfo>> 
             return Err(Error::Plugin(format!(
                 "oracle catalog contains duplicate name {:?}",
                 oracle.name
+            )));
+        }
+        if oracle.description.len() > ORACLE_DESCRIPTION_CAP_BYTES {
+            return Err(Error::Plugin(format!(
+                "oracle {:?} description is {} bytes; maximum is {ORACLE_DESCRIPTION_CAP_BYTES}",
+                oracle.name,
+                oracle.description.len()
             )));
         }
     }
@@ -464,8 +472,13 @@ pub fn catalog() -> Value {
             }
         },
         {
+            "name": "oracle_list",
+            "description": "List the host-side invariant oracles available for this environment session. Returns each oracle's name and description. Use the catalog to decide which oracle to run with oracle_run.",
+            "inputSchema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
             "name": "oracle_run",
-            "description": "Run a host-side invariant oracle by name (e.g. 020-conservation). Returns verdict: hold | violated | inconclusive, with evidence log.",
+            "description": "Run one host-side invariant oracle using an exact name returned by oracle_list. Returns verdict: hold | violated | inconclusive, with evidence log.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
@@ -951,6 +964,7 @@ fn dispatch_inner(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     match name {
         "target_info" => target_info(ctx),
         "sandbox_exec" => sandbox_exec(ctx, &require_str(args, "command")?),
+        "oracle_list" => oracle_list(ctx),
         "oracle_run" => oracle_run(ctx, &require_str(args, "name")?),
         "faucet" => faucet(ctx, args),
         "wallet_fund" => wallet_fund(ctx, args),
@@ -1140,6 +1154,29 @@ fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
     }
     combined.push_str(&format!("\n[exit {}]", result.exit_code));
     Ok(combined)
+}
+
+fn oracle_catalog(ctx: &mut Ctx) -> Result<Vec<OracleInfo>> {
+    let oracles = if ctx
+        .plugin
+        .as_ref()
+        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
+    {
+        let (_, params) = v1_call_params(ctx, json!({}))?;
+        resilient(ctx, |plugin| {
+            let value = plugin.call_v1("oracles", Some(params))?;
+            Ok(serde_json::from_value(value)?)
+        })?
+    } else {
+        resilient(ctx, |plugin| plugin.oracles())?
+    };
+    validate_oracle_catalog(oracles)
+}
+
+fn oracle_list(ctx: &mut Ctx) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&json!({
+        "oracles": oracle_catalog(ctx)?,
+    }))?)
 }
 
 fn oracle_run(ctx: &mut Ctx, name: &str) -> Result<String> {
@@ -1346,21 +1383,7 @@ fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
 
     let mut verified = false;
     let mut oracle_out = String::new();
-    let oracle_list = if ctx
-        .plugin
-        .as_ref()
-        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
-    {
-        v1_call_params(ctx, json!({})).and_then(|(_, params)| {
-            resilient(ctx, |plugin| {
-                let value = plugin.call_v1("oracles", Some(params))?;
-                Ok(serde_json::from_value(value)?)
-            })
-        })
-    } else {
-        resilient(ctx, |p| p.oracles())
-    };
-    match oracle_list.and_then(validate_oracle_catalog) {
+    match oracle_catalog(ctx) {
         Ok(oracles) => {
             for oracle in &oracles {
                 let result = if ctx
@@ -1565,4 +1588,45 @@ fn slugify(raw: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oracle(name: &str, description: &str) -> OracleInfo {
+        OracleInfo {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+
+    #[test]
+    fn oracle_catalog_validation_accepts_described_unique_names() {
+        let catalog = vec![
+            oracle("020-quote-accounting", "quote accounting"),
+            oracle("050-conservation-delta", "backend conservation"),
+        ];
+        assert_eq!(validate_oracle_catalog(catalog).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn oracle_catalog_validation_rejects_bad_names_duplicates_and_bounds() {
+        for catalog in [
+            vec![oracle("bad name", "bad")],
+            vec![oracle("same", "one"), oracle("same", "two")],
+            vec![oracle(
+                "large-description",
+                &"x".repeat(ORACLE_DESCRIPTION_CAP_BYTES + 1),
+            )],
+        ] {
+            assert!(validate_oracle_catalog(catalog).is_err());
+        }
+        assert!(validate_oracle_catalog(
+            (0..=ORACLE_SUITE_CAP)
+                .map(|index| oracle(&format!("oracle-{index}"), "bounded"))
+                .collect()
+        )
+        .is_err());
+    }
 }

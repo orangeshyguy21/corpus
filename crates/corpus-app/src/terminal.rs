@@ -4,22 +4,22 @@
 //! embedded PTY, so tmux stays the supervisor: closing or crashing the
 //! app closes the PTY, the tmux CLIENT detaches, and the run lives on.
 //!
-//! Focus discipline: click the pane to focus it (keys — including the
-//! ctrl chords the opencode TUI uses, and tab — route to the PTY); the
-//! release-focus gesture is a click ANYWHERE OUTSIDE the pane, which is
-//! documented in the run header. egui_term 0.1.0 additionally gates
-//! keyboard input on pointer hover, so keys reach the run while the
-//! pointer is over the pane. Scrollback (mouse wheel), selection
+//! Focus discipline: an operator-launched pane focuses on first attach;
+//! otherwise click the pane to focus it (keys — including the ctrl chords
+//! the opencode TUI uses, and tab — route to the PTY). A click ANYWHERE
+//! OUTSIDE the pane releases focus. The locally pinned egui_term separates
+//! focused keyboard input from hover-gated pointer input. Scrollback,
+//! selection
 //! (drag; double/triple click for word/line), and copy/paste
 //! (Cmd+C / Cmd+V) are egui_term's own.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 
-use alacritty_terminal::term::TermMode;
 /// egui_term does not re-export its SelectionType (its `backend` module is
 /// private), but it IS a public alias of alacritty's — and this crate pins
 /// the same alacritty_terminal version as egui_term, so the types match.
 use alacritty_terminal::selection::SelectionType;
+use alacritty_terminal::term::TermMode;
 use egui_term::{
     BackendCommand, BackendSettings, ColorPalette, FontSettings, PtyEvent, TerminalBackend,
     TerminalFont, TerminalTheme, TerminalView,
@@ -42,6 +42,10 @@ pub struct TerminalPane {
     /// the PTY as mouse reports, starting tmux's own copy-mode selection
     /// instead of a copyable local one — the mouse-mode copy bug).
     shift_selecting: bool,
+    /// Fractional high-resolution wheel movement retained until it becomes
+    /// a whole terminal row. This makes trackpads behave like native terminal
+    /// scrollback without emitting one PTY write per pixel event.
+    scroll_points: f32,
     /// Font matched to the app theme, resolved on first show.
     font: Option<TerminalFont>,
     /// Colors matched to the app theme (panel fill + readable fg).
@@ -60,6 +64,7 @@ impl Default for TerminalPane {
             attached: None,
             focused: false,
             shift_selecting: false,
+            scroll_points: 0.0,
             font: None,
             theme: pane_theme(),
             next_id: 1,
@@ -80,10 +85,11 @@ impl TerminalPane {
         &mut self,
         ctx: &egui::Context,
         target: Option<(String, Vec<String>)>,
+        focus_new: bool,
     ) -> Result<(), String> {
         match target {
             Some((session, _)) if self.attached.as_deref() == Some(session.as_str()) => Ok(()),
-            Some((session, argv)) => self.attach(ctx, &session, &argv),
+            Some((session, argv)) => self.attach(ctx, &session, &argv, focus_new),
             None => {
                 self.detach();
                 Ok(())
@@ -98,13 +104,20 @@ impl TerminalPane {
         self.attached = None;
         self.focused = false;
         self.shift_selecting = false;
+        self.scroll_points = 0.0;
     }
 
     /// Spawn the embedded PTY running the attach argv. The child is
     /// wrapped in `env TERM=… COLORTERM=…` because a GUI-launched app
     /// carries no TERM (tmux refuses to attach without one) and tmux
     /// 3.2+ passes RGB through for clients advertising truecolor.
-    fn attach(&mut self, ctx: &egui::Context, session: &str, argv: &[String]) -> Result<(), String> {
+    fn attach(
+        &mut self,
+        ctx: &egui::Context,
+        session: &str,
+        argv: &[String],
+        focus_new: bool,
+    ) -> Result<(), String> {
         self.detach();
         let Some((program, args)) = argv.split_first() else {
             return Err("empty attach command".to_string());
@@ -126,6 +139,7 @@ impl TerminalPane {
             Ok(backend) => {
                 self.backend = Some(backend);
                 self.attached = Some(session.to_string());
+                self.focused = focus_new;
                 self.next_id += 1;
                 Ok(())
             }
@@ -138,10 +152,7 @@ impl TerminalPane {
     /// every frame); PTY output drives repaints via the backend.
     pub fn show(&mut self, ui: &mut egui::Ui) {
         self.drain_events();
-        let font = self
-            .font
-            .get_or_insert_with(|| pane_font(ui.ctx()))
-            .clone();
+        let font = self.font.get_or_insert_with(|| pane_font(ui.ctx())).clone();
         let Some(backend) = self.backend.as_mut() else {
             return;
         };
@@ -149,6 +160,7 @@ impl TerminalPane {
         // view rect (TerminalView allocates `ui.available_size()` at the
         // current cursor).
         let rect = ui.available_rect_before_wrap();
+        Self::tmux_scroll_pass(&mut self.scroll_points, ui.ctx(), rect, backend);
         let mut selecting = self.shift_selecting;
         Self::shift_select_pass(&mut selecting, ui.ctx(), rect, backend);
         self.shift_selecting = selecting;
@@ -158,54 +170,6 @@ impl TerminalPane {
             .set_focus(self.focused);
         let response = ui.add(view);
         Self::copy_pass(ui.ctx(), rect, self.focused, backend);
-        // Scrollback: forward the wheel as SGR mouse reports when the
-        // attached program requested mouse mode (corpus tmux sessions get
-        // `set-option mouse on` at launch). egui_term's own wheel handler
-        // only scrolls its LOCAL grid — which is empty under the alternate
-        // screen tmux paints into — so without this there is no way to
-        // scroll a run's history (the "can't scroll the log" bug).
-        if backend
-            .last_content()
-            .terminal_mode
-            .intersects(TermMode::MOUSE_MODE)
-        {
-            if let Some(pos) = ui.ctx().pointer_latest_pos() {
-                if response.rect.contains(pos) {
-                    let lines = ui.ctx().input(|i| {
-                        i.events
-                            .iter()
-                            .filter_map(|e| match e {
-                                egui::Event::MouseWheel {
-                                    unit: egui::MouseWheelUnit::Line,
-                                    delta,
-                                    ..
-                                } => Some(delta.y),
-                                _ => None,
-                            })
-                            .sum::<f32>()
-                    });
-                    let mut n = lines.signum() * lines.abs().ceil().min(12.0);
-                    while n != 0.0 {
-                        // SGR wheel report (button 64/65, press-only), the
-                        // exact bytes tmux answers with copy-mode scroll.
-                        // egui_term's MouseButton type is not exported, so
-                        // we write the sequence ourselves.
-                        let button: u8 = if n > 0.0 { 64 } else { 65 };
-                        let size = &backend.last_content().terminal_size;
-                        let col =
-                            ((pos.x - response.rect.left()) / size.cell_width.max(1) as f32) as usize
-                                + 1;
-                        let line =
-                            ((pos.y - response.rect.top()) / size.cell_height.max(1) as f32) as usize
-                                + 1;
-                        backend.process_command(BackendCommand::Write(
-                            format!("\x1b[<{button};{col};{line}M").into_bytes(),
-                        ));
-                        n -= n.signum();
-                    }
-                }
-            }
-        }
         // Focus discipline: click-to-focus; the release gesture is a
         // click anywhere outside the pane (documented in the header).
         if response.clicked() {
@@ -221,6 +185,52 @@ impl TerminalPane {
         if clicked_outside {
             self.focused = false;
         }
+    }
+
+    /// Route wheel/trackpad events to tmux before egui_term can reinterpret
+    /// them as local-grid scroll or application arrow keys. Tmux owns the
+    /// authoritative history for the attached alternate-screen TUI.
+    fn tmux_scroll_pass(
+        scroll_points: &mut f32,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        backend: &mut TerminalBackend,
+    ) {
+        if !backend
+            .last_content()
+            .terminal_mode
+            .intersects(TermMode::MOUSE_MODE)
+        {
+            return;
+        }
+        let Some(pos) = ctx.pointer_latest_pos().filter(|pos| rect.contains(*pos)) else {
+            return;
+        };
+
+        let size = backend.last_content().terminal_size;
+        let cell_height = size.cell_height.max(1) as f32;
+        let page_lines = (rect.height() / cell_height).floor().max(1.0) as i32;
+        let mut lines = 0_i32;
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                let egui::Event::MouseWheel { unit, delta, .. } = event else {
+                    return true;
+                };
+                lines += wheel_lines(*unit, delta.y, cell_height, page_lines, scroll_points);
+                false
+            });
+        });
+
+        let lines = lines.clamp(-24, 24);
+        if lines == 0 {
+            return;
+        }
+        let cell_width = size.cell_width.max(1) as f32;
+        let cols = (rect.width() / cell_width).floor().max(1.0) as usize;
+        let rows = (rect.height() / cell_height).floor().max(1.0) as usize;
+        let col = (((pos.x - rect.left()) / cell_width) as usize + 1).clamp(1, cols);
+        let row = (((pos.y - rect.top()) / cell_height) as usize + 1).clamp(1, rows);
+        backend.process_command(BackendCommand::Write(encode_sgr_scroll(lines, col, row)));
     }
 
     /// Shift-drag local selection (the mouse-mode bypass). egui_term's press
@@ -330,6 +340,31 @@ impl TerminalPane {
     }
 }
 
+fn wheel_lines(
+    unit: egui::MouseWheelUnit,
+    delta_y: f32,
+    cell_height: f32,
+    page_lines: i32,
+    scroll_points: &mut f32,
+) -> i32 {
+    match unit {
+        egui::MouseWheelUnit::Line => (delta_y.signum() * delta_y.abs().ceil()) as i32,
+        egui::MouseWheelUnit::Point => {
+            *scroll_points += delta_y;
+            let lines = (*scroll_points / cell_height.max(1.0)).trunc() as i32;
+            *scroll_points -= lines as f32 * cell_height.max(1.0);
+            lines
+        }
+        egui::MouseWheelUnit::Page => delta_y.signum() as i32 * page_lines,
+    }
+}
+
+fn encode_sgr_scroll(lines: i32, col: usize, row: usize) -> Vec<u8> {
+    let button = if lines > 0 { 64 } else { 65 };
+    let sequence = format!("\x1b[<{button};{col};{row}M");
+    sequence.repeat(lines.unsigned_abs() as usize).into_bytes()
+}
+
 /// Colors matched to the app theme: the run pane sits on the app's
 /// panel fill with the stock readable palette otherwise.
 fn pane_theme() -> TerminalTheme {
@@ -351,4 +386,52 @@ fn pane_font(ctx: &egui::Context) -> TerminalFont {
         .cloned()
         .unwrap_or_else(|| egui::FontId::monospace(14.0));
     TerminalFont::new(FontSettings { font_type })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encode_sgr_scroll, wheel_lines};
+
+    #[test]
+    fn line_and_page_wheels_preserve_direction() {
+        let mut points = 0.0;
+        assert_eq!(
+            wheel_lines(egui::MouseWheelUnit::Line, 1.2, 16.0, 20, &mut points),
+            2
+        );
+        assert_eq!(
+            wheel_lines(egui::MouseWheelUnit::Line, -1.2, 16.0, 20, &mut points),
+            -2
+        );
+        assert_eq!(
+            wheel_lines(egui::MouseWheelUnit::Page, 1.0, 16.0, 20, &mut points),
+            20
+        );
+    }
+
+    #[test]
+    fn trackpad_points_accumulate_into_rows() {
+        let mut points = 0.0;
+        assert_eq!(
+            wheel_lines(egui::MouseWheelUnit::Point, 7.0, 16.0, 20, &mut points),
+            0
+        );
+        assert_eq!(points, 7.0);
+        assert_eq!(
+            wheel_lines(egui::MouseWheelUnit::Point, 11.0, 16.0, 20, &mut points),
+            1
+        );
+        assert_eq!(points, 2.0);
+        assert_eq!(
+            wheel_lines(egui::MouseWheelUnit::Point, -20.0, 16.0, 20, &mut points),
+            -1
+        );
+        assert_eq!(points, -2.0);
+    }
+
+    #[test]
+    fn sgr_scroll_is_batched_into_one_payload() {
+        assert_eq!(encode_sgr_scroll(2, 4, 7), b"\x1b[<64;4;7M\x1b[<64;4;7M");
+        assert_eq!(encode_sgr_scroll(-1, 4, 7), b"\x1b[<65;4;7M");
+    }
 }

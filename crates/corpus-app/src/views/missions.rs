@@ -1,10 +1,6 @@
-//! Mission view (mission-view-plan, "the defluff"): the embedded opencode
-//! TUI — and NOTHING else. No header, no hairline, no buttons, no status
-//! banner, no explainer text, no bottom pane row. The pane is rendered
-//! raw against the available rect (the central panel carries zero margin;
-//! frame the pane here for nothing, terminal only). Mission actions live
-//! in the sidebar mission-row menu; a mission is created AND launched by
-//! the Missions `+` in one click, landing at an empty opencode prompt.
+//! Mission view: a native-feeling, edge-to-edge opencode TUI while a session
+//! is attached, and a compact control surface while the mission is idle.
+//! Live terminal space is never reduced by persistent app chrome.
 //!
 //! Show() = resolve selection -> aim the pane
 //! (see the attach precedence) -> show the pane filling the rect, the
@@ -16,9 +12,10 @@ use std::time::Duration;
 use egui::{RichText, Ui};
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
-use crate::state::AppState;
+use crate::state::{AppState, RunPhase};
 use crate::terminal::TerminalPane;
 use crate::theme;
+use crate::views::mission_actions;
 
 /// Widget state for the Mission view: the embedded terminal and the
 /// tail-follow flag for the piped fallback. Run bookkeeping lives on
@@ -58,10 +55,8 @@ impl MissionsView {
             return;
         };
 
-        if matches!(
-            state.latest_run_phase(&project, &slug),
-            crate::state::RunPhase::Preparing | crate::state::RunPhase::Starting
-        ) {
+        let phase = state.latest_run_phase(&project, &slug);
+        if matches!(phase, RunPhase::Preparing | RunPhase::Starting) {
             let rect = ui.max_rect();
             ui.allocate_new_ui(
                 egui::UiBuilder::new()
@@ -98,7 +93,7 @@ impl MissionsView {
         };
         let target = attach_name
             .and_then(|name| AppState::session_attach_command(&name).map(|argv| (name, argv)));
-        if let Err(error) = self.pane.sync_target(ui.ctx(), target) {
+        if let Err(error) = self.pane.sync_target(ui.ctx(), target, own_run) {
             toast(toasts, ToastKind::Error, error);
         }
 
@@ -114,37 +109,96 @@ impl MissionsView {
             // Piped fallback (no tmux): this mission's transcript tail.
             self.tail(ui, state);
         } else {
-            // Nothing to attach and nothing to restore: a mission that
-            // never ran (or ran before ids were kept). One quiet line —
-            // creating a run is the sidebar `+`'s job.
-            self.idle(ui, &slug, &mission);
+            self.idle(ui, state, toasts, &project, &slug, &mission);
         }
     }
 
-    /// The idle state for a mission with no session to attach and none to
-    /// restore: its name + a faint reason. Actions live in the sidebar
-    /// mission menu; browsing this view never launches a process.
-    fn idle(&mut self, ui: &mut Ui, slug: &str, mission: &corpus_core::Mission) {
+    /// The idle control surface. It deliberately disappears completely once
+    /// a TUI attaches, preserving the terminal-first mission view.
+    fn idle(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        toasts: &mut Toasts,
+        project: &str,
+        slug: &str,
+        mission: &corpus_core::Mission,
+    ) {
         let label = crate::state::mission_label(mission.name.as_deref(), slug);
+        let agent_line = state
+            .agents
+            .iter()
+            .find(|(agent_slug, _)| agent_slug == &mission.agent)
+            .map(|(agent_slug, agent)| {
+                format_agent_line(
+                    &crate::state::agent_label(&agent.meta.name, agent_slug),
+                    agent.meta.role().as_str(),
+                )
+            })
+            .unwrap_or_else(|| format_agent_line(&state.agent_label(&mission.agent), "unknown"));
+        let delete_available = state.mission_delete_available(project, slug);
         let rect = ui.max_rect();
+        let splash_rect = egui::Rect::from_center_size(
+            rect.center(),
+            egui::vec2(rect.width(), 88.0_f32.min(rect.height())),
+        );
         ui.allocate_new_ui(
             egui::UiBuilder::new()
-                .max_rect(rect)
+                .max_rect(splash_rect)
                 .layout(egui::Layout::top_down(egui::Align::Center)),
             |ui| {
-                ui.add_space((rect.height() * 0.36).max(24.0));
                 ui.label(RichText::new(&label).size(15.0).color(theme::TEXT));
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new(format!("agent={}", mission.agent))
+                    RichText::new(agent_line)
                         .size(12.0)
-                        .color(theme::TEXT_FAINT),
+                        .color(theme::TEXT_MUTED),
                 );
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("no session yet — launch this mission from the sidebar")
-                        .size(11.0)
-                        .color(theme::TEXT_FAINT),
+                ui.add_space(12.0);
+
+                // A horizontal layout greedily takes the entire available
+                // width in egui. Give the action row an explicit compact
+                // rectangle so the parent can center it as one unit.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(184.0, 38.0),
+                    egui::Layout::left_to_right(egui::Align::Center)
+                        .with_main_align(egui::Align::Center),
+                    |ui| {
+                        let resumable = mission.opencode_session.is_some();
+                        let primary_available = !state.mission_run_inflight(project, slug)
+                            && !state.mission_environment_needs_cleanup(project, slug);
+                        if ui
+                            .add_enabled_ui(primary_available, |ui| {
+                                theme::primary_button(
+                                    ui,
+                                    if resumable { "Resume" } else { "Launch" },
+                                )
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            if resumable {
+                                state.select_mission(project, slug);
+                                match state.resume_mission(project, slug) {
+                                    Ok(()) => toast(toasts, ToastKind::Info, "mission resumed"),
+                                    Err(error) => {
+                                        toast(toasts, ToastKind::Error, error.to_string())
+                                    }
+                                }
+                            } else {
+                                mission_actions::launch(state, toasts, project, slug);
+                            }
+                        }
+                        if ui
+                            .add_enabled_ui(delete_available, |ui| {
+                                theme::destructive_button(ui, "Delete")
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            mission_actions::delete(state, toasts, project, slug);
+                        }
+                    },
                 );
             },
         );
@@ -183,6 +237,10 @@ impl MissionsView {
     }
 }
 
+fn format_agent_line(name: &str, role: &str) -> String {
+    format!("{name} <{role}>")
+}
+
 /// Add a timed toast to the overlay.
 fn toast(toasts: &mut Toasts, kind: ToastKind, text: impl Into<String>) {
     toasts.add(
@@ -191,4 +249,14 @@ fn toast(toasts: &mut Toasts, kind: ToastKind, text: impl Into<String>) {
             .text(text.into())
             .options(ToastOptions::default().duration(Duration::from_secs(4))),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_agent_line;
+
+    #[test]
+    fn splash_identifies_agent_by_name_and_role() {
+        assert_eq!(format_agent_line("operator", "tester"), "operator <tester>");
+    }
 }

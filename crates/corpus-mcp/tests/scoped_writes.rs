@@ -388,6 +388,7 @@ fn researcher_role_is_refused_execution_and_publication_tools() {
 
     for (tool, args) in [
         ("sandbox_exec", json!({"command": "echo hi"})),
+        ("oracle_list", json!({})),
         ("oracle_run", json!({"name": "double-spend"})),
         ("faucet", json!({"op": "balance"})),
         (
@@ -445,7 +446,14 @@ fn advertised_catalog_matches_the_role() {
     let researcher = names(corpus_core::AgentRole::Researcher);
     assert!(researcher.contains(&"target_info".to_string()), "{researcher:?}");
     assert!(researcher.contains(&"technique_save".to_string()), "{researcher:?}");
-    for hidden in ["sandbox_exec", "faucet", "finding_write", "attack_save"] {
+    for hidden in [
+        "sandbox_exec",
+        "oracle_list",
+        "oracle_run",
+        "faucet",
+        "finding_write",
+        "attack_save",
+    ] {
         assert!(
             !researcher.contains(&hidden.to_string()),
             "a researcher must not be shown {hidden}: {researcher:?}"

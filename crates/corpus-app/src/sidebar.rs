@@ -26,6 +26,7 @@ use crate::fmt::fmt_bytes;
 use crate::nav::Screen;
 use crate::state::{AppState, MissionActivity};
 use crate::theme;
+use crate::views::mission_actions;
 use crate::views::plugin_picker::plugin_picker;
 
 /// Row height for a sidebar list row (15px text + 5px vertical padding).
@@ -323,10 +324,6 @@ impl Sidebar {
         for (slug, mission) in &tree.missions {
             let is_sel = on_screen && state.selected_mission.as_deref() == Some(slug.as_str());
             let label_text = crate::state::mission_label(mission.name.as_deref(), slug);
-            let live = mission
-                .session
-                .as_ref()
-                .is_some_and(|s| state.live_sessions.iter().any(|l| l == s));
             // The status dot: pulses only while the agent is ACTUALLY
             // producing. A session parked at its prompt is live, not
             // busy, and shows a steady dot instead.
@@ -342,16 +339,7 @@ impl Sidebar {
             let (label_resp, _menu_w) = if is_sel || hovered {
                 let menu_w = rui
                     .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.mission_menu(
-                            ui,
-                            state,
-                            toasts,
-                            project,
-                            slug,
-                            live,
-                            mission.opencode_session.is_some(),
-                            &label_text,
-                        )
+                        self.mission_menu(ui, state, toasts, project, slug, &label_text)
                     })
                     .response
                     .rect
@@ -421,7 +409,7 @@ impl Sidebar {
     /// selected agent (when the project is already selected), else
     /// `operator` if present, else the first agent (refuses with a toast
     /// when the project has none). Pins = the project's top-bar pins.
-    /// Creates and selects without launching. A `+` on
+    /// Creates, selects, and launches. A `+` on
     /// a non-selected project's group selects that project first.
     fn new_mission(&mut self, state: &mut AppState, toasts: &mut Toasts, project: &str) {
         if state.effective_project().as_deref() != Some(project) {
@@ -452,19 +440,16 @@ impl Sidebar {
         match state.create_mission(&project, &agent, "") {
             Ok(slug) => {
                 state.refresh_missions(&project);
-                state.select_mission(&project, &slug);
-                toast(
-                    toasts,
-                    ToastKind::Success,
-                    format!("created mission for {agent} on {project}"),
-                );
+                // Launch owns the success feedback; creation and launch are
+                // one operator action.
+                let _ = mission_actions::launch(state, toasts, &project, &slug);
             }
             Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
         }
     }
 
-    /// The mission-row `⋮` menu: Stop run (gated on a live
-    /// session), Rename…, Delete. Operates on the mission record of the
+    /// The mission-row `⋮` menu: Rename…, Delete. Delete owns any live-run
+    /// teardown and transcript export. Operates on the mission record of the
     /// row's OWN project (tree rows can belong to a non-selected
     /// project), so it works regardless of the view.
     fn mission_menu(
@@ -474,8 +459,6 @@ impl Sidebar {
         toasts: &mut Toasts,
         project: &str,
         slug: &str,
-        live: bool,
-        resumable: bool,
         name: &str,
     ) -> egui::Response {
         egui::menu::menu_custom_button(
@@ -487,46 +470,20 @@ impl Sidebar {
             ))
             .frame(false),
             |ui| {
-                let inflight = state.mission_run_inflight(project, slug);
-                // Launch an existing (never-run, or stopped) mission — the
-                // gap that made curator-created missions dead ends. Disabled
-                // while its session is already live. Selects the mission and
-                // routes to the view so the operator lands on the pane as it
-                // attaches; the brief kicks the session off.
-                let launch = ui.add_enabled(!live && !inflight, egui::Button::new("Launch"));
-                if launch.clicked() {
-                    launch_mission(state, toasts, project, slug);
-                    ui.close_menu();
-                }
-                let resume =
-                    ui.add_enabled(!live && resumable && !inflight, egui::Button::new("Resume"));
-                if resume.clicked() {
-                    resume_mission(state, toasts, project, slug);
-                    ui.close_menu();
-                }
-                let environment_cleanup = state.mission_environment_needs_cleanup(project, slug);
-                let stop = ui.add_enabled(
-                    live || environment_cleanup,
-                    egui::Button::new(if live { "Stop run" } else { "Retry cleanup" }),
-                );
-                if stop.clicked() {
-                    stop_mission(state, toasts, project, slug);
-                    ui.close_menu();
-                }
                 if ui.button("Rename…").clicked() {
                     self.rename_mission_project = Some(project.to_string());
                     self.rename_mission = Some(slug.to_string());
                     self.rename_name = name.to_string();
                     ui.close_menu();
                 }
-                if ui.button("Delete").clicked() {
-                    delete_mission(
-                        state,
-                        toasts,
-                        project,
-                        slug,
-                        state.selected_mission.as_deref() == Some(slug),
-                    );
+                if ui
+                    .add_enabled(
+                        state.mission_delete_available(project, slug),
+                        egui::Button::new("Delete"),
+                    )
+                    .clicked()
+                {
+                    mission_actions::delete(state, toasts, project, slug);
                     ui.close_menu();
                 }
             },
@@ -543,7 +500,7 @@ impl Sidebar {
         };
         let mut open = true;
         let mut done = false;
-        egui::Window::new("Rename project")
+        theme::dialog(ui.ctx(), "sidebar_rename_project", "Rename project")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -565,12 +522,8 @@ impl Sidebar {
                     .clicked();
                 if (clicked || (submit && named))
                     && match state.rename_project(&slug, &self.rename_project_name) {
-                        Ok(project) => {
-                            toast(
-                                toasts,
-                                ToastKind::Success,
-                                format!("renamed project to {}", project.name),
-                            );
+                        Ok(_) => {
+                            toast(toasts, ToastKind::Success, "project renamed");
                             true
                         }
                         Err(error) => {
@@ -601,7 +554,7 @@ impl Sidebar {
             return;
         };
         let mut open = true;
-        egui::Window::new("Rename mission")
+        theme::dialog(ui.ctx(), "sidebar_rename_mission", "Rename mission")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -678,9 +631,12 @@ impl Sidebar {
     // --- create flows (modal windows) ---
 
     fn create_project_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
+        if !self.create_project {
+            return;
+        }
         let mut open = self.create_project;
         let mut done = false;
-        egui::Window::new("New project")
+        theme::dialog(ui.ctx(), "sidebar_new_project", "New project")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -703,12 +659,8 @@ impl Sidebar {
                         toast(toasts, ToastKind::Warning, "display name is required");
                     } else {
                         match state.create_project(name, self.create_plugin.trim()) {
-                            Ok((id, project)) => {
-                                toast(
-                                    toasts,
-                                    ToastKind::Success,
-                                    format!("created project {} ({id})", project.name),
-                                );
+                            Ok((id, _)) => {
+                                toast(toasts, ToastKind::Success, "project created");
                                 state.refresh();
                                 state.select_project(&id);
                                 // Land on the new project's page, not
@@ -726,9 +678,12 @@ impl Sidebar {
     }
 
     fn new_agent_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
+        if !self.new_agent {
+            return;
+        }
         let mut open = self.new_agent;
         let mut done = false;
-        egui::Window::new("New agent")
+        theme::dialog(ui.ctx(), "sidebar_new_agent", "New agent")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -768,12 +723,8 @@ impl Sidebar {
                         return;
                     }
                     match state.create_agent_with_role(&project, self.agent_role) {
-                        Ok(slug) => {
-                            toast(
-                                toasts,
-                                ToastKind::Success,
-                                format!("created agent {project}/{slug}"),
-                            );
+                        Ok(_) => {
+                            toast(toasts, ToastKind::Success, "agent created");
                             state.refresh_agents(&project);
                             done = true;
                         }
@@ -792,13 +743,20 @@ impl Sidebar {
     }
 
     fn clone_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
+        if !self.show_clone {
+            return;
+        }
         let Some(from) = self.clone_from.clone() else {
             self.show_clone = false;
             return;
         };
         let mut open = self.show_clone;
         let mut done = false;
-        egui::Window::new(format!("Clone project: {from}"))
+        theme::dialog(
+            ui.ctx(),
+            "sidebar_clone_project",
+            format!("Clone project: {from}"),
+        )
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -817,11 +775,7 @@ impl Sidebar {
                     };
                     match state.clone_project(&from, name, self.clone_corpus) {
                         Ok((to, _)) => {
-                            toast(
-                                toasts,
-                                ToastKind::Success,
-                                format!("cloned project {from} -> {to}"),
-                            );
+                            toast(toasts, ToastKind::Success, "project cloned");
                             state.refresh();
                             state.select_project(&to);
                             done = true;
@@ -1090,77 +1044,10 @@ fn section_header(ui: &mut Ui, title: &str) -> (bool, bool) {
 fn delete_project(state: &mut AppState, toasts: &mut Toasts, slug: &str) {
     match state.delete_project(slug) {
         Ok(()) => {
-            toast(
-                toasts,
-                ToastKind::Success,
-                format!("deleted project {slug}"),
-            );
+            toast(toasts, ToastKind::Success, "project deleted");
             state.refresh();
             // ensure_selection re-picks a project next frame.
             state.selected_project = None;
-        }
-        Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
-    }
-}
-
-/// Launch is an explicit operator action. It selects the mission first so
-/// progress and attachment paint in the central view, then schedules launch
-/// preparation directly; no render path consumes a deferred spawn token.
-fn launch_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
-    state.select_mission(project, slug);
-    if let Err(error) = state.launch_mission(project, slug) {
-        toast(toasts, ToastKind::Error, error.to_string());
-    }
-}
-
-/// Resume is an explicit operator action. Selecting or browsing a mission
-/// never starts a process.
-fn resume_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
-    state.select_mission(project, slug);
-    if let Err(error) = state.resume_mission(project, slug) {
-        toast(toasts, ToastKind::Error, error.to_string());
-    }
-}
-
-/// Stop a mission's run (Mission ⋮ -> Stop run): report export/cleanup
-/// failures and clear the durable session only after cleanup succeeds.
-fn stop_mission(state: &mut AppState, toasts: &mut Toasts, project: &str, slug: &str) {
-    match state.stop_mission(project, slug) {
-        Ok(crate::state::StopMissionResult::Scheduled) => {
-            toast(toasts, ToastKind::Info, format!("stopping mission {slug}…"));
-        }
-        Ok(crate::state::StopMissionResult::Completed(path)) => {
-            let detail = if path.is_empty() {
-                format!("stopped mission {slug}")
-            } else {
-                format!("stopped mission {slug} — transcript: {path}")
-            };
-            toast(toasts, ToastKind::Success, detail);
-            state.refresh_missions(project);
-        }
-        Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
-    }
-}
-
-/// Delete a mission record (transcripts stay in the corpus runs/).
-fn delete_mission(
-    state: &mut AppState,
-    toasts: &mut Toasts,
-    project: &str,
-    slug: &str,
-    was_selected: bool,
-) {
-    match state.delete_mission(project, slug) {
-        Ok(()) => {
-            toast(
-                toasts,
-                ToastKind::Success,
-                format!("deleted mission {slug}"),
-            );
-            state.refresh_missions(project);
-            if was_selected {
-                state.selected_mission = None; // re-defaults to the next
-            }
         }
         Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
     }

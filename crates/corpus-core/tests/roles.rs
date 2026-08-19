@@ -161,6 +161,7 @@ fn roles_bind_their_trust_domains() {
     let res = perm(&read_render("researcher"));
     for denied in [
         "corpus_sandbox_exec",
+        "corpus_oracle_list",
         "corpus_oracle_run",
         "corpus_faucet",
         "corpus_wallet_fund",
@@ -181,7 +182,12 @@ fn roles_bind_their_trust_domains() {
 
     // Tester: acts in the sandbox, loses the open internet.
     let tester = perm(&read_render("tester"));
-    for allowed in ["corpus_sandbox_exec", "corpus_oracle_run", "corpus_finding_write"] {
+    for allowed in [
+        "corpus_sandbox_exec",
+        "corpus_oracle_list",
+        "corpus_oracle_run",
+        "corpus_finding_write",
+    ] {
         assert_eq!(action(&tester, allowed).as_deref(), Some("allow"), "{allowed}");
     }
     assert_eq!(action(&tester, "webfetch").as_deref(), Some("deny"));

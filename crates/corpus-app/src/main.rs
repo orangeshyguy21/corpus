@@ -212,7 +212,7 @@ impl eframe::App for App {
         } else {
             None
         };
-        egui::CentralPanel::default()
+        let workspace_rect = egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(theme::BG))
             .show(ctx, |ui| {
                 components::paint_command_canvas(ui);
@@ -235,7 +235,9 @@ impl eframe::App for App {
                     self.missions.show(ui, &mut self.state, &mut self.toasts);
                 }
             }
-        });
+        })
+        .response
+        .rect;
 
         // Drag dividers LAST: the grab zone paints/interacts over the edge
         // band, so it must come after the panels whose borders it straddles.
@@ -248,7 +250,17 @@ impl eframe::App for App {
             }
         }
 
-        // Toast overlay (top-right of the whole window).
+        // Keep notifications inside the working canvas rather than spanning
+        // the app chrome. Re-applying the anchor preserves both newly added
+        // toasts and the crate's context-owned visible stack.
+        let viewport = ctx.screen_rect();
+        let toast_offset = toast_anchor_offset(workspace_rect, viewport);
+        self.toasts = std::mem::take(&mut self.toasts)
+            .anchor(
+                egui::Align2::RIGHT_TOP,
+                egui::pos2(toast_offset.x, toast_offset.y),
+            )
+            .direction(egui::Direction::TopDown);
         self.toasts.show(ctx);
 
         // Polling has an explicit owner. Jobs, terminal output and chat
@@ -259,6 +271,15 @@ impl eframe::App for App {
             ctx.request_repaint_after(after);
         }
     }
+}
+
+/// Offset a right-anchored toast stack into the central workspace. Sidebars,
+/// chat, and the top bar are all excluded by the panel rectangle.
+fn toast_anchor_offset(workspace: egui::Rect, viewport: egui::Rect) -> egui::Vec2 {
+    egui::vec2(
+        workspace.right() - viewport.right() - 16.0,
+        workspace.top() - viewport.top() + 16.0,
+    )
 }
 
 impl App {
@@ -644,19 +665,6 @@ impl App {
                         self.state.refresh_corpus_stats(&p);
                     }
                 }
-                // The header names the project, never a bare UUID.
-                let label = self
-                    .state
-                    .effective_project()
-                    .and_then(|slug| {
-                        self.state
-                            .projects
-                            .iter()
-                            .find(|(s, _)| s == &slug)
-                            .map(|(_, p)| p.name.clone())
-                    })
-                    .unwrap_or_default();
-                self.chat_panel.set_project_label(&label);
                 self.ensure_chat_started(ui.ctx());
                 // Juice the session with the operator's current position
                 // (re-pushed only when it changes).
@@ -902,6 +910,19 @@ mod tests {
         let (kind, text) = exit_notice(&orphan);
         assert_eq!(kind, egui_toast::ToastKind::Error);
         assert!(text.contains("the run"), "{text}");
+    }
+
+    #[test]
+    fn toast_anchor_stays_inside_the_workspace() {
+        let viewport =
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1440.0, 900.0));
+        let workspace =
+            egui::Rect::from_min_max(egui::pos2(200.0, 56.0), egui::pos2(1080.0, 900.0));
+        let offset = toast_anchor_offset(workspace, viewport);
+
+        assert_eq!(offset, egui::vec2(-376.0, 72.0));
+        assert_eq!(viewport.right() + offset.x, workspace.right() - 16.0);
+        assert_eq!(viewport.top() + offset.y, workspace.top() + 16.0);
     }
 
     #[test]

@@ -565,7 +565,7 @@ fn draft(title: &str, path: Option<&str>) -> NewFinding {
         detail: "agent-defined detail".to_string(),
         timestamp: 1_787_091_300,
         oracle_verified: true,
-        oracle_output: "020-conservation violated".to_string(),
+        oracle_output: "fixture-invariant violated".to_string(),
         path: path.map(str::to_string),
         metadata: BTreeMap::new(),
         run_log: Some("1787091000-operator.raw".to_string()),
@@ -622,7 +622,7 @@ fn writer_serializes_reserved_and_extension_metadata_safely() {
         Some("tester:operator")
     );
     assert!(body.contains("agent-defined detail"));
-    assert!(body.contains("    020-conservation violated"));
+    assert!(body.contains("    fixture-invariant violated"));
 
     finding
         .metadata

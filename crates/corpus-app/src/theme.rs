@@ -3,9 +3,10 @@
 //! health, and signal red reserved for danger and denial. Everything else in
 //! the app reads from these tokens; views do not invent colour literals.
 //!
-//! Inter-Light and Phosphor fonts, semantic colors, and shared control styles
-//! are registered here. View-specific composition lives in `views/components`;
-//! views consume named tokens instead of inventing color literals.
+//! Oswald display faces, Inter reading text, JetBrains Mono data text, and
+//! Phosphor icons are registered here. View-specific composition lives in
+//! `views/components`; views consume named tokens instead of inventing color
+//! literals. Noto Serif SC supplies the card-header annotations.
 
 use egui::{Color32, FontId, TextStyle, Ui, Visuals};
 
@@ -15,6 +16,13 @@ pub const BG: Color32 = Color32::from_rgb(0x09, 0x0b, 0x0d);
 /// Smoked widget/card surface. Cards may apply alpha at paint time; the shared
 /// widget default stays opaque so text-field compositing is deterministic.
 pub const PANEL: Color32 = Color32::from_rgb(0x17, 0x18, 0x18);
+/// Translucent fill shared by the primary Project/Agent cards. Keeping the
+/// alpha here makes the amount of canvas showing through consistent.
+pub fn card_fill() -> Color32 {
+    Color32::from_rgba_unmultiplied(PANEL.r(), PANEL.g(), PANEL.b(), 0x70)
+}
+/// Quiet neutral outline for primary cards. Interaction keylines stay amber.
+pub const CARD_BORDER: Color32 = Color32::from_rgb(0x3a, 0x3c, 0x3e);
 /// A slightly stronger smoked surface for raised cards and menus.
 #[allow(dead_code)] // consumed by the Project/Agent card migration in chunks 2-3
 pub const PANEL_RAISED: Color32 = Color32::from_rgb(0x1d, 0x1d, 0x1b);
@@ -39,12 +47,16 @@ pub const FINDING_LOW: Color32 = HEALTHY;
 pub const FINDING_UNRATED: Color32 = TEXT_MUTED;
 
 // --- type greys ---
-/// Primary light text.
-pub const TEXT: Color32 = Color32::from_rgb(0xe4, 0xe0, 0xd8);
+/// Primary labels, data, and IDs.
+pub const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe2, 0xda);
+/// Reading prose — a touch quieter than labels and display text.
+pub const PROSE: Color32 = Color32::from_rgb(0xd8, 0xd4, 0xcb);
 /// Secondary / body text, icons.
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x9b, 0x98, 0x90);
 /// De-emphasised / captions / created stamps / hints.
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x6c, 0x69, 0x62);
+pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x7d, 0x7a, 0x72);
+/// Reserved for the later 10–11px Noto Serif SC annotation layer.
+pub const SC_ANNOTATION: Color32 = Color32::from_rgb(0x56, 0x53, 0x49);
 
 /// Keyline hierarchy: soft neutral structure and amber-emphasis borders.
 pub const KEYLINE_SOFT: Color32 = Color32::from_rgb(0x32, 0x30, 0x2b);
@@ -103,34 +115,102 @@ pub const PANEL_MARGIN: f32 = 10.0;
 pub const SPACING: f32 = 8.0;
 /// Vertical gap between stacked controls / rows.
 pub const PANEL_GAP: f32 = 6.0;
+/// Equal horizontal and vertical gap between peer cards in responsive grids.
+pub const CARD_GUTTER: f32 = 12.0;
+/// Form controls use hard square corners throughout the app. Cards and
+/// conversational surfaces own their shape separately.
+pub const CONTROL_RADIUS: egui::CornerRadius = egui::CornerRadius::ZERO;
+const DIALOG_SCRIM: Color32 = Color32::from_black_alpha(96);
 
-/// A proportional font id at `size` (family index 0 = Inter-Light).
+const DISPLAY_MEDIUM_FAMILY: &str = "display-medium";
+const DISPLAY_BOLD_FAMILY: &str = "display-bold";
+const SC_ANNOTATION_FAMILY: &str = "sc-annotation";
+
+/// A proportional font id at `size` (family index 0 = Inter Regular).
 pub fn font(size: f32) -> FontId {
     FontId::proportional(size)
 }
 
-/// The monospace font id at `size` — config + log content.
+/// JetBrains Mono at `size` — labels, data, IDs, config, and log content.
 pub fn mono(size: f32) -> FontId {
     FontId::monospace(size)
 }
 
-// --- text helpers (spec §1c) ---
-/// The mock's large screen header: 28px, Inter-Light, TEXT.
-#[allow(dead_code)] // compatibility until remaining screens adopt page_header
-pub fn screen_header(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text.into()).size(28.0).color(TEXT)
+/// Oswald at `size`, selecting either the 500 or 700 face.
+pub fn display(size: f32, bold: bool) -> FontId {
+    FontId::new(
+        size,
+        egui::FontFamily::Name(
+            if bold {
+                DISPLAY_BOLD_FAMILY
+            } else {
+                DISPLAY_MEDIUM_FAMILY
+            }
+            .into(),
+        ),
+    )
 }
 
-/// Compact amber section title used inside command cards.
-pub fn section_heading(text: impl Into<String>) -> egui::RichText {
+/// Uppercase Oswald with deliberate display tracking.
+pub fn display_text(
+    text: impl Into<String>,
+    size: f32,
+    bold: bool,
+    color: Color32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &text.into().to_uppercase(),
+        0.0,
+        egui::TextFormat {
+            font_id: display(size, bold),
+            color,
+            extra_letter_spacing: 1.25,
+            ..Default::default()
+        },
+    );
+    job
+}
+
+// --- text helpers (spec §1c) ---
+/// Large tracked Oswald screen header.
+#[allow(dead_code)] // compatibility until remaining screens adopt page_header
+pub fn screen_header(text: impl Into<String>) -> egui::text::LayoutJob {
+    display_text(text, 28.0, true, TEXT)
+}
+
+/// Compact tracked Oswald Medium card title with quiet-white text held by
+/// amber square brackets.
+pub fn section_heading(text: impl Into<String>) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let format = |color| egui::TextFormat {
+        font_id: display(17.0, false),
+        color,
+        extra_letter_spacing: 1.25,
+        ..Default::default()
+    };
+    job.append("[", 0.0, format(INTERACTION));
+    job.append(
+        &format!("  {}  ", text.into().to_uppercase()),
+        0.0,
+        format(TEXT),
+    );
+    job.append("]", 0.0, format(INTERACTION));
+    job
+}
+
+/// Muted Simplified Chinese annotation used at the right edge of card headers.
+pub fn sc_annotation(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text.into())
-        .size(17.0)
-        .strong()
-        .color(INTERACTION)
+        .font(FontId::new(
+            10.5,
+            egui::FontFamily::Name(SC_ANNOTATION_FAMILY.into()),
+        ))
+        .color(SC_ANNOTATION)
 }
 
 // --- control helpers (spec §1c) ---
-/// A house button: fill #1c1d22, 1px HAIRLINE stroke, radius 2, padding
+/// A square house button: fill #1c1d22, 1px HAIRLINE stroke, padding
 /// (12,7), 14px TEXT. Hover fill #232429.
 pub fn house_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
     ui.scope(|ui| {
@@ -138,6 +218,26 @@ pub fn house_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
         override_button_visuals(style, HOUSE_FILL, ButtonKind::House);
         style.spacing.button_padding = egui::vec2(12.0, 7.0);
         ui.button(egui::RichText::new(text.into()).size(14.0).color(TEXT))
+    })
+    .inner
+}
+
+/// A house button with a Phosphor glyph and a regular text label. Keeping the
+/// runs separate prevents the label font from turning private-use icons into
+/// tofu after custom typography is installed.
+pub fn house_icon_button(ui: &mut Ui, icon: &str, text: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let style = ui.style_mut();
+        override_button_visuals(style, HOUSE_FILL, ButtonKind::House);
+        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        ui.add(egui::Button::new(icon_label(
+            icon,
+            14.0,
+            TEXT,
+            text,
+            FontId::proportional(14.0),
+            TEXT,
+        )))
     })
     .inner
 }
@@ -156,6 +256,24 @@ pub fn primary_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
                 .strong()
                 .color(ON_INTERACTION),
         )
+    })
+    .inner
+}
+
+/// Primary action with a Phosphor icon pinned independently from its label.
+pub fn primary_icon_button(ui: &mut Ui, icon: &str, text: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let style = ui.style_mut();
+        override_button_visuals(style, INTERACTION, ButtonKind::Primary);
+        style.spacing.button_padding = egui::vec2(16.0, 9.0);
+        ui.add(egui::Button::new(icon_label(
+            icon,
+            14.0,
+            ON_INTERACTION,
+            text,
+            FontId::proportional(14.0),
+            ON_INTERACTION,
+        )))
     })
     .inner
 }
@@ -197,7 +315,7 @@ pub fn segment_button(ui: &mut Ui, selected: bool, text: &str) -> egui::Response
                     KEYLINE_SOFT
                 },
             );
-            ws.corner_radius = egui::CornerRadius::same(2);
+            ws.corner_radius = CONTROL_RADIUS;
         }
         let color = if selected { INTERACTION } else { TEXT_MUTED };
         ui.button(egui::RichText::new(text).size(12.5).color(color))
@@ -251,7 +369,7 @@ pub fn icon_text(icon: &str, size: f32, color: Color32) -> egui::RichText {
 }
 
 /// A flat field frame for dropdown-like fields: PANEL fill, 1px HAIRLINE,
-/// radius 2, inner margin (8,4). (Non-ComboBox fields; a ComboBox must be
+/// square corners, inner margin (8,4). (Non-ComboBox fields; a ComboBox must be
 /// restyled via `combo_field`'s scoped widget-visuals — a wrapping Frame
 /// cannot reach its internal button, spec §9.)
 #[allow(dead_code)]
@@ -259,8 +377,40 @@ pub fn flat_field_frame() -> egui::Frame {
     egui::Frame::default()
         .fill(PANEL)
         .stroke(egui::Stroke::new(1.0_f32, HAIRLINE))
-        .corner_radius(egui::CornerRadius::same(2))
+        .corner_radius(CONTROL_RADIUS)
         .inner_margin(egui::Margin::symmetric(8, 4))
+}
+
+/// House dialog chrome: the same square smoked card and bracketed title used
+/// by the main views, above a paint-only full-screen dimming scrim. The scrim
+/// is not an `Area`, so it cannot enter the interaction stack or cover the
+/// foreground dialog (the bug in the first modal-backdrop implementation).
+pub fn dialog(
+    ctx: &egui::Context,
+    id_salt: &'static str,
+    title: impl Into<String>,
+) -> egui::Window<'static> {
+    ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new(("dialog_scrim", id_salt)),
+    ))
+    .rect_filled(ctx.screen_rect(), egui::CornerRadius::ZERO, DIALOG_SCRIM);
+
+    egui::Window::new(section_heading(title.into()))
+        .id(egui::Id::new(("house_dialog", id_salt)))
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .frame(dialog_frame())
+}
+
+fn dialog_frame() -> egui::Frame {
+    egui::Frame::default()
+        .fill(PANEL_RAISED)
+        .stroke(egui::Stroke::new(1.0_f32, CARD_BORDER))
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::same(14))
+        .shadow(egui::epaint::Shadow::NONE)
 }
 
 /// A phosphor glyph followed by text in ONE laid-out line — needed wherever
@@ -315,7 +465,7 @@ pub fn hairline(ui: &mut Ui) {
 }
 
 /// Run `inner` inside a scope whose widget visuals restyle the ComboBox's
-/// internal button into a flat PANEL field — 1px HAIRLINE, radius 2,
+/// internal button into a flat PANEL field — 1px HAIRLINE, square corners,
 /// TEXT text (spec §3). A wrapping Frame cannot reach a ComboBox's button,
 /// so every flat dropdown wraps itself in this.
 pub fn combo_field<R>(ui: &mut Ui, inner: impl FnOnce(&mut Ui) -> R) -> R {
@@ -325,11 +475,12 @@ pub fn combo_field<R>(ui: &mut Ui, inner: impl FnOnce(&mut Ui) -> R) -> R {
             &mut style.visuals.widgets.inactive,
             &mut style.visuals.widgets.hovered,
             &mut style.visuals.widgets.active,
+            &mut style.visuals.widgets.open,
         ] {
             ws.bg_fill = PANEL;
             ws.weak_bg_fill = PANEL; // the ComboBox's button paints THIS one
             ws.bg_stroke = egui::Stroke::new(1.0_f32, HAIRLINE);
-            ws.corner_radius = egui::CornerRadius::same(2);
+            ws.corner_radius = CONTROL_RADIUS;
             ws.fg_stroke.color = TEXT;
         }
         style.spacing.button_padding = egui::vec2(8.0, 4.0);
@@ -373,11 +524,11 @@ fn override_button_visuals(style: &mut egui::Style, resting: Color32, kind: Butt
         // ~10% lighter red on hover.
         ButtonKind::Destructive => Color32::from_rgb(0xed, 0x59, 0x41),
     };
-    let radius = egui::CornerRadius::same(2);
     for ws in [
         &mut style.visuals.widgets.inactive,
         &mut style.visuals.widgets.hovered,
         &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
     ] {
         ws.bg_stroke = egui::Stroke::new(
             1.0_f32,
@@ -387,7 +538,7 @@ fn override_button_visuals(style: &mut egui::Style, resting: Color32, kind: Butt
                 ButtonKind::Destructive => SIGNAL_RED,
             },
         );
-        ws.corner_radius = radius;
+        ws.corner_radius = CONTROL_RADIUS;
     }
     // A Button paints `weak_bg_fill`, NOT `bg_fill` (that one is for
     // checkbox/slider tracks). Setting only `bg_fill` left every house and
@@ -397,6 +548,7 @@ fn override_button_visuals(style: &mut egui::Style, resting: Color32, kind: Butt
         (&mut style.visuals.widgets.inactive, resting),
         (&mut style.visuals.widgets.hovered, hover_fill),
         (&mut style.visuals.widgets.active, hover_fill),
+        (&mut style.visuals.widgets.open, hover_fill),
     ] {
         ws.bg_fill = fill;
         ws.weak_bg_fill = fill;
@@ -405,28 +557,60 @@ fn override_button_visuals(style: &mut egui::Style, resting: Color32, kind: Butt
 
 /// Apply the visual language to the egui context. Call once at startup.
 pub fn apply(ctx: &egui::Context) {
-    // --- fonts (spec §1a + §1b): Inter-Light first in the proportional
-    // family (defaults remain as fallback), Phosphor registered as its own
-    // family (egui falls through to it for icon glyphs).
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "inter-light".to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Light.otf")).into(),
+        "inter-regular".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf")).into(),
+    );
+    fonts.font_data.insert(
+        "jetbrains-mono".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"))
+            .into(),
+    );
+    fonts.font_data.insert(
+        "oswald-medium".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/Oswald-Medium.ttf")).into(),
+    );
+    fonts.font_data.insert(
+        "oswald-bold".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/Oswald-Bold.ttf")).into(),
+    );
+    fonts.font_data.insert(
+        "noto-serif-sc".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSerifSC-Regular.ttf"))
+            .into(),
     );
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
-        .insert(0, "inter-light".to_owned());
+        .insert(0, "inter-regular".to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "jetbrains-mono".to_owned());
+    fonts.families.insert(
+        egui::FontFamily::Name(DISPLAY_MEDIUM_FAMILY.into()),
+        vec!["oswald-medium".to_owned(), "inter-regular".to_owned()],
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name(DISPLAY_BOLD_FAMILY.into()),
+        vec!["oswald-bold".to_owned(), "inter-regular".to_owned()],
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name(SC_ANNOTATION_FAMILY.into()),
+        vec!["noto-serif-sc".to_owned(), "inter-regular".to_owned()],
+    );
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     // Pin icon glyphs to an explicit phosphor-first family: egui_phosphor's
     // own injection puts the phosphor font at Proportional index 1, behind
-    // Inter-Light at index 0, so Inter claims the icon.PUA codepoints first
+    // Inter at index 0, so Inter claims the icon PUA codepoints first
     // and renders stray glyphs (the mangled `⋮`). A dedicated family whose
     // font list is phosphor-first resolves the glyph deterministically.
     fonts.families.insert(
         egui::FontFamily::Name("phosphor".into()),
-        vec!["phosphor".to_owned(), "inter-light".to_owned()],
+        vec!["phosphor".to_owned(), "inter-regular".to_owned()],
     );
     ctx.set_fonts(fonts);
 
@@ -438,21 +622,27 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.noninteractive.bg_fill = BG;
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE_SOFT);
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT_MUTED);
+    visuals.widgets.noninteractive.corner_radius = CONTROL_RADIUS;
     // Widget surfaces are one step lighter than the canvas. `weak_bg_fill` is
     // what a Button/ComboBox actually paints, so it tracks `bg_fill` here —
     // set alone, `bg_fill` left every plain button on egui's default grey.
     visuals.widgets.inactive.bg_fill = PANEL;
     visuals.widgets.inactive.weak_bg_fill = PANEL;
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE_SOFT);
-    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.inactive.corner_radius = CONTROL_RADIUS;
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x28, 0x25, 0x20);
     visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x28, 0x25, 0x20);
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE);
-    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.hovered.corner_radius = CONTROL_RADIUS;
     visuals.widgets.active.bg_fill = Color32::from_rgb(0x31, 0x29, 0x20);
     visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0x31, 0x29, 0x20);
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE_STRONG);
-    visuals.widgets.active.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.active.corner_radius = CONTROL_RADIUS;
+    visuals.widgets.open.bg_fill = PANEL;
+    visuals.widgets.open.weak_bg_fill = PANEL;
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, KEYLINE_STRONG);
+    visuals.widgets.open.corner_radius = CONTROL_RADIUS;
+    visuals.menu_corner_radius = CONTROL_RADIUS;
     // Selected rows stay subordinate to primary actions: a smoked amber tint
     // with amber type remains legible in every ComboBox and menu, unlike a
     // solid interaction slab. Text-edit selection uses the same quiet state.
@@ -461,22 +651,51 @@ pub fn apply(ctx: &egui::Context) {
     // Inline `code` in chat markdown: a dark chip, not egui's light grey
     // block (which glared against the near-black log).
     visuals.code_bg_color = PANEL;
-    visuals.override_text_color = Some(TEXT);
+    visuals.override_text_color = Some(PROSE);
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(SPACING, PANEL_GAP);
     style.spacing.button_padding = egui::vec2(12.0, 7.0);
-    style.text_styles.insert(TextStyle::Body, font(15.0));
-    style.text_styles.insert(TextStyle::Button, font(14.0));
-    style.text_styles.insert(TextStyle::Heading, font(24.0));
-    style.text_styles.insert(TextStyle::Monospace, mono(13.5));
-    style.text_styles.insert(TextStyle::Small, font(12.0));
+    style.text_styles.insert(TextStyle::Body, font(14.5));
+    style.text_styles.insert(TextStyle::Button, mono(13.0));
+    style
+        .text_styles
+        .insert(TextStyle::Heading, display(24.0, true));
+    style.text_styles.insert(TextStyle::Monospace, mono(13.0));
+    style.text_styles.insert(TextStyle::Small, mono(11.0));
     ctx.set_style(style);
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn form_controls_and_menus_are_square() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let style = ctx.style();
+        for widget in [
+            &style.visuals.widgets.noninteractive,
+            &style.visuals.widgets.inactive,
+            &style.visuals.widgets.hovered,
+            &style.visuals.widgets.active,
+            &style.visuals.widgets.open,
+        ] {
+            assert_eq!(widget.corner_radius, CONTROL_RADIUS);
+        }
+        assert_eq!(style.visuals.menu_corner_radius, CONTROL_RADIUS);
+    }
+
+    #[test]
+    fn dialogs_use_opaque_square_cards_without_a_local_shadow() {
+        let frame = dialog_frame();
+        assert_eq!(frame.fill, PANEL_RAISED);
+        assert_eq!(frame.stroke.color, CARD_BORDER);
+        assert_eq!(frame.corner_radius, egui::CornerRadius::ZERO);
+        assert_eq!(frame.shadow, egui::epaint::Shadow::NONE);
+        assert!(DIALOG_SCRIM.a() > 0);
+    }
 
     fn linear(channel: u8) -> f32 {
         let value = channel as f32 / 255.0;
@@ -510,5 +729,59 @@ mod tests {
         assert!(contrast(ON_INTERACTION, INTERACTION) >= 4.5);
         assert!(contrast(ON_DANGER, SIGNAL_RED) >= 4.5);
         assert_ne!(INTERACTION, SIGNAL_RED);
+    }
+
+    #[test]
+    fn cards_use_a_translucent_surface_and_neutral_border() {
+        assert_eq!(card_fill().a(), 0x70);
+        assert_eq!(CARD_BORDER.r(), CARD_BORDER.g() - 2);
+        assert_eq!(CARD_BORDER.g(), CARD_BORDER.b() - 2);
+    }
+
+    #[test]
+    fn bundled_typography_roles_parse_and_layout() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label(display_text("display", 24.0, true, TEXT));
+                ui.label(egui::RichText::new("Reading prose"));
+                ui.monospace("data-id");
+                ui.label(sc_annotation("系统状态"));
+            });
+        });
+        assert!(!output.shapes.is_empty());
+    }
+
+    #[test]
+    fn card_titles_use_white_type_inside_amber_brackets() {
+        let heading = section_heading("system status");
+        assert_eq!(heading.text, "[  SYSTEM STATUS  ]");
+        assert_eq!(heading.sections.len(), 3);
+        assert_eq!(heading.sections[0].format.color, INTERACTION);
+        assert_eq!(heading.sections[1].format.color, TEXT);
+        assert_eq!(heading.sections[2].format.color, INTERACTION);
+    }
+
+    #[test]
+    fn icon_labels_keep_phosphor_separate_from_text_font() {
+        let label = icon_label(
+            egui_phosphor::regular::PLUS,
+            14.0,
+            TEXT,
+            "New Mission",
+            FontId::proportional(14.0),
+            TEXT,
+        );
+
+        assert_eq!(label.sections.len(), 2);
+        assert_eq!(
+            label.sections[0].format.font_id.family,
+            egui::FontFamily::Name("phosphor".into())
+        );
+        assert_eq!(
+            label.sections[1].format.font_id.family,
+            egui::FontFamily::Proportional
+        );
     }
 }

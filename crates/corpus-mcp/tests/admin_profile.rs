@@ -373,7 +373,7 @@ fn admin_catalog_carries_no_sandbox_tools() {
         .iter()
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
         .collect();
-    for bad in ["sandbox_exec", "oracle_run", "faucet", "finding_write", "agent_save_of_missions", "target_info"] {
+    for bad in ["sandbox_exec", "oracle_list", "oracle_run", "faucet", "finding_write", "agent_save_of_missions", "target_info"] {
         assert!(!names.contains(&bad.to_string()), "admin catalog must not carry {bad}");
     }
     for op in [
