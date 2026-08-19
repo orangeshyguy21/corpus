@@ -226,8 +226,8 @@ impl Store {
         )?;
 
         // Pinned source trees: REQUIRED. A run without them reads nothing
-        // and quietly falls back to whatever the prompt says about
-        // sources.toml, auditing a tree nobody chose. The directory itself
+        // and quietly falls back to whatever the prompt says about source
+        // paths, auditing a tree nobody chose. The directory itself
         // is a fetch cache (`srcrev` fills it), so create it rather than
         // refusing a machine that simply hasn't fetched yet — but the
         // Source custody is corpus data, not a shipped-resource concern.

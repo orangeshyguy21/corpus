@@ -12,6 +12,7 @@ open-source project with a reproducible test environment.
 
 ```
 AGENTS.md            this file (read first)
+PLUGINS.md           operator install/upgrade and plugin authoring contract
 Cargo.toml           workspace root
 crates/
   corpus-store/      filesystem data model, finding severity/discovery,
@@ -26,10 +27,6 @@ crates/
   corpus-mcp/        MCP server exposing the corpus tools to agents
   corpus-cli/        headless CLI: run / plugin / models / store administration
   corpus-app/        egui desktop app (corpus-app), the operator UI
-plugins/             transitional bundled-plugin discovery root; production
-                     plugins are independently versioned and installed under
-                     CORPUS_HOME/plugins (the CDK reference lives in the
-                     sibling `corpus-plugin-cdk` repository).
 benchmarks/
   models.yaml        model registry (identity + metadata; scores live in
                      benchmarks/results/<model>/*.yaml)
@@ -37,16 +34,6 @@ benchmarks/
   results/           per-model benchmark score results
 scripts/goose-recipes/ optional Goose CLI fallback recipes. Script-only;
                      corpus-app uses the embedded chat runtime.
-sources.toml         pinned target source manifest (repo → tag + sha; the
-                     DEFAULT pin per repo — the PLUGIN defines the revs
-                     available, the PROJECT owns the pick (persisted on
-                     project.yaml `pins`): the top-bar dropdown discovers
-                     tags via git ls-remote (cached under
-                     sources/.rev-cache/), launch resolves rev → sha +
-                     fetches the tree, and the sandbox is recreated when
-                     its mounts don't match the mission's pins, delivered
-                     via CORPUS_SOURCE_PINS)
-sources/             git-ignored fetch of pinned trees (sources/<name>/<sha>/)
 docs/                (gone — folded into dev/; see below)
 dev/                 everything uncommitted & machine-local: architecture,
                      decisions, research, alpha-1, plus ACTIVE plans
@@ -103,7 +90,7 @@ the run cwd sits outside the repo, opencode's own upward config discovery
 cannot reach this repo's `.opencode/` either.
 
 The **resource root** (`CORPUS_RESOURCES`, else found from the running
-executable — the directory holding `plugins/`, `sources.toml`, and optional
+executable — the directory holding shipped assets such as
 `benchmarks/models.yaml`) is the
 other half: shipped, read-only, replaced by an upgrade. `corpus-store/paths.rs`
 owns both roots. `store.root().parent()` is NOT the repo root and must never
@@ -133,20 +120,25 @@ Chat/embedding build ergonomics (the `goose` git-dep):
 - True cold compile of the goose tree is ~107s (1438 crates); incremental is
   sub-second. Consider `sccache` for repeated cold builds of the dep tree.
 
-The external `cdk-regtest` plugin is a bash adapter plus a Docker-based arena;
-it is not built by cargo. Install its independently versioned bundle, then let
-Corpus fetch its pinned sources, prepare tools/images/regtest, and verify it:
+The external `cdk-regtest` and `nutshell-regtest` plugins are independently
+versioned Docker environment bundles; neither is built by cargo. Install an
+unpacked release bundle, then let Corpus fetch its manifest-pinned sources,
+prepare tools/images/regtest, and verify it:
 
 ```bash
 corpus plugin install ../corpus-plugin-cdk
 corpus plugin setup cdk-regtest
 corpus plugin doctor cdk-regtest
+
+corpus plugin install ../corpus-plugin-nutshell
+corpus plugin setup nutshell-regtest
+corpus plugin doctor nutshell-regtest
 ```
 
-Until the plugin repository becomes public, the external-plugin compatibility
-workflow reads its pinned GitHub release using the `CORPUS_PLUGIN_TOKEN`
-repository secret. That token needs read-only Contents access to
-`orangeshyguy21/corpus-plugin-cdk`; the workflow grants no write permission.
+Until the plugin repositories become public, the external-plugin compatibility
+workflow reads pinned GitHub releases using the `CORPUS_PLUGIN_TOKEN`
+repository secret. That token needs read-only Contents access to both private
+plugin repositories; the workflow grants no write permission.
 
 Environment is checked via `corpus plugin probe cdk-regtest`. The CLI:
 

@@ -167,60 +167,10 @@ pub fn validate_pin(store: &Store, project: &str, source: &str, rev: &str) -> Re
             ))
         });
     }
-    let plugin_dir = plugin.dir;
-    let config = match fs::read_to_string(plugin_dir.join("config.toml")) {
-        Ok(raw) => match toml::from_str::<toml::Value>(&raw) {
-            Ok(config) => config,
-            Err(_) => return Ok(()),
-        },
-        Err(_) => return Ok(()),
-    };
-    let declared = config
-        .get("sources")
-        .and_then(toml::Value::as_table)
-        .is_some_and(|table| table.contains_key(&format!("{source}_sha")));
-    if !declared {
-        return Ok(());
-    }
-    let Ok(resources) = corpus_store::paths::resource_root() else {
-        return Ok(());
-    };
-    let manifest_tag = source_manifest_tag(&resources.join("sources.toml"), source);
-    let cached = cached_revs(
-        &store
-            .source_cache_dir()
-            .join(".rev-cache")
-            .join(format!("{source}.json")),
-    );
-    let accepted = manifest_tag.as_deref() == Some(rev)
-        || cached.iter().any(|candidate| candidate == rev)
-        || matches!(rev, "main" | "master")
-        || is_commit_sha(rev);
-    if accepted {
-        Ok(())
-    } else {
-        let mut known = cached;
-        if let Some(tag) = manifest_tag {
-            known.push(tag);
-        }
-        known.sort();
-        known.dedup();
-        Err(Error::Store(format!(
-            "pin {source}={rev:?} is not a known rev, tag, main/master, or a 40-hex commit sha — known: {}",
-            known.join(", ")
-        )))
-    }
-}
-
-fn source_manifest_tag(path: &Path, source: &str) -> Option<String> {
-    let raw = fs::read_to_string(path).ok()?;
-    let value = toml::from_str::<toml::Value>(&raw).ok()?;
-    value
-        .get("sources")?
-        .get(source)?
-        .get("tag")?
-        .as_str()
-        .map(str::to_string)
+    // Legacy-v0 manifests have no portable source declaration. They remain
+    // inspectable, but author-time source validation is intentionally absent;
+    // production installs require manifest v1.
+    Ok(())
 }
 
 fn cached_revs(path: &Path) -> Vec<String> {

@@ -376,7 +376,6 @@ fn plugin_cmd(args: &[String]) -> Result<(), String> {
                 let origin = match plugin.origin {
                     corpus_core::PluginOrigin::Direct => "override",
                     corpus_core::PluginOrigin::Installed => "installed",
-                    corpus_core::PluginOrigin::Bundled => "bundled",
                 };
                 println!(
                     "{:<20} {:<8} {:<9} {}\n  {}",
@@ -540,8 +539,10 @@ fn find<'a>(
     plugins: &'a [corpus_core::PluginDir],
     name: &str,
 ) -> Result<&'a corpus_core::PluginDir, String> {
-    plugins
+    let plugin = plugins
         .iter()
         .find(|p| p.manifest.name == name)
-        .ok_or_else(|| format!("plugin not found: {name}"))
+        .ok_or_else(|| format!("plugin not found: {name}"))?;
+    corpus_core::verify_plugin_installation(plugin).map_err(|error| error.to_string())?;
+    Ok(plugin)
 }

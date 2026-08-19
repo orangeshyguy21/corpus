@@ -39,8 +39,8 @@ pub struct ProbeResult {
     /// deserializes.
     #[serde(default)]
     pub running_version: Option<String>,
-    /// The rev name the manifest EXPECTS to be running (the `sources.toml`
-    /// tag), for a "runs X, pins Y" readout without re-reading the manifest.
+    /// The rev name the plugin manifest expects to be running, for a "runs X,
+    /// pins Y" readout without re-reading the manifest.
     /// `None` when the plugin does not report one.
     #[serde(default)]
     pub expected_tag: Option<String>,

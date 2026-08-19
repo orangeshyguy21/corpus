@@ -6,7 +6,7 @@
 //!   projects, corpora, missions, run dirs, chat scopes, app prefs. Owned
 //!   by the user, survives a reinstall, never checked into a repo.
 //! - the **resource root** — optional assets shipped WITH the app: model
-//!   metadata, skills, and transitional legacy resources. Production plugins
+//!   metadata and skills. Production plugins
 //!   and fetched sources live under the data root instead. Read-only at
 //!   runtime, replaced wholesale by an upgrade.
 //!
@@ -64,15 +64,12 @@ pub fn store_root() -> PathBuf {
 // over a temp dir must keep its runs there, and an env-derived answer sent
 // every test's run dir into the real `~/.corpus`.
 
-/// A directory is the resource root if it carries any current or transitional
-/// shipped resource. Installed plugins and fetched sources deliberately are
-/// not markers: a clean corpus build must resolve its optional assets before
-/// either exists.
+/// A directory is the resource root if it carries a shipped resource.
+/// Installed plugins and fetched sources deliberately are not markers: a
+/// clean corpus build must resolve its optional assets before either exists.
 fn is_resource_root(dir: &Path) -> bool {
     dir.join("benchmarks/models.yaml").is_file()
         || dir.join(".opencode/skills").is_dir()
-        || dir.join("plugins").is_dir()
-        || dir.join("sources.toml").is_file()
 }
 
 static RESOURCE_ROOT: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
@@ -166,12 +163,6 @@ fn resolve_resource_root() -> std::result::Result<PathBuf, String> {
     ))
 }
 
-/// Transitional legacy resource lookup. New plugins declare sources in their
-/// own manifest and never derive source custody from the plugin directory.
-pub fn resources_for_plugins() -> Result<PathBuf> {
-    resource_root()
-}
-
 /// Writable root for versioned plugin installations.
 pub fn plugin_install_root() -> PathBuf {
     data_root().join("plugins")
@@ -182,14 +173,9 @@ pub fn plugin_runtime_root() -> PathBuf {
     data_root().join("var/plugins")
 }
 
-/// The transitional bundled-plugin root, if this build ships one.
-pub fn bundled_plugins_dir() -> Option<PathBuf> {
-    resource_root_opt().map(|root| root.join("plugins"))
-}
-
 /// Resolve the primary plugin catalog directory. An explicit override is a
 /// complete development/test catalog; otherwise this is the writable install
-/// root. Use the typed catalog API to include bundled fallbacks.
+/// root.
 pub fn plugins_dir() -> PathBuf {
     if let Some(dir) = std::env::var(PLUGINS_DIR_ENV)
         .ok()
@@ -209,11 +195,6 @@ pub fn sources_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(dir));
     }
     Ok(data_root().join("cache/sources"))
-}
-
-/// The pinned-source manifest.
-pub fn sources_manifest() -> Result<PathBuf> {
-    Ok(resource_root()?.join("sources.toml"))
 }
 
 /// The optional model metadata registry shipped under the resource root.

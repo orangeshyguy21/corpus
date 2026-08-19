@@ -66,7 +66,7 @@ pub use models::{
     ModelProviderGroup, ModelRegistry,
 };
 pub use paths::{
-    bundled_plugins_dir, corpus_admin_mcp_bin, corpus_mcp_bin, data_root, models_manifest,
+    corpus_admin_mcp_bin, corpus_mcp_bin, data_root, models_manifest,
     plugin_install_root, plugin_runtime_root, resource_root, resource_root_opt, sources_dir,
     store_root, HOME_ENV, MODELS_ENV, RESOURCES_ENV, SOURCES_DIR_ENV,
 };
@@ -78,6 +78,7 @@ pub use plugin::{
 pub use plugin_install::{
     call_plugin_lifecycle_cancellable, install_plugin_bundle, installed_record,
     plugin_bundle_digest, plugin_lifecycle_params, select_plugin_version, selected_version,
+    verify_plugin_installation,
     InstallReceipt, InstallRecord,
 };
 pub use environment_session::{

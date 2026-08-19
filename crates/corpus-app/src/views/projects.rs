@@ -988,7 +988,6 @@ fn plugin_identity(ui: &mut Ui, status: &corpus_core::PluginStatus) {
     let origin = match status.origin {
         corpus_core::PluginOrigin::Direct => "development override",
         corpus_core::PluginOrigin::Installed => "selected install",
-        corpus_core::PluginOrigin::Bundled => "bundled transition",
     };
     ui.horizontal_wrapped(|ui| {
         components::status_badge(

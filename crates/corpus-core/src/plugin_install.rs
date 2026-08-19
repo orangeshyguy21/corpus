@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, PluginManifest, PluginManifestVersion, Result};
 
 static INSTALL_NONCE: AtomicU64 = AtomicU64::new(1);
+static VERIFIED_INSTALLS: OnceLock<Mutex<std::collections::HashMap<PathBuf, String>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallReceipt {
@@ -95,6 +98,48 @@ pub fn installed_record(id: &str, version: &str) -> Result<InstallRecord> {
     let raw = fs::read_to_string(&path)?;
     serde_json::from_str(&raw)
         .map_err(|error| Error::Store(format!("invalid install record {}: {error}", path.display())))
+}
+
+/// Verify the selected bundle against its immutable installation receipt.
+/// Development overrides have no receipt, so their current digest is returned
+/// directly. Call this immediately before executing plugin code.
+pub fn verify_plugin_installation(plugin: &crate::PluginDir) -> Result<String> {
+    if plugin.origin == crate::PluginOrigin::Installed {
+        let version = plugin
+            .manifest
+            .version
+            .as_deref()
+            .ok_or_else(|| {
+                Error::Store(format!(
+                    "installed plugin {} has no version",
+                    plugin.manifest.name
+                ))
+            })?;
+        let expected = installed_record(&plugin.manifest.name, version)?.digest;
+        let verified =
+            VERIFIED_INSTALLS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        if verified
+            .lock()
+            .map_err(|_| Error::Store("plugin verification cache is poisoned".into()))?
+            .get(&plugin.dir)
+            == Some(&expected)
+        {
+            return Ok(expected);
+        }
+        let digest = plugin_bundle_digest(&plugin.dir)?;
+        if digest != expected {
+            return Err(Error::Store(format!(
+                "installed plugin {}@{} is damaged: bundle digest {} does not match installation receipt {}",
+                plugin.manifest.name, version, digest, expected
+            )));
+        }
+        verified
+            .lock()
+            .map_err(|_| Error::Store("plugin verification cache is poisoned".into()))?
+            .insert(plugin.dir.clone(), expected.clone());
+        return Ok(expected);
+    }
+    plugin_bundle_digest(&plugin.dir)
 }
 
 pub fn select_plugin_version(id: &str, version: &str) -> Result<()> {
@@ -456,7 +501,7 @@ mod tests {
             first.digest
         );
         assert_eq!(
-            crate::find_plugin("fixture-regtest").unwrap().unwrap().origin,
+            crate::plugin_catalog().unwrap()[0].origin,
             crate::PluginOrigin::Installed
         );
         assert!(!first.path.join(".git").exists());
@@ -465,9 +510,7 @@ mod tests {
         let second = install_plugin_bundle(&v2).unwrap();
         assert_eq!(second.previous.as_deref(), Some("1.0.0"));
         assert_eq!(
-            crate::find_plugin("fixture-regtest")
-                .unwrap()
-                .unwrap()
+            crate::plugin_catalog().unwrap()[0]
                 .manifest
                 .version
                 .as_deref(),
@@ -485,6 +528,27 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("immutable versions cannot be overwritten"));
+
+        // A privileged/local mutation of the read-only selected bundle is
+        // detected before execution and projected as an unhealthy status.
+        let installed_exec = first.path.join("bin/plugin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&installed_exec, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(&installed_exec, "#!/bin/sh\nexit 7\n").unwrap();
+        let error = crate::find_plugin("fixture-regtest")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is damaged"), "{error}");
+        let status = crate::selected_plugin_status(Some("fixture-regtest"));
+        let selected = status
+            .iter()
+            .find(|candidate| candidate.name == "fixture-regtest")
+            .unwrap();
+        assert!(!selected.ready);
+        assert!(selected.notes.contains("bundle verification failed"));
 
         let _ = fs::remove_dir_all(&root);
     }

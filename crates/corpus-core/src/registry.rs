@@ -3,8 +3,10 @@
 //! the host (this module); consumers never spawn plugins themselves.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
+
+#[cfg(test)]
+use std::fs;
 
 use serde::Deserialize;
 
@@ -21,13 +23,17 @@ pub fn discover(dir: &Path) -> Result<Vec<PluginDir>, Error> {
     corpus_observe::discover_plugins(dir)
 }
 
-/// Effective installed + transitional bundled catalog.
+/// Effective installed catalog, or the explicit development/test override.
 pub fn plugin_catalog() -> Result<Vec<PluginDir>, Error> {
     corpus_observe::plugin_catalog()
 }
 
 pub fn find_plugin(name: &str) -> Result<Option<PluginDir>, Error> {
-    corpus_observe::catalog_plugin(name)
+    let plugin = corpus_observe::catalog_plugin(name)?;
+    if let Some(plugin) = plugin.as_ref() {
+        crate::verify_plugin_installation(plugin)?;
+    }
+    Ok(plugin)
 }
 
 /// A discovered plugin plus its live probe status — the aggregation the
@@ -52,8 +58,7 @@ pub struct PluginStatus {
     /// The version the TARGET is actually running right now (from the live
     /// probe), e.g. the mint's reported version. `None` when unreachable.
     pub running_version: Option<String>,
-    /// The rev name the manifest expects to be running (the probe's view of
-    /// the `sources.toml` tag).
+    /// The rev name the executable reports as its expected target revision.
     pub expected_tag: Option<String>,
     /// Negotiated protocol identity from the immutable manifest. Legacy
     /// adapters leave this empty rather than pretending to speak v1.
@@ -61,8 +66,8 @@ pub struct PluginStatus {
     /// Capability vocabulary declared by the manifest and checked against
     /// `hello` for v1 plugins.
     pub capabilities: Vec<String>,
-    /// Whether this exact selected bundle came from an override, an immutable
-    /// install, or the transitional bundled catalog.
+    /// Whether this exact selected bundle came from an override or an
+    /// immutable install.
     pub origin: corpus_observe::PluginOrigin,
     /// Digest of the selected bundle bytes. This is computed on the probe
     /// worker, never while painting, and is the identity launch records use.
@@ -101,41 +106,54 @@ fn plugin_status_for(selected: Option<&str>, probe_all: bool) -> Vec<PluginStatu
     let mut out = Vec::new();
     for plugin in plugin_catalog().unwrap_or_default() {
         let should_probe = probe_all || selected == Some(plugin.manifest.name.as_str());
+        let verified_digest = should_probe.then(|| crate::verify_plugin_installation(&plugin));
         // Keep the whole ProbeResult so the version fields survive — a
         // `(ready, notes)` destructure was what dropped them before.
         let (probe, prepared) = if should_probe {
-            match Plugin::spawn(&plugin.dir) {
-                Ok(mut spawned) => {
-                    let result = if plugin.manifest.manifest_version
-                        == corpus_observe::PluginManifestVersion::V1
-                    {
-                        v1_status(&plugin, &mut spawned)
-                    } else {
-                        spawned
-                            .probe()
-                            .map(|probe| (probe, PluginPreparedStatus::default()))
-                    };
-                    result.unwrap_or_else(|error| {
-                        (
-                            ProbeResult {
-                                ready: false,
-                                notes: format!("probe failed: {error}"),
-                                running_version: None,
-                                expected_tag: None,
-                            },
-                            PluginPreparedStatus::default(),
-                        )
-                    })
-                }
-                Err(error) => (
+            if let Some(Err(error)) = verified_digest.as_ref() {
+                (
                     ProbeResult {
                         ready: false,
-                        notes: format!("spawn failed: {error}"),
+                        notes: format!("bundle verification failed: {error}"),
                         running_version: None,
                         expected_tag: None,
                     },
                     PluginPreparedStatus::default(),
-                ),
+                )
+            } else {
+                match Plugin::spawn(&plugin.dir) {
+                    Ok(mut spawned) => {
+                        let result = if plugin.manifest.manifest_version
+                            == corpus_observe::PluginManifestVersion::V1
+                        {
+                            v1_status(&plugin, &mut spawned)
+                        } else {
+                            spawned
+                                .probe()
+                                .map(|probe| (probe, PluginPreparedStatus::default()))
+                        };
+                        result.unwrap_or_else(|error| {
+                            (
+                                ProbeResult {
+                                    ready: false,
+                                    notes: format!("probe failed: {error}"),
+                                    running_version: None,
+                                    expected_tag: None,
+                                },
+                                PluginPreparedStatus::default(),
+                            )
+                        })
+                    }
+                    Err(error) => (
+                        ProbeResult {
+                            ready: false,
+                            notes: format!("spawn failed: {error}"),
+                            running_version: None,
+                            expected_tag: None,
+                        },
+                        PluginPreparedStatus::default(),
+                    ),
+                }
             }
         } else {
             (
@@ -148,22 +166,7 @@ fn plugin_status_for(selected: Option<&str>, probe_all: bool) -> Vec<PluginStatu
                 PluginPreparedStatus::default(),
             )
         };
-        let bundle_digest = should_probe
-            .then(|| {
-                if plugin.origin == corpus_observe::PluginOrigin::Installed {
-                    plugin
-                        .manifest
-                        .version
-                        .as_deref()
-                        .and_then(|version| {
-                            crate::installed_record(&plugin.manifest.name, version).ok()
-                        })
-                        .map(|record| record.digest)
-                } else {
-                    crate::plugin_bundle_digest(&plugin.dir).ok()
-                }
-            })
-            .flatten();
+        let bundle_digest = verified_digest.and_then(Result::ok);
         out.push(PluginStatus {
             name: plugin.manifest.name.clone(),
             version: plugin.manifest.version.clone(),
@@ -243,7 +246,7 @@ fn string_at(value: &serde_json::Value, pointer: &str) -> Option<String> {
 pub struct SourceRevs {
     /// Repository name (`cdk`, `nuts`).
     pub name: String,
-    /// The plugin's pinned revision from the repo's `sources.toml` — the
+    /// The plugin's pinned revision from its v1 manifest — the
     /// default the top bar offers (falls back to `main` when unknown).
     pub pinned: String,
     /// Selectable revisions, DEFAULT FIRST: `main`/`master` leads when
@@ -374,15 +377,15 @@ pub fn prepare_source_pins(
         }
         let Some(entry) = entries.get(name).filter(|e| !e.repo.is_empty()) else {
             return Err(Error::Store(format!(
-                "source pin {name}: no repo URL in sources.toml"
+                "source pin {name}: no repo URL in the plugin manifest"
             )));
         };
         // The manifest tag is the audited default: normally resolve it
         // sha-direct, no ls-remote needed — the default path must work
         // offline. EXCEPTION: a manifest "tag" that is itself a branch
         // (`main`/`master`) is MUTABLE — the recorded sha is a
-        // setup-time freeze, not the tip (cdk's sources.toml pins
-        // `main` for the spec), so branch-valued defaults resolve
+        // setup-time freeze, not the tip (a plugin manifest may pin `main`),
+        // so branch-valued defaults resolve
         // through the rev cache like any other branch pin. Offline with
         // no cache at all, the recorded default sha is the graceful
         // fallback — but ONLY for the manifest's own rev; any other pin
@@ -412,13 +415,6 @@ pub fn prepare_source_pins(
     Ok(resolved)
 }
 
-/// The root `sources.toml`: `[sources.<name>]` → repo / tag / sha.
-#[derive(Deserialize)]
-struct SourceFile {
-    #[serde(default)]
-    sources: BTreeMap<String, SourceEntry>,
-}
-
 #[derive(Clone, Deserialize)]
 struct SourceEntry {
     #[serde(default)]
@@ -431,7 +427,7 @@ struct SourceEntry {
 
 fn source_entries_for_plugin(
     plugin: &PluginDir,
-    plugin_name: &str,
+    _plugin_name: &str,
 ) -> Result<BTreeMap<String, SourceEntry>, Error> {
     if plugin.manifest.manifest_version == corpus_observe::PluginManifestVersion::V1 {
         return Ok(plugin
@@ -451,46 +447,10 @@ fn source_entries_for_plugin(
             .collect());
     }
 
-    let raw = fs::read_to_string(plugin.dir.join("config.toml"))
-        .map_err(|error| Error::Store(format!("plugin {plugin_name} config.toml: {error}")))?;
-    let config: toml::Value = toml::from_str(&raw)
-        .map_err(|error| Error::Store(format!("plugin {plugin_name} config.toml: {error}")))?;
-    let declared: Vec<String> = config
-        .get("sources")
-        .and_then(toml::Value::as_table)
-        .map(|table| {
-            table
-                .keys()
-                .filter(|key| key.ends_with("_sha"))
-                .map(|key| key.trim_end_matches("_sha").to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    let manifest = std::env::var(crate::paths::PLUGINS_DIR_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .and_then(|root| Path::new(&root).parent().map(|parent| parent.join("sources.toml")))
-        .unwrap_or(crate::paths::sources_manifest()?);
-    let entries = load_source_entries(&manifest);
-    Ok(entries
-        .into_iter()
-        .filter(|(name, _)| declared.contains(name))
-        .collect())
-}
-
-/// Best-effort map of repo name → manifest entry from a repo-root
-/// `sources.toml`. Missing/unparseable file yields an empty map (revs
-/// degrade to the pin + `main`).
-fn load_source_entries(path: &Path) -> BTreeMap<String, SourceEntry> {
-    let raw = match fs::read_to_string(path) {
-        Ok(r) => r,
-        Err(_) => return BTreeMap::new(),
-    };
-    let parsed: SourceFile = match toml::from_str(&raw) {
-        Ok(p) => p,
-        Err(_) => return BTreeMap::new(),
-    };
-    parsed.sources
+    // Legacy-v0 manifests remain identifiable for compatibility, but source
+    // custody is a v1 contract. Corpus no longer infers source identity from
+    // a plugin checkout's config.toml or a repository-relative sources.toml.
+    Ok(BTreeMap::new())
 }
 
 #[cfg(test)]
@@ -537,87 +497,29 @@ mod tests {
     }
 
     #[test]
-    fn plugin_sources_reads_config_and_tags() {
+    fn legacy_plugin_does_not_infer_repository_relative_sources() {
         let _guard = env_lock();
         let root = unique_temp_path("corpus-plugin-src");
         let _ = std::fs::remove_dir_all(&root);
 
-        // A fake plugin tree: <root>/plugins/cdk-regtest/ ; repo root = <root>.
         let pdir = root.join("plugins").join("cdk-regtest");
         write(&pdir.join("plugin.toml"), "name = \"cdk-regtest\"\nexec = \"plugin\"\n");
         write(
             &pdir.join("config.toml"),
             "[sources]\ncdk_sha = \"86a7c6\"\nnuts_sha = \"3bc8b6\"\n",
         );
-        let (remote, tag_sha) = fixture_remote(&root, "v0.17.0");
         write(
             &root.join("sources.toml"),
-            &format!(
-                "[sources.cdk]\nrepo = \"{remote}\"\ntag = \"v0.17.0\"\nsha = \"{tag_sha}\"\n\
-                 [sources.nuts]\nrepo = \"/nonexistent/corpus-nuts-fixture\"\ntag = \"main\"\nsha = \"3bc8b6d5\"\n"
-            ),
+            "[sources.cdk]\nrepo = \"must/not/be/read\"\ntag = \"main\"\nsha = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
         );
         let _plugins = EnvVarGuard::set("CORPUS_PLUGINS_DIR", root.join("plugins"));
-        let _sources = EnvVarGuard::set("CORPUS_SOURCES_DIR", root.join("sources"));
-
         let store = Store::new(root.join("store"));
         store.create_project("p", "P", "cdk-regtest").unwrap();
-        let revs = plugin_sources(&store, "p").unwrap();
-        assert_eq!(revs.len(), 2, "config.toml declares cdk + nuts");
-        let cdk = revs.iter().find(|s| s.name == "cdk").unwrap();
-        assert_eq!(cdk.pinned, "v0.17.0");
-        assert_eq!(
-            cdk.revs,
-            vec!["main".to_string(), "v0.17.0".to_string(), "v0.1.0".to_string()],
-            "main first (the default), then the pin, then tags newest-first: {:?}",
-            cdk.revs
-        );
-        assert_eq!(cdk.default_rev(), "main");
-        let nuts = revs.iter().find(|s| s.name == "nuts").unwrap();
-        assert_eq!(nuts.pinned, "main");
-        // nuts' remote is unreachable — degrades to the pin alone.
-        assert_eq!(nuts.revs, vec!["main".to_string()]);
-
-        // A project bound to a missing plugin degrades to empty, not error.
-        store.create_project("q", "Q", "ghost-plugin").unwrap();
-        assert!(plugin_sources(&store, "q").unwrap().is_empty());
-        // A missing project errors.
-        assert!(plugin_sources(&store, "ghost").is_err());
-
-        // prepare_source_pins: the manifest pin resolves sha-direct and
-        // fetches the tree; a branch pin resolves via the rev cache.
+        assert!(plugin_sources(&store, "p").unwrap().is_empty());
         let mut pins = BTreeMap::new();
-        pins.insert("cdk".to_string(), "v0.17.0".to_string());
-        let resolved = prepare_source_pins(&store, "p", &pins).unwrap();
-        assert_eq!(resolved["cdk"], tag_sha);
-        assert!(root.join("sources/cdk").join(&tag_sha).join(".git").is_dir());
         pins.insert("cdk".to_string(), "main".to_string());
-        let resolved = prepare_source_pins(&store, "p", &pins).unwrap();
-        assert_eq!(resolved["cdk"].len(), 40);
-        // Unknown revs and undeclared repos: error / ignored.
-        pins.insert("cdk".to_string(), "v8.8.8".to_string());
-        assert!(prepare_source_pins(&store, "p", &pins).is_err());
-        pins.clear();
-        pins.insert("ghost".to_string(), "main".to_string());
         assert!(prepare_source_pins(&store, "p", &pins).unwrap().is_empty());
-
-        // A raw commit SHA pins DIRECTLY — no name resolution (the failure
-        // mode this fixes), fetched by sha into sources/cdk/<sha>/.
-        pins.clear();
-        pins.insert("cdk".to_string(), tag_sha.clone());
-        let resolved = prepare_source_pins(&store, "p", &pins).unwrap();
-        assert_eq!(resolved["cdk"], tag_sha);
-        assert!(root.join("sources/cdk").join(&tag_sha).join(".git").is_dir());
-
-        // validate_pin (author-time, structural): the manifest tag, main, a
-        // selectable tag, and a 40-hex sha all pass; a typo fails; an
-        // undeclared source is fail-open (mirrors prepare_source_pins).
-        assert!(validate_pin(&store, "p", "cdk", "v0.17.0").is_ok());
-        assert!(validate_pin(&store, "p", "cdk", "main").is_ok());
-        assert!(validate_pin(&store, "p", "cdk", "v0.1.0").is_ok());
-        assert!(validate_pin(&store, "p", "cdk", &tag_sha).is_ok());
-        assert!(validate_pin(&store, "p", "cdk", "v9.9.9").is_err());
-        assert!(validate_pin(&store, "p", "ghost", "anything").is_ok());
+        assert!(validate_pin(&store, "p", "cdk", "anything").is_ok());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -632,8 +534,6 @@ mod tests {
         let root = unique_temp_path("corpus-branchpin");
         let _ = std::fs::remove_dir_all(&root);
         let pdir = root.join("plugins").join("cdk-regtest");
-        write(&pdir.join("plugin.toml"), "name = \"cdk-regtest\"\nexec = \"plugin\"\n");
-        write(&pdir.join("config.toml"), "[sources]\nnuts_sha = \"x\"\n");
         let (remote, tag_sha) = fixture_remote(&root, "v0.2.0");
         // The live branch head: after the two fixtures commits, main ==
         // the second commit (== the peeled annotated tag).
@@ -644,13 +544,14 @@ mod tests {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap();
         assert_eq!(head, tag_sha, "fixture main head == annotated tag commit");
-        // Manifest tag = "main" with a FABRICATED recorded sha.
+        // V1 manifest default = "main" with a FABRICATED recorded sha.
         write(
-            &root.join("sources.toml"),
+            &pdir.join("plugin.toml"),
             &format!(
-                "[sources.nuts]\nrepo = \"{remote}\"\ntag = \"main\"\nsha = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n"
+                "manifest_version = 1\nid = \"cdk-regtest\"\nversion = \"1.0.0\"\nprotocol = \"corpus.environment/1\"\nexec = \"plugin\"\n\n[[sources]]\nid = \"nuts\"\nrepo = \"{remote}\"\ndefault_rev = \"main\"\ndefault_sha = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\nmount = \"/opt/src/nuts\"\n"
             ),
         );
+        write(&pdir.join("plugin"), "#!/bin/sh\nexit 0\n");
         let _plugins = EnvVarGuard::set("CORPUS_PLUGINS_DIR", root.join("plugins"));
         let _sources = EnvVarGuard::set("CORPUS_SOURCES_DIR", root.join("sources"));
         let store = Store::new(root.join("store"));
@@ -670,9 +571,9 @@ mod tests {
         // default must resolve without the network — while a NON-default
         // branch pin on the same source is a loud error.
         write(
-            &root.join("sources.toml"),
+            &pdir.join("plugin.toml"),
             &format!(
-                "[sources.nuts]\nrepo = \"/nonexistent/corpus-nuts-branch\"\ntag = \"main\"\nsha = \"{tag_sha}\"\n"
+                "manifest_version = 1\nid = \"cdk-regtest\"\nversion = \"1.0.0\"\nprotocol = \"corpus.environment/1\"\nexec = \"plugin\"\n\n[[sources]]\nid = \"nuts\"\nrepo = \"/nonexistent/corpus-nuts-branch\"\ndefault_rev = \"main\"\ndefault_sha = \"{tag_sha}\"\nmount = \"/opt/src/nuts\"\n"
             ),
         );
         let mut default = BTreeMap::new();

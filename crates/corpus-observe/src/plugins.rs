@@ -72,7 +72,6 @@ pub struct PluginDir {
 pub enum PluginOrigin {
     Direct,
     Installed,
-    Bundled,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,9 +241,9 @@ pub fn discover_plugins(root: &Path) -> Result<Vec<PluginDir>, Error> {
     Ok(plugins)
 }
 
-/// The effective catalog. `CORPUS_PLUGINS_DIR` is a complete direct override.
-/// Otherwise selected versioned installs win by id and bundled plugins fill
-/// only missing ids during the migration window.
+/// The effective catalog. `CORPUS_PLUGINS_DIR` is a complete development/test
+/// override. Production discovery reads only explicitly selected, immutable
+/// installations under `CORPUS_HOME/plugins`.
 pub fn plugin_catalog() -> Result<Vec<PluginDir>, Error> {
     if let Some(root) = std::env::var(corpus_store::paths::PLUGINS_DIR_ENV)
         .ok()
@@ -254,18 +253,6 @@ pub fn plugin_catalog() -> Result<Vec<PluginDir>, Error> {
     }
 
     let mut catalog = discover_selected_installs(&corpus_store::paths::plugin_install_root())?;
-    let mut names: HashSet<String> = catalog
-        .iter()
-        .map(|plugin| plugin.manifest.name.clone())
-        .collect();
-    if let Some(root) = corpus_store::paths::bundled_plugins_dir() {
-        for mut plugin in discover_plugins(&root)? {
-            if names.insert(plugin.manifest.name.clone()) {
-                plugin.origin = PluginOrigin::Bundled;
-                catalog.push(plugin);
-            }
-        }
-    }
     catalog.sort_by(|left, right| left.manifest.name.cmp(&right.manifest.name));
     Ok(catalog)
 }
