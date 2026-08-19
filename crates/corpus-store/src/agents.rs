@@ -94,10 +94,11 @@ pub enum AgentRole {
 /// (`corpus_` + the MCP tool name). One list, so a tool added to
 /// corpus-mcp without a role decision fails the totality test rather
 /// than silently defaulting to allowed.
-pub const CORPUS_TOOLS: [&str; 8] = [
+pub const CORPUS_TOOLS: [&str; 9] = [
     "corpus_target_info",
     "corpus_technique_save",
     "corpus_sandbox_exec",
+    "corpus_oracle_list",
     "corpus_oracle_run",
     "corpus_faucet",
     "corpus_wallet_fund",
@@ -2473,6 +2474,7 @@ mod tests {
         assert_eq!(perm["corpus_technique_save"].as_str(), Some("allow"));
         for denied in [
             "corpus_sandbox_exec",
+            "corpus_oracle_list",
             "corpus_oracle_run",
             "corpus_faucet",
             "corpus_wallet_fund",
@@ -2564,6 +2566,7 @@ mod tests {
             "permission": {
                 "corpus_sandbox_exec": "deny", "corpus_faucet": "deny",
                 "corpus_wallet_fund": "deny", "corpus_oracle_run": "deny",
+                "corpus_oracle_list": "deny",
                 "corpus_finding_write": "deny", "corpus_attack_save": "deny",
                 "corpus_target_info": "allow", "corpus_technique_save": "allow",
                 "webfetch": "allow", "websearch": "allow",

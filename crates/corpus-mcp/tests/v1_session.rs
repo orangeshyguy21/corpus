@@ -94,6 +94,15 @@ fn generic_tools_forward_the_durable_v1_session_and_typed_description() {
     assert!(paid.contains("Payment succeeded (7 sat"), "{paid}");
     assert_eq!(ctx.faucet_spent_sats, 17);
 
+    let oracle_catalog: serde_json::Value = serde_json::from_str(
+        &tools::dispatch(&mut ctx, "oracle_list", &json!({})).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        oracle_catalog,
+        json!({"oracles":[{"name":"fixture-invariant","description":"fixture"}]})
+    );
+
     let replay = tools::dispatch(
         &mut ctx,
         "faucet",
@@ -168,11 +177,45 @@ fn generic_mcp_layer_contains_no_target_specific_wallet_contract() {
         concat!("nuts", "hell"),
         "targets[0]",
         r#""target":{"type":"integer""#,
+        concat!("020-", "conservation"),
     ] {
         assert!(
             !source.contains(forbidden),
             "generic MCP tools must not contain target-specific marker {forbidden:?}"
         );
+    }
+}
+
+#[test]
+fn oracle_tools_require_dynamic_discovery() {
+    let catalog = tools::catalog();
+    let tools = catalog.as_array().unwrap();
+    let list = tools
+        .iter()
+        .find(|tool| tool["name"] == "oracle_list")
+        .expect("oracle_list is advertised");
+    assert_eq!(list["inputSchema"]["required"], json!([]));
+    assert!(
+        list["description"]
+            .as_str()
+            .unwrap()
+            .contains("decide which oracle")
+    );
+    let run = tools
+        .iter()
+        .find(|tool| tool["name"] == "oracle_run")
+        .expect("oracle_run is advertised");
+    assert!(run["description"].as_str().unwrap().contains("oracle_list"));
+
+    let stale = concat!("020-", "conservation");
+    for (name, text) in [
+        (
+            "tester prompt",
+            include_str!("../../corpus-store/src/prompts/tester.md"),
+        ),
+        ("agent guidance", include_str!("../../../AGENTS.md")),
+    ] {
+        assert!(!text.contains(stale), "{name} contains stale oracle example");
     }
 }
 

@@ -103,6 +103,7 @@ fn a_curator_advertises_exactly_its_grant_set() {
         "agent_copy",
         "corpus_wipe",
         "sandbox_exec",
+        "oracle_list",
         "oracle_run",
         "faucet",
         "finding_write",

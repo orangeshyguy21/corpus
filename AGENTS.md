@@ -358,9 +358,10 @@ the launch unit. Agent configs carry model/description/prompt/permission
 only.
 
 A fresh agent should answer "how do I run the oracle suite?" with: `corpus
-plugin probe cdk-regtest` (is the environment healthy) then via the MCP
-tools `oracle_run` per oracle reported by `corpus plugin call cdk-regtest
-oracles`. "Who may touch the sandbox?" → the `tester` and `super` roles, via
+plugin probe <plugin>` (is the environment healthy), then via the MCP tools
+call `oracle_list`, read the returned names and descriptions, and use
+`oracle_run` for the relevant exact names. "Who may touch the sandbox?" →
+the `tester` and `super` roles, via
 the `corpus_sandbox_exec` MCP tool (see Trust domains below).
 
 ## Trust domains (hard rules)
