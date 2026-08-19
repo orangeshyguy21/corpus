@@ -287,7 +287,7 @@ impl AgentsView {
 
         // --- JSON editor (spec §6): monospace 13.5px, fills the width,
         // min height 480, in a Frame (EDITOR_BG fill, 1px HAIRLINE, radius 2).
-        components::panel_card(ui, "Raw configuration", |ui| {
+        components::panel_card(ui, "Raw configuration", "原始配置", |ui| {
             egui::Frame::default()
                 .fill(theme::EDITOR_BG)
                 .stroke(egui::Stroke::new(1.0_f32, theme::HAIRLINE))
@@ -481,7 +481,7 @@ impl AgentsView {
     }
 
     fn identity_card(&mut self, ui: &mut Ui, state: &mut AppState, is_primary: bool) {
-        components::panel_card(ui, "Identity", |ui| {
+        components::panel_card(ui, "Identity", "身份", |ui| {
             if is_primary {
                 self.name_section(ui);
                 ui.add_space(14.0);
@@ -502,17 +502,17 @@ impl AgentsView {
         cfg: &serde_json::Map<String, serde_json::Value>,
         is_primary: bool,
     ) {
-        components::panel_card(ui, "Role & access", |ui| {
+        components::panel_card(ui, "Role & access", "角色与权限", |ui| {
             self.role_section(ui, state, toasts, project, slug, agent, cfg, is_primary);
         });
     }
 
     fn description_card(&mut self, ui: &mut Ui) {
-        components::panel_card(ui, "Description", |ui| self.description_section(ui));
+        components::panel_card(ui, "Description", "描述", |ui| self.description_section(ui));
     }
 
     fn prompt_card(&mut self, ui: &mut Ui) {
-        components::panel_card(ui, "Prompt", |ui| self.prompt_section(ui));
+        components::panel_card(ui, "Prompt", "提示词", |ui| self.prompt_section(ui));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -526,7 +526,7 @@ impl AgentsView {
         agent: &corpus_core::AgentConfig,
         subagents: &[String],
     ) {
-        components::panel_card(ui, "", |ui| {
+        components::panel_card(ui, "Subagents", "子代理", |ui| {
             self.subagents_section(ui, state, toasts, project, slug, agent, subagents);
         });
     }

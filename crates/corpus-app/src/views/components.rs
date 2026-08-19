@@ -60,21 +60,16 @@ pub fn page_header_with_context<C, R>(
         .horizontal(|ui| {
             let context_result = ui
                 .horizontal(|ui| {
-                    ui.label(
-                        RichText::new(kind.to_uppercase())
-                            .size(24.0)
-                            .strong()
-                            .color(theme::INTERACTION),
-                    );
+                    ui.label(theme::display_text(
+                        kind,
+                        24.0,
+                        true,
+                        theme::INTERACTION,
+                    ));
                     ui.label(RichText::new("/").size(24.0).color(theme::TEXT_FAINT));
                     ui.add(
-                        egui::Label::new(
-                            RichText::new(name.to_uppercase())
-                                .size(24.0)
-                                .strong()
-                                .color(theme::TEXT),
-                        )
-                        .truncate(),
+                        egui::Label::new(theme::display_text(name, 24.0, true, theme::TEXT))
+                            .truncate(),
                     );
                     ui.add_space(10.0);
                     context(ui)
@@ -103,26 +98,28 @@ pub fn page_header_with_context<C, R>(
     result
 }
 
-/// A smoked card with an optional amber command title and clipped content.
+/// A translucent, square-edged card with a bracketed command title, a muted
+/// right-aligned Simplified Chinese annotation, and clipped content.
 pub fn panel_card<R>(
     ui: &mut Ui,
     title: &str,
+    annotation: &str,
     body: impl FnOnce(&mut Ui) -> R,
 ) -> egui::InnerResponse<R> {
     egui::Frame::default()
-        .fill(Color32::from_rgba_unmultiplied(
-            theme::PANEL.r(),
-            theme::PANEL.g(),
-            theme::PANEL.b(),
-            0xee,
-        ))
-        .stroke(egui::Stroke::new(1.0_f32, theme::KEYLINE))
-        .corner_radius(egui::CornerRadius::same(3))
+        .fill(theme::card_fill())
+        .stroke(egui::Stroke::new(1.0_f32, theme::CARD_BORDER))
+        .corner_radius(egui::CornerRadius::ZERO)
         .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             if !title.is_empty() {
-                ui.label(theme::section_heading(title.to_uppercase()));
+                ui.horizontal(|ui| {
+                    ui.label(theme::section_heading(title));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(theme::sc_annotation(annotation));
+                    });
+                });
                 ui.add_space(8.0);
                 soft_rule(ui);
                 ui.add_space(10.0);
@@ -175,6 +172,85 @@ pub fn metric_cell(ui: &mut Ui, label: &str, value: impl Into<String>, tone: Sta
                 .color(tone.color()),
         );
     });
+}
+
+/// Equal-width score cells used by the System Status card. At narrow widths
+/// the strip becomes a 2×2 grid without changing the visual grammar.
+pub fn score_strip(ui: &mut Ui, metrics: &[(&str, String)]) {
+    if metrics.is_empty() {
+        return;
+    }
+    let columns = score_strip_columns(ui.available_width(), metrics.len());
+    let rows = metrics.len().div_ceil(columns);
+    let row_height = 78.0;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_height * rows as f32),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::ZERO,
+        egui::Stroke::new(1.0_f32, theme::CARD_BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let cell_width = rect.width() / columns as f32;
+    for row in 1..rows {
+        let y = rect.top() + row_height * row as f32;
+        painter.hline(
+            rect.left()..=rect.right(),
+            y,
+            egui::Stroke::new(1.0_f32, theme::CARD_BORDER),
+        );
+    }
+    for column in 1..columns {
+        let x = rect.left() + cell_width * column as f32;
+        painter.vline(
+            x,
+            rect.top()..=rect.bottom(),
+            egui::Stroke::new(1.0_f32, theme::CARD_BORDER),
+        );
+    }
+
+    for (index, (label, value)) in metrics.iter().enumerate() {
+        let row = index / columns;
+        let column = index % columns;
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.left() + column as f32 * cell_width,
+                rect.top() + row as f32 * row_height,
+            ),
+            egui::vec2(cell_width, row_height),
+        )
+        .shrink2(egui::vec2(14.0, 10.0));
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("score_cell", index))
+                .max_rect(cell)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        child.label(
+            RichText::new(label.to_uppercase())
+                .size(10.5)
+                .monospace()
+                .color(theme::TEXT_FAINT),
+        );
+        child.add_space(4.0);
+        child.label(
+            RichText::new(value)
+                .font(theme::display(29.0, true))
+                .color(theme::INTERACTION),
+        );
+    }
+}
+
+fn score_strip_columns(available_width: f32, metric_count: usize) -> usize {
+    if available_width >= 520.0 {
+        metric_count
+    } else {
+        metric_count.min(2)
+    }
 }
 
 /// Framed overflow menu button shared by Project and Agent action rails.
@@ -386,5 +462,12 @@ mod tests {
         assert_ne!(StatusTone::Interaction.color(), StatusTone::Danger.color());
         assert_ne!(theme::INTERACTION, theme::SIGNAL_RED);
         assert_eq!(StatusTone::Healthy.color(), theme::HEALTHY);
+    }
+
+    #[test]
+    fn score_strip_collapses_to_two_columns_on_narrow_cards() {
+        assert_eq!(score_strip_columns(900.0, 4), 4);
+        assert_eq!(score_strip_columns(519.0, 4), 2);
+        assert_eq!(score_strip_columns(300.0, 1), 1);
     }
 }

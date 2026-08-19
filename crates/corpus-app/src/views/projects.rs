@@ -143,53 +143,54 @@ impl ProjectsView {
     }
 
     fn status_band(&self, ui: &mut Ui, state: &AppState, slug: &str) {
-        components::panel_card(ui, "System status", |ui| {
+        components::panel_card(ui, "System status", "系统状态", |ui| {
             let env = state.env_status(slug);
-            ui.horizontal_wrapped(|ui| {
-                match env {
-                    Some(ref env) if env.ready => {
-                        components::status_badge(ui, "environment ready", components::StatusTone::Healthy)
-                            .on_hover_text(&env.notes);
-                    }
-                    Some(ref env) => {
-                        components::status_badge(ui, "environment degraded", components::StatusTone::Danger)
-                            .on_hover_text(&env.notes);
-                    }
-                    None => {
-                        components::status_badge(ui, "probe unavailable", components::StatusTone::Warning);
-                    }
+            let (status, tone, notes) = match env {
+                Some(ref env) if env.ready => (
+                    "environment ready",
+                    components::StatusTone::Healthy,
+                    Some(env.notes.as_str()),
+                ),
+                Some(ref env) => (
+                    "environment degraded",
+                    components::StatusTone::Danger,
+                    Some(env.notes.as_str()),
+                ),
+                None => (
+                    "probe unavailable",
+                    components::StatusTone::Warning,
+                    None,
+                ),
+            };
+            let metrics = [
+                ("source pins", state.source_pins.len().to_string()),
+                ("agents", state.agents.len().to_string()),
+                ("missions", state.missions.len().to_string()),
+                (
+                    "corpus files",
+                    state
+                        .corpus_stats()
+                        .map(|stats| stats.knowledge_files().to_string())
+                        .unwrap_or_else(|| "—".to_owned()),
+                ),
+            ];
+            let status_badge = |ui: &mut Ui| {
+                let response = components::status_badge(ui, status, tone);
+                if let Some(notes) = notes {
+                    response.on_hover_text(notes);
                 }
-                ui.add_space(18.0);
-                components::metric_cell(
-                    ui,
-                    "source pins",
-                    state.source_pins.len().to_string(),
-                    components::StatusTone::Interaction,
-                );
-                ui.add_space(18.0);
-                components::metric_cell(
-                    ui,
-                    "agents",
-                    state.agents.len().to_string(),
-                    components::StatusTone::Neutral,
-                );
-                ui.add_space(18.0);
-                components::metric_cell(
-                    ui,
-                    "missions",
-                    state.missions.len().to_string(),
-                    components::StatusTone::Neutral,
-                );
-                if let Some(stats) = state.corpus_stats() {
-                    ui.add_space(18.0);
-                    components::metric_cell(
-                        ui,
-                        "corpus files",
-                        stats.knowledge_files().to_string(),
-                        components::StatusTone::Neutral,
-                    );
-                }
-            });
+            };
+            if ui.available_width() >= 760.0 {
+                ui.horizontal(|ui| {
+                    status_badge(ui);
+                    ui.add_space(24.0);
+                    components::score_strip(ui, &metrics);
+                });
+            } else {
+                status_badge(ui);
+                ui.add_space(12.0);
+                components::score_strip(ui, &metrics);
+            }
         });
     }
 
@@ -239,7 +240,7 @@ impl ProjectsView {
         toasts: &mut Toasts,
         slug: &str,
     ) {
-        components::panel_card(ui, "Configuration", |ui| {
+        components::panel_card(ui, "Configuration", "配置", |ui| {
             ui.label(command_label("Environment plugin"));
             ui.add_space(6.0);
             plugin_picker(
@@ -384,7 +385,7 @@ impl ProjectsView {
     }
 
     fn team_card(&self, ui: &mut Ui, state: &mut AppState) {
-        components::panel_card(ui, "Team", |ui| {
+        components::panel_card(ui, "Team", "团队", |ui| {
             let agents = state.agents.clone();
             if agents.is_empty() {
                 empty_hint(ui, "no agents in this project");
@@ -404,7 +405,7 @@ impl ProjectsView {
     }
 
     fn missions_card(&self, ui: &mut Ui, state: &mut AppState, project: &str) {
-        components::panel_card(ui, "Missions", |ui| {
+        components::panel_card(ui, "Missions", "任务", |ui| {
             let missions = state.missions.clone();
             if missions.is_empty() {
                 empty_hint(ui, "no missions in this project");
@@ -450,7 +451,7 @@ impl ProjectsView {
 
     fn corpus_card(&mut self, ui: &mut Ui, state: &AppState) {
         let findings = finding_summary_model(state.finding_discovery());
-        components::panel_card(ui, "Corpus signal", |ui| {
+        components::panel_card(ui, "Corpus signal", "语料库信号", |ui| {
             ui.horizontal(|ui| {
                 match state.corpus_stats() {
                     Some(stats) => {
@@ -500,7 +501,7 @@ impl ProjectsView {
     }
 
     fn logs_card(&self, ui: &mut Ui, state: &AppState) {
-        components::panel_card(ui, "Mission logs", |ui| {
+        components::panel_card(ui, "Mission logs", "任务日志", |ui| {
             let logs = state
                 .corpus_stats()
                 .map(|stats| stats.logs.clone())
@@ -528,7 +529,7 @@ impl ProjectsView {
     }
 
     fn cost_card(&self, ui: &mut Ui, state: &AppState) {
-        components::panel_card(ui, "Cost", |ui| match state.corpus_cost() {
+        components::panel_card(ui, "Cost", "成本", |ui| match state.corpus_cost() {
             Some(report) if !report.rows.is_empty() => {
                 cost_headline(ui, report);
                 ui.add_space(12.0);
