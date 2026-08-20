@@ -19,13 +19,13 @@ jobs:
           - id: cdk-regtest
             repo: orangeshyguy21/corpus-plugin-cdk
             archive: corpus-plugin-cdk
-            version: 0.3.8
-            sha256: eaa8a9e0181e391b142198dcdddd6177d6560aa6728692326cb587a85f17eded
+            version: 0.4.4
+            sha256: 5f06374a100c40542134dd333900a27b16d213263e485868bc8709926442c012
           - id: nutshell-regtest
             repo: orangeshyguy21/corpus-plugin-nutshell
             archive: corpus-plugin-nutshell
-            version: 0.3.2
-            sha256: 255e4de06d372e5b16ba6e6349a8a8938510cb9af0d6f649d15c0cfbf38814f4
+            version: 0.4.0
+            sha256: 29472c615fe01a86c50708a8a5f80f2c924e105cfa0ed473f3ebb099f3922a9c
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain

@@ -45,8 +45,8 @@ The current private release locks are:
 
 | Plugin | Tag | Release archive SHA-256 |
 |---|---|---|
-| `cdk-regtest` | `corpus-plugin-cdk@v0.3.8` | `eaa8a9e0181e391b142198dcdddd6177d6560aa6728692326cb587a85f17eded` |
-| `nutshell-regtest` | `corpus-plugin-nutshell@v0.3.0` | `2ac77e231c447da918f746055482f657617e2b22c562f96c2b9fd946addbc33e` |
+| `cdk-regtest` | `corpus-plugin-cdk@v0.4.4` | `5f06374a100c40542134dd333900a27b16d213263e485868bc8709926442c012` |
+| `nutshell-regtest` | `corpus-plugin-nutshell@v0.4.0` | `29472c615fe01a86c50708a8a5f80f2c924e105cfa0ed473f3ebb099f3922a9c` |
 
 Corpus CI downloads both assets, verifies both the attached checksum and this
 independent lock, installs them through the operator path, negotiates v1, and
