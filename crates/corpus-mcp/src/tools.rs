@@ -5,7 +5,7 @@
 //! project corpus (the ONLY corpus scope).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use corpus_core::refusal::Gate;
 use corpus_core::{
@@ -25,6 +25,9 @@ const OUTPUT_CAP_BYTES: usize = 8 * 1024;
 const ORACLE_LOG_CAP_BYTES: usize = 16 * 1024;
 const ORACLE_SUITE_CAP: usize = 64;
 const ORACLE_DESCRIPTION_CAP_BYTES: usize = 2 * 1024;
+/// Keep generated `docker exec` argv comfortably below common ARG_MAX and
+/// prevent a model from using the convenience tool as an unbounded blob pipe.
+const SANDBOX_WRITE_CAP_BYTES: usize = 128 * 1024;
 
 fn valid_oracle_name(name: &str) -> bool {
     !name.is_empty()
@@ -469,6 +472,19 @@ pub fn catalog() -> Value {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
                 "required": ["command"]
+            }
+        },
+        {
+            "name": "sandbox_write",
+            "description": "Write a UTF-8 file into the sandbox's session-scoped writable workspace without shell-quoting the content yourself. Paths must be beneath /work or /tmp. Use /work for PoCs and attack_save for the final durable replay script.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "absolute path beneath /work or /tmp"},
+                    "content": {"type": "string", "description": "UTF-8 file content (maximum 128 KiB)"},
+                    "executable": {"type": "boolean", "description": "set owner-executable mode; defaults to false"}
+                },
+                "required": ["path", "content"]
             }
         },
         {
@@ -964,6 +980,7 @@ fn dispatch_inner(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     match name {
         "target_info" => target_info(ctx),
         "sandbox_exec" => sandbox_exec(ctx, &require_str(args, "command")?),
+        "sandbox_write" => sandbox_write(ctx, args),
         "oracle_list" => oracle_list(ctx),
         "oracle_run" => oracle_run(ctx, &require_str(args, "name")?),
         "faucet" => faucet(ctx, args),
@@ -1132,8 +1149,8 @@ fn target_info(ctx: &mut Ctx) -> Result<String> {
     .unwrap_or_else(|_| "{}".to_string()))
 }
 
-fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
-    let result = if ctx
+fn run_sandbox_command(ctx: &mut Ctx, command: &str) -> Result<corpus_core::SandboxExecResult> {
+    if ctx
         .plugin
         .as_ref()
         .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
@@ -1142,11 +1159,15 @@ fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
         resilient(ctx, |plugin| {
             let value = plugin.call_v1("sandbox_exec", Some(params))?;
             Ok(serde_json::from_value(value)?)
-        })?
+        })
     } else {
         let pins = ctx.source_pins.clone();
-        resilient(ctx, |p| p.sandbox_exec_with_sources(command, pins.as_ref()))?
-    };
+        resilient(ctx, |p| p.sandbox_exec_with_sources(command, pins.as_ref()))
+    }
+}
+
+fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
+    let result = run_sandbox_command(ctx, command)?;
     let mut combined = result.output;
     if combined.len() > OUTPUT_CAP_BYTES {
         combined.truncate(OUTPUT_CAP_BYTES);
@@ -1154,6 +1175,85 @@ fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
     }
     combined.push_str(&format!("\n[exit {}]", result.exit_code));
     Ok(combined)
+}
+
+fn sandbox_write_path(path: &str) -> Result<&Path> {
+    let path = Path::new(path);
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(Error::Args(
+            "sandbox_write path must be absolute beneath /work or /tmp".into(),
+        ));
+    }
+    match components.next() {
+        Some(Component::Normal(root)) if root == "work" || root == "tmp" => {}
+        _ => {
+            return Err(Error::Args(
+                "sandbox_write path must be beneath /work or /tmp".into(),
+            ));
+        }
+    }
+    let mut has_leaf = false;
+    for component in components {
+        match component {
+            Component::Normal(_) => has_leaf = true,
+            _ => {
+                return Err(Error::Args(
+                    "sandbox_write path may not contain parent or special components".into(),
+                ));
+            }
+        }
+    }
+    if !has_leaf {
+        return Err(Error::Args("sandbox_write path must name a file".into()));
+    }
+    Ok(path)
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn sandbox_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let path_raw = require_str(args, "path")?;
+    let path = sandbox_write_path(&path_raw)?;
+    let content = require_str(args, "content")?;
+    if content.len() > SANDBOX_WRITE_CAP_BYTES {
+        return Err(Error::Args(format!(
+            "sandbox_write content is {} bytes; maximum is {SANDBOX_WRITE_CAP_BYTES}",
+            content.len()
+        )));
+    }
+    if content.contains('\0') {
+        return Err(Error::Args("sandbox_write content may not contain NUL".into()));
+    }
+    let parent = path.parent().ok_or_else(|| Error::Args("invalid sandbox path".into()))?;
+    let executable = args
+        .get("executable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mode = if executable { "700" } else { "600" };
+    // Content and paths are data, never shell syntax. The quote helper uses
+    // the standard close-quote / literal-quote / reopen-quote sequence.
+    let command = format!(
+        "umask 077; mkdir -p {}; printf '%s' {} > {}; chmod {mode} {}",
+        shell_single_quote(&parent.to_string_lossy()),
+        shell_single_quote(&content),
+        shell_single_quote(&path.to_string_lossy()),
+        shell_single_quote(&path.to_string_lossy()),
+    );
+    let result = run_sandbox_command(ctx, &command)?;
+    if result.exit_code != 0 {
+        return Err(Error::Plugin(format!(
+            "sandbox_write failed with exit {}: {}",
+            result.exit_code, result.output
+        )));
+    }
+    Ok(format!(
+        "wrote {} bytes to {} (executable={executable})",
+        content.len(),
+        path.display()
+    ))
 }
 
 fn oracle_catalog(ctx: &mut Ctx) -> Result<Vec<OracleInfo>> {
@@ -1628,5 +1728,30 @@ mod tests {
                 .collect()
         )
         .is_err());
+    }
+
+    #[test]
+    fn sandbox_write_paths_are_confined_to_writable_roots() {
+        for valid in ["/work/poc.py", "/work/nested/run.sh", "/tmp/state.json"] {
+            assert_eq!(sandbox_write_path(valid).unwrap(), Path::new(valid));
+        }
+        for invalid in [
+            "work/poc.py",
+            "/work",
+            "/tmp",
+            "/etc/passwd",
+            "/work/../etc/passwd",
+        ] {
+            assert!(sandbox_write_path(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn sandbox_write_shell_quotes_content_as_data() {
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        assert_eq!(
+            shell_single_quote("can't $(escape)"),
+            "'can'\"'\"'t $(escape)'"
+        );
     }
 }

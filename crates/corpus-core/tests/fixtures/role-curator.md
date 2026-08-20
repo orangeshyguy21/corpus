@@ -38,6 +38,7 @@ permission:
   corpus_oracle_list: deny
   corpus_oracle_run: deny
   corpus_sandbox_exec: deny
+  corpus_sandbox_write: deny
   corpus_target_info: deny
   corpus_technique_save: deny
   corpus_wallet_fund: deny

@@ -26,7 +26,8 @@ pub(crate) fn delete(state: &mut AppState, toasts: &mut Toasts, project: &str, s
     let was_selected = state.selected_mission.as_deref() == Some(slug);
     match state.delete_mission(project, slug) {
         Ok(DeleteMissionResult::Scheduled) => {
-            toast(toasts, ToastKind::Info, "deleting mission");
+            // The mission pane owns this progress state; a second transient
+            // toast only obscures it and survives after the record is gone.
         }
         Ok(DeleteMissionResult::Completed) => {
             toast(toasts, ToastKind::Success, "mission deleted");

@@ -94,10 +94,11 @@ pub enum AgentRole {
 /// (`corpus_` + the MCP tool name). One list, so a tool added to
 /// corpus-mcp without a role decision fails the totality test rather
 /// than silently defaulting to allowed.
-pub const CORPUS_TOOLS: [&str; 9] = [
+pub const CORPUS_TOOLS: [&str; 10] = [
     "corpus_target_info",
     "corpus_technique_save",
     "corpus_sandbox_exec",
+    "corpus_sandbox_write",
     "corpus_oracle_list",
     "corpus_oracle_run",
     "corpus_faucet",
@@ -417,7 +418,15 @@ pub fn infer_role(cfg: &serde_json::Map<String, serde_json::Value>) -> AgentRole
         )
     };
     let wants_web = ["webfetch", "websearch"].iter().any(|k| granted(k));
-    let needed: Vec<&str> = CORPUS_TOOLS.into_iter().filter(|t| granted(t)).collect();
+    let needed: Vec<&str> = CORPUS_TOOLS
+        .into_iter()
+        // A tool that did not exist when a legacy document was authored was
+        // not an omitted allow. Only consider sandbox_write during migration
+        // when the old document actually names it; current agents have a
+        // sidecar role and never use this inference path.
+        .filter(|tool| *tool != "corpus_sandbox_write" || perm.contains_key(*tool))
+        .filter(|tool| granted(tool))
+        .collect();
     AgentRole::LEGACY_INFERENCE_ORDER
         .into_iter()
         .find(|role| needed.iter().all(|t| role.allows(t)) && (!wants_web || role.grants_web()))
@@ -1776,7 +1785,7 @@ struct Policy {
     /// one project by construction; this is the switch deciding whether
     /// that construction can be stepped around.
     external_directory: Action,
-    /// The `corpus_*` switches: 8 research tools and 26 management ones,
+    /// The `corpus_*` switches: 10 sandbox/corpus tools and 29 management ones,
     /// every one written explicitly so the artifact never leans on
     /// omission-means-allow. Three come out `corpus_corpus_*` because the
     /// run config names the MCP server `corpus`.
@@ -2474,6 +2483,7 @@ mod tests {
         assert_eq!(perm["corpus_technique_save"].as_str(), Some("allow"));
         for denied in [
             "corpus_sandbox_exec",
+            "corpus_sandbox_write",
             "corpus_oracle_list",
             "corpus_oracle_run",
             "corpus_faucet",

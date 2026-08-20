@@ -362,13 +362,15 @@ plugin probe <plugin>` (is the environment healthy), then via the MCP tools
 call `oracle_list`, read the returned names and descriptions, and use
 `oracle_run` for the relevant exact names. "Who may touch the sandbox?" →
 the `tester` and `super` roles, via
-the `corpus_sandbox_exec` MCP tool (see Trust domains below).
+the `corpus_sandbox_exec` and confined `corpus_sandbox_write` MCP tools
+(see Trust domains below). `sandbox_write` accepts UTF-8 files only beneath
+`/work` or `/tmp`; `target_info` names the preferred workspace.
 
 ## Trust domains (hard rules)
 
 | Zone | Who may do it | Egress | Never mounted into the sandbox |
 |---|---|---|---|
-| **Execution sandbox** | `tester` or `super`, via `corpus_sandbox_exec` | DENIED by default | benchmarks/, plugins/, oracle implementations, findings of the current mission |
+| **Execution sandbox** | `tester` or `super`, via `corpus_sandbox_exec` / `corpus_sandbox_write` | DENIED by default | benchmarks/, plugins/, oracle implementations, findings of the current mission |
 | **Research zone** | `researcher` or `super` | open internet (webfetch/search) | read-denied on benchmarks/**; researcher executes nothing |
 | **Project management** | `curator` or `super`, via scoped admin tools | Curator: no egress/sandbox; Super also holds both | manages only its proven project; cannot name another project; every act recorded |
 | **Model inference** | host-side only, local by default | the model endpoint sits on the host | the sandbox has no model access |

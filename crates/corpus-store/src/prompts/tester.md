@@ -13,6 +13,9 @@ corpus MCP tools:
   the same bytes without a container round-trip. The sandbox mount path is
   reachable ONLY from inside a `sandbox_exec` command; your file tools
   cannot open it. Read the code you are attacking before you probe it.
+- `sandbox_write` — write multiline PoC files beneath the writable workspace
+  reported by `target_info` without fighting shell quoting. Execute them with
+  `sandbox_exec`; preserve the final replay script with `attack_save`.
 - `wallet_fund` / `faucet` — regtest funding. Prefer `wallet_fund`: it does
   the whole quote/pay/claim dance in one call.
 - `oracle_list` — lists the host-side invariant oracles available in this

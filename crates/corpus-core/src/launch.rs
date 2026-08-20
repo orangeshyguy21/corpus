@@ -252,7 +252,9 @@ impl RunSession {
             return None;
         }
         *discovery = std::time::Instant::now();
-        let found = find_opencode_session(repo.as_path(), *launched_at_ms, claimed).ok()?;
+        let found = find_opencode_session(repo.as_path(), *launched_at_ms, claimed)
+            .ok()
+            .flatten()?;
         *tui_session_id = Some(found.clone());
         Some(found)
     }
@@ -658,6 +660,7 @@ impl RunSession {
             tui_session_id,
             launched_at_ms,
             repo,
+            raw,
             ..
         } = &mut self.backend
         else {
@@ -669,8 +672,16 @@ impl RunSession {
         let id = match tui_session_id.clone() {
             Some(id) => id,
             None => {
-                let found =
-                    find_opencode_session(repo.as_path(), *launched_at_ms, &BTreeSet::new())?;
+                let Some(found) =
+                    find_opencode_session(repo.as_path(), *launched_at_ms, &BTreeSet::new())?
+                else {
+                    // OpenCode can reject an agent/model before it creates a
+                    // conversation. There is consequently nothing to export,
+                    // but the pipe-pane raw capture is already the durable
+                    // transcript of that failed launch. This is a normal
+                    // fallback, not a teardown failure.
+                    return Ok(raw.clone());
+                };
                 *tui_session_id = Some(found.clone());
                 found
             }
@@ -843,7 +854,7 @@ fn find_opencode_session(
     cwd: &Path,
     launched_at_ms: u64,
     claimed: &BTreeSet<String>,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let opencode = resolve_opencode()?;
     let output = Command::new(&opencode)
         .args(["session", "list", "--format", "json", "-n", "50"])
@@ -888,8 +899,7 @@ fn find_opencode_session(
             best = Some((created, id.to_string()));
         }
     }
-    best.map(|(_, id)| id)
-        .ok_or_else(|| Error::Store("no opencode session found for this launch".into()))
+    Ok(best.map(|(_, id)| id))
 }
 
 /// `opencode export <id>` -> the pretty JSON transcript. The JSON is on
@@ -984,7 +994,9 @@ pub fn session_conversation(
 ) -> Option<String> {
     let ts = session_stamp(session)?;
     let cwd = store.project_run_dir(project);
-    find_opencode_session(&cwd, ts.saturating_mul(1000), claimed).ok()
+    find_opencode_session(&cwd, ts.saturating_mul(1000), claimed)
+        .ok()
+        .flatten()
 }
 
 /// The launch stamp in `corpus-<agent>-<ts>`. `<agent>` may itself contain
@@ -1589,19 +1601,15 @@ mod tests {
         let _ = fs::remove_dir_all(&bin);
         fs::create_dir_all(&bin).unwrap();
         let fake = bin.join("opencode");
-        // The launched TUI stays alive, while Stop's discovery/export
-        // subprocesses answer immediately. A fake that sleeps for every
-        // argv makes the test itself hang inside `Command::output()` and
-        // hides which phase failed.
+        // The launched TUI stays alive, while Stop's discovery subprocess
+        // answers with no conversation. That is what happens when OpenCode
+        // rejects a configured model before creating a session: the raw log
+        // remains the valid durable transcript and deletion must stay clean.
         fs::write(
             &fake,
             "#!/bin/sh\n\
              if [ \"$1\" = session ]; then\n\
-               printf '[{\"directory\":\"%s\",\"created\":9999999999999,\"id\":\"fixture-session\"}]\\n' \"$PWD\"\n\
-               exit 0\n\
-             fi\n\
-             if [ \"$1\" = export ]; then\n\
-               printf '{\"id\":\"fixture-session\"}\\n'\n\
+               printf '[]\\n'\n\
                exit 0\n\
              fi\n\
              sleep 90128\n",
@@ -1633,7 +1641,9 @@ mod tests {
 
         // Simulate pane output, then stop: the run log must survive.
         fs::write(&raw, "pane output\n").unwrap();
-        session.stop();
+        let outcome = session.stop_detailed();
+        assert_eq!(outcome.transcript, raw);
+        assert_eq!(outcome.export_error, None);
         assert!(raw.exists(), "stop keeps the durable run log");
 
         let _ = fs::remove_dir_all(&bin);

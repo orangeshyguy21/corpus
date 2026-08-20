@@ -388,6 +388,10 @@ fn researcher_role_is_refused_execution_and_publication_tools() {
 
     for (tool, args) in [
         ("sandbox_exec", json!({"command": "echo hi"})),
+        (
+            "sandbox_write",
+            json!({"path": "/work/poc.py", "content": "print(1)"}),
+        ),
         ("oracle_list", json!({})),
         ("oracle_run", json!({"name": "double-spend"})),
         ("faucet", json!({"op": "balance"})),
@@ -448,6 +452,7 @@ fn advertised_catalog_matches_the_role() {
     assert!(researcher.contains(&"technique_save".to_string()), "{researcher:?}");
     for hidden in [
         "sandbox_exec",
+        "sandbox_write",
         "oracle_list",
         "oracle_run",
         "faucet",

@@ -2496,6 +2496,14 @@ impl AppState {
             .allows_delete_action()
     }
 
+    /// Whether Delete has committed to tearing this mission down in the
+    /// background. Views keep the mission selected and render a stable busy
+    /// pane until teardown and record removal complete.
+    pub fn mission_delete_pending(&self, project: &str, mission: &str) -> bool {
+        self.pending_mission_deletes
+            .contains(&(project.to_string(), mission.to_string()))
+    }
+
     /// A mission may outlive the app between environment creation and agent
     /// spawn. Its persisted key remains the operator's cleanup handle even
     /// when no tmux session was ever created.
@@ -5562,6 +5570,7 @@ mod tests {
             state.delete_mission("p", "mission").unwrap(),
             DeleteMissionResult::Scheduled
         ));
+        assert!(state.mission_delete_pending("p", "mission"));
         assert_eq!(state.run_phase(&run_id), RunPhase::Stopping);
         for _ in 0..200 {
             state.poll_background_jobs();
@@ -5571,6 +5580,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(state.run_phase(&run_id), RunPhase::Idle);
+        assert!(!state.mission_delete_pending("p", "mission"));
         assert!(store.load_mission("p", "mission").is_err());
         let _ = std::fs::remove_dir_all(root);
     }

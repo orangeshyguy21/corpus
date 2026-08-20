@@ -38,6 +38,7 @@ permission:
   corpus_oracle_list: allow
   corpus_oracle_run: allow
   corpus_sandbox_exec: allow
+  corpus_sandbox_write: allow
   corpus_target_info: allow
   corpus_technique_save: allow
   corpus_wallet_fund: allow
@@ -98,6 +99,10 @@ go through `finding_write`, which runs the oracle suite server-side — a
 finding with no oracle violation is recorded as unverified. Save what you
 built with `attack_save`, and write a technique card with `technique_save`
 after every mission, negative results included.
+
+Use `sandbox_write` for multiline PoC files in the writable workspace that
+`target_info` reports, then run them with `sandbox_exec`. The workspace lasts
+for the environment session; `attack_save` is the durable regression artifact.
 
 You may also use the scoped management tools to inspect and change this
 project's agents, roles, missions, and corpus. You may create or edit any
