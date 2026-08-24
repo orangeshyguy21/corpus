@@ -112,6 +112,32 @@ impl Store {
             .join(format!("{key}.json"));
         serde_json::from_slice(&std::fs::read(&path)?).map_err(Into::into)
     }
+
+    /// List every durable session record for a plugin. Records live outside
+    /// project subtrees specifically so this still finds cleanup identities
+    /// after a buggy or historical mission deletion removed their owner.
+    pub fn list_environment_sessions(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Vec<EnvironmentSessionRecord>> {
+        validate_component("plugin id", plugin_id)?;
+        let dir = self.plugin_runtime_dir(plugin_id)?.join("sessions");
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut records: Vec<EnvironmentSessionRecord> = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            records.push(serde_json::from_slice(&std::fs::read(path)?)?);
+        }
+        records.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(records)
+    }
 }
 
 fn validate_component(label: &str, value: &str) -> Result<()> {

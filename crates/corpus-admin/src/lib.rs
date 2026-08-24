@@ -23,7 +23,7 @@ use std::{
 use corpus_observe::{MissionActivity, MissionRunState};
 use corpus_store::{
     fnv1a_hex, AgentRole, EntryAccess, FindingQuery, FindingSeverity, FindingSort, Mission,
-    MissionLaunchRequest, MissionRunRef, Project, Store, CATEGORIES,
+    MissionDeleteRequest, MissionLaunchRequest, MissionRunRef, Project, Store, CATEGORIES,
 };
 use serde_json::{json, Value};
 
@@ -442,7 +442,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "mission_delete",
-            "description": "CONFIRM-GATED. Delete a mission record. Dry-run first; returns a one-shot token to complete.",
+            "description": "CONFIRM-GATED. Request mission deletion. The app tears down any run and plugin environment first, then removes the record; cleanup failures retain the mission for retry. Dry-run first; returns a one-shot token to complete.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1444,6 +1444,7 @@ fn mission_new(ctx: &mut Ctx, args: &Value) -> Result<String> {
         opencode_session: None,
         environment_session: None,
         launch_requested: None,
+        delete_requested: None,
         dispatch: None,
     };
     ctx.store
@@ -1473,6 +1474,11 @@ fn mission_launch(
         .store
         .load_mission(&project, &slug)
         .map_err(|e| Error::Args(e.to_string()))?;
+    if mission.delete_requested.is_some() {
+        return Err(Error::Args(format!(
+            "mission {project}/{slug} is pending deletion"
+        )));
+    }
     if mission.launch_requested.is_none() {
         mission.launch_requested = Some(MissionLaunchRequest {
             requested_at: now(),
@@ -1493,8 +1499,27 @@ fn mission_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let target = format!("{project}/{mission}");
     if let Some(token) = args.get("confirm_token").and_then(Value::as_str) {
         confirm_and_run(ctx, "mission_delete", &target, token, |store| {
-            store.delete_mission(&project, &mission).map_err(|e| Error::Args(e.to_string()))?;
-            Ok(format!("deleted mission {project}/{mission}"))
+            let mut record = store
+                .load_mission(&project, &mission)
+                .map_err(|e| Error::Args(e.to_string()))?;
+            if store.ensure_mission_deletable(&project, &mission).is_ok() {
+                store
+                    .delete_mission(&project, &mission)
+                    .map_err(|e| Error::Args(e.to_string()))?;
+                return Ok(format!("deleted mission {project}/{mission}"));
+            }
+            record.launch_requested = None;
+            if record.delete_requested.is_none() {
+                record.delete_requested = Some(MissionDeleteRequest {
+                    requested_at: now(),
+                });
+                store
+                    .update_mission(&project, &mission, &record)
+                    .map_err(|e| Error::Args(e.to_string()))?;
+            }
+            Ok(format!(
+                "deletion requested for mission {project}/{mission} — the app will tear down its run and environment before removing the record"
+            ))
         })
     } else {
         let record = ctx

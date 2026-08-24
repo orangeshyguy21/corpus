@@ -103,7 +103,7 @@ pub use srcrev::{ensure_source_tree, is_commit_sha, resolve_rev, revs_cache_fetc
 pub use store::{
     corpus_cost, corpus_cost_cached, corpus_stats, fnv1a_hex, mission_logs, project_slug_env, slugify,
     store_root_env, validate_slug, AppPrefs, CategoryStat, CorpusCostCache, CorpusStats, CostReport, CostRow,
-    EntryAccess, Mission, MissionCompletion, MissionControl, MissionDispatch, MissionLaunchRequest,
-    MissionLog, MissionRunRef, Project, Scope, Store, CATEGORIES, AGENT_ENV, ENVIRONMENT_SESSION_ENV,
+    EntryAccess, Mission, MissionCompletion, MissionControl, MissionDeleteRequest, MissionDispatch,
+    MissionLaunchRequest, MissionLog, MissionRunRef, Project, Scope, Store, CATEGORIES, AGENT_ENV, ENVIRONMENT_SESSION_ENV,
     MISSION_ENV, PROJECT_ENV, RUN_ID_ENV, RUN_LOG_ENV, RUNS, SOURCE_PINS_ENV, STORE_ENV,
 };

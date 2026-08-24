@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corpus_core::{
     AgentConfig, CorpusStats, CostReport, Error, FindingCard, FindingIndexCache, Mission,
-    PluginStatus, Project, RunLine, RunSession, SourceRevs, StopOutcome, Store,
+    MissionDeleteRequest, PluginStatus, Project, RunLine, RunSession, SourceRevs, StopOutcome, Store,
 };
 
 use crate::file_watch::{FileInvalidationSource, NotifyFileInvalidationSource};
@@ -296,7 +296,9 @@ pub struct ProjectTree {
 /// Docker, plugin state directories, or mission files while painting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginLeaseView {
+    pub session_key: String,
     pub mission: String,
+    pub orphaned: bool,
     pub state: corpus_core::EnvironmentSessionState,
     pub plugin_version: String,
     pub plugin_digest: String,
@@ -587,8 +589,12 @@ enum AppJobOutput {
     SessionMaintenance(SessionMaintenance),
     DispatchDeliveries,
     TeardownReady(TeardownReady),
+    OrphanCleanup { project: String, plugin: String },
     ProjectScope(ProjectScopeSnapshot),
-    LaunchRequests(Vec<LaunchRequest>),
+    LaunchRequests {
+        launches: Vec<LaunchRequest>,
+        deletions: Vec<DeletionRequest>,
+    },
     ProjectIndex(Vec<(String, Project)>, BTreeMap<String, ProjectTree>),
     Agents(Vec<(String, AgentConfig)>),
     Missions(Vec<(String, Mission)>),
@@ -653,6 +659,11 @@ struct LaunchRequest {
     slug: String,
     label: String,
     already_live: bool,
+}
+
+struct DeletionRequest {
+    project: String,
+    slug: String,
 }
 
 #[derive(Debug)]
@@ -1061,6 +1072,11 @@ impl AppState {
                         });
                     }
                 }
+                JobTerminal::Success(AppJobOutput::OrphanCleanup { project, plugin }) => {
+                    if self.effective_project().as_deref() == Some(project.as_str()) {
+                        self.refresh_plugins(Some(&plugin));
+                    }
+                }
                 JobTerminal::Success(AppJobOutput::ProjectScope(snapshot)) => {
                     let project = result.scope.project;
                     self.agents = snapshot.agents;
@@ -1077,8 +1093,11 @@ impl AppState {
                     self.corpus_stats_project = Some(project);
                     self.corpus_polled_at = Some(self.clock.monotonic_now());
                 }
-                JobTerminal::Success(AppJobOutput::LaunchRequests(requests)) => {
-                    self.apply_launch_requests(requests);
+                JobTerminal::Success(AppJobOutput::LaunchRequests {
+                    launches,
+                    deletions,
+                }) => {
+                    self.apply_mission_requests(deletions, launches);
                 }
                 JobTerminal::Success(AppJobOutput::ProjectIndex(projects, trees)) => {
                     self.projects = projects;
@@ -1580,6 +1599,54 @@ impl AppState {
 
     pub fn plugin_leases(&self) -> &[PluginLeaseView] {
         &self.plugin_leases
+    }
+
+    /// Retry cleanup for a durable lease whose mission record is already
+    /// gone. Plugin mutation is explicit and never happens during a probe.
+    pub fn cleanup_orphan_environment(
+        &mut self,
+        plugin_id: &str,
+        session_key: &str,
+    ) -> Result<bool, String> {
+        let record = self
+            .store
+            .load_environment_session_key(plugin_id, session_key)
+            .map_err(|error| error.to_string())?;
+        if self
+            .store
+            .load_mission(&record.id.project, &record.id.mission)
+            .is_ok()
+        {
+            return Err(
+                "environment still belongs to a mission; delete that mission instead".into(),
+            );
+        }
+        if self.jobs.is_none() {
+            corpus_core::close_environment_session_key(&self.store, plugin_id, session_key)
+                .map_err(|error| error.to_string())?;
+            self.refresh_plugins(Some(plugin_id));
+            return Ok(true);
+        }
+
+        let store = self.store.clone();
+        let plugin = plugin_id.to_string();
+        let key = session_key.to_string();
+        let project = record.id.project;
+        let scope = self.job_scope(&project, None);
+        let jobs = self.jobs.as_mut().expect("checked above");
+        Ok(matches!(
+            jobs.start(
+                JobKind::OrphanCleanup,
+                scope,
+                Duration::from_secs(30),
+                move |_| {
+                    corpus_core::close_environment_session_key(&store, &plugin, &key)
+                        .map_err(|error| error.to_string())?;
+                    Ok(AppJobOutput::OrphanCleanup { project, plugin })
+                },
+            ),
+            StartOutcome::Started(_)
+        ))
     }
 
     pub fn plugin_operation(&self) -> Option<PluginOperationView> {
@@ -2407,6 +2474,7 @@ impl AppState {
             opencode_session: None,
             environment_session: None,
             launch_requested: None,
+            delete_requested: None,
             dispatch: None,
         };
         self.store.write_mission(project, &id, &mission, brief)?;
@@ -2421,7 +2489,18 @@ impl AppState {
         project: &str,
         slug: &str,
     ) -> Result<DeleteMissionResult, Error> {
-        let mission = self.store.load_mission(project, slug)?;
+        let mut mission = self.store.load_mission(project, slug)?;
+        // Persist intent before starting teardown. If the app exits after
+        // killing tmux or closing the plugin but before removing the record,
+        // the next reconciliation beat resumes this request instead of
+        // leaving a half-cleaned mission behind.
+        if mission.delete_requested.is_none() || mission.launch_requested.is_some() {
+            mission.launch_requested = None;
+            mission.delete_requested.get_or_insert(MissionDeleteRequest {
+                requested_at: self.clock.unix_seconds(),
+            });
+            self.store.update_mission(project, slug, &mission)?;
+        }
         let needs_teardown =
             mission.session.is_some() || self.mission_environment_needs_cleanup(project, slug);
         if needs_teardown {
@@ -2614,6 +2693,17 @@ impl AppState {
     pub fn mission_delete_pending(&self, project: &str, mission: &str) -> bool {
         self.pending_mission_deletes
             .contains(&(project.to_string(), mission.to_string()))
+            || (self.missions_project.as_deref() == Some(project)
+                && self
+                    .missions
+                    .iter()
+                    .find(|(slug, _)| slug == mission)
+                    .is_some_and(|(_, record)| record.delete_requested.is_some()))
+            || self
+                .trees
+                .get(project)
+                .and_then(|tree| tree.missions.iter().find(|(slug, _)| slug == mission))
+                .is_some_and(|(_, record)| record.delete_requested.is_some())
     }
 
     /// A mission may outlive the app between environment creation and agent
@@ -3042,12 +3132,20 @@ impl AppState {
                 Duration::from_secs(15),
                 move |_| {
                     let live = catalog.live_tui_sessions();
-                    let mut requests = Vec::new();
+                    let mut launches = Vec::new();
+                    let mut deletions = Vec::new();
                     for project in projects {
                         let Ok(missions) = store.list_missions(&project) else {
                             continue;
                         };
                         for (slug, mission) in missions {
+                            if mission.delete_requested.is_some() {
+                                deletions.push(DeletionRequest {
+                                    project: project.clone(),
+                                    slug,
+                                });
+                                continue;
+                            }
                             if mission.launch_requested.is_none() {
                                 continue;
                             }
@@ -3055,7 +3153,7 @@ impl AppState {
                                 .session
                                 .as_deref()
                                 .is_some_and(|session| live.iter().any(|item| item == session));
-                            requests.push(LaunchRequest {
+                            launches.push(LaunchRequest {
                                 project: project.clone(),
                                 label: mission_label(mission.name.as_deref(), &slug),
                                 slug,
@@ -3063,25 +3161,37 @@ impl AppState {
                             });
                         }
                     }
-                    Ok(AppJobOutput::LaunchRequests(requests))
+                    Ok(AppJobOutput::LaunchRequests {
+                        launches,
+                        deletions,
+                    })
                 },
             );
             return;
         }
         let mut pending: Vec<(String, String, Option<String>)> = Vec::new();
+        let mut deletions = Vec::new();
         for project in &projects {
             let Ok(missions) = self.store.list_missions(project) else {
                 continue;
             };
             for (slug, m) in missions {
+                if m.delete_requested.is_some() {
+                    deletions.push(DeletionRequest {
+                        project: project.clone(),
+                        slug,
+                    });
+                    continue;
+                }
                 if m.launch_requested.is_some() {
                     pending.push((project.clone(), slug, m.session.clone()));
                 }
             }
         }
-        if pending.is_empty() {
+        if pending.is_empty() && deletions.is_empty() {
             return;
         }
+        self.apply_deletion_requests(deletions);
         // A fresh listing so "already live" is a real answer, not a stale
         // one that would spawn a duplicate.
         self.refresh_live_sessions();
@@ -3113,8 +3223,13 @@ impl AppState {
         }
     }
 
-    fn apply_launch_requests(&mut self, requests: Vec<LaunchRequest>) {
-        for request in requests {
+    fn apply_mission_requests(
+        &mut self,
+        deletions: Vec<DeletionRequest>,
+        launches: Vec<LaunchRequest>,
+    ) {
+        self.apply_deletion_requests(deletions);
+        for request in launches {
             if let Err(error) = self.clear_launch_request(
                 &request.project,
                 &request.slug,
@@ -3140,6 +3255,21 @@ impl AppState {
                     result: Err(error.to_string()),
                 });
             }
+        }
+    }
+
+    fn apply_deletion_requests(&mut self, requests: Vec<DeletionRequest>) {
+        let mut refresh = BTreeSet::new();
+        for request in requests {
+            match self.delete_mission(&request.project, &request.slug) {
+                Ok(DeleteMissionResult::Completed) => {
+                    refresh.insert(request.project);
+                }
+                Ok(DeleteMissionResult::Scheduled) | Err(_) => {}
+            }
+        }
+        for project in refresh {
+            self.refresh_missions(&project);
         }
     }
 
@@ -5215,17 +5345,26 @@ fn prepared_plugin_leases(
     let selected = statuses.iter().find(|status| status.name == plugin_id);
     let manifest = corpus_core::find_plugin(plugin_id).ok().flatten();
     let mut leases = Vec::new();
-    for (mission_slug, mission) in store.list_missions(project).unwrap_or_default() {
-        let Some(key) = mission.environment_session.as_deref() else {
-            continue;
-        };
-        let Ok(record) = store.load_environment_session_key(plugin_id, key) else {
-            continue;
-        };
+    let missions: BTreeMap<String, Mission> = store
+        .list_missions(project)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    for record in store
+        .list_environment_sessions(plugin_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|record| record.id.project == project)
+    {
         if record.state == corpus_core::EnvironmentSessionState::Closed {
             continue;
         }
+        let mission_slug = record.id.mission.clone();
+        let mission = missions.get(&mission_slug);
         let mut drift = Vec::new();
+        if mission.is_none() {
+            drift.push("mission record is missing; orphan cleanup required".into());
+        }
         if record.plugin_id != plugin_id {
             drift.push(format!(
                 "plugin id {} != selected {plugin_id}",
@@ -5252,7 +5391,7 @@ fn prepared_plugin_leases(
                 }
             }
         }
-        if let Some(plugin) = manifest.as_ref() {
+        if let (Some(plugin), Some(mission)) = (manifest.as_ref(), mission) {
             for source in &plugin.manifest.sources {
                 let chosen = mission
                     .pins
@@ -5279,7 +5418,9 @@ fn prepared_plugin_leases(
             }
         }
         leases.push(PluginLeaseView {
+            session_key: record.id.storage_key(),
             mission: mission_slug,
+            orphaned: mission.is_none(),
             state: record.state,
             plugin_version: record.plugin_version,
             plugin_digest: record.plugin_digest,
@@ -5829,6 +5970,7 @@ mod tests {
             opencode_session: None,
             environment_session: Some(id.storage_key()),
             launch_requested: None,
+            delete_requested: None,
             dispatch: None,
         };
         store
@@ -5877,6 +6019,22 @@ mod tests {
             prepared_plugin_leases(&store, Some("p"), Some("fixture-regtest"), &statuses,)
                 .is_empty()
         );
+
+        record.id.mission = "deleted-mission".into();
+        record.state = corpus_core::EnvironmentSessionState::Ready;
+        store.save_environment_session(&record).unwrap();
+        let orphan = prepared_plugin_leases(
+            &store,
+            Some("p"),
+            Some("fixture-regtest"),
+            &statuses,
+        );
+        assert_eq!(orphan.len(), 1);
+        assert_eq!(orphan[0].mission, "deleted-mission");
+        assert!(orphan[0]
+            .drift
+            .iter()
+            .any(|drift| drift.contains("orphan cleanup required")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5916,6 +6074,7 @@ mod tests {
             opencode_session: None,
             environment_session: None,
             launch_requested: None,
+            delete_requested: None,
             dispatch: None,
         }
     }
@@ -6011,6 +6170,34 @@ mod tests {
         state.poll_launch_requests();
         assert!(state.launch_requests_polled_at.unwrap() > first_poll);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconciler_consumes_a_durable_delete_request() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-delete-request-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.clone());
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "operator", corpus_core::AgentRole::Tester)
+            .unwrap();
+        let mut record = mission(1);
+        record.delete_requested = Some(MissionDeleteRequest { requested_at: 2 });
+        store.write_mission("p", "delete-me", &record, "brief").unwrap();
+        let mut state = AppState::with_runtime(
+            store.clone(),
+            Arc::new(ManualClock::new(3)),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+
+        state.poll_launch_requests();
+
+        assert!(store.load_mission("p", "delete-me").is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6751,6 +6938,14 @@ mod tests {
             state.delete_mission("p", "mission").unwrap(),
             DeleteMissionResult::Scheduled
         ));
+        assert!(
+            store
+                .load_mission("p", "mission")
+                .unwrap()
+                .delete_requested
+                .is_some(),
+            "delete intent is durable before asynchronous teardown finishes"
+        );
         assert!(state.mission_delete_pending("p", "mission"));
         assert_eq!(state.run_phase(&run_id), RunPhase::Stopping);
         for _ in 0..200 {

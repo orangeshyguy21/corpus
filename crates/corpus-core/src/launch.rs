@@ -2326,6 +2326,7 @@ mod tests {
             opencode_session: None,
             environment_session: None,
             launch_requested: None,
+            delete_requested: None,
             dispatch: None,
         };
         // No session at all → Idle, no reading.

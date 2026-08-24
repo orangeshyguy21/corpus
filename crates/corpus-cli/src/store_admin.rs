@@ -1,7 +1,9 @@
 //! `corpus project/agent/mission/store` admin commands: the scoped
 //! store (projects, agents, missions, corpus) exposed headlessly.
 
-use corpus_core::{FindingQuery, FindingSeverity, FindingSort, Mission, Store};
+use corpus_core::{
+    FindingQuery, FindingSeverity, FindingSort, Mission, MissionDeleteRequest, Store,
+};
 
 /// `corpus project ...`
 pub fn project_cmd(args: &[String]) -> Result<(), String> {
@@ -387,6 +389,7 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
                 opencode_session: None,
                 environment_session: None,
                 launch_requested: None,
+                delete_requested: None,
                 dispatch: None,
             };
             store
@@ -399,10 +402,27 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
             let slug = args
                 .get(2)
                 .ok_or("usage: corpus mission delete <project> <slug>")?;
-            store
-                .delete_mission(project, slug)
+            if store.ensure_mission_deletable(project, slug).is_ok() {
+                store.delete_mission(project, slug).map_err(|e| e.to_string())?;
+                println!("deleted mission {project}/{slug}");
+                return Ok(());
+            }
+            let mut mission = store
+                .load_mission(project, slug)
                 .map_err(|e| e.to_string())?;
-            println!("deleted mission {project}/{slug}");
+            mission.launch_requested = None;
+            mission.delete_requested.get_or_insert(MissionDeleteRequest {
+                requested_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            });
+            store
+                .update_mission(project, slug, &mission)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "deletion requested for mission {project}/{slug}; open corpus-app to complete lifecycle teardown"
+            );
             Ok(())
         }
         _ => Err("usage: corpus mission list|new|delete <project> [<slug>] ...".to_string()),

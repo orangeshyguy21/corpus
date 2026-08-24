@@ -382,7 +382,7 @@ impl ProjectsView {
                     plugin_identity(ui, status);
                 }
                 ui.add_space(12.0);
-                plugin_environments(ui, &leases);
+                plugin_environments(ui, state, toasts, &self.edit_plugin, &leases);
             }
         });
     }
@@ -1195,7 +1195,13 @@ fn plugin_operation(ui: &mut Ui, operation: &crate::state::PluginOperationView) 
     }
 }
 
-fn plugin_environments(ui: &mut Ui, leases: &[crate::state::PluginLeaseView]) {
+fn plugin_environments(
+    ui: &mut Ui,
+    state: &mut AppState,
+    toasts: &mut Toasts,
+    plugin_id: &str,
+    leases: &[crate::state::PluginLeaseView],
+) {
     ui.label(command_label("Active mission environments"));
     ui.add_space(4.0);
     if leases.is_empty() {
@@ -1238,13 +1244,28 @@ fn plugin_environments(ui: &mut Ui, leases: &[crate::state::PluginLeaseView]) {
         }
         for drift in &lease.drift {
             ui.label(
-                RichText::new(format!("pin drift: {drift}"))
+                RichText::new(format!("attention: {drift}"))
                     .size(12.0)
                     .color(theme::WARN),
             );
         }
         if let Some(error) = lease.error.as_deref() {
             ui.label(RichText::new(error).size(12.0).color(theme::SIGNAL_RED));
+        }
+        if lease.orphaned && ui.button("Clean orphan").clicked() {
+            match state.cleanup_orphan_environment(plugin_id, &lease.session_key) {
+                Ok(true) => toast(
+                    toasts,
+                    ToastKind::Info,
+                    format!("cleanup started for {}", lease.mission),
+                ),
+                Ok(false) => toast(
+                    toasts,
+                    ToastKind::Warning,
+                    "another orphan cleanup is already running",
+                ),
+                Err(error) => toast(toasts, ToastKind::Error, error),
+            }
         }
         ui.add_space(8.0);
     }

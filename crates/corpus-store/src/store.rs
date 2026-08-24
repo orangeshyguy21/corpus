@@ -920,6 +920,14 @@ pub struct MissionLaunchRequest {
     pub requested_by: Option<MissionRunRef>,
 }
 
+/// Durable request consumed by the app's lifecycle reconciler. Deletion is
+/// intentionally a request rather than an immediate store mutation because
+/// only the app owns tmux and plugin-environment teardown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionDeleteRequest {
+    pub requested_at: u64,
+}
+
 /// Terminal outcome observed for one Curator/Super-dispatched child run.
 /// This is operational routing state, not corpus research output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1025,6 +1033,10 @@ pub struct Mission {
     /// only an epoch integer; they deserialize as an origin-less request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_requested: Option<MissionLaunchRequest>,
+    /// A deletion request the app has not yet completed. The mission record
+    /// remains present until all run and environment cleanup succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_requested: Option<MissionDeleteRequest>,
     /// Durable routing and completion state for a Curator/Super-dispatched
     /// child. Operator and legacy launches leave this unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1191,6 +1203,12 @@ impl Store {
         let dir = self.project_dir(slug);
         if !dir.is_dir() {
             return Err(Error::Store(format!("project not found: {slug}")));
+        }
+        // Preflight the entire cascade before removing anything. A partial
+        // project deletion would be worse than a refusal because it could
+        // erase the mission identity needed to retry environment cleanup.
+        for (mission, _) in self.list_missions(slug)? {
+            self.ensure_mission_deletable(slug, &mission)?;
         }
         fs::remove_dir_all(&dir)?;
         // The run dir is a sibling of the store now, so deleting the
@@ -1544,7 +1562,42 @@ impl Store {
 
     /// Delete a mission record.
     pub fn delete_mission(&self, project: &str, slug: &str) -> Result<()> {
+        self.ensure_mission_deletable(project, slug)?;
+        self.delete_mission_record(project, slug)
+    }
+
+    /// Refuse to discard the durable identity needed to retry cleanup. This
+    /// is the last line of defence for direct CLI/admin calls and cascades;
+    /// lifecycle-aware callers clear the tmux binding and close the lease
+    /// before reaching this primitive.
+    pub fn ensure_mission_deletable(&self, project: &str, slug: &str) -> Result<()> {
         validate_slug(slug)?;
+        let mission = self.load_mission(project, slug)?;
+        if mission.session.is_some() {
+            return Err(Error::Store(format!(
+                "mission {project}/{slug} still has a run session; request lifecycle teardown first"
+            )));
+        }
+        if let Some(key) = mission.environment_session.as_deref() {
+            let plugin = Project::load(self, project)?.plugin;
+            let record = self
+                .load_environment_session_key(&plugin, key)
+                .map_err(|error| {
+                    Error::Store(format!(
+                        "mission {project}/{slug} still has environment cleanup identity {key}: {error}"
+                    ))
+                })?;
+            if record.state != crate::EnvironmentSessionState::Closed {
+                return Err(Error::Store(format!(
+                    "mission {project}/{slug} environment is {}; request lifecycle teardown first",
+                    format!("{:?}", record.state).to_ascii_lowercase()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_mission_record(&self, project: &str, slug: &str) -> Result<()> {
         let path = self
             .project_missions_dir(project)
             .join(format!("{slug}.md"));
@@ -1950,6 +2003,7 @@ mod tests {
             opencode_session: Some("ses_abc".into()),
             environment_session: None,
             launch_requested: None,
+            delete_requested: None,
             dispatch: None,
         };
         store.write_mission("p", "probe", &mission, "brief").unwrap();
@@ -1988,6 +2042,7 @@ mod tests {
             opencode_session: Some("ses_old".into()),
             environment_session: None,
             launch_requested: None,
+            delete_requested: None,
             dispatch: None,
         };
         store.write_mission("p", "orphan", &mission, "brief").unwrap();
@@ -2003,6 +2058,73 @@ mod tests {
             .delete_mission("p", "orphan")
             .expect("the orphan can be removed");
         assert!(store.load_mission("p", "orphan").is_err());
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn active_environment_identity_blocks_every_delete_cascade() {
+        let store = tmp_store("active-environment-delete");
+        store
+            .create_project("p", "P", "fixture-regtest")
+            .unwrap();
+        store
+            .create_agent_with_role("p", "runner", crate::agents::AgentRole::Tester)
+            .unwrap();
+        let id = crate::EnvironmentSessionId {
+            project: "p".into(),
+            mission: "probe".into(),
+            generation: 1,
+        };
+        let key = id.storage_key();
+        store
+            .save_environment_session(&crate::EnvironmentSessionRecord {
+                id,
+                plugin_id: "fixture-regtest".into(),
+                plugin_version: "1.0.0".into(),
+                plugin_digest: "sha256:fixture".into(),
+                state: crate::EnvironmentSessionState::Ready,
+                source_shas: BTreeMap::new(),
+                environment_lock: None,
+                image_digest: None,
+                created: 1,
+                updated: 1,
+                error: None,
+            })
+            .unwrap();
+        let mission = Mission {
+            agent: "runner".into(),
+            pins: BTreeMap::new(),
+            budget: None,
+            created: 1,
+            name: None,
+            session: None,
+            control: None,
+            opencode_session: None,
+            environment_session: Some(key.clone()),
+            launch_requested: None,
+            delete_requested: None,
+            dispatch: None,
+        };
+        store.write_mission("p", "probe", &mission, "brief").unwrap();
+
+        for error in [
+            store.delete_mission("p", "probe").unwrap_err(),
+            store.delete_agent("p", "runner").unwrap_err(),
+            store.delete_project("p").unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("lifecycle teardown first"), "{error}");
+        }
+        assert!(store.load_mission("p", "probe").is_ok());
+        assert!(store.project_agent_dir("p", "runner").is_dir());
+        assert!(store.project_dir("p").is_dir());
+
+        let mut environment = store
+            .load_environment_session_key("fixture-regtest", &key)
+            .unwrap();
+        environment.state = crate::EnvironmentSessionState::Closed;
+        store.save_environment_session(&environment).unwrap();
+        store.delete_agent("p", "runner").unwrap();
+        assert!(store.load_mission("p", "probe").is_err());
         let _ = fs::remove_dir_all(store.root());
     }
 

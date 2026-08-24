@@ -1261,7 +1261,13 @@ impl Store {
         if !dir.join("opencode.json").is_file() {
             return Err(Error::Store(format!("agent not found: {project}/{slug}")));
         }
-        for mission in self.missions_for_agent(project, slug)? {
+        let missions = self.missions_for_agent(project, slug)?;
+        // Preflight the whole cascade so an active later mission cannot leave
+        // the agent with only some of its assigned mission records removed.
+        for mission in &missions {
+            self.ensure_mission_deletable(project, mission)?;
+        }
+        for mission in missions {
             self.delete_mission(project, &mission)?;
         }
         fs::remove_dir_all(&dir)?;

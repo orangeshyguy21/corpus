@@ -714,6 +714,38 @@ fn confirm_token(dry_run: &str) -> String {
         .to_string()
 }
 
+#[test]
+fn curator_delete_preserves_a_live_mission_as_a_lifecycle_request() {
+    let mut rig = rig("curator-live-delete", AgentRole::Curator);
+    tools::dispatch(
+        &mut rig.ctx,
+        "mission_new",
+        &json!({ "slug": "live", "agent": "keeper", "brief": "b" }),
+    )
+    .expect("mission");
+    let mut mission = rig.store.load_mission("alpha", "live").unwrap();
+    mission.session = Some("corpus-live-session".into());
+    rig.store.update_mission("alpha", "live", &mission).unwrap();
+
+    let dry = tools::dispatch(&mut rig.ctx, "mission_delete", &json!({ "mission": "live" }))
+        .expect("mission dry run");
+    let requested = tools::dispatch(
+        &mut rig.ctx,
+        "mission_delete",
+        &json!({ "mission": "live", "confirm_token": confirm_token(&dry) }),
+    )
+    .expect("confirmed mission delete request");
+
+    assert!(requested.contains("deletion requested"), "{requested}");
+    let retained = rig.store.load_mission("alpha", "live").unwrap();
+    assert_eq!(retained.session.as_deref(), Some("corpus-live-session"));
+    assert!(retained.delete_requested.is_some());
+    assert!(
+        rig.store.delete_mission("alpha", "live").is_err(),
+        "the raw store cannot erase teardown identity"
+    );
+}
+
 /// Curators need scoped cleanup authority. Each delete stays inside the
 /// injected project, produces an audited dry-run, and requires the server's
 /// one-shot token before mutation.

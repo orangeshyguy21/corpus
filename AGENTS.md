@@ -229,6 +229,12 @@ get/new/delete/set_budget/set_pins`, `corpus_wipe`, `corpus_stats/list/read`,
   op+target+nonce, 60s TTL); the mutation only lands when the tool is
   re-called with that token, which is consumed (single-use). `corpus_wipe`
   without a token is a dry-run by construction.
+- **Mission deletion is lifecycle-owned.** An already-clean record may be
+  removed immediately. When a tmux or plugin-environment identity remains,
+  `mission_delete` persists `delete_requested` and the app performs teardown
+  before removing the record. Low-level mission, agent, and project deletes
+  refuse non-closed identities. Orphaned environment records stay visible in
+  Project → Configuration with an explicit **Clean orphan** recovery action.
 - **`project_rebind` validates the plugin against the registry** before
   writing — a hallucinated/dangling plugin name is refused (chunk-0
   finding). "Budget" edits are per-MISSION (`mission_set_budget`), never

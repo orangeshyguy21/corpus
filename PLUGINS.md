@@ -29,6 +29,12 @@ Setup is idempotent and may fetch pinned sources and build images. Doctor is a
 read-only verification; status is the fast readiness view. Stop refuses while
 the plugin has live mission leases.
 
+Session close is a verified postcondition: a plugin must report failure when
+session containers or networks cannot be removed, leave the session retryable,
+and report success only after proving those resources absent. Operation status
+must invalidate a legacy successful close when resources or plugin session
+state still show live.
+
 Installing a newer bundle preserves prior versions. Roll back explicitly:
 
 ```bash
