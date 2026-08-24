@@ -40,6 +40,12 @@ pub const PROJECT_ENV: &str = "CORPUS_PROJECT";
 /// the revs the mission recorded, not config.toml's defaults.
 pub const SOURCE_PINS_ENV: &str = "CORPUS_SOURCE_PINS";
 pub const ENVIRONMENT_SESSION_ENV: &str = "CORPUS_ENVIRONMENT_SESSION";
+/// The mission slug for this exact run. Paired with [`RUN_ID_ENV`] so a
+/// project-management call can record which Curator mission dispatched work.
+pub const MISSION_ENV: &str = "CORPUS_MISSION";
+/// Exact launcher session identity. TUI runs use their persisted tmux session
+/// name; the no-tmux fallback uses its unique transcript basename.
+pub const RUN_ID_ENV: &str = "CORPUS_RUN_ID";
 
 /// The basename of the current run's transcript file in the project
 /// corpus `runs/` (e.g. `1786891368-verify.raw`). Set by the launcher
@@ -641,6 +647,12 @@ pub struct CostRow {
     pub tokens_reasoning: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// Wall-clock milliseconds spent awaiting the model/provider. Derived
+    /// from the assistant message span with tool execution intervals removed.
+    pub inference_ms: u64,
+    /// Assistant messages with complete timing data. Kept separate from
+    /// `messages` because historical exports may not carry timestamps.
+    pub timed_messages: u64,
     /// USD, as reported by opencode's export.
     pub cost: f64,
 }
@@ -652,6 +664,8 @@ pub struct CostRow {
 pub struct CostReport {
     pub rows: Vec<CostRow>,
     pub tokens: u64,
+    pub inference_ms: u64,
+    pub timed_messages: u64,
     pub cost: f64,
 }
 
@@ -765,6 +779,12 @@ fn parse_cost_file(path: &Path) -> CostReport {
                 row.tokens_reasoning += take(&tokens, "reasoning");
                 row.cache_read += take(&cache, "read");
                 row.cache_write += take(&cache, "write");
+                if let Some(inference_ms) = message_inference_ms(message) {
+                    row.inference_ms = row.inference_ms.saturating_add(inference_ms);
+                    row.timed_messages += 1;
+                    report.inference_ms = report.inference_ms.saturating_add(inference_ms);
+                    report.timed_messages += 1;
+                }
                 row.cost += info.get("cost").and_then(|c| c.as_f64()).unwrap_or(0.0);
                 report.tokens = report.tokens.saturating_add(
                     take(&tokens, "input")
@@ -777,6 +797,55 @@ fn parse_cost_file(path: &Path) -> CostReport {
     report.rows = rows.into_values().collect();
     report.cost = report.rows.iter().map(|row| row.cost).sum();
     report
+}
+
+/// OpenCode's assistant message clock covers both provider work and any tool
+/// calls emitted by that response. Remove the union of tool intervals so
+/// parallel tools are not double-subtracted. The remainder is measured
+/// end-to-end model/provider time (queueing, prefill, and generation), not an
+/// estimate based on a nominal tokens-per-second rate.
+fn message_inference_ms(message: &serde_json::Value) -> Option<u64> {
+    let time = message.get("info")?.get("time")?;
+    let created = time.get("created")?.as_u64()?;
+    let completed = time.get("completed")?.as_u64()?;
+    if completed < created {
+        return None;
+    }
+
+    let mut tool_intervals = message
+        .get("parts")
+        .and_then(|parts| parts.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(|kind| kind.as_str()) == Some("tool"))
+        .filter_map(|part| {
+            let time = part.get("state")?.get("time")?;
+            let start = time.get("start")?.as_u64()?.max(created);
+            let end = time.get("end")?.as_u64()?.min(completed);
+            (end > start).then_some((start, end))
+        })
+        .collect::<Vec<_>>();
+    tool_intervals.sort_unstable();
+
+    let mut tool_ms = 0_u64;
+    let mut merged: Option<(u64, u64)> = None;
+    for (start, end) in tool_intervals {
+        match merged {
+            Some((merged_start, merged_end)) if start <= merged_end => {
+                merged = Some((merged_start, merged_end.max(end)));
+            }
+            Some((merged_start, merged_end)) => {
+                tool_ms = tool_ms.saturating_add(merged_end - merged_start);
+                merged = Some((start, end));
+            }
+            None => merged = Some((start, end)),
+        }
+    }
+    if let Some((start, end)) = merged {
+        tool_ms = tool_ms.saturating_add(end - start);
+    }
+
+    Some((completed - created).saturating_sub(tool_ms))
 }
 
 fn merge_cost_reports<'a>(reports: impl Iterator<Item = &'a CostReport>) -> CostReport {
@@ -798,10 +867,14 @@ fn merge_cost_reports<'a>(reports: impl Iterator<Item = &'a CostReport>) -> Cost
             row.tokens_reasoning += source_row.tokens_reasoning;
             row.cache_read += source_row.cache_read;
             row.cache_write += source_row.cache_write;
+            row.inference_ms += source_row.inference_ms;
+            row.timed_messages += source_row.timed_messages;
             row.cost += source_row.cost;
         }
     }
     report.rows = rows.into_values().collect();
+    report.inference_ms = report.rows.iter().map(|row| row.inference_ms).sum();
+    report.timed_messages = report.rows.iter().map(|row| row.timed_messages).sum();
     report.rows.sort_by(|a, b| {
         b.cost
             .partial_cmp(&a.cost)
@@ -820,6 +893,103 @@ fn merge_cost_reports<'a>(reports: impl Iterator<Item = &'a CostReport>) -> Cost
 /// `AppState::mission_activity`), which is the only account that survives
 /// the app being killed mid-run. A persisted status could only drift out of
 /// agreement with it.
+/// Exact project mission/run that requested another mission's launch.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MissionRunRef {
+    pub project: String,
+    pub mission: String,
+    pub run_id: String,
+}
+
+/// Private loopback control endpoint for the exact OpenCode process that
+/// owns this mission's conversation. Its per-run password is deliberately
+/// kept outside project-visible mission metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionControl {
+    pub run_id: String,
+    pub port: u16,
+}
+
+/// Durable request consumed by the app's launch reconciler. The custom
+/// deserializer accepts the historical integer timestamp, so existing mission
+/// records remain valid without a rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissionLaunchRequest {
+    pub requested_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<MissionRunRef>,
+}
+
+/// Terminal outcome observed for one Curator/Super-dispatched child run.
+/// This is operational routing state, not corpus research output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MissionCompletion {
+    Completed { at: u64 },
+    LaunchFailed { at: u64, error: String },
+    UnexpectedExit { at: u64 },
+}
+
+/// Durable supervision state for the current dispatched child run. The
+/// parent is launcher-proven, and `child_run_id` is filled only after spawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionDispatch {
+    pub parent: MissionRunRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_run_id: Option<String>,
+    #[serde(default)]
+    pub live_seen: bool,
+    /// The exact child OpenCode process reported this conversation active at
+    /// least once. PTY output alone is deliberately insufficient evidence.
+    #[serde(default)]
+    pub running_seen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<MissionCompletion>,
+    /// Number of distinct continuation prompts admitted for this result.
+    /// Each attempt receives a new message id; replaying an id only proves
+    /// admission and cannot restart an OpenCode loop that already failed.
+    #[serde(default)]
+    pub delivery_attempt: u32,
+    /// The currently admitted continuation prompt. `delivered` remains false
+    /// until the owning curator loop parks after a successful model step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_message_id: Option<String>,
+    #[serde(default)]
+    pub delivered: bool,
+}
+
+impl<'de> Deserialize<'de> for MissionLaunchRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Legacy(u64),
+            Current {
+                requested_at: u64,
+                #[serde(default)]
+                requested_by: Option<MissionRunRef>,
+            },
+        }
+
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Legacy(requested_at) => Self {
+                requested_at,
+                requested_by: None,
+            },
+            Wire::Current {
+                requested_at,
+                requested_by,
+            } => Self {
+                requested_at,
+                requested_by,
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mission {
     /// Slug of the agent to launch.
@@ -837,24 +1007,28 @@ pub struct Mission {
     /// slug in the corpus store; the app renders `new` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// The tmux session the mission's run is attached to (`corpus-<agent>-<ts>`),
+    /// The tmux session the mission's run is attached to (`corpus-<run-stem>-<ts>`),
     /// when live — re-attach after an app relaunch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// Exact app-launched TUI endpoint that can durably queue input for this
+    /// run. Legacy, piped, and operator-started sessions leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<MissionControl>,
     /// The opencode session id (transcript of record) — export-on-stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_session: Option<String>,
     /// Durable plugin environment session bound to this mission launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_session: Option<String>,
-    /// A launch the CURATOR requested but the app has not yet honored
-    /// (epoch seconds of the request). The curator (an MCP client) cannot
-    /// spawn a run itself — run spawning is the app's alone — so it flags
-    /// the record here and the app's poll beat picks it up, spawns a
-    /// detached session with the brief as the kickoff prompt, and clears
-    /// the flag. `None` on every mission the curator did not ask to launch.
+    /// A launch request the app has not yet honored. Historical records stored
+    /// only an epoch integer; they deserialize as an origin-less request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_requested: Option<u64>,
+    pub launch_requested: Option<MissionLaunchRequest>,
+    /// Durable routing and completion state for a Curator/Super-dispatched
+    /// child. Operator and legacy launches leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<MissionDispatch>,
 }
 
 impl Mission {
@@ -1386,7 +1560,12 @@ impl Store {
     /// run bookkeeping (session / opencode_session) and the display name.
     pub fn update_mission(&self, project: &str, slug: &str, mission: &Mission) -> Result<()> {
         let brief = self.mission_brief(project, slug)?;
-        self.write_mission(project, slug, mission, &brief)
+        // This is an update of a record proven to exist above, not mission
+        // authoring. Historical versions allowed deleting an agent without
+        // its missions, so teardown bookkeeping must remain able to update
+        // those orphan records long enough to cleanly delete them. New
+        // missions still go through write_mission and require a live agent.
+        mission.save(self, project, slug, &brief)
     }
 }
 
@@ -1767,9 +1946,11 @@ mod tests {
             created: 1,
             name: None,
             session: None,
+            control: None,
             opencode_session: Some("ses_abc".into()),
             environment_session: None,
             launch_requested: None,
+            dispatch: None,
         };
         store.write_mission("p", "probe", &mission, "brief").unwrap();
         write(
@@ -1786,6 +1967,42 @@ mod tests {
         assert_eq!(linked.agent.as_deref(), Some("runner"));
         let legacy = logs.iter().find(|log| log.name == "legacy.json").unwrap();
         assert_eq!(legacy.agent, None);
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn an_historical_orphan_mission_can_be_updated_for_teardown_and_deleted() {
+        let store = tmp_store("orphan-mission-delete");
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "gone", crate::agents::AgentRole::Tester)
+            .unwrap();
+        let mut mission = Mission {
+            agent: "gone".into(),
+            pins: BTreeMap::new(),
+            budget: None,
+            created: 1,
+            name: None,
+            session: Some("corpus-old-run".into()),
+            control: None,
+            opencode_session: Some("ses_old".into()),
+            environment_session: None,
+            launch_requested: None,
+            dispatch: None,
+        };
+        store.write_mission("p", "orphan", &mission, "brief").unwrap();
+
+        // Reproduce the historical bug: the agent disappeared without its
+        // mission. New delete_agent calls cannot create this state.
+        fs::remove_dir_all(store.project_agent_dir("p", "gone")).unwrap();
+        mission.session = None;
+        store
+            .update_mission("p", "orphan", &mission)
+            .expect("teardown bookkeeping tolerates the old orphan");
+        store
+            .delete_mission("p", "orphan")
+            .expect("the orphan can be removed");
+        assert!(store.load_mission("p", "orphan").is_err());
         let _ = fs::remove_dir_all(store.root());
     }
 
@@ -1838,6 +2055,46 @@ mod tests {
         assert!((report.cost - 2.25).abs() < 1e-9);
         assert_eq!(report.tokens, 108 + 58 + 208);
         assert!(corpus_cost(&store, "ghost").unwrap().rows.is_empty());
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn corpus_cost_measures_inference_time_without_parallel_tool_time() {
+        let store = tmp_store("cost-inference-time");
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        let export = serde_json::json!({
+            "messages": [{
+                "info": {
+                    "role": "assistant",
+                    "providerID": "ollama",
+                    "modelID": "qwen/qwen3",
+                    "time": {"created": 1_000, "completed": 6_000},
+                    "tokens": {"input": 10, "output": 5}
+                },
+                "parts": [
+                    {"type": "tool", "state": {"time": {"start": 3_000, "end": 4_000}}},
+                    {"type": "tool", "state": {"time": {"start": 3_500, "end": 4_500}}},
+                    {"type": "tool", "state": {"time": {"start": 5_000, "end": 5_250}}}
+                ]
+            }, {
+                "info": {
+                    "role": "assistant",
+                    "providerID": "ollama",
+                    "modelID": "qwen/qwen3",
+                    "tokens": {"input": 10, "output": 5}
+                }
+            }]
+        });
+        let runs = store.project_corpus_dir("p").join("runs");
+        write(&runs.join("timed.json"), &export.to_string());
+
+        let report = corpus_cost(&store, "p").unwrap();
+        // 5,000ms assistant span - 1,500ms overlapping tool union - 250ms tool.
+        assert_eq!(report.inference_ms, 3_250);
+        assert_eq!(report.timed_messages, 1);
+        assert_eq!(report.rows[0].inference_ms, 3_250);
+        assert_eq!(report.rows[0].timed_messages, 1);
+        assert_eq!(report.rows[0].messages, 2);
         let _ = fs::remove_dir_all(store.root());
     }
 
@@ -1896,5 +2153,37 @@ mod tests {
             .join("opencode.json")
             .is_file());
         let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn legacy_launch_timestamp_deserializes_without_inventing_an_origin() {
+        let legacy: Mission = serde_yaml::from_str(
+            "agent: keeper\nlaunch_requested: 1700000000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.launch_requested,
+            Some(MissionLaunchRequest {
+                requested_at: 1_700_000_000,
+                requested_by: None,
+            })
+        );
+        assert_eq!(legacy.dispatch, None);
+
+        let current = MissionLaunchRequest {
+            requested_at: 1_700_000_001,
+            requested_by: Some(MissionRunRef {
+                project: "p".into(),
+                mission: "curator-a".into(),
+                run_id: "p1-p-m9-curator-a-g2".into(),
+            }),
+        };
+        let yaml = serde_yaml::to_string(&current).unwrap();
+        assert!(yaml.contains("requested_at: 1700000001"), "{yaml}");
+        assert!(yaml.contains("mission: curator-a"), "{yaml}");
+        assert_eq!(
+            serde_yaml::from_str::<MissionLaunchRequest>(&yaml).unwrap(),
+            current
+        );
     }
 }

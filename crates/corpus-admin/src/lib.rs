@@ -23,7 +23,7 @@ use std::{
 use corpus_observe::{MissionActivity, MissionRunState};
 use corpus_store::{
     fnv1a_hex, AgentRole, EntryAccess, FindingQuery, FindingSeverity, FindingSort, Mission,
-    Project, Store, CATEGORIES,
+    MissionLaunchRequest, MissionRunRef, Project, Store, CATEGORIES,
 };
 use serde_json::{json, Value};
 
@@ -363,7 +363,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "agent_delete",
-            "description": "CONFIRM-GATED. Delete an agent. Dry-run first; returns a one-shot token to complete.",
+            "description": "CONFIRM-GATED. Delete an agent and every mission assigned to it. Dry-run first; returns a one-shot token and lists the missions that will also be deleted.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -395,7 +395,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "mission_status",
-            "description": "Poll the LIVE run state of missions: 'running' (the agent is producing right now), 'waiting · last active <dur>' (session live but parked at its prompt — done, stuck, or awaiting input), or 'idle' (nothing up). This — NOT the `live` flag from mission_list/mission_get — is how you tell whether an agent is still working or has stopped. Use it to pace a team you launched; a mission that just flipped running→waiting has finished its turn, and combining it with corpus_list shows what that turn produced. Omit 'mission' to status every mission on the project, or name one for a single row. This returns ONE snapshot and comes back immediately; to WAIT for the next change instead of polling in a loop, use mission_await.",
+            "description": "Read ONE immediate snapshot of mission run state: 'running' (the agent is producing now), 'waiting · last active <dur>' (session live but parked), or 'idle' (nothing up). This — not the `live` flag from mission_list/mission_get — distinguishes work from a parked session. Omit 'mission' for every project mission, or name one. Do not call this in a polling loop. Agent roles should finish their turn after dispatch; `mission_await` remains only as a one-shot operator diagnostic.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"project": {"type": "string"}, "mission": {"type": "string", "description": "optional — one mission's status; omitted = all"}},
@@ -404,7 +404,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "mission_await",
-            "description": "BLOCK until a launched mission changes, then return WHAT changed — the wake-me-when-it's-done tool, so you pace a team without polling in a loop or asking the operator. Waits server-side (up to timeout_secs, default 45, max 90) and returns the moment a watched mission's run state flips (e.g. running → waiting: its turn just finished) OR new corpus output appears (a technique card, finding, or attack it wrote). If nothing changes before the cap it returns the current state plus 'call again' — re-call to keep waiting. Typical loop: launch, mission_await, react to what it reports, launch the next step. Omit 'mission' to wake on ANY mission on the project, or name one to wait on just it. Note: while this blocks, the session shows as working and cannot service another call until it returns.",
+            "description": "Operator diagnostic: block once (up to timeout_secs, default 45, max 90) until a launched mission changes, then return what changed. Do NOT call this repeatedly in one model turn; agent roles do not receive this tool because Corpus owns background supervision. Omit 'mission' to observe any mission on the project, or name one. While blocked, this MCP session cannot service another call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"project": {"type": "string"}, "mission": {"type": "string", "description": "optional — one mission's status; omitted = all"}},
@@ -423,7 +423,7 @@ pub fn catalog() -> Value {
                     "brief": {"type": "string"},
                     "name": {"type": "string", "description": "operator-facing display name for the mission nav"},
                     "budget": {"type": "string"},
-                    "pins": {"type": "object"}
+                    "pins": {"type": "object", "description": "optional per-source overrides; omitted sources inherit the project's selected revisions (or plugin defaults when the project has no explicit selection)"}
                 },
                 "required": ["project", "slug", "agent", "brief"]
             }
@@ -607,6 +607,18 @@ pub fn catalog() -> Value {
 /// Dispatch a corpus-admin tools/call. Rejects any tool not in this group —
 /// the admin profile carries NO sandbox/oracle/faucet tools by construction.
 pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
+    dispatch_with_origin(ctx, name, args, None)
+}
+
+/// Scoped-agent entry point. `origin` is launcher-proven context supplied by
+/// corpus-mcp, never a model argument. The host admin profile calls [`dispatch`]
+/// and therefore cannot invent a Curator return address.
+pub fn dispatch_with_origin(
+    ctx: &mut Ctx,
+    name: &str,
+    args: &Value,
+    origin: Option<&MissionRunRef>,
+) -> Result<String> {
     let project = |args: &Value| -> Result<String> { require_str(args, "project") };
     match name {
         "project_list" => project_list(ctx),
@@ -640,7 +652,7 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
             args.get("timeout_secs").and_then(Value::as_u64),
         ),
         "mission_new" => mission_new(ctx, args),
-        "mission_launch" => mission_launch(ctx, args),
+        "mission_launch" => mission_launch(ctx, args, origin),
         "mission_delete" => mission_delete(ctx, args),
         "mission_set_budget" => mission_set_budget(ctx, args),
         "mission_set_pins" => mission_set_pins(ctx, args),
@@ -993,8 +1005,15 @@ fn agent_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let target = format!("{project}/{agent}");
     if let Some(token) = args.get("confirm_token").and_then(Value::as_str) {
         confirm_and_run(ctx, "agent_delete", &target, token, |store| {
+            let missions = store
+                .missions_for_agent(&project, &agent)
+                .map_err(|e| Error::Args(e.to_string()))?;
             store.delete_agent(&project, &agent).map_err(|e| Error::Args(e.to_string()))?;
-            Ok(format!("deleted agent {project}/{agent}"))
+            Ok(format!(
+                "deleted agent {project}/{agent} and {} assigned mission(s){}",
+                missions.len(),
+                mission_list_suffix(&missions)
+            ))
         })
     } else {
         // Load the target FIRST. A dry-run that mints a token for an agent
@@ -1011,6 +1030,10 @@ fn agent_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
             .and_then(|a| a.as_object())
             .map_or(0, |m| m.len().saturating_sub(1));
         let orphaned = delegation_dependents(&ctx.store, &project, &agent);
+        let missions = ctx
+            .store
+            .missions_for_agent(&project, &agent)
+            .map_err(|e| Error::Args(e.to_string()))?;
         let consequence = match orphaned.is_empty() {
             true => String::new(),
             // The delegation-closure check refuses to render a project
@@ -1024,10 +1047,18 @@ fn agent_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
             ),
         };
         mint_confirm(ctx, "agent_delete", &target, &format!(
-            "DRY RUN — would delete agent {project}/{agent} (role {}, {subagents} subagent(s)){consequence}",
-            config.meta.role().as_str()
+            "DRY RUN — would delete agent {project}/{agent} (role {}, {subagents} subagent(s)) and {} assigned mission(s){}{consequence}",
+            config.meta.role().as_str(),
+            missions.len(),
+            mission_list_suffix(&missions)
         ))
     }
+}
+
+fn mission_list_suffix(missions: &[String]) -> String {
+    (!missions.is_empty())
+        .then(|| format!(": {}", missions.join(", ")))
+        .unwrap_or_default()
 }
 
 /// Agents that delegate to an entry `agent` declares. Deleting it would
@@ -1190,8 +1221,8 @@ fn mission_status(ctx: &mut Ctx, project: &str, mission: Option<&str>) -> Result
 /// How often `mission_await` re-checks while it blocks.
 const AWAIT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Default and hard cap for how long ONE `mission_await` call blocks. Kept
-/// short of a typical MCP client's tool-call timeout — the curator re-calls
-/// to keep waiting — and a modest cap also bounds how long a blocked call
+/// short of a typical MCP client's tool-call timeout. The modest cap also
+/// bounds how long a blocked call
 /// withholds this single-threaded server from its next request (a cancel
 /// included). Tune to opencode's actual tool timeout if it differs.
 const AWAIT_DEFAULT_SECS: u64 = 45;
@@ -1295,10 +1326,10 @@ fn await_report(
     Some(lines.join("\n"))
 }
 
-/// Block until a watched mission's run state flips or new corpus output
-/// lands, then report it — the curator's wake-me signal, so it paces a team
-/// without a polling loop. Bounded by `timeout_secs` (default 45, max 90):
-/// on timeout it returns the current state and invites another call.
+/// Operator diagnostic: block until a watched mission's run state flips or
+/// new corpus output lands, then report it. Agent roles do not receive this
+/// tool; background supervision belongs to the app. Bounded by `timeout_secs`
+/// (default 45, max 90); on timeout it returns the current state and stops.
 fn mission_await(
     ctx: &mut Ctx,
     project: &str,
@@ -1328,7 +1359,7 @@ fn mission_await(
                 .collect::<Vec<_>>()
                 .join("\n");
             return Ok(format!(
-                "no change in {cap}s — call mission_await again to keep waiting.\n{status}"
+                "no change in {cap}s — bounded diagnostic wait ended.\n{status}"
             ));
         }
         std::thread::sleep(AWAIT_POLL);
@@ -1398,7 +1429,9 @@ fn mission_new(ctx: &mut Ctx, args: &Value) -> Result<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let pins = parse_pins(args.get("pins"))?;
+    let mut pins = corpus_observe::project_source_pins(ctx.store, &project)
+        .map_err(|e| Error::Args(e.to_string()))?;
+    pins.extend(parse_pins(args.get("pins"))?);
     validate_pins(ctx, &project, &pins)?;
     let mission = Mission {
         agent,
@@ -1407,9 +1440,11 @@ fn mission_new(ctx: &mut Ctx, args: &Value) -> Result<String> {
         created: now(),
         name,
         session: None,
+        control: None,
         opencode_session: None,
         environment_session: None,
         launch_requested: None,
+        dispatch: None,
     };
     ctx.store
         .write_mission(&project, &slug, &mission, &brief)
@@ -1422,15 +1457,27 @@ fn mission_new(ctx: &mut Ctx, args: &Value) -> Result<String> {
 /// itself (run spawning, tmux, and the embedded pane are the app's), so
 /// this is a REQUEST, honored the moment the app sees it. Idempotent: a
 /// mission already flagged (or already live) is left as it is.
-fn mission_launch(ctx: &mut Ctx, args: &Value) -> Result<String> {
+fn mission_launch(
+    ctx: &mut Ctx,
+    args: &Value,
+    origin: Option<&MissionRunRef>,
+) -> Result<String> {
     let project = require_str(args, "project")?;
     let slug = require_str(args, "mission")?;
+    if origin.is_some_and(|origin| origin.project != project) {
+        return Err(Error::Args(
+            "launch origin does not belong to the proven project scope".into(),
+        ));
+    }
     let mut mission = ctx
         .store
         .load_mission(&project, &slug)
         .map_err(|e| Error::Args(e.to_string()))?;
     if mission.launch_requested.is_none() {
-        mission.launch_requested = Some(now());
+        mission.launch_requested = Some(MissionLaunchRequest {
+            requested_at: now(),
+            requested_by: origin.cloned(),
+        });
         ctx.store
             .update_mission(&project, &slug, &mission)
             .map_err(|e| Error::Args(e.to_string()))?;

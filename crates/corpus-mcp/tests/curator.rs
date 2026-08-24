@@ -116,6 +116,21 @@ fn a_curator_advertises_exactly_its_grant_set() {
     }
 }
 
+/// Waiting for child work is an app responsibility. Keeping this assertion
+/// separate from exact catalog parity makes a future grant expansion fail with
+/// the credit-safety reason instead of only a large set diff.
+#[test]
+fn project_agents_never_receive_the_blocking_wait_tool() {
+    for role in [AgentRole::Curator, AgentRole::Super] {
+        let got = names(&tools::catalog_for(&Ok(role)));
+        assert!(
+            !got.contains(&"mission_await".to_string()),
+            "{} must end its turn instead of paying to wait",
+            role.as_str()
+        );
+    }
+}
+
 /// Narrow roles receive one domain; Super receives their current-project
 /// union without acquiring operator-only cross-project tools.
 #[test]
@@ -246,6 +261,53 @@ fn a_pinned_mission_authors_cleanly_when_sources_are_unknown() {
 }
 
 #[test]
+fn a_mission_inherits_project_pins_and_explicit_values_override_them() {
+    let mut rig = rig("mission-project-pins", AgentRole::Curator);
+    rig.store
+        .set_project_pins(
+            "alpha",
+            std::collections::BTreeMap::from([
+                ("nuts".to_string(), "main".to_string()),
+                ("target".to_string(), "v1".to_string()),
+            ]),
+        )
+        .expect("project pins");
+
+    tools::dispatch(
+        &mut rig.ctx,
+        "mission_new",
+        &json!({ "slug": "inherited", "agent": "keeper", "brief": "b" }),
+    )
+    .expect("mission inherits project pins");
+    assert_eq!(
+        rig.store.load_mission("alpha", "inherited").unwrap().pins,
+        std::collections::BTreeMap::from([
+            ("nuts".to_string(), "main".to_string()),
+            ("target".to_string(), "v1".to_string()),
+        ])
+    );
+
+    tools::dispatch(
+        &mut rig.ctx,
+        "mission_new",
+        &json!({
+            "slug": "overridden",
+            "agent": "keeper",
+            "brief": "b",
+            "pins": { "target": "v2" }
+        }),
+    )
+    .expect("explicit mission pin overrides project pin");
+    assert_eq!(
+        rig.store.load_mission("alpha", "overridden").unwrap().pins,
+        std::collections::BTreeMap::from([
+            ("nuts".to_string(), "main".to_string()),
+            ("target".to_string(), "v2".to_string()),
+        ])
+    );
+}
+
+#[test]
 fn a_curator_cannot_reach_another_project() {
     let mut rig = rig("cross", AgentRole::Curator);
 
@@ -362,6 +424,12 @@ fn a_curator_writes_corpus_entries_by_relative_path() {
 #[test]
 fn a_curator_requests_a_launch_by_flagging_the_record() {
     let mut rig = rig("launch", AgentRole::Curator);
+    let origin = corpus_core::MissionRunRef {
+        project: "alpha".into(),
+        mission: "curator-campaign".into(),
+        run_id: "p5-alpha-m16-curator-campaign-g4".into(),
+    };
+    rig.ctx.run_origin = Ok(Some(origin.clone()));
 
     tools::dispatch(
         &mut rig.ctx,
@@ -379,7 +447,11 @@ fn a_curator_requests_a_launch_by_flagging_the_record() {
     let out = tools::dispatch(
         &mut rig.ctx,
         "mission_launch",
-        &json!({ "project": "beta", "mission": "m1" }),
+        &json!({
+            "project": "beta",
+            "mission": "m1",
+            "requested_by": {"project": "beta", "mission": "spoof", "run_id": "fake"}
+        }),
     )
     .expect("launch requested");
     assert!(out.contains("launch requested"), "{out}");
@@ -388,6 +460,11 @@ fn a_curator_requests_a_launch_by_flagging_the_record() {
     // and the brief survived the record rewrite.
     let m = rig.store.load_mission("alpha", "m1").unwrap();
     assert!(m.launch_requested.is_some(), "the launch is now requested");
+    assert_eq!(
+        m.launch_requested.as_ref().unwrap().requested_by.as_ref(),
+        Some(&origin),
+        "the scoped adapter records only launcher-proven origin"
+    );
     assert_eq!(
         rig.store.mission_brief("alpha", "m1").unwrap().trim(),
         "probe the mint",
@@ -402,6 +479,72 @@ fn a_curator_requests_a_launch_by_flagging_the_record() {
         rig.store.load_mission("alpha", "m1").unwrap().launch_requested,
         first,
         "a pending request is left as it is"
+    );
+}
+
+#[test]
+fn simultaneous_curator_missions_keep_distinct_return_addresses() {
+    let mut rig = rig("multi-curator-origin", AgentRole::Curator);
+    let origins = [
+        corpus_core::MissionRunRef {
+            project: "alpha".into(),
+            mission: "curator-one".into(),
+            run_id: "p5-alpha-m11-curator-one-g1".into(),
+        },
+        corpus_core::MissionRunRef {
+            project: "alpha".into(),
+            mission: "curator-two".into(),
+            run_id: "p5-alpha-m11-curator-two-g1".into(),
+        },
+    ];
+    for (index, origin) in origins.iter().enumerate() {
+        let child = format!("child-{}", index + 1);
+        tools::dispatch(
+            &mut rig.ctx,
+            "mission_new",
+            &json!({"slug": child, "agent": "keeper", "brief": "work"}),
+        )
+        .unwrap();
+        rig.ctx.run_origin = Ok(Some(origin.clone()));
+        tools::dispatch(
+            &mut rig.ctx,
+            "mission_launch",
+            &json!({"mission": child}),
+        )
+        .unwrap();
+        let stored = rig.store.load_mission("alpha", &child).unwrap();
+        assert_eq!(
+            stored.launch_requested.unwrap().requested_by,
+            Some(origin.clone())
+        );
+    }
+}
+
+#[test]
+fn a_partial_launcher_identity_refuses_dispatch_instead_of_losing_the_return_path() {
+    let mut rig = rig("partial-run-origin", AgentRole::Curator);
+    tools::dispatch(
+        &mut rig.ctx,
+        "mission_new",
+        &json!({"slug": "child", "agent": "keeper", "brief": "work"}),
+    )
+    .unwrap();
+    rig.ctx.run_origin = Err(
+        "CORPUS_MISSION and CORPUS_RUN_ID must be set together".into(),
+    );
+    let error = tools::dispatch(
+        &mut rig.ctx,
+        "mission_launch",
+        &json!({"mission": "child"}),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("run origin is unresolved"), "{error}");
+    assert!(
+        rig.store
+            .load_mission("alpha", "child")
+            .unwrap()
+            .launch_requested
+            .is_none()
     );
 }
 
@@ -598,14 +741,40 @@ fn a_curator_can_confirm_scoped_deletions() {
     )
     .expect("confirmed mission delete");
 
+    tools::dispatch(
+        &mut rig.ctx,
+        "mission_new",
+        &json!({ "slug": "owned-by-victim", "agent": "victim", "brief": "b" }),
+    )
+    .expect("owned mission");
+    tools::dispatch(
+        &mut rig.ctx,
+        "mission_new",
+        &json!({ "slug": "owned-by-keeper", "agent": "keeper", "brief": "b" }),
+    )
+    .expect("unrelated mission");
+
     let dry = tools::dispatch(&mut rig.ctx, "agent_delete", &json!({ "agent": "victim" }))
         .expect("agent dry run");
-    tools::dispatch(
+    assert!(dry.contains("1 assigned mission(s): owned-by-victim"), "{dry}");
+    let deleted = tools::dispatch(
         &mut rig.ctx,
         "agent_delete",
         &json!({ "agent": "victim", "confirm_token": confirm_token(&dry) }),
     )
     .expect("confirmed agent delete");
+    assert!(
+        deleted.contains("1 assigned mission(s): owned-by-victim"),
+        "{deleted}"
+    );
+    assert!(
+        rig.store.load_mission("alpha", "owned-by-victim").is_err(),
+        "agent-owned mission is deleted with the agent"
+    );
+    assert!(
+        rig.store.load_mission("alpha", "owned-by-keeper").is_ok(),
+        "unrelated mission survives"
+    );
 
     let dry = tools::dispatch(
         &mut rig.ctx,

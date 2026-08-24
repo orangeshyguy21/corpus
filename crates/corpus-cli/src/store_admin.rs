@@ -315,7 +315,23 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
             let slug = args.get(2).ok_or("usage: corpus mission new <project> <slug> --agent <agent> [--budget <val>] [--pin <repo=rev>] <brief>")?;
             let mut agent: Option<String> = None;
             let mut budget: Option<String> = None;
-            let mut pins = std::collections::BTreeMap::new();
+            // Missions stamp the project's effective source selection. A
+            // stored project pin overrides the plugin default; --pin below
+            // is the final per-mission override.
+            let mut pins: std::collections::BTreeMap<String, String> =
+                corpus_core::plugin_sources(&store, project)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|source| {
+                        let rev = source.default_rev().to_string();
+                        (source.name, rev)
+                    })
+                    .collect();
+            pins.extend(
+                corpus_core::Project::load(&store, project)
+                    .map_err(|e| e.to_string())?
+                    .pins,
+            );
             let mut brief_words: Vec<String> = Vec::new();
             let mut i = 3;
             while i < args.len() {
@@ -367,9 +383,11 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
                     .unwrap_or(0),
                 name: None,
                 session: None,
+                control: None,
                 opencode_session: None,
                 environment_session: None,
                 launch_requested: None,
+                dispatch: None,
             };
             store
                 .write_mission(project, slug, &mission, &brief_words.join(" "))

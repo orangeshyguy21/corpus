@@ -1046,6 +1046,7 @@ impl AgentsView {
             Ok(()) => {
                 toast(toasts, ToastKind::Success, "agent deleted");
                 state.refresh_agents(project);
+                state.refresh_missions(project);
                 // The view re-defaults to the first remaining agent.
                 state.selected_agent = None;
                 true

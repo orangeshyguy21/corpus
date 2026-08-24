@@ -8,6 +8,7 @@
 pub mod models;
 pub mod plugins;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -171,6 +172,31 @@ pub fn validate_pin(store: &Store, project: &str, source: &str, rev: &str) -> Re
     // inspectable, but author-time source validation is intentionally absent;
     // production installs require manifest v1.
     Ok(())
+}
+
+/// Return the project's effective source selection. Explicit picks stored on
+/// the project win; sources without an explicit pick use the installed v1
+/// plugin manifest's default revision. Legacy plugins have no portable source
+/// declarations, so their effective selection is just the stored project map.
+pub fn project_source_pins(
+    store: &Store,
+    project: &str,
+) -> Result<BTreeMap<String, String>, Error> {
+    let project = corpus_store::Project::load(store, project)?;
+    let mut pins = BTreeMap::new();
+    if let Some(plugin) = catalog_plugin(&project.plugin)? {
+        if plugin.manifest.manifest_version == PluginManifestVersion::V1 {
+            pins.extend(
+                plugin
+                    .manifest
+                    .sources
+                    .into_iter()
+                    .map(|source| (source.id, source.default_rev)),
+            );
+        }
+    }
+    pins.extend(project.pins);
+    Ok(pins)
 }
 
 fn cached_revs(path: &Path) -> Vec<String> {

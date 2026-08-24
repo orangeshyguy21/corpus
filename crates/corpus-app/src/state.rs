@@ -20,7 +20,10 @@ use corpus_core::{
 use crate::file_watch::{FileInvalidationSource, NotifyFileInvalidationSource};
 use crate::jobs::{JobKind, JobScope, JobSet, JobTerminal, StartOutcome};
 use crate::nav::Screen;
-use crate::session_service::{launch_stamp_ms, ConfiguredSessionService, SessionService};
+use crate::session_service::{
+    launch_stamp_ms, ConfiguredSessionService, PromptDeliveryState, SessionRef, SessionService,
+    SessionTurnState,
+};
 
 /// How often the raw captures are re-stat'd. Cheap next to the tmux
 /// listing (no subprocess), so it runs on the faster beat.
@@ -78,6 +81,8 @@ trait ActiveRun: Send {
     fn pty_attach_command(&self) -> Option<Vec<String>>;
     fn stop(&mut self) -> StopOutcome;
     fn opencode_session_id(&mut self, claimed: &BTreeSet<String>) -> Option<String>;
+    fn launch_identity(&self) -> Option<String>;
+    fn control_port(&self) -> Option<u16>;
 }
 
 impl ActiveRun for RunSession {
@@ -100,11 +105,20 @@ impl ActiveRun for RunSession {
     fn opencode_session_id(&mut self, claimed: &BTreeSet<String>) -> Option<String> {
         RunSession::opencode_session_id(self, claimed)
     }
+
+    fn launch_identity(&self) -> Option<String> {
+        RunSession::launch_identity(self)
+    }
+
+    fn control_port(&self) -> Option<u16> {
+        RunSession::control_port(self)
+    }
 }
 
 trait RunBackend: Send + Sync {
     fn spawn(
         &self,
+        run_id: &RunId,
         project: &str,
         agent: &str,
         model: Option<&str>,
@@ -116,6 +130,7 @@ trait RunBackend: Send + Sync {
 
     fn resume(
         &self,
+        run_id: &RunId,
         project: &str,
         agent: &str,
         model: Option<&str>,
@@ -142,6 +157,7 @@ struct CoreRunBackend;
 impl RunBackend for CoreRunBackend {
     fn spawn(
         &self,
+        run_id: &RunId,
         project: &str,
         agent: &str,
         model: Option<&str>,
@@ -153,8 +169,9 @@ impl RunBackend for CoreRunBackend {
         if cancellation.is_cancelled() {
             return Err(Error::Store("launch start cancelled".into()));
         }
-        RunSession::spawn_with_environment(
-            project,
+        debug_assert_eq!(project, run_id.project);
+        RunSession::spawn_mission_with_environment(
+            run_id,
             agent,
             model,
             mission,
@@ -166,6 +183,7 @@ impl RunBackend for CoreRunBackend {
 
     fn resume(
         &self,
+        run_id: &RunId,
         project: &str,
         agent: &str,
         model: Option<&str>,
@@ -177,8 +195,9 @@ impl RunBackend for CoreRunBackend {
         if cancellation.is_cancelled() {
             return Err(Error::Store("launch start cancelled".into()));
         }
-        RunSession::resume_with_environment(
-            project,
+        debug_assert_eq!(project, run_id.project);
+        RunSession::resume_mission_with_environment(
+            run_id,
             agent,
             model,
             opencode_session_id,
@@ -462,6 +481,9 @@ pub struct AppState {
     /// an autonomous launch the operator did not initiate should still
     /// announce itself.
     launch_notices: Vec<LaunchNotice>,
+    /// Last distinct delivery failure already reported to the operator.
+    /// Retries remain automatic without producing a toast wall.
+    last_dispatch_delivery_error: Option<String>,
 }
 
 /// A curator-requested launch the app carried out (or tried to), queued
@@ -523,6 +545,7 @@ enum AppJobOutput {
     CorpusSnapshot(CorpusSnapshot),
     LiveSessions(Vec<String>),
     SessionMaintenance(SessionMaintenance),
+    DispatchDeliveries,
     TeardownReady(TeardownReady),
     ProjectScope(ProjectScopeSnapshot),
     LaunchRequests(Vec<LaunchRequest>),
@@ -906,6 +929,11 @@ impl AppState {
                 JobTerminal::Success(AppJobOutput::LaunchReady(ready)) => {
                     if let Some(run_id) = result.scope.run_id.as_ref() {
                         if let Err(error) = self.apply_launch_ready(run_id, ready) {
+                            self.record_dispatch_launch_failure(
+                                &run_id.project,
+                                &run_id.mission,
+                                &error.to_string(),
+                            );
                             notices.push((true, error.to_string()));
                         }
                     }
@@ -925,6 +953,8 @@ impl AppState {
                 JobTerminal::Success(AppJobOutput::LiveSessions(sessions)) => {
                     self.live_sessions = sessions;
                     self.live_sessions_polled_at = Some(self.clock.monotonic_now());
+                    self.reconcile_mission_dispatches();
+                    self.schedule_dispatch_deliveries();
                     if let Some(project) = self.effective_project() {
                         self.schedule_session_maintenance(&project);
                     }
@@ -972,6 +1002,10 @@ impl AppState {
                         self.note_corpus_mutation(&project);
                         self.refresh_corpus_stats(&project);
                     }
+                    self.schedule_dispatch_deliveries();
+                }
+                JobTerminal::Success(AppJobOutput::DispatchDeliveries) => {
+                    self.last_dispatch_delivery_error = None;
                 }
                 JobTerminal::Success(AppJobOutput::TeardownReady(ready)) => {
                     if let Some(run_id) = result.scope.run_id.as_ref() {
@@ -1024,6 +1058,13 @@ impl AppState {
                     }
                     self.mark_job_failed(result.kind, &result.scope, &error);
                     if let Some(run_id) = result.scope.run_id.as_ref() {
+                        if result.kind == JobKind::LaunchPreparation {
+                            self.record_dispatch_launch_failure(
+                                &run_id.project,
+                                &run_id.mission,
+                                &error,
+                            );
+                        }
                         let wrapped = Error::Store(error.clone());
                         let teardown = result.kind == JobKind::SessionTeardown;
                         self.fail_run(
@@ -1038,7 +1079,14 @@ impl AppState {
                             teardown,
                         );
                     }
-                    notices.push((true, error));
+                    if result.kind == JobKind::DispatchDelivery {
+                        if self.last_dispatch_delivery_error.as_deref() != Some(error.as_str()) {
+                            notices.push((true, error.clone()));
+                        }
+                        self.last_dispatch_delivery_error = Some(error);
+                    } else {
+                        notices.push((true, error));
+                    }
                 }
                 JobTerminal::Cancelled => {
                     if self.retry_stale_plugin_probe(result.kind) {
@@ -1046,6 +1094,13 @@ impl AppState {
                     }
                     self.mark_job_failed(result.kind, &result.scope, "cancelled");
                     if let Some(run_id) = result.scope.run_id.as_ref() {
+                        if result.kind == JobKind::LaunchPreparation {
+                            self.record_dispatch_launch_failure(
+                                &run_id.project,
+                                &run_id.mission,
+                                "launch cancelled",
+                            );
+                        }
                         self.finish_run(run_id);
                     }
                     notices.push((false, "background work cancelled".into()));
@@ -1057,6 +1112,13 @@ impl AppState {
                     self.mark_job_failed(result.kind, &result.scope, "timed out");
                     if let Some(run_id) = result.scope.run_id.as_ref() {
                         let error = Error::Store(format!("{} timed out", result.kind.label()));
+                        if result.kind == JobKind::LaunchPreparation {
+                            self.record_dispatch_launch_failure(
+                                &run_id.project,
+                                &run_id.mission,
+                                &error.to_string(),
+                            );
+                        }
                         let teardown = result.kind == JobKind::SessionTeardown;
                         self.fail_run(
                             run_id,
@@ -1346,6 +1408,7 @@ impl AppState {
             last_exported_at: BTreeMap::new(),
             launch_requests_polled_at: None,
             launch_notices: Vec::new(),
+            last_dispatch_delivery_error: None,
         };
         if eager_refresh {
             state.refresh();
@@ -2294,9 +2357,11 @@ impl AppState {
             created: self.clock.unix_seconds(),
             name: None,
             session: None,
+            control: None,
             opencode_session: None,
             environment_session: None,
             launch_requested: None,
+            dispatch: None,
         };
         self.store.write_mission(project, &id, &mission, brief)?;
         Ok(id)
@@ -2403,6 +2468,7 @@ impl AppState {
                 return Err(Error::Store("launch start cancelled".into()));
             }
             self.run_backend.spawn(
+                &run_id,
                 project,
                 agent,
                 model,
@@ -2593,6 +2659,20 @@ impl AppState {
                 code,
             });
             if let Some(run_id) = self.owned_run_id.take() {
+                let completion = if code == 0 {
+                    corpus_core::MissionCompletion::Completed {
+                        at: self.clock.unix_seconds(),
+                    }
+                } else {
+                    corpus_core::MissionCompletion::UnexpectedExit {
+                        at: self.clock.unix_seconds(),
+                    }
+                };
+                let _ = self.record_dispatch_completion(
+                    &run_id.project,
+                    &run_id.mission,
+                    completion,
+                );
                 self.finish_run(&run_id);
             }
             return;
@@ -2798,6 +2878,33 @@ impl AppState {
         );
     }
 
+    /// Deliver terminal child results through each exact parent TUI. The
+    /// worker owns all HTTP and store I/O; the render loop only schedules a
+    /// coalesced global pass after liveness/conversation reconciliation.
+    fn schedule_dispatch_deliveries(&mut self) {
+        let Some(jobs) = self.jobs.as_mut() else {
+            return;
+        };
+        let store = self.store.clone();
+        let service = self.session_service.clone();
+        let live = self.live_sessions.clone();
+        jobs.start(
+            JobKind::DispatchDelivery,
+            JobScope {
+                project: String::new(),
+                project_generation: 0,
+                corpus_revision: None,
+                run_id: None,
+            },
+            Duration::from_secs(10),
+            move |_| {
+                reconcile_dispatch_activity(&store, service.as_ref(), &live)?;
+                deliver_completed_dispatches(&store, service.as_ref(), &live)?;
+                Ok(AppJobOutput::DispatchDeliveries)
+            },
+        );
+    }
+
     /// Poll live sessions on a throttle (2 s): the poll spawns a `tmux
     /// list-sessions` subprocess, so never per frame — and only when a
     /// live session can even matter (a run is up, or some mission record
@@ -2819,6 +2926,7 @@ impl AppState {
         if due {
             self.refresh_live_sessions();
             if self.jobs.is_none() {
+                self.reconcile_mission_dispatches();
                 // Synchronous test/headless fallback retains the legacy
                 // maintenance path. Production schedules listing first;
                 // maintenance moves to its own scoped jobs below.
@@ -2932,24 +3040,26 @@ impl AppState {
         // one that would spawn a duplicate.
         self.refresh_live_sessions();
         for (project, slug, session) in pending {
+            let already_live = session
+                .as_deref()
+                .is_some_and(|s| self.live_sessions.iter().any(|l| l == s));
             // Clear FIRST: a spawn failure must not loop the request.
-            if let Err(error) = self.clear_launch_request(&project, &slug) {
+            if let Err(error) = self.clear_launch_request(&project, &slug, !already_live) {
                 self.launch_notices.push(LaunchNotice {
                     mission: slug.clone(),
                     result: Err(error.to_string()),
                 });
                 continue;
             }
-            let already_live = session
-                .as_deref()
-                .is_some_and(|s| self.live_sessions.iter().any(|l| l == s));
             if already_live {
                 continue;
             }
             let label = self.mission_display_label(&project, &slug);
-            let result = self
-                .launch_mission_detached(&project, &slug)
-                .map_err(|e| e.to_string());
+            let result = self.launch_mission_detached(&project, &slug).map_err(|error| {
+                let message = error.to_string();
+                self.record_dispatch_launch_failure(&project, &slug, &message);
+                message
+            });
             self.launch_notices.push(LaunchNotice {
                 mission: label,
                 result,
@@ -2959,7 +3069,11 @@ impl AppState {
 
     fn apply_launch_requests(&mut self, requests: Vec<LaunchRequest>) {
         for request in requests {
-            if let Err(error) = self.clear_launch_request(&request.project, &request.slug) {
+            if let Err(error) = self.clear_launch_request(
+                &request.project,
+                &request.slug,
+                !request.already_live,
+            ) {
                 self.launch_notices.push(LaunchNotice {
                     mission: request.label,
                     result: Err(error.to_string()),
@@ -2970,6 +3084,11 @@ impl AppState {
                 continue;
             }
             if let Err(error) = self.launch_mission_detached(&request.project, &request.slug) {
+                self.record_dispatch_launch_failure(
+                    &request.project,
+                    &request.slug,
+                    &error.to_string(),
+                );
                 self.launch_notices.push(LaunchNotice {
                     mission: request.label,
                     result: Err(error.to_string()),
@@ -2984,11 +3103,122 @@ impl AppState {
         std::mem::take(&mut self.launch_notices)
     }
 
-    /// Clear a mission's `launch_requested` flag, preserving its brief.
-    fn clear_launch_request(&mut self, project: &str, slug: &str) -> Result<(), Error> {
+    /// Consume a mission's launch request before spawning. The proven parent
+    /// origin is copied onto the child record in the same write, so a spawn
+    /// failure or app restart cannot lose the return path.
+    fn clear_launch_request(
+        &mut self,
+        project: &str,
+        slug: &str,
+        bind_origin: bool,
+    ) -> Result<(), Error> {
         let mut mission = self.store.load_mission(project, slug)?;
-        mission.launch_requested = None;
+        let request = mission.launch_requested.take();
+        if bind_origin {
+            mission.dispatch = request
+                .and_then(|request| request.requested_by)
+                .map(|parent| corpus_core::MissionDispatch {
+                    parent,
+                    child_run_id: None,
+                    live_seen: false,
+                    running_seen: false,
+                    completion: None,
+                    delivery_attempt: 0,
+                    delivery_message_id: None,
+                    delivered: false,
+                });
+        }
         self.store.update_mission(project, slug, &mission)
+    }
+
+    fn record_dispatch_launch_failure(&mut self, project: &str, slug: &str, error: &str) {
+        let bounded: String = error.chars().take(2_000).collect();
+        let _ = self.record_dispatch_completion(
+            project,
+            slug,
+            corpus_core::MissionCompletion::LaunchFailed {
+                at: self.clock.unix_seconds(),
+                error: bounded,
+            },
+        );
+    }
+
+    /// Persist one terminal child result. Once present it is immutable, so
+    /// repeated liveness scans and app restarts cannot create duplicates.
+    fn record_dispatch_completion(
+        &mut self,
+        project: &str,
+        slug: &str,
+        completion: corpus_core::MissionCompletion,
+    ) -> Result<bool, Error> {
+        let mut mission = self.store.load_mission(project, slug)?;
+        let Some(dispatch) = mission.dispatch.as_mut() else {
+            return Ok(false);
+        };
+        if dispatch.completion.is_some() {
+            return Ok(false);
+        }
+        dispatch.completion = Some(completion);
+        self.store.update_mission(project, slug, &mission)?;
+        Ok(true)
+    }
+
+    /// Fold the existing tmux/raw-capture state into durable dispatch facts.
+    /// This starts no inference and performs no delivery. An initial parked
+    /// session is only remembered as live; completion requires that the exact
+    /// child run was first observed producing output.
+    fn reconcile_mission_dispatches(&mut self) {
+        let Ok(projects) = self.store.list_projects() else {
+            return;
+        };
+        let now = self.clock.unix_seconds();
+        for (project, _) in projects {
+            let Ok(missions) = self.store.list_missions(&project) else {
+                continue;
+            };
+            for (slug, mut mission) in missions {
+                let Some(snapshot) = mission.dispatch.as_ref() else {
+                    continue;
+                };
+                if snapshot.completion.is_some() {
+                    continue;
+                }
+                let Some(child_run_id) = snapshot.child_run_id.as_deref() else {
+                    continue;
+                };
+                // Piped children have no tmux binding; `poll_run` owns their
+                // exact process exit and records completion there.
+                if mission.session.is_none() {
+                    continue;
+                }
+                // Only the exact bound child may advance this dispatch. A
+                // later manual relaunch cannot complete an older request.
+                let exact_binding = mission.session.as_deref() == Some(child_run_id);
+                let live = exact_binding
+                    && self
+                        .live_sessions
+                        .iter()
+                        .any(|session| session == child_run_id);
+                let dispatch = mission.dispatch.as_mut().expect("checked above");
+                let mut changed = false;
+                if live && !dispatch.live_seen {
+                    dispatch.live_seen = true;
+                    changed = true;
+                }
+                // Terminal-paint recency is only a display signal. A quiet
+                // provider or tool may produce no PTY bytes for many seconds,
+                // so successful completion is recorded off-thread from the
+                // exact OpenCode process's active-session endpoint instead.
+                if !live && dispatch.live_seen {
+                    dispatch.completion =
+                        Some(corpus_core::MissionCompletion::UnexpectedExit { at: now });
+                    changed = true;
+                }
+                if changed {
+                    let _ = self.store.update_mission(&project, &slug, &mission);
+                }
+            }
+        }
     }
 
     /// A mission's operator-facing label from its DISK record (name, else
@@ -3235,7 +3465,11 @@ impl AppState {
             record.environment_session.as_deref(),
         )?;
         let session = self.live_run_session();
-        if let Err(error) = self.bind_fresh_run(project, slug, session) {
+        let control_port = self.run.as_ref().and_then(|run| run.control_port());
+        let child_run_id = self.run.as_ref().and_then(|run| run.launch_identity());
+        if let Err(error) =
+            self.bind_fresh_run(project, slug, session, child_run_id, control_port)
+        {
             return Err(self.cleanup_failed_adoption(&run_id, error));
         }
         self.refresh_missions(project);
@@ -3291,6 +3525,7 @@ impl AppState {
                 return Err(Error::Store("launch start cancelled".into()));
             }
             self.run_backend.spawn(
+                &run_id,
                 project,
                 &record.agent,
                 model.as_deref(),
@@ -3312,6 +3547,8 @@ impl AppState {
             }
         };
         self.run_cancellations.remove(&run_id);
+        let control_port = session.control_port();
+        let child_run_id = session.launch_identity();
         let tmux = session
             .pty_attach_command()
             .and_then(|argv| AppState::pty_attach_session(&argv));
@@ -3319,7 +3556,15 @@ impl AppState {
             Some(name) => {
                 // A detached TUI: record the session and let go. Discovery
                 // takes it from here.
-                if let Err(error) = self.bind_fresh_run(project, slug, Some(name)) {
+                if let Err(error) =
+                    self.bind_fresh_run(
+                        project,
+                        slug,
+                        Some(name),
+                        child_run_id.clone(),
+                        control_port,
+                    )
+                {
                     self.run_phases.insert(run_id.clone(), RunPhase::Stopping);
                     let transcript = session.stop();
                     let combined = Error::Store(format!(
@@ -3348,7 +3593,9 @@ impl AppState {
                     return Err(combined);
                 }
                 self.adopt_run(session, run_id.clone());
-                if let Err(error) = self.bind_fresh_run(project, slug, None) {
+                if let Err(error) =
+                    self.bind_fresh_run(project, slug, None, child_run_id, control_port)
+                {
                     return Err(self.cleanup_failed_adoption(&run_id, error));
                 }
             }
@@ -3401,6 +3648,7 @@ impl AppState {
                 return Err(Error::Store("launch start cancelled".into()));
             }
             self.run_backend.resume(
+                &run_id,
                 project,
                 &record.agent,
                 model.as_deref(),
@@ -3422,9 +3670,17 @@ impl AppState {
             }
         };
         self.run_cancellations.remove(&run_id);
+        let resumed_run_id = run.launch_identity();
+        let control_port = run.control_port();
         self.adopt_run(run, run_id.clone());
         if let Some(session) = self.live_run_session() {
-            if let Err(error) = self.set_tmux_session(project, slug, Some(session)) {
+            if let Err(error) = self.bind_resumed_run(
+                project,
+                slug,
+                Some(session),
+                resumed_run_id,
+                control_port,
+            ) {
                 return Err(self.cleanup_failed_adoption(&run_id, error));
             }
         }
@@ -3460,6 +3716,10 @@ impl AppState {
                 let mut mission = store
                     .load_mission(&project, &slug)
                     .map_err(|error| error.to_string())?;
+                let mut effective_pins = corpus_observe::project_source_pins(&store, &project)
+                    .map_err(|error| error.to_string())?;
+                effective_pins.extend(mission.pins.clone());
+                mission.pins = effective_pins;
                 let prepared = backend
                     .prepare_source_pins(&store, &project, &mission.pins, &cancellation)
                     .map_err(|error| error.to_string())?;
@@ -3500,6 +3760,7 @@ impl AppState {
                                     .to_string()
                             })?;
                         backend.resume(
+                            &run_id,
                             &project,
                             &mission.agent,
                             model.as_deref(),
@@ -3515,6 +3776,7 @@ impl AppState {
                             .map(|brief| brief.trim().to_string())
                             .unwrap_or_default();
                         backend.spawn(
+                            &run_id,
                             &project,
                             &mission.agent,
                             model.as_deref(),
@@ -3555,6 +3817,8 @@ impl AppState {
 
     fn apply_launch_ready(&mut self, run_id: &RunId, mut ready: LaunchReady) -> Result<(), Error> {
         let notice = ready.notice.take();
+        let control_port = ready.session.control_port();
+        let child_run_id = ready.session.launch_identity();
         self.run_phases.insert(run_id.clone(), RunPhase::Starting);
         match ready.mode {
             LaunchMode::DetachedFresh => {
@@ -3564,7 +3828,13 @@ impl AppState {
                     .and_then(|argv| AppState::pty_attach_session(&argv));
                 if let Some(session) = tmux {
                     if let Err(error) =
-                        self.bind_fresh_run(&run_id.project, &run_id.mission, Some(session))
+                        self.bind_fresh_run(
+                            &run_id.project,
+                            &run_id.mission,
+                            Some(session),
+                            child_run_id.clone(),
+                            control_port,
+                        )
                     {
                         let cleanup = ready.session.stop();
                         let combined = Error::Store(format!(
@@ -3579,8 +3849,13 @@ impl AppState {
                 } else {
                     self.background_active_run()?;
                     self.adopt_run(ready.session, run_id.clone());
-                    if let Err(error) = self.bind_fresh_run(&run_id.project, &run_id.mission, None)
-                    {
+                    if let Err(error) = self.bind_fresh_run(
+                        &run_id.project,
+                        &run_id.mission,
+                        None,
+                        child_run_id.clone(),
+                        control_port,
+                    ) {
                         return Err(self.cleanup_failed_adoption(run_id, error));
                     }
                 }
@@ -3602,11 +3877,15 @@ impl AppState {
                         &run_id.project,
                         &run_id.mission,
                         self.live_run_session(),
+                        child_run_id,
+                        control_port,
                     ),
-                    LaunchMode::Resume => self.set_tmux_session(
+                    LaunchMode::Resume => self.bind_resumed_run(
                         &run_id.project,
                         &run_id.mission,
                         self.live_run_session(),
+                        child_run_id,
+                        control_port,
                     ),
                     LaunchMode::DetachedFresh => unreachable!(),
                 };
@@ -3639,6 +3918,10 @@ impl AppState {
                 return Err(Error::Store("launch preparation cancelled".into()));
             }
             let mut mission_record = self.store.load_mission(&run_id.project, &run_id.mission)?;
+            let mut effective_pins =
+                corpus_observe::project_source_pins(&self.store, &run_id.project)?;
+            effective_pins.extend(mission_record.pins.clone());
+            mission_record.pins = effective_pins;
             let prepared = self.run_backend.prepare_source_pins(
                 &self.store,
                 &run_id.project,
@@ -3872,6 +4155,23 @@ impl AppState {
     ) -> Result<(), Error> {
         let mut mission = self.store.load_mission(project, slug)?;
         mission.session = session;
+        mission.control = None;
+        self.store.update_mission(project, slug, &mission)
+    }
+
+    fn bind_resumed_run(
+        &mut self,
+        project: &str,
+        slug: &str,
+        session: Option<String>,
+        run_id: Option<String>,
+        control_port: Option<u16>,
+    ) -> Result<(), Error> {
+        let mut mission = self.store.load_mission(project, slug)?;
+        mission.session = session;
+        mission.control = run_id.zip(control_port).map(|(run_id, port)| {
+            corpus_core::MissionControl { run_id, port }
+        });
         self.store.update_mission(project, slug, &mission)
     }
 
@@ -3883,10 +4183,28 @@ impl AppState {
         project: &str,
         slug: &str,
         session: Option<String>,
+        child_run_id: Option<String>,
+        control_port: Option<u16>,
     ) -> Result<(), Error> {
         let mut mission = self.store.load_mission(project, slug)?;
+        let piped_child = session.is_none() && child_run_id.is_some();
         mission.session = session;
+        mission.control = child_run_id
+            .clone()
+            .zip(control_port)
+            .map(|(run_id, port)| corpus_core::MissionControl { run_id, port });
         mission.opencode_session = None;
+        if let Some(dispatch) = mission
+            .dispatch
+            .as_mut()
+            .filter(|dispatch| {
+                dispatch.completion.is_none() && dispatch.child_run_id.is_none()
+            })
+        {
+            dispatch.child_run_id = child_run_id;
+            dispatch.live_seen = piped_child;
+            dispatch.running_seen = piped_child;
+        }
         self.store.update_mission(project, slug, &mission)
     }
 
@@ -4075,8 +4393,15 @@ impl AppState {
         } else {
             let run_id = self.next_run_id(project, slug);
             self.run_phases.insert(run_id.clone(), RunPhase::Exporting);
-            // A run that outlived the app: attempt export, but cleanup even
-            // when export fails. Both outcomes are reported independently.
+            // A run that outlived the app: stop the writer before exporting
+            // so OpenCode cannot return a partial JSON string. Both outcomes
+            // are still reported independently.
+            self.run_phases.insert(run_id.clone(), RunPhase::Stopping);
+            let cleanup_error = self
+                .run_backend
+                .kill_tmux_session(session)
+                .err()
+                .map(|error| format!("session cleanup failed: {error}"));
             let (exported, export_error) = match mission.opencode_session.as_deref() {
                 Some(id) => match self.run_backend.export_session(project, id) {
                     Ok(path) => (Some(path.display().to_string()), None),
@@ -4084,12 +4409,6 @@ impl AppState {
                 },
                 None => (None, None),
             };
-            self.run_phases.insert(run_id.clone(), RunPhase::Stopping);
-            let cleanup_error = self
-                .run_backend
-                .kill_tmux_session(session)
-                .err()
-                .map(|error| format!("session cleanup failed: {error}"));
             let cleanup_complete = cleanup_error.is_none();
             let error = match (export_error, cleanup_error) {
                 (None, None) => None,
@@ -4202,6 +4521,15 @@ impl AppState {
                         retained: (!cleanup_complete).then_some(session),
                     }));
                 }
+                // Stabilize OpenCode's session data before asking the CLI to
+                // serialize it. A live streaming response can otherwise end
+                // in a successful but truncated export.
+                let cleanup_error = tmux_owned.as_deref().and_then(|tmux| {
+                    backend
+                        .kill_tmux_session(tmux)
+                        .err()
+                        .map(|error| format!("session cleanup failed: {error}"))
+                });
                 let (transcript, export_error) = match conversation.as_deref() {
                     Some(conversation) => {
                         match backend.export_session(&project_owned, conversation) {
@@ -4213,12 +4541,6 @@ impl AppState {
                     }
                     None => (None, None),
                 };
-                let cleanup_error = tmux_owned.as_deref().and_then(|tmux| {
-                    backend
-                        .kill_tmux_session(tmux)
-                        .err()
-                        .map(|error| format!("session cleanup failed: {error}"))
-                });
                 let environment_error = match (plugin_id.as_deref(), environment_session.as_deref())
                 {
                     (Some(plugin_id), Some(environment_session)) => {
@@ -4318,6 +4640,416 @@ impl AppState {
         corpus_core::launch::agent_default_model(&self.store, project, agent)
             .or_else(|| self.suggested_model())
     }
+}
+
+#[derive(Clone)]
+struct DispatchDeliveryItem {
+    project: String,
+    slug: String,
+    child_run_id: Option<String>,
+    completion: corpus_core::MissionCompletion,
+    delivery_attempt: u32,
+    delivery_message_id: Option<String>,
+}
+
+/// Advance dispatched children from running to completed using the private
+/// endpoint owned by each exact child TUI. A live-but-quiet terminal is not a
+/// terminal event: intermediate assistant messages ending in `tool-calls`
+/// remain active, while the first later non-tool finish is the restart-safe
+/// whole-loop completion proof.
+fn reconcile_dispatch_activity(
+    store: &Store,
+    service: &dyn SessionService,
+    live: &[String],
+) -> Result<(), String> {
+    let projects = store.list_projects().map_err(|error| error.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut failures = Vec::new();
+    for (project, _) in projects {
+        let missions = match store.list_missions(&project) {
+            Ok(missions) => missions,
+            Err(error) => {
+                failures.push(format!("{project}: {error}"));
+                continue;
+            }
+        };
+        for (slug, mut mission) in missions {
+            let Some(snapshot) = mission.dispatch.as_ref() else {
+                continue;
+            };
+            if snapshot.completion.is_some() {
+                continue;
+            }
+            let Some(child_run_id) = snapshot.child_run_id.as_deref() else {
+                continue;
+            };
+            let exact_live = mission.session.as_deref() == Some(child_run_id)
+                && live.iter().any(|session| session == child_run_id);
+            if !exact_live {
+                continue;
+            }
+            let Some(control) = mission
+                .control
+                .as_ref()
+                .filter(|control| control.run_id == child_run_id)
+            else {
+                continue;
+            };
+            let Some(conversation) = mission.opencode_session.as_ref() else {
+                continue;
+            };
+            let password = match corpus_core::opencode_control_password(store, child_run_id) {
+                Ok(password) => password,
+                Err(error) => {
+                    failures.push(format!("{project}/{slug}: {error}"));
+                    continue;
+                }
+            };
+            let session = SessionRef {
+                id: conversation.clone(),
+                directory: store.project_run_dir(&project),
+            };
+            let launched_at_ms = launch_stamp_ms(child_run_id).unwrap_or(0);
+            let turn_state = match service.session_turn_state(
+                control,
+                &password,
+                &session,
+                launched_at_ms,
+            ) {
+                Ok(state) => state,
+                Err(error) => {
+                    failures.push(format!("{project}/{slug}: {error}"));
+                    continue;
+                }
+            };
+            let dispatch = mission.dispatch.as_mut().expect("checked above");
+            let changed = match turn_state {
+                SessionTurnState::Active if !dispatch.running_seen => {
+                    dispatch.running_seen = true;
+                    true
+                }
+                SessionTurnState::Completed => {
+                    dispatch.running_seen = true;
+                    dispatch.completion =
+                        Some(corpus_core::MissionCompletion::Completed { at: now });
+                    true
+                }
+                SessionTurnState::Pending | SessionTurnState::Active => false,
+            };
+            if changed {
+                if let Err(error) = store.update_mission(&project, &slug, &mission) {
+                    failures.push(format!("{project}/{slug}: {error}"));
+                }
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("mission completion delivery failed: {}", failures.join("; ")))
+    }
+}
+
+/// Reconcile persisted completion deliveries, then group newly completed
+/// children by launcher-proven parent and resume each exact curator. Intent,
+/// admission, and acknowledgement are deliberately separate: a stored id can
+/// wait safely while the curator is active, and only a terminal assistant
+/// response marks delivery complete.
+fn deliver_completed_dispatches(
+    store: &Store,
+    service: &dyn SessionService,
+    live: &[String],
+) -> Result<(), String> {
+    let projects = store.list_projects().map_err(|error| error.to_string())?;
+    let mut groups: BTreeMap<corpus_core::MissionRunRef, Vec<DispatchDeliveryItem>> =
+        BTreeMap::new();
+    for (project, _) in projects {
+        let Ok(missions) = store.list_missions(&project) else {
+            continue;
+        };
+        for (slug, mission) in missions {
+            let Some(dispatch) = mission.dispatch else {
+                continue;
+            };
+            let Some(completion) = dispatch.completion else {
+                continue;
+            };
+            // Records written by the old admission-is-delivery implementation
+            // have `delivered=true` but no message id. They were never
+            // acknowledged and must be repaired rather than silently skipped.
+            if dispatch.delivered && dispatch.delivery_message_id.is_some() {
+                continue;
+            }
+            groups
+                .entry(dispatch.parent)
+                .or_default()
+                .push(DispatchDeliveryItem {
+                    project: project.clone(),
+                    slug,
+                    child_run_id: dispatch.child_run_id,
+                    completion,
+                    delivery_attempt: dispatch.delivery_attempt,
+                    delivery_message_id: dispatch.delivery_message_id,
+                });
+        }
+    }
+    if groups.is_empty() {
+        return Ok(());
+    }
+    let mut failures = Vec::new();
+    for (parent, mut children) in groups {
+        children.sort_by(|left, right| {
+            (&left.project, &left.slug).cmp(&(&right.project, &right.slug))
+        });
+        let Ok(parent_mission) = store.load_mission(&parent.project, &parent.mission) else {
+            continue;
+        };
+        let Some(control) = parent_mission.control.as_ref() else {
+            continue;
+        };
+        if parent_mission.session.as_deref() != Some(parent.run_id.as_str())
+            || control.run_id != parent.run_id
+            || !live.iter().any(|session| session == &parent.run_id)
+        {
+            continue;
+        }
+        let Some(conversation) = parent_mission.opencode_session.as_ref() else {
+            continue;
+        };
+        let Ok(password) = corpus_core::opencode_control_password(store, &control.run_id) else {
+            continue;
+        };
+
+        let session = SessionRef {
+            id: conversation.clone(),
+            directory: store.project_run_dir(&parent.project),
+        };
+
+        let mut admitted: BTreeMap<String, Vec<DispatchDeliveryItem>> = BTreeMap::new();
+        let mut pending = Vec::new();
+        for child in children {
+            if let Some(message_id) = child.delivery_message_id.clone() {
+                admitted.entry(message_id).or_default().push(child);
+            } else {
+                pending.push(child);
+            }
+        }
+        for (message_id, attempted) in admitted {
+            match service.prompt_delivery_state(
+                control,
+                &password,
+                &session,
+                &message_id,
+            ) {
+                Ok(PromptDeliveryState::Acknowledged) => {
+                    for child in &attempted {
+                        mark_dispatch_acknowledged(store, &parent, child, &message_id);
+                    }
+                }
+                Ok(PromptDeliveryState::Failed { error, retry_ready }) => {
+                    // Keep the failed admission durable. Re-posting the same
+                    // id cannot restart it, while immediately minting ids in a
+                    // loop can burn credits. A deliberate model switch is the
+                    // event that permits attempt N+1.
+                    if retry_ready {
+                        for child in &attempted {
+                            mark_dispatch_retryable(store, &parent, child, &message_id);
+                        }
+                    }
+                    failures.push(format!(
+                        "{}/{}: curator did not handle completion prompt: {error}{}",
+                        parent.project,
+                        parent.mission,
+                        if retry_ready { "; retrying after model switch" } else { "" }
+                    ));
+                }
+                Ok(PromptDeliveryState::Pending) => {
+                    // A persisted id with no legacy user message is either a
+                    // delivery deferred while the curator was active or an
+                    // admission made by the unusable V2 queue path. Re-submit
+                    // the same deterministic id; the adapter preflights the
+                    // transcript, so this is idempotent.
+                    let prompt = completion_prompt(&attempted);
+                    if let Err(error) =
+                        service.queue_prompt(control, &password, &session, &message_id, &prompt)
+                    {
+                        failures.push(format!(
+                            "{}/{}: {error}",
+                            parent.project, parent.mission
+                        ));
+                    }
+                }
+                Ok(PromptDeliveryState::Active) => {}
+                Err(error) => failures.push(format!(
+                    "{}/{}: {error}",
+                    parent.project, parent.mission
+                )),
+            }
+        }
+        if pending.is_empty() {
+            continue;
+        }
+
+        let attempt = pending
+            .iter()
+            .map(|child| child.delivery_attempt)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let signature = pending
+            .iter()
+            .map(|child| {
+                format!(
+                    "{}/{}:{}:{}",
+                    child.project,
+                    child.slug,
+                    child.child_run_id.as_deref().unwrap_or("launch_failed"),
+                    serde_json::to_string(&child.completion).unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        let message_id = format!(
+            "msg_corpus{}",
+            corpus_core::fnv1a_hex(
+                format!(
+                    "{}/{}/{}|attempt={attempt}|{signature}",
+                    parent.project, parent.mission, parent.run_id,
+                )
+                .as_bytes()
+            )
+        );
+        let prompt = completion_prompt(&pending);
+        match service.queue_prompt(control, &password, &session, &message_id, &prompt) {
+            Ok(()) => {
+                for child in &pending {
+                    if !mark_dispatch_admitted(store, &parent, child, attempt, &message_id) {
+                        failures.push(format!(
+                            "{}/{}: admitted completion prompt but could not persist its state",
+                            child.project, child.slug
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                failures.push(format!("{}/{}: {error}", parent.project, parent.mission));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("mission completion delivery failed: {}", failures.join("; ")))
+    }
+}
+
+fn mark_dispatch_admitted(
+    store: &Store,
+    parent: &corpus_core::MissionRunRef,
+    child: &DispatchDeliveryItem,
+    attempt: u32,
+    message_id: &str,
+) -> bool {
+    let Ok(mut mission) = store.load_mission(&child.project, &child.slug) else {
+        return false;
+    };
+    let Some(dispatch) = mission.dispatch.as_mut() else {
+        return false;
+    };
+    if &dispatch.parent != parent
+        || dispatch.child_run_id != child.child_run_id
+        || dispatch.completion.as_ref() != Some(&child.completion)
+        || dispatch.delivery_message_id.is_some()
+    {
+        return false;
+    }
+    dispatch.delivery_attempt = attempt;
+    dispatch.delivery_message_id = Some(message_id.to_string());
+    dispatch.delivered = false;
+    store
+        .update_mission(&child.project, &child.slug, &mission)
+        .is_ok()
+}
+
+fn mark_dispatch_acknowledged(
+    store: &Store,
+    parent: &corpus_core::MissionRunRef,
+    child: &DispatchDeliveryItem,
+    message_id: &str,
+) -> bool {
+    let Ok(mut mission) = store.load_mission(&child.project, &child.slug) else {
+        return false;
+    };
+    let Some(dispatch) = mission.dispatch.as_mut() else {
+        return false;
+    };
+    if &dispatch.parent != parent
+        || dispatch.child_run_id != child.child_run_id
+        || dispatch.completion.as_ref() != Some(&child.completion)
+        || dispatch.delivery_message_id.as_deref() != Some(message_id)
+        || dispatch.delivered
+    {
+        return false;
+    }
+    dispatch.delivered = true;
+    store
+        .update_mission(&child.project, &child.slug, &mission)
+        .is_ok()
+}
+
+fn mark_dispatch_retryable(
+    store: &Store,
+    parent: &corpus_core::MissionRunRef,
+    child: &DispatchDeliveryItem,
+    message_id: &str,
+) -> bool {
+    let Ok(mut mission) = store.load_mission(&child.project, &child.slug) else {
+        return false;
+    };
+    let Some(dispatch) = mission.dispatch.as_mut() else {
+        return false;
+    };
+    if &dispatch.parent != parent
+        || dispatch.child_run_id != child.child_run_id
+        || dispatch.completion.as_ref() != Some(&child.completion)
+        || dispatch.delivery_message_id.as_deref() != Some(message_id)
+        || dispatch.delivered
+    {
+        return false;
+    }
+    dispatch.delivery_message_id = None;
+    store
+        .update_mission(&child.project, &child.slug, &mission)
+        .is_ok()
+}
+
+fn completion_summary(completion: &corpus_core::MissionCompletion) -> String {
+    match completion {
+        corpus_core::MissionCompletion::Completed { .. } => "completed".into(),
+        corpus_core::MissionCompletion::UnexpectedExit { .. } => "exited unexpectedly".into(),
+        corpus_core::MissionCompletion::LaunchFailed { error, .. } => {
+            let bounded = error.chars().take(240).collect::<String>();
+            format!("launch failed: {bounded}")
+        }
+    }
+}
+
+fn completion_prompt(children: &[DispatchDeliveryItem]) -> String {
+    let mut prompt = String::from(
+        "[Corpus mission completions]\nThe missions you dispatched have finished. Continue your current work using these results; do not poll mission status.\n",
+    );
+    for child in children {
+        prompt.push_str(&format!(
+            "- {}/{}: {}\n",
+            child.project,
+            child.slug,
+            completion_summary(&child.completion)
+        ));
+    }
+    prompt
 }
 
 /// The label to show for an agent: its display name, never an opaque
@@ -4666,6 +5398,104 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct QueueCall {
+        run_id: String,
+        password: String,
+        session_id: String,
+        message_id: String,
+        prompt: String,
+    }
+
+    struct RecordingQueueService {
+        calls: Mutex<Vec<QueueCall>>,
+        fail: AtomicBool,
+        active: AtomicBool,
+        prompt_state: Mutex<PromptDeliveryState>,
+    }
+
+    impl Default for RecordingQueueService {
+        fn default() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail: AtomicBool::new(false),
+                active: AtomicBool::new(false),
+                prompt_state: Mutex::new(PromptDeliveryState::Acknowledged),
+            }
+        }
+    }
+
+    impl SessionService for RecordingQueueService {
+        fn health(
+            &self,
+        ) -> Result<crate::session_service::ServiceHealth, String> {
+            Ok(crate::session_service::ServiceHealth {
+                backend: crate::session_service::SessionBackend::Http,
+                version: crate::session_service::MINIMUM_OPENCODE_VERSION.into(),
+                compatible: true,
+            })
+        }
+
+        fn list(
+            &self,
+            _directory: &std::path::Path,
+        ) -> Result<Vec<crate::session_service::SessionSummary>, String> {
+            Ok(Vec::new())
+        }
+
+        fn messages(
+            &self,
+            _session: &SessionRef,
+        ) -> Result<Vec<crate::session_service::SessionMessage>, String> {
+            Ok(Vec::new())
+        }
+
+        fn queue_prompt(
+            &self,
+            control: &corpus_core::MissionControl,
+            password: &str,
+            session: &SessionRef,
+            message_id: &str,
+            prompt: &str,
+        ) -> Result<(), String> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err("injected queue failure".into());
+            }
+            self.calls.lock().unwrap().push(QueueCall {
+                run_id: control.run_id.clone(),
+                password: password.to_string(),
+                session_id: session.id.clone(),
+                message_id: message_id.to_string(),
+                prompt: prompt.to_string(),
+            });
+            Ok(())
+        }
+
+        fn session_turn_state(
+            &self,
+            _control: &corpus_core::MissionControl,
+            _password: &str,
+            _session: &SessionRef,
+            _launched_at_ms: u64,
+        ) -> Result<SessionTurnState, String> {
+            Ok(if self.active.load(Ordering::Relaxed) {
+                SessionTurnState::Active
+            } else {
+                SessionTurnState::Completed
+            })
+        }
+
+        fn prompt_delivery_state(
+            &self,
+            _control: &corpus_core::MissionControl,
+            _password: &str,
+            _session: &SessionRef,
+            _message_id: &str,
+        ) -> Result<PromptDeliveryState, String> {
+            Ok(self.prompt_state.lock().unwrap().clone())
+        }
+    }
+
     struct FakeRun {
         lines: VecDeque<RunLine>,
         exit: Option<i32>,
@@ -4708,6 +5538,14 @@ mod tests {
         fn opencode_session_id(&mut self, _claimed: &BTreeSet<String>) -> Option<String> {
             Some("fake-conversation".into())
         }
+
+        fn launch_identity(&self) -> Option<String> {
+            Some("fake-run".into())
+        }
+
+        fn control_port(&self) -> Option<u16> {
+            Some(43_111)
+        }
     }
 
     #[derive(Default)]
@@ -4725,6 +5563,7 @@ mod tests {
     impl RunBackend for FakeRunBackend {
         fn spawn(
             &self,
+            _run_id: &RunId,
             _project: &str,
             _agent: &str,
             _model: Option<&str>,
@@ -4759,6 +5598,7 @@ mod tests {
 
         fn resume(
             &self,
+            run_id: &RunId,
             project: &str,
             agent: &str,
             model: Option<&str>,
@@ -4768,6 +5608,7 @@ mod tests {
             cancellation: &RunCancellation,
         ) -> Result<Box<dyn ActiveRun>, Error> {
             self.spawn(
+                run_id,
                 project,
                 agent,
                 model,
@@ -4938,9 +5779,11 @@ mod tests {
             created: 1,
             name: None,
             session: None,
+            control: None,
             opencode_session: None,
             environment_session: Some(id.storage_key()),
             launch_requested: None,
+            dispatch: None,
         };
         store
             .write_mission("p", "mission", &mission, "probe")
@@ -5023,9 +5866,11 @@ mod tests {
             created,
             name: None,
             session: None,
+            control: None,
             opencode_session: None,
             environment_session: None,
             launch_requested: None,
+            dispatch: None,
         }
     }
 
@@ -5124,6 +5969,280 @@ mod tests {
     }
 
     #[test]
+    fn consuming_a_launch_request_preserves_its_exact_parent_origin() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-launch-origin-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.clone());
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "operator", corpus_core::AgentRole::Tester)
+            .unwrap();
+        let origin = corpus_core::MissionRunRef {
+            project: "p".into(),
+            mission: "curator-a".into(),
+            run_id: "p1-p-m9-curator-a-g3".into(),
+        };
+        let mut child = mission(1_700_000_123);
+        child.launch_requested = Some(corpus_core::MissionLaunchRequest {
+            requested_at: 1_700_000_124,
+            requested_by: Some(origin.clone()),
+        });
+        store.write_mission("p", "child", &child, "work").unwrap();
+
+        let mut state = AppState::with_runtime(
+            store.clone(),
+            Arc::new(ManualClock::new(1_700_000_125)),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+        state.clear_launch_request("p", "child", true).unwrap();
+        let stored = store.load_mission("p", "child").unwrap();
+        assert_eq!(stored.launch_requested, None);
+        assert_eq!(
+            stored.dispatch.as_ref().map(|dispatch| &dispatch.parent),
+            Some(&origin)
+        );
+        state
+            .bind_fresh_run(
+                "p",
+                "child",
+                Some("corpus-worker-1700000125".into()),
+                Some("corpus-worker-1700000125".into()),
+                Some(43_111),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .load_mission("p", "child")
+                .unwrap()
+                .dispatch
+                .as_ref()
+                .and_then(|dispatch| dispatch.child_run_id.as_deref()),
+            Some("corpus-worker-1700000125")
+        );
+        assert_eq!(
+            store.load_mission("p", "child").unwrap().control,
+            Some(corpus_core::MissionControl {
+                run_id: "corpus-worker-1700000125".into(),
+                port: 43_111,
+            })
+        );
+
+        let mut live = store.load_mission("p", "child").unwrap();
+        live.launch_requested = Some(corpus_core::MissionLaunchRequest {
+            requested_at: 1_700_000_126,
+            requested_by: Some(corpus_core::MissionRunRef {
+                project: "p".into(),
+                mission: "curator-b".into(),
+                run_id: "corpus-curator-b-1700000126".into(),
+            }),
+        });
+        store.update_mission("p", "child", &live).unwrap();
+        state.clear_launch_request("p", "child", false).unwrap();
+        assert_eq!(
+            store
+                .load_mission("p", "child")
+                .unwrap()
+                .dispatch
+                .map(|dispatch| dispatch.parent),
+            Some(origin),
+            "an already-live child cannot be silently reassigned"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn child_completion_uses_exact_process_activity_not_terminal_quiet() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-dispatch-completion-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.clone());
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "operator", corpus_core::AgentRole::Tester)
+            .unwrap();
+        let session = "corpus-worker-1700000000";
+        let mut child = mission(1_700_000_000);
+        child.session = Some(session.into());
+        child.control = Some(corpus_core::MissionControl {
+            run_id: session.into(),
+            port: 41_001,
+        });
+        child.opencode_session = Some("ses_child".into());
+        child.dispatch = Some(corpus_core::MissionDispatch {
+            parent: corpus_core::MissionRunRef {
+                project: "p".into(),
+                mission: "curator-a".into(),
+                run_id: "corpus-curator-1699999990".into(),
+            },
+            child_run_id: Some(session.into()),
+            live_seen: false,
+            running_seen: false,
+            completion: None,
+            delivery_attempt: 0,
+            delivery_message_id: None,
+            delivered: false,
+        });
+        store.write_mission("p", "child", &child, "work").unwrap();
+        let clock = Arc::new(ManualClock::new(1_700_000_100));
+        let mut state = AppState::with_runtime(
+            store.clone(),
+            clock,
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+        state.live_sessions = vec![session.into()];
+
+        let raw = store
+            .project_corpus_dir("p")
+            .join(corpus_core::RUNS)
+            .join("1700000000-worker.raw");
+        std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        std::fs::write(&raw, "").unwrap();
+
+        // pipe-pane creates an empty capture immediately; that alone is not
+        // evidence the child entered a turn.
+        state.reconcile_mission_dispatches();
+        let parked = store.load_mission("p", "child").unwrap().dispatch.unwrap();
+        assert!(parked.live_seen);
+        assert!(!parked.running_seen);
+        assert_eq!(parked.completion, None);
+
+        // Terminal output is a display signal only. Even after output, a
+        // quiet interval cannot declare the child complete or running.
+        std::fs::write(&raw, "working\n").unwrap();
+        state.reconcile_mission_dispatches();
+        assert!(!store
+            .load_mission("p", "child")
+            .unwrap()
+            .dispatch
+            .unwrap()
+            .running_seen);
+        std::fs::remove_file(raw).unwrap();
+        state.reconcile_mission_dispatches();
+        assert_eq!(
+            store
+                .load_mission("p", "child")
+                .unwrap()
+                .dispatch
+                .unwrap()
+                .completion,
+            None
+        );
+
+        // Only the exact owning OpenCode process may prove the foreground
+        // turn started and then parked.
+        let service = RecordingQueueService::default();
+        service.active.store(true, Ordering::Relaxed);
+        reconcile_dispatch_activity(&store, &service, &[session.into()]).unwrap();
+        assert!(store
+            .load_mission("p", "child")
+            .unwrap()
+            .dispatch
+            .unwrap()
+            .running_seen);
+        service.active.store(false, Ordering::Relaxed);
+        reconcile_dispatch_activity(&store, &service, &[session.into()]).unwrap();
+        let completed = store.load_mission("p", "child").unwrap().dispatch.unwrap();
+        assert!(matches!(
+            completed.completion.as_ref(),
+            Some(corpus_core::MissionCompletion::Completed { .. })
+        ));
+        state.reconcile_mission_dispatches();
+        let mut restarted = AppState::with_runtime(
+            store.clone(),
+            Arc::new(ManualClock::new(1_700_000_999)),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+        restarted.live_sessions = vec![session.into()];
+        restarted.reconcile_mission_dispatches();
+        assert_eq!(
+            store
+                .load_mission("p", "child")
+                .unwrap()
+                .dispatch
+                .unwrap()
+                .completion,
+            completed.completion
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disappeared_child_and_launch_failure_each_record_once() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-dispatch-failures-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.clone());
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "operator", corpus_core::AgentRole::Tester)
+            .unwrap();
+        for slug in ["vanished", "failed"] {
+            let mut child = mission(1_700_000_000);
+            child.session = (slug == "vanished").then(|| "corpus-worker-1700000000".into());
+            child.dispatch = Some(corpus_core::MissionDispatch {
+                parent: corpus_core::MissionRunRef {
+                    project: "p".into(),
+                    mission: "curator".into(),
+                    run_id: "corpus-curator-1699999990".into(),
+                },
+                child_run_id: child.session.clone(),
+                live_seen: slug == "vanished",
+                running_seen: false,
+                completion: None,
+                delivery_attempt: 0,
+                delivery_message_id: None,
+                delivered: false,
+            });
+            store.write_mission("p", slug, &child, "work").unwrap();
+        }
+        let mut state = AppState::with_runtime(
+            store.clone(),
+            Arc::new(ManualClock::new(1_700_000_100)),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+        state.live_sessions.clear();
+        state.reconcile_mission_dispatches();
+        assert_eq!(
+            store
+                .load_mission("p", "vanished")
+                .unwrap()
+                .dispatch
+                .unwrap()
+                .completion,
+            Some(corpus_core::MissionCompletion::UnexpectedExit {
+                at: 1_700_000_100
+            })
+        );
+
+        state.record_dispatch_launch_failure("p", "failed", "boom");
+        state.record_dispatch_launch_failure("p", "failed", "different retry");
+        assert_eq!(
+            store
+                .load_mission("p", "failed")
+                .unwrap()
+                .dispatch
+                .unwrap()
+                .completion,
+            Some(corpus_core::MissionCompletion::LaunchFailed {
+                at: 1_700_000_100,
+                error: "boom".into()
+            })
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn file_events_only_make_coarse_reconciliation_domains_due() {
         let root = std::env::temp_dir().join(format!(
             "corpus-app-file-events-{}-{}",
@@ -5134,7 +6253,7 @@ mod tests {
         store.create_project("p", "P", "cdk-regtest").unwrap();
         let clock = Arc::new(ManualClock::new(1_700_000_123));
         let mut state = AppState::with_runtime(
-            store,
+            store.clone(),
             clock.clone(),
             Arc::new(FakeRunBackend::default()),
             Arc::new(FakeSessionCatalog),
@@ -5478,6 +6597,12 @@ mod tests {
         let store = Store::new(root.clone());
         store.create_project("p", "P", "cdk-regtest").unwrap();
         store
+            .set_project_pins(
+                "p",
+                BTreeMap::from([("target".into(), "project-default".into())]),
+            )
+            .unwrap();
+        store
             .create_agent_with_role("p", "runner", corpus_core::AgentRole::Tester)
             .unwrap();
         let mut record = mission(1);
@@ -5487,7 +6612,7 @@ mod tests {
             .unwrap();
         let backend = Arc::new(FakeRunBackend::default());
         let mut state = AppState::with_runtime(
-            store,
+            store.clone(),
             Arc::new(ManualClock::new(0)),
             backend.clone(),
             Arc::new(FakeSessionCatalog),
@@ -5524,6 +6649,16 @@ mod tests {
         assert_eq!(state.run_phase(&run_id), RunPhase::Running);
         assert_eq!(backend.spawns.load(Ordering::Relaxed), 1);
         assert!(state.run_belongs_to("p", "mission"));
+        assert_eq!(
+            store
+                .load_mission("p", "mission")
+                .unwrap()
+                .pins
+                .get("target")
+                .map(String::as_str),
+            Some("project-default"),
+            "launch must repair an empty mission created by a stale curator MCP"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6066,6 +7201,260 @@ mod tests {
         let sorted = sort_missions(list);
         let order: Vec<&str> = sorted.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(order, ["a-new", "d-tie", "c-mid", "b-old"]);
+    }
+
+    #[test]
+    fn completion_delivery_groups_children_for_each_exact_curator() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-delivery-groups-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.join("store"));
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "operator", corpus_core::AgentRole::Tester)
+            .unwrap();
+
+        let parents = [
+            ("curator-a", "run-a", "ses_a", 41_001_u16),
+            ("curator-b", "run-b", "ses_b", 41_002_u16),
+            ("curator-stale", "old-run", "ses_stale", 41_003_u16),
+        ];
+        for (slug, run_id, conversation, port) in parents {
+            let mut parent = mission(1);
+            parent.session = Some(if slug == "curator-stale" {
+                "new-run".into()
+            } else {
+                run_id.into()
+            });
+            parent.control = Some(corpus_core::MissionControl {
+                run_id: run_id.into(),
+                port,
+            });
+            parent.opencode_session = Some(conversation.into());
+            store.write_mission("p", slug, &parent, "curate").unwrap();
+        }
+
+        let children = [
+            ("child-a1", "curator-a", "run-a"),
+            ("child-a2", "curator-a", "run-a"),
+            ("child-b1", "curator-b", "run-b"),
+            ("child-stale", "curator-stale", "old-run"),
+        ];
+        for (slug, parent_slug, parent_run) in children {
+            let mut child = mission(2);
+            child.dispatch = Some(corpus_core::MissionDispatch {
+                parent: corpus_core::MissionRunRef {
+                    project: "p".into(),
+                    mission: parent_slug.into(),
+                    run_id: parent_run.into(),
+                },
+                child_run_id: Some(format!("{slug}-run")),
+                live_seen: true,
+                running_seen: true,
+                completion: Some(corpus_core::MissionCompletion::Completed { at: 3 }),
+                delivery_attempt: 0,
+                delivery_message_id: None,
+                delivered: slug == "child-a1",
+            });
+            store.write_mission("p", slug, &child, "work").unwrap();
+        }
+
+        let service = RecordingQueueService::default();
+        deliver_completed_dispatches(
+            &store,
+            &service,
+            &["run-a".into(), "run-b".into(), "old-run".into()],
+        )
+        .unwrap();
+        // Admission is not delivery. A later pass observes the exact curator
+        // turn's successful terminal state and acknowledges it.
+        deliver_completed_dispatches(
+            &store,
+            &service,
+            &["run-a".into(), "run-b".into(), "old-run".into()],
+        )
+        .unwrap();
+        let mut calls = service.calls.lock().unwrap().clone();
+        calls.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].run_id, "run-a");
+        assert_eq!(calls[0].session_id, "ses_a");
+        assert!(calls[0].message_id.starts_with("msg_corpus"));
+        assert!(calls[0].prompt.contains("p/child-a1"));
+        assert!(calls[0].prompt.contains("p/child-a2"));
+        assert!(!calls[0].prompt.contains("child-b1"));
+        assert_eq!(calls[1].run_id, "run-b");
+        assert_ne!(calls[0].password, calls[1].password);
+        assert!(calls[1].prompt.contains("p/child-b1"));
+        assert!(store
+            .load_mission("p", "child-a1")
+            .unwrap()
+            .dispatch
+            .unwrap()
+            .delivered);
+        assert!(!store
+            .load_mission("p", "child-stale")
+            .unwrap()
+            .dispatch
+            .unwrap()
+            .delivered);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_queue_admission_remains_retryable_with_the_same_message_id() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-delivery-retry-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.join("store"));
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "operator", corpus_core::AgentRole::Tester)
+            .unwrap();
+        let mut parent = mission(1);
+        parent.session = Some("run-a".into());
+        parent.control = Some(corpus_core::MissionControl {
+            run_id: "run-a".into(),
+            port: 41_001,
+        });
+        parent.opencode_session = Some("ses_a".into());
+        store
+            .write_mission("p", "curator", &parent, "curate")
+            .unwrap();
+        let mut child = mission(2);
+        child.dispatch = Some(corpus_core::MissionDispatch {
+            parent: corpus_core::MissionRunRef {
+                project: "p".into(),
+                mission: "curator".into(),
+                run_id: "run-a".into(),
+            },
+            child_run_id: Some("child-run".into()),
+            live_seen: true,
+            running_seen: true,
+            completion: Some(corpus_core::MissionCompletion::UnexpectedExit { at: 3 }),
+            delivery_attempt: 0,
+            delivery_message_id: None,
+            delivered: false,
+        });
+        store.write_mission("p", "child", &child, "work").unwrap();
+
+        let service = RecordingQueueService::default();
+        service.fail.store(true, Ordering::Relaxed);
+        assert!(deliver_completed_dispatches(&store, &service, &["run-a".into()]).is_err());
+        assert!(!store
+            .load_mission("p", "child")
+            .unwrap()
+            .dispatch
+            .unwrap()
+            .delivered);
+        service.fail.store(false, Ordering::Relaxed);
+        deliver_completed_dispatches(&store, &service, &["run-a".into()]).unwrap();
+        assert!(!store
+            .load_mission("p", "child")
+            .unwrap()
+            .dispatch
+            .unwrap()
+            .delivered);
+        deliver_completed_dispatches(&store, &service, &["run-a".into()]).unwrap();
+        let calls = service.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].prompt.contains("exited unexpectedly"));
+        assert!(store
+            .load_mission("p", "child")
+            .unwrap()
+            .dispatch
+            .unwrap()
+            .delivered);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admitted_prompt_is_not_delivered_when_the_curator_model_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-delivery-model-failure-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.join("store"));
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        store
+            .create_agent_with_role("p", "operator", corpus_core::AgentRole::Tester)
+            .unwrap();
+        let mut parent = mission(1);
+        parent.session = Some("run-a".into());
+        parent.control = Some(corpus_core::MissionControl {
+            run_id: "run-a".into(),
+            port: 41_001,
+        });
+        parent.opencode_session = Some("ses_a".into());
+        store
+            .write_mission("p", "curator", &parent, "curate")
+            .unwrap();
+        let mut child = mission(2);
+        child.dispatch = Some(corpus_core::MissionDispatch {
+            parent: corpus_core::MissionRunRef {
+                project: "p".into(),
+                mission: "curator".into(),
+                run_id: "run-a".into(),
+            },
+            child_run_id: Some("child-run".into()),
+            live_seen: true,
+            running_seen: true,
+            completion: Some(corpus_core::MissionCompletion::Completed { at: 3 }),
+            delivery_attempt: 0,
+            delivery_message_id: None,
+            delivered: false,
+        });
+        store.write_mission("p", "child", &child, "work").unwrap();
+
+        let service = RecordingQueueService::default();
+        *service.prompt_state.lock().unwrap() =
+            PromptDeliveryState::Failed {
+                error: "Model unavailable".into(),
+                retry_ready: false,
+            };
+        deliver_completed_dispatches(&store, &service, &["run-a".into()]).unwrap();
+        let admitted = store.load_mission("p", "child").unwrap().dispatch.unwrap();
+        assert_eq!(admitted.delivery_attempt, 1);
+        assert!(admitted.delivery_message_id.is_some());
+        assert!(!admitted.delivered);
+
+        let error = deliver_completed_dispatches(&store, &service, &["run-a".into()])
+            .unwrap_err();
+        assert!(error.contains("Model unavailable"));
+        assert_eq!(service.calls.lock().unwrap().len(), 1);
+        let failed = store.load_mission("p", "child").unwrap().dispatch.unwrap();
+        assert!(!failed.delivered);
+        assert_eq!(failed.delivery_message_id, admitted.delivery_message_id);
+
+        // Reconciliation remains observational after the failure; it does
+        // not mint fresh prompt ids and spin the paid model overnight.
+        assert!(deliver_completed_dispatches(&store, &service, &["run-a".into()]).is_err());
+        assert_eq!(service.calls.lock().unwrap().len(), 1);
+
+        *service.prompt_state.lock().unwrap() = PromptDeliveryState::Failed {
+            error: "Model unavailable".into(),
+            retry_ready: true,
+        };
+        assert!(deliver_completed_dispatches(&store, &service, &["run-a".into()]).is_err());
+        assert!(store
+            .load_mission("p", "child")
+            .unwrap()
+            .dispatch
+            .unwrap()
+            .delivery_message_id
+            .is_none());
+        *service.prompt_state.lock().unwrap() = PromptDeliveryState::Acknowledged;
+        deliver_completed_dispatches(&store, &service, &["run-a".into()]).unwrap();
+        assert_eq!(service.calls.lock().unwrap().len(), 2);
+        let retried = store.load_mission("p", "child").unwrap().dispatch.unwrap();
+        assert_eq!(retried.delivery_attempt, 2);
+        assert_ne!(retried.delivery_message_id, admitted.delivery_message_id);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

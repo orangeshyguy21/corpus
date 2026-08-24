@@ -155,7 +155,7 @@ corpus plugin call <name> <method> [params-json]
 # opencode runs with that dir as cwd: each project owns its agent set AND
 # its opencode session pool, and no other project exists in its namespace. The app
 # launches the FULL opencode TUI in a
-# DETACHED tmux session (corpus-<agent>-<ts>) and shows it in the
+# DETACHED tmux session (corpus-<run-stem>-<ts>) and shows it in the
 # EMBEDDED terminal pane (egui_term; the pane runs `tmux attach`
 # in-process — no external-terminal popup): click the pane to steer,
 # and the run survives attach/detach/app-close; a relaunched app lists
@@ -447,6 +447,12 @@ one that should be reading attacker-controlled text.
   agent may write with opencode's own file tools.
 - **It may launch.** `mission_launch` starts a prepared project mission; that
   mutation is scoped and audit-recorded like its other management acts.
+  It may dispatch several independent missions and continue other management
+  work in the same turn. Waiting is app-owned: `mission_await` is denied to
+  every project agent because keeping an inference turn alive to supervise
+  child work burns credits without making a decision. `mission_status` remains
+  available for one intentional snapshot, never a polling loop. Event-driven
+  continuation is tracked in `dev/curator-orchestration-plan.md`.
 
 ## Debugging a run: the refusal log
 

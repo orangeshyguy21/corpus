@@ -1426,6 +1426,7 @@ dependencies = [
  "anyhow",
  "corpus-admin",
  "corpus-core",
+ "corpus-observe",
  "eframe",
  "egui",
  "egui-phosphor",
@@ -1464,6 +1465,7 @@ version = "0.1.0"
 dependencies = [
  "corpus-observe",
  "corpus-store",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "serde_yaml",

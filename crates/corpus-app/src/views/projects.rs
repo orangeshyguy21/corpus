@@ -1439,22 +1439,44 @@ fn mission_log_list(ui: &mut Ui, state: &AppState, total: u64) {
     }
 }
 
-/// The Cost section's headline: the two figures that matter at a glance —
-/// total tokens across the project, and total USD. Cost stays $0 for local /
-/// free providers, so tokens lead: they are the real usage signal here. The
-/// per-model table below is the breakdown.
+/// The Cost section's headline: usage, measured inference time, and spend.
 fn cost_headline(ui: &mut Ui, report: &corpus_core::CostReport) {
-    let stat = |ui: &mut Ui, value: String, label: &str| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new(value).size(22.0).strong().color(theme::TEXT));
-            ui.add_space(2.0);
-            ui.label(RichText::new(label).size(11.0).color(theme::TEXT_FAINT));
-        });
+    let stat = |ui: &mut Ui, value: String, label: &str, hover: Option<String>| {
+        let response = ui
+            .vertical(|ui| {
+                ui.label(RichText::new(value).size(22.0).strong().color(theme::TEXT));
+                ui.add_space(2.0);
+                ui.label(RichText::new(label).size(11.0).color(theme::TEXT_FAINT));
+            })
+            .response;
+        if let Some(hover) = hover {
+            response.on_hover_text(hover);
+        }
     };
     ui.horizontal(|ui| {
-        stat(ui, crate::fmt::fmt_tokens(report.tokens), "total tokens");
+        stat(
+            ui,
+            crate::fmt::fmt_tokens(report.tokens),
+            "total tokens",
+            None,
+        );
         ui.add_space(32.0);
-        stat(ui, crate::fmt::fmt_usd(report.cost), "total cost");
+        stat(
+            ui,
+            if report.timed_messages == 0 {
+                "—".into()
+            } else {
+                crate::fmt::fmt_duration(report.inference_ms)
+            },
+            "inference time",
+            Some(format!(
+                "Measured across {} of {} assistant messages; excludes tool execution.",
+                report.timed_messages,
+                report.rows.iter().map(|row| row.messages).sum::<u64>()
+            )),
+        );
+        ui.add_space(32.0);
+        stat(ui, crate::fmt::fmt_usd(report.cost), "total cost", None);
     });
 }
 
@@ -1479,10 +1501,11 @@ fn cost_table(ui: &mut Ui, report: &corpus_core::CostReport) {
         .column(Column::exact(70.0)) // reasoning
         .column(Column::exact(70.0)) // cache read
         .column(Column::exact(70.0)) // cache write
+        .column(Column::exact(75.0)) // inference time
         .column(Column::exact(90.0)) // cost
         .header(20.0, |mut header| {
             for title in [
-                "model", "provider", "in", "out", "reason", "cache r", "cache w", "cost",
+                "model", "provider", "in", "out", "reason", "cache r", "cache w", "time", "cost",
             ] {
                 header.col(|ui| {
                     ui.label(heading(title));
@@ -1512,6 +1535,17 @@ fn cost_table(ui: &mut Ui, report: &corpus_core::CostReport) {
                     });
                     tr.col(|ui| {
                         ui.label(num(crate::fmt::fmt_tokens(row.cache_write)));
+                    });
+                    tr.col(|ui| {
+                        let value = if row.timed_messages == 0 {
+                            "—".into()
+                        } else {
+                            crate::fmt::fmt_duration(row.inference_ms)
+                        };
+                        ui.label(num(value)).on_hover_text(format!(
+                            "Measured across {} of {} assistant messages; excludes tool execution.",
+                            row.timed_messages, row.messages
+                        ));
                     });
                     tr.col(|ui| {
                         ui.label(
@@ -1561,6 +1595,14 @@ fn cost_table(ui: &mut Ui, report: &corpus_core::CostReport) {
                 });
                 tr.col(|ui| {
                     ui.label(strong_num(crate::fmt::fmt_tokens(total_cw)));
+                });
+                tr.col(|ui| {
+                    let value = if report.timed_messages == 0 {
+                        "—".into()
+                    } else {
+                        crate::fmt::fmt_duration(report.inference_ms)
+                    };
+                    ui.label(strong_num(value));
                 });
                 tr.col(|ui| {
                     ui.label(strong_num(crate::fmt::fmt_usd(report.cost)));

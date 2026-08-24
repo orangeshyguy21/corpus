@@ -124,7 +124,7 @@ const RESEARCHER_TOOLS: [&str; 2] = ["corpus_target_info", "corpus_technique_sav
 /// - project lifecycle and cross-project operations remain operator-only;
 /// - Curator may delete agents, missions, and corpus entries inside the
 ///   injected project, but only Super may wipe that project's whole corpus.
-pub const CURATOR_TOOLS: [&str; 28] = [
+pub const CURATOR_TOOLS: [&str; 27] = [
     "agent_list",
     "agent_get",
     "agent_new",
@@ -139,7 +139,6 @@ pub const CURATOR_TOOLS: [&str; 28] = [
     "mission_list",
     "mission_get",
     "mission_status",
-    "mission_await",
     "mission_new",
     "mission_launch",
     "mission_delete",
@@ -158,7 +157,44 @@ pub const CURATOR_TOOLS: [&str; 28] = [
 /// Super's project-management surface: Curator plus project-local corpus wipe.
 /// Destructive calls still pass through scope injection, audit recording, and
 /// the server's dry-run/token confirmation gate.
-pub const SUPER_ADMIN_TOOLS: [&str; 29] = [
+pub const SUPER_ADMIN_TOOLS: [&str; 28] = [
+    "agent_list",
+    "agent_get",
+    "agent_new",
+    "agent_save",
+    "agent_clone",
+    "agent_delete",
+    "agent_set",
+    "agent_set_role",
+    "agent_set_permission",
+    "agent_subagent_add",
+    "agent_subagent_remove",
+    "mission_list",
+    "mission_get",
+    "mission_status",
+    "mission_new",
+    "mission_launch",
+    "mission_delete",
+    "mission_set_budget",
+    "mission_set_pins",
+    "corpus_wipe",
+    "corpus_stats",
+    "corpus_list",
+    "corpus_read",
+    "finding_list",
+    "entry_delete",
+    "entry_move",
+    "entry_write",
+    "model_list",
+];
+
+/// Every project-management permission on which a project role has an
+/// opinion. This is deliberately wider than Super's grant set: retired or
+/// operator-only model-facing tools remain here so a stored `allow` cannot
+/// survive into a rendered agent merely because the server stopped advertising
+/// the tool. `mission_await` is the first such case — waiting is app-owned,
+/// never an agent capability.
+const PROJECT_MANAGEMENT_TOOLS: [&str; 29] = [
     "agent_list",
     "agent_get",
     "agent_new",
@@ -189,11 +225,6 @@ pub const SUPER_ADMIN_TOOLS: [&str; 29] = [
     "entry_write",
     "model_list",
 ];
-
-/// Every project-management permission on which a project role has an
-/// opinion. Alias the widest scoped catalog so render rules cannot drift from
-/// Super's server grant set.
-const PROJECT_MANAGEMENT_TOOLS: [&str; 29] = SUPER_ADMIN_TOOLS;
 
 impl AgentRole {
     /// Parse a role name (config, CLI flag, sidecar).
@@ -1210,12 +1241,28 @@ impl Store {
         Ok(out)
     }
 
-    /// Delete an agent directory.
+    /// Missions assigned to an agent. Kept here with agent deletion so every
+    /// caller (app, CLI, host admin, or scoped curator) observes the same
+    /// ownership rule.
+    pub fn missions_for_agent(&self, project: &str, slug: &str) -> Result<Vec<String>> {
+        validate_slug(slug)?;
+        Ok(self
+            .list_missions(project)?
+            .into_iter()
+            .filter_map(|(mission_slug, mission)| (mission.agent == slug).then_some(mission_slug))
+            .collect())
+    }
+
+    /// Delete an agent directory and every mission assigned to it. Mission
+    /// records must not outlive the agent reference required to load them.
     pub fn delete_agent(&self, project: &str, slug: &str) -> Result<()> {
         validate_slug(slug)?;
         let dir = self.project_agent_dir(project, slug);
         if !dir.join("opencode.json").is_file() {
             return Err(Error::Store(format!("agent not found: {project}/{slug}")));
+        }
+        for mission in self.missions_for_agent(project, slug)? {
+            self.delete_mission(project, &mission)?;
         }
         fs::remove_dir_all(&dir)?;
         Ok(())
@@ -2825,8 +2872,15 @@ mod tests {
                 "deny"
             };
             assert_eq!(cur[&key].as_str(), Some(expected), "curator: {key}");
-            assert_eq!(sup[&key].as_str(), Some("allow"), "super: {key}");
+            let expected = if SUPER_ADMIN_TOOLS.contains(&tool) {
+                "allow"
+            } else {
+                "deny"
+            };
+            assert_eq!(sup[&key].as_str(), Some(expected), "super: {key}");
         }
+        assert_eq!(cur["corpus_mission_await"].as_str(), Some("deny"));
+        assert_eq!(sup["corpus_mission_await"].as_str(), Some("deny"));
         // And the reverse: a curator holds no sandbox tools at all.
         for tool in CORPUS_TOOLS {
             assert_eq!(cur[tool].as_str(), Some("deny"), "curator: {tool}");
@@ -3805,4 +3859,5 @@ mod tests {
         assert!(err.to_string().contains("agent_new"), "{err}");
         let _ = fs::remove_dir_all(store.root());
     }
+
 }

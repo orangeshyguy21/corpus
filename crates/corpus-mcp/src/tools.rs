@@ -154,10 +154,40 @@ pub struct Ctx {
     /// agent omits it — the sandbox has no host FS and cannot enumerate
     /// `runs/`, so without this the agent must guess.
     pub run_log: Option<String>,
+    /// Exact mission/run identity supplied by the app launcher. `Ok(None)` is
+    /// a legacy/manual process with no automatic return address; `Err` means a
+    /// partial or malformed identity and makes mission dispatch fail closed.
+    pub run_origin: std::result::Result<Option<corpus_core::MissionRunRef>, String>,
 }
 
 /// Minimum interval between re-probes while the gate is closed.
 const REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn resolve_run_origin(
+    scope: &std::result::Result<Scope, String>,
+    mission: Option<String>,
+    run_id: Option<String>,
+) -> std::result::Result<Option<corpus_core::MissionRunRef>, String> {
+    match (mission, run_id) {
+        (None, None) => Ok(None),
+        (Some(mission), Some(run_id)) => scope.as_ref().map_err(Clone::clone).and_then(|scope| {
+            corpus_core::validate_slug(&mission).map_err(|error| error.to_string())?;
+            if run_id.len() > 512 || run_id.chars().any(char::is_whitespace) {
+                return Err("CORPUS_RUN_ID is malformed".to_string());
+            }
+            Ok(Some(corpus_core::MissionRunRef {
+                project: scope.project.clone(),
+                mission,
+                run_id,
+            }))
+        }),
+        _ => Err(format!(
+            "{} and {} must be set together",
+            corpus_core::MISSION_ENV,
+            corpus_core::RUN_ID_ENV
+        )),
+    }
+}
 
 impl Ctx {
     /// Resolve from the environment.
@@ -267,6 +297,13 @@ impl Ctx {
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .and_then(|v| v.as_object().cloned());
         let run_log = std::env::var(corpus_core::RUN_LOG_ENV).ok().filter(|s| !s.is_empty());
+        let mission_env = std::env::var(corpus_core::MISSION_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let run_id_env = std::env::var(corpus_core::RUN_ID_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let run_origin = resolve_run_origin(&scope, mission_env, run_id_env);
         // The role is resolved against a PROVEN scope: an agent name is only
         // meaningful inside a project, so a scope failure is a role failure.
         let role = scope
@@ -297,6 +334,7 @@ impl Ctx {
             source_pins,
             environment_session,
             run_log,
+            run_origin,
         })
     }
 
@@ -319,6 +357,7 @@ impl Ctx {
             source_pins: None,
             environment_session: None,
             run_log: None,
+            run_origin: Ok(None),
         }
     }
 
@@ -1752,6 +1791,33 @@ mod tests {
         assert_eq!(
             shell_single_quote("can't $(escape)"),
             "'can'\"'\"'t $(escape)'"
+        );
+    }
+
+    #[test]
+    fn run_origin_requires_the_launcher_identity_pair_and_uses_proven_scope() {
+        let scope = Ok(Scope::new("alpha"));
+        assert_eq!(resolve_run_origin(&scope, None, None).unwrap(), None);
+        assert!(resolve_run_origin(&scope, Some("curator".into()), None).is_err());
+        assert!(resolve_run_origin(&scope, None, Some("run-1".into())).is_err());
+        assert!(resolve_run_origin(
+            &scope,
+            Some("curator".into()),
+            Some("run id with spaces".into())
+        )
+        .is_err());
+        assert_eq!(
+            resolve_run_origin(
+                &scope,
+                Some("curator".into()),
+                Some("p5-alpha-m7-curator-g2".into())
+            )
+            .unwrap(),
+            Some(corpus_core::MissionRunRef {
+                project: "alpha".into(),
+                mission: "curator".into(),
+                run_id: "p5-alpha-m7-curator-g2".into(),
+            })
         );
     }
 }

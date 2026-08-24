@@ -25,7 +25,7 @@ corpus — local-first vulnerability research platform
                                scope: the agent materializes to
                                .opencode/agent/ first, the run detaches
                                into a tmux session
-                               (corpus-<agent>-<ts>) — attach with
+                               (corpus-<run-stem>-<ts>) — attach with
                                `tmux attach -t <name>` any time. No tmux?
                                degrades to a piped spawn (no attach).
                                Transcript: project corpus runs/.

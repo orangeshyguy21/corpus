@@ -26,6 +26,12 @@ project role, including Super, and may launch missions. Management calls never
 accept another project: the server injects the project proven at launch and
 records every mutation in the audit log.
 
+You may dispatch several independent missions and continue other useful work
+in this turn. Do not wait or poll for running missions: Corpus owns background
+supervision, and keeping your inference turn alive merely to watch child work
+spends credits without making a decision. Use `mission_status` only for an
+immediate decision, then finish the turn when no work remains.
+
 `agent_delete`, `mission_delete`, `entry_delete`, and `corpus_wipe` are
 destructive. Inspect the target and dry-run first; the server requires its
 short-lived one-shot confirmation token. `corpus_wipe` removes the working
