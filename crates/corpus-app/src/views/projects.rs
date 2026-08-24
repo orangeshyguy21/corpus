@@ -614,7 +614,7 @@ impl ProjectsView {
     fn delete_project(&mut self, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
         match state.delete_project(slug) {
             Ok(()) => {
-                toast(toasts, ToastKind::Success, "project deleted");
+                toast(toasts, ToastKind::Success, "project deletion started");
                 state.refresh();
                 // ensure_selection re-picks a project next frame.
                 state.selected_project = None;
@@ -1222,7 +1222,7 @@ fn plugin_environments(
                     components::StatusTone::Danger
                 },
             );
-            ui.label(
+            let mission = ui.label(
                 RichText::new(format!(
                     "{} · {:?} · plugin {}",
                     lease.mission, lease.state, lease.plugin_version
@@ -1231,6 +1231,9 @@ fn plugin_environments(
                 .size(12.0)
                 .color(theme::TEXT),
             );
+            if lease.mission != lease.mission_slug {
+                mission.on_hover_text(format!("mission id: {}", lease.mission_slug));
+            }
         });
         identity_line(ui, "bundle", &lease.plugin_digest);
         if let Some(lock) = lease.environment_lock.as_deref() {
@@ -1252,7 +1255,11 @@ fn plugin_environments(
         if let Some(error) = lease.error.as_deref() {
             ui.label(RichText::new(error).size(12.0).color(theme::SIGNAL_RED));
         }
-        if lease.orphaned && ui.button("Clean orphan").clicked() {
+        if lease.orphaned
+            && (lease.state == corpus_core::EnvironmentSessionState::Failed
+                || lease.error.is_some())
+            && ui.button("Retry cleanup").clicked()
+        {
             match state.cleanup_orphan_environment(plugin_id, &lease.session_key) {
                 Ok(true) => toast(
                     toasts,

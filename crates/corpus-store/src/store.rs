@@ -374,6 +374,10 @@ pub struct Project {
     /// at its default rev.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pins: BTreeMap<String, String>,
+    /// Durable lifecycle intent consumed by the desktop app. The project
+    /// remains present until every mission environment has been torn down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_requested: Option<MissionDeleteRequest>,
 }
 
 impl Project {
@@ -1156,6 +1160,7 @@ impl Store {
             cloned_from: None,
             corpus_generation: 0,
             pins: BTreeMap::new(),
+            delete_requested: None,
         };
         fs::create_dir_all(self.project_agents_dir(slug))?;
         fs::create_dir_all(self.project_missions_dir(slug))?;
@@ -1219,6 +1224,16 @@ impl Store {
         Ok(())
     }
 
+    /// Persist a project deletion request for the app lifecycle reconciler.
+    pub fn request_project_delete(&self, slug: &str) -> Result<()> {
+        validate_slug(slug)?;
+        let mut project = Project::load(self, slug)?;
+        project.delete_requested.get_or_insert(MissionDeleteRequest {
+            requested_at: now_epoch(),
+        });
+        project.save(self, slug)
+    }
+
     /// Clone a project: config + agents + missions, corpus copy optional.
     /// The clone mirrors its source exactly.
     pub fn clone_project(
@@ -1229,10 +1244,21 @@ impl Store {
         with_corpus: bool,
     ) -> Result<Project> {
         let source = Project::load(self, from)?;
+        if source.delete_requested.is_some()
+            || self
+                .list_agents(from)?
+                .iter()
+                .any(|(_, agent)| agent.meta.delete_requested.is_some())
+        {
+            return Err(Error::Store(format!(
+                "project {from} or one of its agents is pending deletion"
+            )));
+        }
         self.create_project(to, name.unwrap_or(&source.name), &source.plugin)?;
         let project = Project {
             name: name.unwrap_or(&source.name).to_string(),
             cloned_from: Some(from.to_string()),
+            delete_requested: None,
             ..source
         };
         project.save(self, to)?;
@@ -1510,12 +1536,22 @@ impl Store {
         brief: &str,
     ) -> Result<()> {
         validate_slug(slug)?;
-        if Project::load(self, project).is_err() {
-            return Err(Error::Store(format!("project not found: {project}")));
+        let project_record = Project::load(self, project)
+            .map_err(|_| Error::Store(format!("project not found: {project}")))?;
+        if project_record.delete_requested.is_some() {
+            return Err(Error::Store(format!(
+                "project {project} is pending deletion"
+            )));
         }
         // The agent ref must resolve on the project.
-        self.load_agent(project, &mission.agent)
+        let agent = self.load_agent(project, &mission.agent)
             .map_err(|e| Error::Store(format!("mission {slug}: agent {:?}: {e}", mission.agent)))?;
+        if agent.meta.delete_requested.is_some() {
+            return Err(Error::Store(format!(
+                "agent {project}/{} is pending deletion",
+                mission.agent
+            )));
+        }
         mission.save(self, project, slug, brief)
     }
 

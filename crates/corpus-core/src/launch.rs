@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::models::ModelRegistry;
@@ -1125,20 +1125,47 @@ fn find_opencode_session(
 /// `opencode export <id>` -> the pretty JSON transcript. The JSON is on
 /// stdout; the "Exporting…" chatter is on stderr.
 fn export_opencode_json(cwd: &Path, session_id: &str) -> Result<String> {
+    export_opencode_json_with_timeout(cwd, session_id, Duration::from_secs(10))
+}
+
+fn export_opencode_json_with_timeout(
+    cwd: &Path,
+    session_id: &str,
+    command_timeout: Duration,
+) -> Result<String> {
     let opencode = resolve_opencode()?;
+    let deadline = Instant::now() + command_timeout;
     let mut last_eof = None;
     for delay_ms in [0, 50, 150] {
         if delay_ms != 0 {
             std::thread::sleep(Duration::from_millis(delay_ms));
         }
-        let output = Command::new(&opencode)
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Store(format!(
+                "opencode export timed out after {}s",
+                command_timeout.as_secs_f32()
+            )));
+        }
+        let mut command = Command::new(&opencode);
+        command
             .arg("export")
             .arg(session_id)
-            .current_dir(cwd)
-            .output()
-            .map_err(|e| Error::Store(format!("opencode export failed: {e}")))?;
+            .current_dir(cwd);
+        let output = managed_command_output(command, remaining, 128 * 1024 + 1)?;
         if !output.status.success() {
-            return Err(Error::Store("opencode export reported an error".into()));
+            let detail = String::from_utf8_lossy(&output.stderr);
+            let detail = detail.trim();
+            return Err(Error::Store(if detail.is_empty() {
+                "opencode export reported an error".into()
+            } else {
+                format!("opencode export reported an error: {detail}")
+            }));
+        }
+        if output.stdout_truncated {
+            return Err(Error::Store(
+                "opencode export exceeded its 128 KiB output cap".into(),
+            ));
         }
         match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
             Ok(value) => {
@@ -1167,6 +1194,109 @@ fn export_opencode_json(cwd: &Path, session_id: &str) -> Result<String> {
         "opencode export gave incomplete JSON after 3 attempts: {}",
         last_eof.expect("each attempt ended at EOF")
     )))
+}
+
+struct ManagedOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+}
+
+/// Run a subprocess with explicit ownership. `Command::output()` cannot be
+/// interrupted by the app's cooperative job token; a stuck exporter would
+/// outlive its coordinator and allow a replacement job to pile up beside it.
+/// This runner bounds both time and retained output, kills the whole process
+/// group on timeout, and reaps the child before returning.
+fn managed_command_output(
+    mut command: Command,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<ManagedOutput> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| Error::Store(format!("opencode export failed: {error}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Store("opencode export stdout was not captured".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::Store("opencode export stderr was not captured".into()))?;
+    let stdout_reader = std::thread::spawn(move || read_stream_capped(stdout, stdout_limit));
+    let stderr_reader = std::thread::spawn(move || read_stream_capped(stderr, 64 * 1024));
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let cleanup = kill_tree_checked(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(Error::Store(if cleanup.is_empty() {
+                    format!("opencode export timed out after {}s", timeout.as_secs_f32())
+                } else {
+                    format!(
+                        "opencode export timed out after {}s; cleanup: {}",
+                        timeout.as_secs_f32(),
+                        cleanup.join("; ")
+                    )
+                }));
+            }
+            Err(error) => {
+                let cleanup = kill_tree_checked(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(Error::Store(format!(
+                    "cannot wait for opencode export: {error}; cleanup: {}",
+                    cleanup.join("; ")
+                )));
+            }
+        }
+    };
+    let (stdout, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| Error::Store("opencode export stdout reader panicked".into()))??;
+    let (stderr, _) = stderr_reader
+        .join()
+        .map_err(|_| Error::Store("opencode export stderr reader panicked".into()))??;
+    Ok(ManagedOutput {
+        status,
+        stdout,
+        stderr,
+        stdout_truncated,
+    })
+}
+
+fn read_stream_capped(
+    mut stream: impl Read,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut retained = Vec::with_capacity(limit.min(16 * 1024));
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(retained.len());
+        let keep = remaining.min(read);
+        retained.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
+    Ok((retained, truncated))
 }
 
 fn valid_existing_export(path: &Path) -> bool {
@@ -1707,9 +1837,33 @@ fn kill_tree_checked(child: &mut Child) -> Vec<String> {
         let pgid = child.id().to_string();
         if let Err(error) = Command::new("kill")
             .args(["-TERM", &format!("-{pgid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
         {
             errors.push(format!("signal process group {pgid}: {error}"));
+        }
+        let grace_started = Instant::now();
+        while grace_started.elapsed() < Duration::from_millis(150) {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    errors.push(format!("poll child {} during cleanup: {error}", child.id()));
+                    break;
+                }
+            }
+        }
+        // TERM is advisory. A descendant that keeps stdout/stderr open would
+        // otherwise keep the reader threads alive after the direct child is
+        // killed, so the whole owned group gets a final KILL before reap.
+        if let Err(error) = Command::new("kill")
+            .args(["-KILL", &format!("-{pgid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            errors.push(format!("kill process group {pgid}: {error}"));
         }
     }
     if let Err(error) = child.kill() {
@@ -1796,6 +1950,41 @@ mod tests {
             serde_json::json!({"messages": []})
         );
         assert_eq!(fs::read_to_string(bin.join("attempts")).unwrap(), "2");
+        let _ = fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn hanging_opencode_export_is_killed_and_reaped() {
+        let bin = unique_temp_path("opencode-export-timeout");
+        fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("opencode");
+        let pid_file = bin.join("pid");
+        let quoted_pid = shell_quote(&pid_file.to_string_lossy());
+        fs::write(
+            &fake,
+            format!("#!/bin/sh\nprintf '%s' \"$$\" > {quoted_pid}\nsleep 30\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let mut command = Command::new(&fake);
+        command.current_dir(&bin);
+        let error = managed_command_output(command, Duration::from_secs(1), 128 * 1024)
+            .err()
+            .expect("hanging child must time out");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "timed-out exporter process {pid} still exists");
         let _ = fs::remove_dir_all(&bin);
     }
 

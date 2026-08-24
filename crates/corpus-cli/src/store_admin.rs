@@ -84,8 +84,17 @@ pub fn project_cmd(args: &[String]) -> Result<(), String> {
         }
         Some("delete") => {
             let slug = args.get(1).ok_or("usage: corpus project delete <slug>")?;
-            store.delete_project(slug).map_err(|e| e.to_string())?;
-            println!("deleted project {slug}");
+            let missions = store.list_missions(slug).map_err(|e| e.to_string())?;
+            if missions
+                .iter()
+                .any(|(mission, _)| store.ensure_mission_deletable(slug, mission).is_err())
+            {
+                store.request_project_delete(slug).map_err(|e| e.to_string())?;
+                println!("requested deletion of project {slug}; the app will tear down its missions first");
+            } else {
+                store.delete_project(slug).map_err(|e| e.to_string())?;
+                println!("deleted project {slug}");
+            }
             Ok(())
         }
         Some("wipe") => {
@@ -197,10 +206,23 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
             let slug = args
                 .get(2)
                 .ok_or("usage: corpus agent delete <project> <slug>")?;
-            store
-                .delete_agent(project, slug)
+            let missions = store
+                .missions_for_agent(project, slug)
                 .map_err(|e| e.to_string())?;
-            println!("deleted agent {project}/{slug}");
+            if missions
+                .iter()
+                .any(|mission| store.ensure_mission_deletable(project, mission).is_err())
+            {
+                store
+                    .request_agent_delete(project, slug)
+                    .map_err(|e| e.to_string())?;
+                println!("requested deletion of agent {project}/{slug}; the app will tear down its missions first");
+            } else {
+                store
+                    .delete_agent(project, slug)
+                    .map_err(|e| e.to_string())?;
+                println!("deleted agent {project}/{slug}");
+            }
             Ok(())
         }
         "role" => {

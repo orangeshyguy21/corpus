@@ -190,7 +190,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "project_delete",
-            "description": "CONFIRM-GATED. Delete a project (whole subtree). Dry-run first; returns a one-shot token to complete.",
+            "description": "CONFIRM-GATED. Delete a project (whole subtree), lifecycle-tearing down contained missions first when needed. Dry-run first; returns a one-shot token to complete.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -363,7 +363,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "agent_delete",
-            "description": "CONFIRM-GATED. Delete an agent and every mission assigned to it. Dry-run first; returns a one-shot token and lists the missions that will also be deleted.",
+            "description": "CONFIRM-GATED. Delete an agent and every mission assigned to it, lifecycle-tearing down those missions first when needed. Dry-run first; returns a one-shot token and lists the missions that will also be deleted.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -733,8 +733,22 @@ fn project_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let slug = require_str(args, "slug")?;
     if let Some(token) = args.get("confirm_token").and_then(Value::as_str) {
         confirm_and_run(ctx, "project_delete", &slug, token, |store| {
-            store.delete_project(&slug).map_err(|e| Error::Args(e.to_string()))?;
-            Ok(format!("deleted project {slug}"))
+            let missions = store
+                .list_missions(&slug)
+                .map_err(|e| Error::Args(e.to_string()))?;
+            if missions.iter().any(|(mission, _)| {
+                store.ensure_mission_deletable(&slug, mission).is_err()
+            }) {
+                store
+                    .request_project_delete(&slug)
+                    .map_err(|e| Error::Args(e.to_string()))?;
+                Ok(format!(
+                    "requested deletion of project {slug}; the app will tear down its missions first"
+                ))
+            } else {
+                store.delete_project(&slug).map_err(|e| Error::Args(e.to_string()))?;
+                Ok(format!("deleted project {slug}"))
+            }
         })
     } else {
         let p = load_project(&ctx.store, &slug)?;
@@ -1008,12 +1022,25 @@ fn agent_delete(ctx: &mut Ctx, args: &Value) -> Result<String> {
             let missions = store
                 .missions_for_agent(&project, &agent)
                 .map_err(|e| Error::Args(e.to_string()))?;
-            store.delete_agent(&project, &agent).map_err(|e| Error::Args(e.to_string()))?;
-            Ok(format!(
-                "deleted agent {project}/{agent} and {} assigned mission(s){}",
-                missions.len(),
-                mission_list_suffix(&missions)
-            ))
+            if missions.iter().any(|mission| {
+                store.ensure_mission_deletable(&project, mission).is_err()
+            }) {
+                store
+                    .request_agent_delete(&project, &agent)
+                    .map_err(|e| Error::Args(e.to_string()))?;
+                Ok(format!(
+                    "requested deletion of agent {project}/{agent}; the app will tear down {} assigned mission(s) first{}",
+                    missions.len(),
+                    mission_list_suffix(&missions)
+                ))
+            } else {
+                store.delete_agent(&project, &agent).map_err(|e| Error::Args(e.to_string()))?;
+                Ok(format!(
+                    "deleted agent {project}/{agent} and {} assigned mission(s){}",
+                    missions.len(),
+                    mission_list_suffix(&missions)
+                ))
+            }
         })
     } else {
         // Load the target FIRST. A dry-run that mints a token for an agent
@@ -1474,6 +1501,22 @@ fn mission_launch(
         .store
         .load_mission(&project, &slug)
         .map_err(|e| Error::Args(e.to_string()))?;
+    if load_project(&ctx.store, &project)?.delete_requested.is_some() {
+        return Err(Error::Args(format!("project {project} is pending deletion")));
+    }
+    if ctx
+        .store
+        .load_agent(&project, &mission.agent)
+        .map_err(|e| Error::Args(e.to_string()))?
+        .meta
+        .delete_requested
+        .is_some()
+    {
+        return Err(Error::Args(format!(
+            "agent {project}/{} is pending deletion",
+            mission.agent
+        )));
+    }
     if mission.delete_requested.is_some() {
         return Err(Error::Args(format!(
             "mission {project}/{slug} is pending deletion"

@@ -863,21 +863,16 @@ fn row_ui(ui: &mut Ui, selected: bool, has_kebab: bool, id_seed: impl std::hash:
 ///                 live but the agent is parked at its prompt. Motion
 ///                 here would claim work that isn't happening, so the
 ///                 dot only says "attached".
-///   - `Working` — health-green with a soft pulsing halo: producing now.
-/// The pulse is pure paint off the app's live-producer clock — no widget,
-/// no state. `AppState::live_repaint_after` owns the 50 ms working cadence.
+///   - `Working` — health-green with a soft steady halo: producing now.
+/// Producer events wake egui directly; status decoration must not impose a
+/// permanent animation loop on the entire application.
 fn status_dot(ui: &Ui, rect: egui::Rect, activity: MissionActivity) {
     let center = rect.center();
     match activity {
         MissionActivity::Working => {
-            // Smooth ease-in-out pulse at ~1.4 Hz (two full breaths).
-            let t = ui.ctx().input(|i| i.time) as f32;
-            let pulse = ((t * std::f32::consts::TAU * 1.4).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-            let halo_r = 3.0 + 4.0 * pulse;
-            let core_r = 2.2 + 0.6 * (pulse - 0.5).abs() * -2.0; // slimmer at the extremes
-            let halo = theme::HEALTHY.gamma_multiply(0.10 + 0.20 * pulse);
-            ui.painter().circle_filled(center, halo_r, halo);
-            ui.painter().circle_filled(center, core_r, theme::HEALTHY);
+            ui.painter()
+                .circle_filled(center, 5.0, theme::HEALTHY.gamma_multiply(0.20));
+            ui.painter().circle_filled(center, 2.2, theme::HEALTHY);
         }
         MissionActivity::Waiting => {
             ui.painter()
@@ -1044,7 +1039,7 @@ fn section_header(ui: &mut Ui, title: &str) -> (bool, bool) {
 fn delete_project(state: &mut AppState, toasts: &mut Toasts, slug: &str) {
     match state.delete_project(slug) {
         Ok(()) => {
-            toast(toasts, ToastKind::Success, "project deleted");
+            toast(toasts, ToastKind::Success, "project deletion started");
             state.refresh();
             // ensure_selection re-picks a project next frame.
             state.selected_project = None;

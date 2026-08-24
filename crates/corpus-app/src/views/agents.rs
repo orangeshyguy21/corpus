@@ -1044,7 +1044,7 @@ impl AgentsView {
     ) -> bool {
         match state.delete_agent(project, slug) {
             Ok(()) => {
-                toast(toasts, ToastKind::Success, "agent deleted");
+                toast(toasts, ToastKind::Success, "agent deletion started");
                 state.refresh_agents(project);
                 state.refresh_missions(project);
                 // The view re-defaults to the first remaining agent.
