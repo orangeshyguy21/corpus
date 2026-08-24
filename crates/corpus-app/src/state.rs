@@ -481,9 +481,49 @@ pub struct AppState {
     /// an autonomous launch the operator did not initiate should still
     /// announce itself.
     launch_notices: Vec<LaunchNotice>,
-    /// Last distinct delivery failure already reported to the operator.
-    /// Retries remain automatic without producing a toast wall.
-    last_dispatch_delivery_error: Option<String>,
+}
+
+/// A completed background job's operator-facing notice. Keeping the job kind
+/// alongside the message lets the app condense bursts without parsing copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundNotice {
+    pub severity: BackgroundNoticeSeverity,
+    pub job_kind: JobKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundNoticeSeverity {
+    Info,
+    Error,
+    /// Silent signal used to end repeat suppression after a job recovers.
+    Resolved,
+}
+
+impl BackgroundNotice {
+    fn info(job_kind: JobKind, message: impl Into<String>) -> Self {
+        Self {
+            severity: BackgroundNoticeSeverity::Info,
+            job_kind,
+            message: message.into(),
+        }
+    }
+
+    fn error(job_kind: JobKind, message: impl Into<String>) -> Self {
+        Self {
+            severity: BackgroundNoticeSeverity::Error,
+            job_kind,
+            message: message.into(),
+        }
+    }
+
+    fn resolved(job_kind: JobKind) -> Self {
+        Self {
+            severity: BackgroundNoticeSeverity::Resolved,
+            job_kind,
+            message: String::new(),
+        }
+    }
 }
 
 /// A curator-requested launch the app carried out (or tried to), queued
@@ -844,7 +884,7 @@ impl AppState {
     /// Apply all completed jobs that still belong to current state. The
     /// returned notices are rendered as toasts by `App`; discovery failures
     /// also remain in their field state so reopening a picker is explanatory.
-    pub fn poll_background_jobs(&mut self) -> Vec<(bool, String)> {
+    pub fn poll_background_jobs(&mut self) -> Vec<BackgroundNotice> {
         let Some(mut jobs) = self.jobs.take() else {
             return Vec::new();
         };
@@ -854,6 +894,9 @@ impl AppState {
         for result in results {
             if self.retry_stale_corpus_job(result.kind, &result.scope) {
                 continue;
+            }
+            if matches!(&result.terminal, JobTerminal::Success(_)) {
+                notices.push(BackgroundNotice::resolved(result.kind));
             }
             match result.terminal {
                 JobTerminal::Success(AppJobOutput::Plugins {
@@ -890,8 +933,8 @@ impl AppState {
                         ),
                         None,
                     );
-                    notices.push((
-                        false,
+                    notices.push(BackgroundNotice::info(
+                        result.kind,
                         format!("installed {}@{}", receipt.id, receipt.version),
                     ));
                     let desired = self.plugin_probe_target.clone();
@@ -903,8 +946,8 @@ impl AppState {
                     } else {
                         format!(" ({})", lifecycle.phases.join(" → "))
                     };
-                    notices.push((
-                        false,
+                    notices.push(BackgroundNotice::info(
+                        result.kind,
                         format!(
                             "{} {} complete{}: {}",
                             lifecycle.plugin, lifecycle.operation, phases, lifecycle.result
@@ -934,7 +977,10 @@ impl AppState {
                                 &run_id.mission,
                                 &error.to_string(),
                             );
-                            notices.push((true, error.to_string()));
+                            notices.push(BackgroundNotice::error(
+                                result.kind,
+                                error.to_string(),
+                            ));
                         }
                     }
                 }
@@ -962,7 +1008,7 @@ impl AppState {
                 JobTerminal::Success(AppJobOutput::SessionMaintenance(maintenance)) => {
                     let project = result.scope.project;
                     if let Some(warning) = maintenance.warning {
-                        notices.push((false, warning));
+                        notices.push(BackgroundNotice::info(result.kind, warning));
                     }
                     let mut missions_changed = false;
                     for (slug, tmux, conversation) in maintenance.conversations {
@@ -1004,13 +1050,15 @@ impl AppState {
                     }
                     self.schedule_dispatch_deliveries();
                 }
-                JobTerminal::Success(AppJobOutput::DispatchDeliveries) => {
-                    self.last_dispatch_delivery_error = None;
-                }
+                JobTerminal::Success(AppJobOutput::DispatchDeliveries) => {}
                 JobTerminal::Success(AppJobOutput::TeardownReady(ready)) => {
                     if let Some(run_id) = result.scope.run_id.as_ref() {
-                        let message = self.apply_teardown_ready(run_id, ready);
-                        notices.push(message);
+                        let (is_error, message) = self.apply_teardown_ready(run_id, ready);
+                        notices.push(if is_error {
+                            BackgroundNotice::error(result.kind, message)
+                        } else {
+                            BackgroundNotice::info(result.kind, message)
+                        });
                     }
                 }
                 JobTerminal::Success(AppJobOutput::ProjectScope(snapshot)) => {
@@ -1079,14 +1127,7 @@ impl AppState {
                             teardown,
                         );
                     }
-                    if result.kind == JobKind::DispatchDelivery {
-                        if self.last_dispatch_delivery_error.as_deref() != Some(error.as_str()) {
-                            notices.push((true, error.clone()));
-                        }
-                        self.last_dispatch_delivery_error = Some(error);
-                    } else {
-                        notices.push((true, error));
-                    }
+                    notices.push(BackgroundNotice::error(result.kind, error));
                 }
                 JobTerminal::Cancelled => {
                     if self.retry_stale_plugin_probe(result.kind) {
@@ -1103,7 +1144,10 @@ impl AppState {
                         }
                         self.finish_run(run_id);
                     }
-                    notices.push((false, "background work cancelled".into()));
+                    notices.push(BackgroundNotice::info(
+                        result.kind,
+                        "background work cancelled",
+                    ));
                 }
                 JobTerminal::TimedOut => {
                     if self.retry_stale_plugin_probe(result.kind) {
@@ -1132,7 +1176,10 @@ impl AppState {
                             teardown,
                         );
                     }
-                    notices.push((true, format!("{} timed out", result.kind.label())));
+                    notices.push(BackgroundNotice::error(
+                        result.kind,
+                        format!("{} timed out", result.kind.label()),
+                    ));
                 }
             }
         }
@@ -1408,7 +1455,6 @@ impl AppState {
             last_exported_at: BTreeMap::new(),
             launch_requests_polled_at: None,
             launch_notices: Vec::new(),
-            last_dispatch_delivery_error: None,
         };
         if eager_refresh {
             state.refresh();

@@ -21,15 +21,18 @@ mod terminal;
 mod theme;
 mod views;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui_phosphor::regular as ph;
 
 use crate::chat::Chat as _;
+use crate::jobs::JobKind;
 use crate::nav::Screen;
 use crate::sidebar::Sidebar;
-use crate::state::AppState;
+use crate::state::{AppState, BackgroundNotice, BackgroundNoticeSeverity};
 use crate::views::{agents, components, missions, projects};
 
 /// corpus-app application state: the app's state layer, per-screen widget
@@ -45,6 +48,7 @@ struct App {
     agents: agents::AgentsView,
     missions: missions::MissionsView,
     toasts: egui_toast::Toasts,
+    background_toasts: BackgroundToastCondenser,
     /// The management chat (dev/decisions.md + dev/decisions.md): a native egui
     /// panel backed by the EMBEDDED goose runtime (`chat/embedded.rs`). All
     /// GDK lives in `chat`.
@@ -98,6 +102,7 @@ impl App {
             agents: agents::AgentsView::default(),
             missions: missions::MissionsView::default(),
             toasts: egui_toast::Toasts::new(),
+            background_toasts: BackgroundToastCondenser::default(),
             chat: chat::ChatHandle::idle(""),
             chat_panel,
             chat_role: chat::team::TeamRole::Operator,
@@ -109,6 +114,116 @@ impl App {
             state,
         }
     }
+}
+
+const BACKGROUND_TOAST_BATCH_WINDOW: Duration = Duration::from_millis(250);
+const BACKGROUND_TOAST_COOLDOWN: Duration = Duration::from_secs(30);
+const BACKGROUND_TOAST_DURATION: Duration = Duration::from_secs(6);
+const BACKGROUND_TOAST_DETAIL_LIMIT: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BackgroundToastKey {
+    job_kind: JobKind,
+    message: String,
+}
+
+/// Owns only background-job error condensation. Direct action toasts keep
+/// their existing behavior and never enter this queue.
+#[derive(Default)]
+struct BackgroundToastCondenser {
+    pending: Vec<BackgroundNotice>,
+    pending_since: Option<Instant>,
+    last_emitted: BTreeMap<BackgroundToastKey, Instant>,
+}
+
+impl BackgroundToastCondenser {
+    fn push(&mut self, now: Instant, notice: BackgroundNotice) {
+        debug_assert_eq!(notice.severity, BackgroundNoticeSeverity::Error);
+        self.pending_since.get_or_insert(now);
+        self.pending.push(notice);
+    }
+
+    fn resolve(&mut self, job_kind: JobKind) {
+        self.pending.retain(|notice| notice.job_kind != job_kind);
+        if self.pending.is_empty() {
+            self.pending_since = None;
+        }
+        self.last_emitted
+            .retain(|key, _| key.job_kind != job_kind);
+    }
+
+    fn time_until_flush(&self, now: Instant) -> Option<Duration> {
+        self.pending_since.map(|started| {
+            BACKGROUND_TOAST_BATCH_WINDOW.saturating_sub(now.duration_since(started))
+        })
+    }
+
+    fn flush_ready(&mut self, now: Instant) -> Option<String> {
+        let started = self.pending_since?;
+        if now.duration_since(started) < BACKGROUND_TOAST_BATCH_WINDOW {
+            return None;
+        }
+        self.pending_since = None;
+
+        self.last_emitted.retain(|_, emitted| {
+            now.duration_since(*emitted) < BACKGROUND_TOAST_COOLDOWN
+        });
+
+        let mut signatures = BTreeMap::<BackgroundToastKey, usize>::new();
+        for notice in std::mem::take(&mut self.pending) {
+            *signatures
+                .entry(BackgroundToastKey {
+                    job_kind: notice.job_kind,
+                    message: notice.message,
+                })
+                .or_default() += 1;
+        }
+
+        let mut by_kind = BTreeMap::<JobKind, usize>::new();
+        for (key, count) in signatures {
+            if self
+                .last_emitted
+                .get(&key)
+                .is_some_and(|emitted| now.duration_since(*emitted) < BACKGROUND_TOAST_COOLDOWN)
+            {
+                continue;
+            }
+            *by_kind.entry(key.job_kind).or_default() += count;
+            self.last_emitted.insert(key, now);
+        }
+
+        condensed_background_error_text(&by_kind)
+    }
+}
+
+fn condensed_background_error_text(by_kind: &BTreeMap<JobKind, usize>) -> Option<String> {
+    let total: usize = by_kind.values().sum();
+    if total == 0 {
+        return None;
+    }
+    let headline = if total == 1 {
+        "Background operation failed".to_string()
+    } else {
+        format!("{total} background operations failed")
+    };
+    let mut details = by_kind
+        .iter()
+        .take(BACKGROUND_TOAST_DETAIL_LIMIT)
+        .map(|(kind, count)| {
+            if *count == 1 {
+                kind.label().to_string()
+            } else {
+                format!("{} ×{count}", kind.label())
+            }
+        })
+        .collect::<Vec<_>>();
+    if by_kind.len() > BACKGROUND_TOAST_DETAIL_LIMIT {
+        details.push(format!(
+            "{} more",
+            by_kind.len() - BACKGROUND_TOAST_DETAIL_LIMIT
+        ));
+    }
+    Some(format!("{headline} — {}", details.join(", ")))
 }
 
 /// Which side panel a divider drag is moving.
@@ -149,16 +264,40 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        for (is_error, message) in self.state.poll_background_jobs() {
+        let notice_time = Instant::now();
+        for notice in self.state.poll_background_jobs() {
+            match notice.severity {
+                BackgroundNoticeSeverity::Error => {
+                    self.background_toasts.push(notice_time, notice);
+                }
+                BackgroundNoticeSeverity::Resolved => {
+                    self.background_toasts.resolve(notice.job_kind);
+                }
+                BackgroundNoticeSeverity::Info => {
+                    self.toasts.add(
+                        egui_toast::Toast::new()
+                            .kind(egui_toast::ToastKind::Info)
+                            .text(notice.message)
+                            .options(
+                                egui_toast::ToastOptions::default()
+                                    .duration(BACKGROUND_TOAST_DURATION),
+                            ),
+                    );
+                }
+            }
+        }
+        if let Some(message) = self.background_toasts.flush_ready(notice_time) {
             self.toasts.add(
                 egui_toast::Toast::new()
-                    .kind(if is_error {
-                        egui_toast::ToastKind::Error
-                    } else {
-                        egui_toast::ToastKind::Info
-                    })
-                    .text(message),
+                    .kind(egui_toast::ToastKind::Error)
+                    .text(message)
+                    .options(
+                        egui_toast::ToastOptions::default()
+                            .duration(BACKGROUND_TOAST_DURATION),
+                    ),
             );
+        } else if let Some(after) = self.background_toasts.time_until_flush(notice_time) {
+            ctx.request_repaint_after(after);
         }
         // Keep the selected project's scoped caches loaded (only hits disk
         // when the selection changed).
@@ -890,6 +1029,104 @@ mod tests {
 
     fn drag(width: f32, x: f32) -> DividerDrag {
         DividerDrag { target: Divider::Sidebar, start_width: width, start_x: x }
+    }
+
+    fn background_error(kind: JobKind, message: &str) -> BackgroundNotice {
+        BackgroundNotice {
+            severity: BackgroundNoticeSeverity::Error,
+            job_kind: kind,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn background_error_burst_is_grouped_and_counted() {
+        let start = Instant::now();
+        let mut condenser = BackgroundToastCondenser::default();
+        condenser.push(
+            start,
+            background_error(JobKind::DispatchDelivery, "delivery failed"),
+        );
+        condenser.push(
+            start + Duration::from_millis(50),
+            background_error(JobKind::DispatchDelivery, "delivery failed"),
+        );
+        condenser.push(
+            start + Duration::from_millis(100),
+            background_error(JobKind::SessionExport, "export timed out"),
+        );
+
+        assert_eq!(
+            condenser.flush_ready(start + Duration::from_millis(249)),
+            None
+        );
+        let text = condenser
+            .flush_ready(start + BACKGROUND_TOAST_BATCH_WINDOW)
+            .unwrap();
+        assert!(text.starts_with("3 background operations failed"), "{text}");
+        assert!(text.contains("mission completion delivery ×2"), "{text}");
+        assert!(text.contains("session export"), "{text}");
+    }
+
+    #[test]
+    fn repeated_background_error_is_suppressed_until_cooldown_expires() {
+        let start = Instant::now();
+        let mut condenser = BackgroundToastCondenser::default();
+        let repeat = || background_error(JobKind::SessionDiscovery, "discovery timed out");
+
+        condenser.push(start, repeat());
+        assert!(condenser
+            .flush_ready(start + BACKGROUND_TOAST_BATCH_WINDOW)
+            .is_some());
+
+        let retry = start + Duration::from_secs(1);
+        condenser.push(retry, repeat());
+        assert_eq!(
+            condenser.flush_ready(retry + BACKGROUND_TOAST_BATCH_WINDOW),
+            None
+        );
+
+        let after_cooldown = start + BACKGROUND_TOAST_COOLDOWN + Duration::from_secs(1);
+        condenser.push(after_cooldown, repeat());
+        assert!(condenser
+            .flush_ready(after_cooldown + BACKGROUND_TOAST_BATCH_WINDOW)
+            .is_some());
+    }
+
+    #[test]
+    fn distinct_error_bypasses_repeat_suppression() {
+        let start = Instant::now();
+        let mut condenser = BackgroundToastCondenser::default();
+        condenser.push(
+            start,
+            background_error(JobKind::SessionExport, "first failure"),
+        );
+        condenser.flush_ready(start + BACKGROUND_TOAST_BATCH_WINDOW);
+
+        let retry = start + Duration::from_secs(1);
+        condenser.push(
+            retry,
+            background_error(JobKind::SessionExport, "different failure"),
+        );
+        assert!(condenser
+            .flush_ready(retry + BACKGROUND_TOAST_BATCH_WINDOW)
+            .is_some());
+    }
+
+    #[test]
+    fn successful_job_resets_repeat_suppression() {
+        let start = Instant::now();
+        let mut condenser = BackgroundToastCondenser::default();
+        let repeat = || background_error(JobKind::DispatchDelivery, "delivery failed");
+        condenser.push(start, repeat());
+        condenser.flush_ready(start + BACKGROUND_TOAST_BATCH_WINDOW);
+
+        condenser.resolve(JobKind::DispatchDelivery);
+        let retry = start + Duration::from_secs(1);
+        condenser.push(retry, repeat());
+        assert!(condenser
+            .flush_ready(retry + BACKGROUND_TOAST_BATCH_WINDOW)
+            .is_some());
     }
 
     #[test]
