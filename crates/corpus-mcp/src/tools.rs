@@ -5,7 +5,7 @@
 //! project corpus (the ONLY corpus scope).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use corpus_core::refusal::Gate;
 use corpus_core::{
@@ -25,6 +25,9 @@ const OUTPUT_CAP_BYTES: usize = 8 * 1024;
 const ORACLE_LOG_CAP_BYTES: usize = 16 * 1024;
 const ORACLE_SUITE_CAP: usize = 64;
 const ORACLE_DESCRIPTION_CAP_BYTES: usize = 2 * 1024;
+/// Keep generated `docker exec` argv comfortably below common ARG_MAX and
+/// prevent a model from using the convenience tool as an unbounded blob pipe.
+const SANDBOX_WRITE_CAP_BYTES: usize = 128 * 1024;
 
 fn valid_oracle_name(name: &str) -> bool {
     !name.is_empty()
@@ -151,10 +154,40 @@ pub struct Ctx {
     /// agent omits it — the sandbox has no host FS and cannot enumerate
     /// `runs/`, so without this the agent must guess.
     pub run_log: Option<String>,
+    /// Exact mission/run identity supplied by the app launcher. `Ok(None)` is
+    /// a legacy/manual process with no automatic return address; `Err` means a
+    /// partial or malformed identity and makes mission dispatch fail closed.
+    pub run_origin: std::result::Result<Option<corpus_core::MissionRunRef>, String>,
 }
 
 /// Minimum interval between re-probes while the gate is closed.
 const REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn resolve_run_origin(
+    scope: &std::result::Result<Scope, String>,
+    mission: Option<String>,
+    run_id: Option<String>,
+) -> std::result::Result<Option<corpus_core::MissionRunRef>, String> {
+    match (mission, run_id) {
+        (None, None) => Ok(None),
+        (Some(mission), Some(run_id)) => scope.as_ref().map_err(Clone::clone).and_then(|scope| {
+            corpus_core::validate_slug(&mission).map_err(|error| error.to_string())?;
+            if run_id.len() > 512 || run_id.chars().any(char::is_whitespace) {
+                return Err("CORPUS_RUN_ID is malformed".to_string());
+            }
+            Ok(Some(corpus_core::MissionRunRef {
+                project: scope.project.clone(),
+                mission,
+                run_id,
+            }))
+        }),
+        _ => Err(format!(
+            "{} and {} must be set together",
+            corpus_core::MISSION_ENV,
+            corpus_core::RUN_ID_ENV
+        )),
+    }
+}
 
 impl Ctx {
     /// Resolve from the environment.
@@ -264,6 +297,13 @@ impl Ctx {
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .and_then(|v| v.as_object().cloned());
         let run_log = std::env::var(corpus_core::RUN_LOG_ENV).ok().filter(|s| !s.is_empty());
+        let mission_env = std::env::var(corpus_core::MISSION_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let run_id_env = std::env::var(corpus_core::RUN_ID_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let run_origin = resolve_run_origin(&scope, mission_env, run_id_env);
         // The role is resolved against a PROVEN scope: an agent name is only
         // meaningful inside a project, so a scope failure is a role failure.
         let role = scope
@@ -294,6 +334,7 @@ impl Ctx {
             source_pins,
             environment_session,
             run_log,
+            run_origin,
         })
     }
 
@@ -316,6 +357,7 @@ impl Ctx {
             source_pins: None,
             environment_session: None,
             run_log: None,
+            run_origin: Ok(None),
         }
     }
 
@@ -469,6 +511,19 @@ pub fn catalog() -> Value {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
                 "required": ["command"]
+            }
+        },
+        {
+            "name": "sandbox_write",
+            "description": "Write a UTF-8 file into the sandbox's session-scoped writable workspace without shell-quoting the content yourself. Paths must be beneath /work or /tmp. Use /work for PoCs and attack_save for the final durable replay script.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "absolute path beneath /work or /tmp"},
+                    "content": {"type": "string", "description": "UTF-8 file content (maximum 128 KiB)"},
+                    "executable": {"type": "boolean", "description": "set owner-executable mode; defaults to false"}
+                },
+                "required": ["path", "content"]
             }
         },
         {
@@ -964,6 +1019,7 @@ fn dispatch_inner(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     match name {
         "target_info" => target_info(ctx),
         "sandbox_exec" => sandbox_exec(ctx, &require_str(args, "command")?),
+        "sandbox_write" => sandbox_write(ctx, args),
         "oracle_list" => oracle_list(ctx),
         "oracle_run" => oracle_run(ctx, &require_str(args, "name")?),
         "faucet" => faucet(ctx, args),
@@ -1132,8 +1188,8 @@ fn target_info(ctx: &mut Ctx) -> Result<String> {
     .unwrap_or_else(|_| "{}".to_string()))
 }
 
-fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
-    let result = if ctx
+fn run_sandbox_command(ctx: &mut Ctx, command: &str) -> Result<corpus_core::SandboxExecResult> {
+    if ctx
         .plugin
         .as_ref()
         .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
@@ -1142,11 +1198,15 @@ fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
         resilient(ctx, |plugin| {
             let value = plugin.call_v1("sandbox_exec", Some(params))?;
             Ok(serde_json::from_value(value)?)
-        })?
+        })
     } else {
         let pins = ctx.source_pins.clone();
-        resilient(ctx, |p| p.sandbox_exec_with_sources(command, pins.as_ref()))?
-    };
+        resilient(ctx, |p| p.sandbox_exec_with_sources(command, pins.as_ref()))
+    }
+}
+
+fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
+    let result = run_sandbox_command(ctx, command)?;
     let mut combined = result.output;
     if combined.len() > OUTPUT_CAP_BYTES {
         combined.truncate(OUTPUT_CAP_BYTES);
@@ -1154,6 +1214,85 @@ fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
     }
     combined.push_str(&format!("\n[exit {}]", result.exit_code));
     Ok(combined)
+}
+
+fn sandbox_write_path(path: &str) -> Result<&Path> {
+    let path = Path::new(path);
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(Error::Args(
+            "sandbox_write path must be absolute beneath /work or /tmp".into(),
+        ));
+    }
+    match components.next() {
+        Some(Component::Normal(root)) if root == "work" || root == "tmp" => {}
+        _ => {
+            return Err(Error::Args(
+                "sandbox_write path must be beneath /work or /tmp".into(),
+            ));
+        }
+    }
+    let mut has_leaf = false;
+    for component in components {
+        match component {
+            Component::Normal(_) => has_leaf = true,
+            _ => {
+                return Err(Error::Args(
+                    "sandbox_write path may not contain parent or special components".into(),
+                ));
+            }
+        }
+    }
+    if !has_leaf {
+        return Err(Error::Args("sandbox_write path must name a file".into()));
+    }
+    Ok(path)
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn sandbox_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
+    let path_raw = require_str(args, "path")?;
+    let path = sandbox_write_path(&path_raw)?;
+    let content = require_str(args, "content")?;
+    if content.len() > SANDBOX_WRITE_CAP_BYTES {
+        return Err(Error::Args(format!(
+            "sandbox_write content is {} bytes; maximum is {SANDBOX_WRITE_CAP_BYTES}",
+            content.len()
+        )));
+    }
+    if content.contains('\0') {
+        return Err(Error::Args("sandbox_write content may not contain NUL".into()));
+    }
+    let parent = path.parent().ok_or_else(|| Error::Args("invalid sandbox path".into()))?;
+    let executable = args
+        .get("executable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mode = if executable { "700" } else { "600" };
+    // Content and paths are data, never shell syntax. The quote helper uses
+    // the standard close-quote / literal-quote / reopen-quote sequence.
+    let command = format!(
+        "umask 077; mkdir -p {}; printf '%s' {} > {}; chmod {mode} {}",
+        shell_single_quote(&parent.to_string_lossy()),
+        shell_single_quote(&content),
+        shell_single_quote(&path.to_string_lossy()),
+        shell_single_quote(&path.to_string_lossy()),
+    );
+    let result = run_sandbox_command(ctx, &command)?;
+    if result.exit_code != 0 {
+        return Err(Error::Plugin(format!(
+            "sandbox_write failed with exit {}: {}",
+            result.exit_code, result.output
+        )));
+    }
+    Ok(format!(
+        "wrote {} bytes to {} (executable={executable})",
+        content.len(),
+        path.display()
+    ))
 }
 
 fn oracle_catalog(ctx: &mut Ctx) -> Result<Vec<OracleInfo>> {
@@ -1628,5 +1767,57 @@ mod tests {
                 .collect()
         )
         .is_err());
+    }
+
+    #[test]
+    fn sandbox_write_paths_are_confined_to_writable_roots() {
+        for valid in ["/work/poc.py", "/work/nested/run.sh", "/tmp/state.json"] {
+            assert_eq!(sandbox_write_path(valid).unwrap(), Path::new(valid));
+        }
+        for invalid in [
+            "work/poc.py",
+            "/work",
+            "/tmp",
+            "/etc/passwd",
+            "/work/../etc/passwd",
+        ] {
+            assert!(sandbox_write_path(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn sandbox_write_shell_quotes_content_as_data() {
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        assert_eq!(
+            shell_single_quote("can't $(escape)"),
+            "'can'\"'\"'t $(escape)'"
+        );
+    }
+
+    #[test]
+    fn run_origin_requires_the_launcher_identity_pair_and_uses_proven_scope() {
+        let scope = Ok(Scope::new("alpha"));
+        assert_eq!(resolve_run_origin(&scope, None, None).unwrap(), None);
+        assert!(resolve_run_origin(&scope, Some("curator".into()), None).is_err());
+        assert!(resolve_run_origin(&scope, None, Some("run-1".into())).is_err());
+        assert!(resolve_run_origin(
+            &scope,
+            Some("curator".into()),
+            Some("run id with spaces".into())
+        )
+        .is_err());
+        assert_eq!(
+            resolve_run_origin(
+                &scope,
+                Some("curator".into()),
+                Some("p5-alpha-m7-curator-g2".into())
+            )
+            .unwrap(),
+            Some(corpus_core::MissionRunRef {
+                project: "alpha".into(),
+                mission: "curator".into(),
+                run_id: "p5-alpha-m7-curator-g2".into(),
+            })
+        );
     }
 }

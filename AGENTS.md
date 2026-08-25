@@ -155,7 +155,7 @@ corpus plugin call <name> <method> [params-json]
 # opencode runs with that dir as cwd: each project owns its agent set AND
 # its opencode session pool, and no other project exists in its namespace. The app
 # launches the FULL opencode TUI in a
-# DETACHED tmux session (corpus-<agent>-<ts>) and shows it in the
+# DETACHED tmux session (corpus-<run-stem>-<ts>) and shows it in the
 # EMBEDDED terminal pane (egui_term; the pane runs `tmux attach`
 # in-process — no external-terminal popup): click the pane to steer,
 # and the run survives attach/detach/app-close; a relaunched app lists
@@ -229,6 +229,16 @@ get/new/delete/set_budget/set_pins`, `corpus_wipe`, `corpus_stats/list/read`,
   op+target+nonce, 60s TTL); the mutation only lands when the tool is
   re-called with that token, which is consumed (single-use). `corpus_wipe`
   without a token is a dry-run by construction.
+- **Mission deletion is lifecycle-owned.** An already-clean record may be
+  removed immediately. When a tmux or plugin-environment identity remains,
+  `mission_delete` persists `delete_requested` and the app performs teardown
+  before removing the record. Agent and project deletion use the same durable
+  request: the app tears down assigned/contained missions first and removes
+  the parent only after the cascade is empty. Low-level mission, agent, and
+  project deletes refuse non-closed identities. The app automatically closes
+  non-closed environment records whose mission is missing; failures stay
+  visible in Project → Configuration with an explicit **Retry cleanup**
+  recovery action.
 - **`project_rebind` validates the plugin against the registry** before
   writing — a hallucinated/dangling plugin name is refused (chunk-0
   finding). "Budget" edits are per-MISSION (`mission_set_budget`), never
@@ -362,13 +372,15 @@ plugin probe <plugin>` (is the environment healthy), then via the MCP tools
 call `oracle_list`, read the returned names and descriptions, and use
 `oracle_run` for the relevant exact names. "Who may touch the sandbox?" →
 the `tester` and `super` roles, via
-the `corpus_sandbox_exec` MCP tool (see Trust domains below).
+the `corpus_sandbox_exec` and confined `corpus_sandbox_write` MCP tools
+(see Trust domains below). `sandbox_write` accepts UTF-8 files only beneath
+`/work` or `/tmp`; `target_info` names the preferred workspace.
 
 ## Trust domains (hard rules)
 
 | Zone | Who may do it | Egress | Never mounted into the sandbox |
 |---|---|---|---|
-| **Execution sandbox** | `tester` or `super`, via `corpus_sandbox_exec` | DENIED by default | benchmarks/, plugins/, oracle implementations, findings of the current mission |
+| **Execution sandbox** | `tester` or `super`, via `corpus_sandbox_exec` / `corpus_sandbox_write` | DENIED by default | benchmarks/, plugins/, oracle implementations, findings of the current mission |
 | **Research zone** | `researcher` or `super` | open internet (webfetch/search) | read-denied on benchmarks/**; researcher executes nothing |
 | **Project management** | `curator` or `super`, via scoped admin tools | Curator: no egress/sandbox; Super also holds both | manages only its proven project; cannot name another project; every act recorded |
 | **Model inference** | host-side only, local by default | the model endpoint sits on the host | the sandbox has no model access |
@@ -445,6 +457,12 @@ one that should be reading attacker-controlled text.
   agent may write with opencode's own file tools.
 - **It may launch.** `mission_launch` starts a prepared project mission; that
   mutation is scoped and audit-recorded like its other management acts.
+  It may dispatch several independent missions and continue other management
+  work in the same turn. Waiting is app-owned: `mission_await` is denied to
+  every project agent because keeping an inference turn alive to supervise
+  child work burns credits without making a decision. `mission_status` remains
+  available for one intentional snapshot, never a polling loop. Event-driven
+  continuation is tracked in `dev/curator-orchestration-plan.md`.
 
 ## Debugging a run: the refusal log
 

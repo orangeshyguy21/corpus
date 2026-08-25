@@ -94,10 +94,11 @@ pub enum AgentRole {
 /// (`corpus_` + the MCP tool name). One list, so a tool added to
 /// corpus-mcp without a role decision fails the totality test rather
 /// than silently defaulting to allowed.
-pub const CORPUS_TOOLS: [&str; 9] = [
+pub const CORPUS_TOOLS: [&str; 10] = [
     "corpus_target_info",
     "corpus_technique_save",
     "corpus_sandbox_exec",
+    "corpus_sandbox_write",
     "corpus_oracle_list",
     "corpus_oracle_run",
     "corpus_faucet",
@@ -123,7 +124,7 @@ const RESEARCHER_TOOLS: [&str; 2] = ["corpus_target_info", "corpus_technique_sav
 /// - project lifecycle and cross-project operations remain operator-only;
 /// - Curator may delete agents, missions, and corpus entries inside the
 ///   injected project, but only Super may wipe that project's whole corpus.
-pub const CURATOR_TOOLS: [&str; 28] = [
+pub const CURATOR_TOOLS: [&str; 27] = [
     "agent_list",
     "agent_get",
     "agent_new",
@@ -138,7 +139,6 @@ pub const CURATOR_TOOLS: [&str; 28] = [
     "mission_list",
     "mission_get",
     "mission_status",
-    "mission_await",
     "mission_new",
     "mission_launch",
     "mission_delete",
@@ -157,7 +157,44 @@ pub const CURATOR_TOOLS: [&str; 28] = [
 /// Super's project-management surface: Curator plus project-local corpus wipe.
 /// Destructive calls still pass through scope injection, audit recording, and
 /// the server's dry-run/token confirmation gate.
-pub const SUPER_ADMIN_TOOLS: [&str; 29] = [
+pub const SUPER_ADMIN_TOOLS: [&str; 28] = [
+    "agent_list",
+    "agent_get",
+    "agent_new",
+    "agent_save",
+    "agent_clone",
+    "agent_delete",
+    "agent_set",
+    "agent_set_role",
+    "agent_set_permission",
+    "agent_subagent_add",
+    "agent_subagent_remove",
+    "mission_list",
+    "mission_get",
+    "mission_status",
+    "mission_new",
+    "mission_launch",
+    "mission_delete",
+    "mission_set_budget",
+    "mission_set_pins",
+    "corpus_wipe",
+    "corpus_stats",
+    "corpus_list",
+    "corpus_read",
+    "finding_list",
+    "entry_delete",
+    "entry_move",
+    "entry_write",
+    "model_list",
+];
+
+/// Every project-management permission on which a project role has an
+/// opinion. This is deliberately wider than Super's grant set: retired or
+/// operator-only model-facing tools remain here so a stored `allow` cannot
+/// survive into a rendered agent merely because the server stopped advertising
+/// the tool. `mission_await` is the first such case — waiting is app-owned,
+/// never an agent capability.
+const PROJECT_MANAGEMENT_TOOLS: [&str; 29] = [
     "agent_list",
     "agent_get",
     "agent_new",
@@ -188,11 +225,6 @@ pub const SUPER_ADMIN_TOOLS: [&str; 29] = [
     "entry_write",
     "model_list",
 ];
-
-/// Every project-management permission on which a project role has an
-/// opinion. Alias the widest scoped catalog so render rules cannot drift from
-/// Super's server grant set.
-const PROJECT_MANAGEMENT_TOOLS: [&str; 29] = SUPER_ADMIN_TOOLS;
 
 impl AgentRole {
     /// Parse a role name (config, CLI flag, sidecar).
@@ -417,7 +449,15 @@ pub fn infer_role(cfg: &serde_json::Map<String, serde_json::Value>) -> AgentRole
         )
     };
     let wants_web = ["webfetch", "websearch"].iter().any(|k| granted(k));
-    let needed: Vec<&str> = CORPUS_TOOLS.into_iter().filter(|t| granted(t)).collect();
+    let needed: Vec<&str> = CORPUS_TOOLS
+        .into_iter()
+        // A tool that did not exist when a legacy document was authored was
+        // not an omitted allow. Only consider sandbox_write during migration
+        // when the old document actually names it; current agents have a
+        // sidecar role and never use this inference path.
+        .filter(|tool| *tool != "corpus_sandbox_write" || perm.contains_key(*tool))
+        .filter(|tool| granted(tool))
+        .collect();
     AgentRole::LEGACY_INFERENCE_ORDER
         .into_iter()
         .find(|role| needed.iter().all(|t| role.allows(t)) && (!wants_web || role.grants_web()))
@@ -464,6 +504,10 @@ pub struct AgentSidecar {
     pub modified: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_by: Option<String>,
+    /// Durable lifecycle intent consumed by the desktop app after assigned
+    /// mission environments have been torn down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_requested: Option<crate::store::MissionDeleteRequest>,
 }
 
 impl AgentSidecar {
@@ -529,7 +573,14 @@ impl Store {
         // otherwise materialize `projects/<typo>/agents/<slug>/` — a
         // project directory with no `project.yaml`, which every later
         // check reads as "no such project" while the agent sits inside it.
-        crate::store::Project::load(self, project)?;
+        if crate::store::Project::load(self, project)?
+            .delete_requested
+            .is_some()
+        {
+            return Err(Error::Store(format!(
+                "project {project} is pending deletion"
+            )));
+        }
         let dir = self.project_agent_dir(project, slug);
         if dir.join("opencode.json").is_file() {
             return Err(Error::Store(format!(
@@ -641,6 +692,14 @@ impl Store {
         role: Option<AgentRole>,
     ) -> Result<()> {
         validate_slug(slug)?;
+        if crate::store::Project::load(self, project)?
+            .delete_requested
+            .is_some()
+        {
+            return Err(Error::Store(format!(
+                "project {project} is pending deletion"
+            )));
+        }
         let dir = self.project_agent_dir(project, slug);
         if dir.join("opencode.json").is_file() {
             return Err(Error::Store(format!(
@@ -707,10 +766,24 @@ impl Store {
     /// "researcher" doc; the depbot session, 2026-08-14).
     pub fn clone_agent(&self, project: &str, from: &str, to: &str) -> Result<()> {
         validate_slug(to)?;
+        if crate::store::Project::load(self, project)?
+            .delete_requested
+            .is_some()
+        {
+            return Err(Error::Store(format!(
+                "project {project} is pending deletion"
+            )));
+        }
         let source = self.project_agent_dir(project, from);
         if !source.join("opencode.json").is_file() {
             return Err(Error::Store(format!(
                 "agent not found: {project}/{from} — 'from' must name an existing agent in this project (see agent_list)"
+            )));
+        }
+        let src_meta = read_sidecar(&source, from);
+        if src_meta.delete_requested.is_some() {
+            return Err(Error::Store(format!(
+                "agent {project}/{from} is pending deletion"
             )));
         }
         let dest = self.project_agent_dir(project, to);
@@ -755,7 +828,6 @@ impl Store {
         // an agent that already holds those powers, so it grants nothing new
         // — and silently downgrading would break "copy this agent" in a way
         // that only shows up as a refused tool mid-mission.
-        let src_meta = read_sidecar(&source, from);
         write_sidecar(
             &dest,
             to,
@@ -1201,15 +1273,52 @@ impl Store {
         Ok(out)
     }
 
-    /// Delete an agent directory.
+    /// Missions assigned to an agent. Kept here with agent deletion so every
+    /// caller (app, CLI, host admin, or scoped curator) observes the same
+    /// ownership rule.
+    pub fn missions_for_agent(&self, project: &str, slug: &str) -> Result<Vec<String>> {
+        validate_slug(slug)?;
+        Ok(self
+            .list_missions(project)?
+            .into_iter()
+            .filter_map(|(mission_slug, mission)| (mission.agent == slug).then_some(mission_slug))
+            .collect())
+    }
+
+    /// Delete an agent directory and every mission assigned to it. Mission
+    /// records must not outlive the agent reference required to load them.
     pub fn delete_agent(&self, project: &str, slug: &str) -> Result<()> {
         validate_slug(slug)?;
         let dir = self.project_agent_dir(project, slug);
         if !dir.join("opencode.json").is_file() {
             return Err(Error::Store(format!("agent not found: {project}/{slug}")));
         }
+        let missions = self.missions_for_agent(project, slug)?;
+        // Preflight the whole cascade so an active later mission cannot leave
+        // the agent with only some of its assigned mission records removed.
+        for mission in &missions {
+            self.ensure_mission_deletable(project, mission)?;
+        }
+        for mission in missions {
+            self.delete_mission(project, &mission)?;
+        }
         fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    /// Persist an agent deletion request for the app lifecycle reconciler.
+    pub fn request_agent_delete(&self, project: &str, slug: &str) -> Result<()> {
+        validate_slug(slug)?;
+        let dir = self.project_agent_dir(project, slug);
+        if !dir.join("opencode.json").is_file() {
+            return Err(Error::Store(format!("agent not found: {project}/{slug}")));
+        }
+        let mut meta = read_sidecar(&dir, slug);
+        meta.delete_requested
+            .get_or_insert(crate::store::MissionDeleteRequest {
+                requested_at: now_epoch(),
+            });
+        self.stamp_and_write_sidecar(&dir, &mut meta)
     }
 
     /// The agent's config hash: FNV-1a over the opencode.json bytes, hex.
@@ -1776,7 +1885,7 @@ struct Policy {
     /// one project by construction; this is the switch deciding whether
     /// that construction can be stepped around.
     external_directory: Action,
-    /// The `corpus_*` switches: 8 research tools and 26 management ones,
+    /// The `corpus_*` switches: 10 sandbox/corpus tools and 29 management ones,
     /// every one written explicitly so the artifact never leans on
     /// omission-means-allow. Three come out `corpus_corpus_*` because the
     /// run config names the MCP server `corpus`.
@@ -2321,6 +2430,7 @@ fn write_sidecar(
         subagent_roles,
         modified: Some(now_epoch()),
         modified_by: Some(actor.to_string()),
+        delete_requested: None,
     };
     fs::write(dir.join("agent.yaml"), serde_yaml::to_string(&sidecar)?)?;
     Ok(())
@@ -2357,6 +2467,7 @@ fn read_sidecar(dir: &Path, slug: &str) -> AgentSidecar {
             subagent_roles: std::collections::BTreeMap::new(),
             modified: None,
             modified_by: None,
+            delete_requested: None,
         })
 }
 
@@ -2474,6 +2585,7 @@ mod tests {
         assert_eq!(perm["corpus_technique_save"].as_str(), Some("allow"));
         for denied in [
             "corpus_sandbox_exec",
+            "corpus_sandbox_write",
             "corpus_oracle_list",
             "corpus_oracle_run",
             "corpus_faucet",
@@ -2598,6 +2710,7 @@ mod tests {
             subagent_roles: Default::default(),
             modified: None,
             modified_by: None,
+            delete_requested: None,
         };
         meta.subagent_roles.insert("scout".into(), AgentRole::Super);
         assert_eq!(
@@ -2815,8 +2928,15 @@ mod tests {
                 "deny"
             };
             assert_eq!(cur[&key].as_str(), Some(expected), "curator: {key}");
-            assert_eq!(sup[&key].as_str(), Some("allow"), "super: {key}");
+            let expected = if SUPER_ADMIN_TOOLS.contains(&tool) {
+                "allow"
+            } else {
+                "deny"
+            };
+            assert_eq!(sup[&key].as_str(), Some(expected), "super: {key}");
         }
+        assert_eq!(cur["corpus_mission_await"].as_str(), Some("deny"));
+        assert_eq!(sup["corpus_mission_await"].as_str(), Some("deny"));
         // And the reverse: a curator holds no sandbox tools at all.
         for tool in CORPUS_TOOLS {
             assert_eq!(cur[tool].as_str(), Some("deny"), "curator: {tool}");
@@ -3795,4 +3915,5 @@ mod tests {
         assert!(err.to_string().contains("agent_new"), "{err}");
         let _ = fs::remove_dir_all(store.root());
     }
+
 }

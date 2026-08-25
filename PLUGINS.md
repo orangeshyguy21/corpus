@@ -29,6 +29,12 @@ Setup is idempotent and may fetch pinned sources and build images. Doctor is a
 read-only verification; status is the fast readiness view. Stop refuses while
 the plugin has live mission leases.
 
+Session close is a verified postcondition: a plugin must report failure when
+session containers or networks cannot be removed, leave the session retryable,
+and report success only after proving those resources absent. Operation status
+must invalidate a legacy successful close when resources or plugin session
+state still show live.
+
 Installing a newer bundle preserves prior versions. Roll back explicitly:
 
 ```bash
@@ -45,8 +51,8 @@ The current private release locks are:
 
 | Plugin | Tag | Release archive SHA-256 |
 |---|---|---|
-| `cdk-regtest` | `corpus-plugin-cdk@v0.3.8` | `eaa8a9e0181e391b142198dcdddd6177d6560aa6728692326cb587a85f17eded` |
-| `nutshell-regtest` | `corpus-plugin-nutshell@v0.3.0` | `2ac77e231c447da918f746055482f657617e2b22c562f96c2b9fd946addbc33e` |
+| `cdk-regtest` | `corpus-plugin-cdk@v0.4.5` | `8bb5fb68cdad18d6688e195b4d02d291e553f2dfd470c0fec68edcd52c25d2ee` |
+| `nutshell-regtest` | `corpus-plugin-nutshell@v0.4.1` | `fb8fa891634f9c40c8b3bbeb1a1b631a5433705a1e7c78822ed4a8479e27f9aa` |
 
 Corpus CI downloads both assets, verifies both the attached checksum and this
 independent lock, installs them through the operator path, negotiates v1, and

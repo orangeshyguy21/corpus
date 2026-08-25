@@ -161,6 +161,7 @@ fn roles_bind_their_trust_domains() {
     let res = perm(&read_render("researcher"));
     for denied in [
         "corpus_sandbox_exec",
+        "corpus_sandbox_write",
         "corpus_oracle_list",
         "corpus_oracle_run",
         "corpus_faucet",
@@ -184,6 +185,7 @@ fn roles_bind_their_trust_domains() {
     let tester = perm(&read_render("tester"));
     for allowed in [
         "corpus_sandbox_exec",
+        "corpus_sandbox_write",
         "corpus_oracle_list",
         "corpus_oracle_run",
         "corpus_finding_write",

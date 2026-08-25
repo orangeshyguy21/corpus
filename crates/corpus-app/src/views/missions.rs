@@ -56,6 +56,14 @@ impl MissionsView {
         };
 
         let phase = state.latest_run_phase(&project, &slug);
+        if state.mission_delete_pending(&project, &slug) {
+            // Drop the local tmux client immediately. The teardown worker owns
+            // the run now; keeping a dead terminal visible for one frame is
+            // the full-screen flash that used to precede mission removal.
+            let _ = self.pane.sync_target(ui.ctx(), None, false);
+            self.deleting(ui);
+            return;
+        }
         if matches!(phase, RunPhase::Preparing | RunPhase::Starting) {
             let rect = ui.max_rect();
             ui.allocate_new_ui(
@@ -214,6 +222,33 @@ impl MissionsView {
             text,
             egui::FontId::monospace(12.0),
             color,
+        );
+    }
+
+    /// Stable full-pane transition while asynchronous teardown exports the
+    /// transcript, closes the environment, and removes the mission record.
+    fn deleting(&self, ui: &mut Ui) {
+        let rect = ui.max_rect();
+        ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+            |ui| {
+                ui.add_space((rect.height() * 0.4).max(24.0));
+                ui.spinner();
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Deleting mission…")
+                        .size(13.0)
+                        .color(theme::TEXT_MUTED),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Saving the run log and closing its environment")
+                        .size(11.0)
+                        .color(theme::TEXT_FAINT),
+                );
+            },
         );
     }
 

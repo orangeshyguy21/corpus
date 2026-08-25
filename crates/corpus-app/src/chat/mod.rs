@@ -51,9 +51,17 @@ pub enum ChatEvent {
     /// as a collapsible thought card, chronological with text and tools).
     ThinkingChunk { turn: u64, delta: String },
     /// The agent emitted a tool call (name + args).
-    ToolCallStart { id: String, name: String, args_json: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+        args_json: String,
+    },
     /// The agent tool call completed with this output.
-    ToolCallResult { id: String, is_error: bool, output: String },
+    ToolCallResult {
+        id: String,
+        is_error: bool,
+        output: String,
+    },
     /// The agent requested permission before executing a tool (a
     /// `RequestPermissionRequest`-equivalent). `summary` is the human-facing
     /// dry-run text; this is what the panel renders as inline Approve/Reject.
@@ -275,7 +283,12 @@ fn spawn_event_bridge(
 
 impl Chat for ChatHandle {
     fn send(&mut self, message: &str) {
-        let _ = self.inner.lock().unwrap().tx.send(ChatCommand::Send(message.to_string()));
+        let _ = self
+            .inner
+            .lock()
+            .unwrap()
+            .tx
+            .send(ChatCommand::Send(message.to_string()));
         self.inner
             .lock()
             .unwrap()
@@ -343,12 +356,16 @@ impl Chat for ChatHandle {
                     Some(last) if last.starts_with("### thought") => last.push_str(delta),
                     _ => inner.transcript.push(format!("### thought\n\n{delta}")),
                 },
-                ChatEvent::ToolCallStart { name, args_json, .. } => {
+                ChatEvent::ToolCallStart {
+                    name, args_json, ..
+                } => {
                     inner
                         .transcript
                         .push(format!("### tool › {name}\n\n```json\n{args_json}\n```"));
                 }
-                ChatEvent::ToolCallResult { is_error, output, .. } => {
+                ChatEvent::ToolCallResult {
+                    is_error, output, ..
+                } => {
                     let marker = if *is_error { "→ (error) " } else { "→ " };
                     match inner.transcript.last_mut() {
                         Some(last) if last.starts_with("### tool ›") => {
@@ -407,7 +424,10 @@ pub fn truncate(s: &str, max: usize) -> String {
 /// See dev/decisions.md decision 5. This list keeps the gate explicit for
 /// tests/UI emphasis; enforcement rides goose's `GooseMode::Approve`.
 pub fn is_destructive(tool: &str) -> bool {
-    matches!(tool, "corpus_wipe" | "project_delete" | "agent_delete" | "mission_delete")
+    matches!(
+        tool,
+        "corpus_wipe" | "project_delete" | "agent_delete" | "mission_delete"
+    )
 }
 
 /// The confirm-token gate, as a pure unit testable in isolation: a tool call
@@ -478,18 +498,69 @@ mod tests {
 
     #[test]
     fn event_kinds_are_stable() {
-        assert_eq!(ChatEvent::Ready { session_id: "s".into(), project: "p".into() }.kind(), "ready");
-        assert_eq!(ChatEvent::TurnStart { turn: 1 }.kind(), "turn_start");
-        assert_eq!(ChatEvent::TextChunk { turn: 1, delta: "x".into() }.kind(), "text_chunk");
-        assert_eq!(ChatEvent::ThinkingChunk { turn: 1, delta: "x".into() }.kind(), "thinking_chunk");
-        assert_eq!(ChatEvent::ToolCallStart { id: "i".into(), name: "n".into(), args_json: "{}".into() }.kind(), "tool_call_start");
-        assert_eq!(ChatEvent::ToolCallResult { id: "i".into(), is_error: false, output: "o".into() }.kind(), "tool_call_result");
         assert_eq!(
-            ChatEvent::PermissionRequest { id: "i".into(), tool: "t".into(), args_json: "{}".into(), summary: "s".into() }.kind(),
+            ChatEvent::Ready {
+                session_id: "s".into(),
+                project: "p".into()
+            }
+            .kind(),
+            "ready"
+        );
+        assert_eq!(ChatEvent::TurnStart { turn: 1 }.kind(), "turn_start");
+        assert_eq!(
+            ChatEvent::TextChunk {
+                turn: 1,
+                delta: "x".into()
+            }
+            .kind(),
+            "text_chunk"
+        );
+        assert_eq!(
+            ChatEvent::ThinkingChunk {
+                turn: 1,
+                delta: "x".into()
+            }
+            .kind(),
+            "thinking_chunk"
+        );
+        assert_eq!(
+            ChatEvent::ToolCallStart {
+                id: "i".into(),
+                name: "n".into(),
+                args_json: "{}".into()
+            }
+            .kind(),
+            "tool_call_start"
+        );
+        assert_eq!(
+            ChatEvent::ToolCallResult {
+                id: "i".into(),
+                is_error: false,
+                output: "o".into()
+            }
+            .kind(),
+            "tool_call_result"
+        );
+        assert_eq!(
+            ChatEvent::PermissionRequest {
+                id: "i".into(),
+                tool: "t".into(),
+                args_json: "{}".into(),
+                summary: "s".into()
+            }
+            .kind(),
             "permission_request"
         );
         assert_eq!(ChatEvent::TurnEnd { turn: 1 }.kind(), "turn_end");
-        assert_eq!(ChatEvent::Usage { input_tokens: Some(1), output_tokens: Some(2), total_tokens: Some(3) }.kind(), "usage");
+        assert_eq!(
+            ChatEvent::Usage {
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+                total_tokens: Some(3)
+            }
+            .kind(),
+            "usage"
+        );
         assert_eq!(ChatEvent::Error("e".into()).kind(), "error");
     }
 
@@ -520,7 +591,12 @@ mod tests {
 
     #[test]
     fn destructive_tool_set_is_operator_gated() {
-        for tool in ["corpus_wipe", "project_delete", "agent_delete", "mission_delete"] {
+        for tool in [
+            "corpus_wipe",
+            "project_delete",
+            "agent_delete",
+            "mission_delete",
+        ] {
             assert!(is_destructive(tool), "{tool} must be gated");
         }
         for tool in ["project_list", "corpus_stats", "mission_set_budget"] {

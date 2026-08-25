@@ -30,6 +30,7 @@ chat-embed = [
 
 [dependencies]
 corpus-core = { path = "../corpus-core" }
+corpus-observe = { path = "../corpus-observe" }
 notify = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }

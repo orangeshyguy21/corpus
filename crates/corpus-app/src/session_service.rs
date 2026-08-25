@@ -5,7 +5,8 @@
 //! not an authorization boundary and its cross-process event stream is not
 //! useful in OpenCode 1.18.18.  This module consequently validates every
 //! id-addressed read against the returned session directory, version-gates
-//! the HTTP adapter, and retains a subprocess adapter as the safe fallback.
+//! the HTTP adapter, and uses the exact owner's message and process-local
+//! status projections for mission supervision.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,22 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 use serde_json::Value;
 
-pub(crate) const SUPPORTED_OPENCODE_VERSION: &str = "1.18.18";
+pub(crate) const MINIMUM_OPENCODE_VERSION: &str = "1.18.18";
+
+fn is_compatible_opencode_version(version: &str) -> bool {
+    let core = version
+        .trim()
+        .split_once('-')
+        .map_or(version.trim(), |(core, _)| core);
+    let mut parts = core.split('.');
+    let parsed = (
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next(),
+    );
+    matches!(parsed, (Some(1), Some(18), Some(patch), None) if patch >= 18)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionBackend {
@@ -57,6 +73,21 @@ pub(crate) struct SessionRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionTurnState {
+    Pending,
+    Active,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PromptDeliveryState {
+    Pending,
+    Active,
+    Acknowledged,
+    Failed { error: String, retry_ready: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Contract is explicit even while P2.1 keeps polling in force.
 pub(crate) enum EventSupport {
     /// P2.1 observed only connected/heartbeat for changes made by an
@@ -69,6 +100,51 @@ pub(crate) trait SessionService: Send + Sync {
     fn list(&self, directory: &Path) -> Result<Vec<SessionSummary>, String>;
     #[allow(dead_code)] // Consumed by the live drawer after this boundary lands.
     fn messages(&self, session: &SessionRef) -> Result<Vec<SessionMessage>, String>;
+
+    /// Read compact cumulative accounting from the owning process. This is
+    /// intentionally independent of transcript/message export.
+    fn usage_snapshot(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+    ) -> Result<corpus_core::UsageSnapshot, String> {
+        Err("live usage requires the owning OpenCode TUI endpoint".into())
+    }
+
+    /// State of the exact launch turn in its owning TUI process. The durable
+    /// user message proves that the launch prompt exists; only an assistant
+    /// step with a non-tool continuation finish ends the whole loop.
+    fn session_turn_state(
+        &self,
+        control: &corpus_core::MissionControl,
+        password: &str,
+        session: &SessionRef,
+        launched_at_ms: u64,
+    ) -> Result<SessionTurnState, String>;
+
+    /// Resume the exact session with one idempotent prompt when its owning
+    /// TUI process is idle. Implementations must bind the id to
+    /// `session.directory` before writing.
+    fn queue_prompt(
+        &self,
+        control: &corpus_core::MissionControl,
+        password: &str,
+        session: &SessionRef,
+        message_id: &str,
+        prompt: &str,
+    ) -> Result<(), String>;
+
+    /// State of one persisted delivery intent in the exact owning process.
+    /// A legacy user message proves admission; only its terminal assistant
+    /// response proves acknowledgement.
+    fn prompt_delivery_state(
+        &self,
+        control: &corpus_core::MissionControl,
+        password: &str,
+        session: &SessionRef,
+        message_id: &str,
+    ) -> Result<PromptDeliveryState, String>;
 
     #[allow(dead_code)] // P2.1 deliberately selected PollingOnly.
     fn event_support(&self) -> EventSupport {
@@ -137,7 +213,7 @@ impl SessionService for CliSessionService {
         let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok(ServiceHealth {
             backend: SessionBackend::Cli,
-            compatible: version == SUPPORTED_OPENCODE_VERSION,
+            compatible: is_compatible_opencode_version(&version),
             version,
         })
     }
@@ -158,6 +234,37 @@ impl SessionService for CliSessionService {
         let value: Value = serde_json::from_slice(&output.stdout)
             .map_err(|error| format!("opencode export gave bad JSON: {error}"))?;
         parse_messages(value.get("messages").unwrap_or(&Value::Null))
+    }
+
+    fn queue_prompt(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+        _message_id: &str,
+        _prompt: &str,
+    ) -> Result<(), String> {
+        Err("durable queued input requires the owning OpenCode TUI endpoint".into())
+    }
+
+    fn session_turn_state(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+        _launched_at_ms: u64,
+    ) -> Result<SessionTurnState, String> {
+        Err("exact active-run state requires the owning OpenCode TUI endpoint".into())
+    }
+
+    fn prompt_delivery_state(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+        _message_id: &str,
+    ) -> Result<PromptDeliveryState, String> {
+        Err("durable prompt acknowledgement requires the owning OpenCode TUI endpoint".into())
     }
 }
 
@@ -225,12 +332,256 @@ impl HttpSessionService {
         let health = self.health()?;
         if !health.compatible {
             return Err(format!(
-                "OpenCode server version {} is unsupported (expected {})",
-                health.version, SUPPORTED_OPENCODE_VERSION
+                "OpenCode server version {} is unsupported (expected {} or a newer 1.18.x patch)",
+                health.version, MINIMUM_OPENCODE_VERSION
             ));
         }
         Ok(health)
     }
+
+    fn queue_prompt(
+        &self,
+        session: &SessionRef,
+        message_id: &str,
+        prompt: &str,
+    ) -> Result<(), String> {
+        self.require_compatible()?;
+        let record = self.get(
+            &format!("/session/{}", session.id),
+            Some(&session.directory),
+        )?;
+        require_bound_session(
+            parse_session_list(&Value::Array(vec![record]), true)?,
+            session,
+        )?;
+
+        let messages = self.get(
+            &format!("/session/{}/message", session.id),
+            Some(&session.directory),
+        )?;
+        if has_user_message(&messages, message_id) {
+            return Ok(());
+        }
+        // Do not interrupt a curator that is still working. Persisting the
+        // deterministic message id leaves a durable delivery intent; the app
+        // retries it once this exact owning server reports the session idle.
+        if self.session_is_active(session)? {
+            return Ok(());
+        }
+
+        let response = self
+            .client
+            .post(format!("{}/session/{}/prompt_async", self.base, session.id))
+            .basic_auth("opencode", Some(&self.password))
+            .query(&[("directory", session.directory.to_string_lossy().as_ref())])
+            .json(&legacy_prompt_body(message_id, prompt))
+            .send()
+            .map_err(|error| format!("OpenCode queue request failed: {error}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = response.text().unwrap_or_default();
+            return Err(format!(
+                "OpenCode prompt endpoint returned HTTP {status}{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            ));
+        }
+        Ok(())
+    }
+
+    fn session_turn_state(
+        &self,
+        session: &SessionRef,
+        launched_at_ms: u64,
+    ) -> Result<SessionTurnState, String> {
+        self.require_bound_session(session)?;
+        // TUI-launched turns still use OpenCode's legacy message projection
+        // in 1.18.19; `session.next.step.started` exists only for the V2 loop.
+        // A user message after this exact launch is therefore the portable
+        // durable start proof. Intermediate `tool-calls` assistant messages
+        // are loop steps, not completed turns.
+        let messages = self.get(
+            &format!("/session/{}/message", session.id),
+            Some(&session.directory),
+        )?;
+        Ok(legacy_turn_state(&messages, launched_at_ms))
+    }
+
+    fn prompt_delivery_state(
+        &self,
+        session: &SessionRef,
+        message_id: &str,
+    ) -> Result<PromptDeliveryState, String> {
+        self.require_bound_session(session)?;
+        let messages = self.get(
+            &format!("/session/{}/message", session.id),
+            Some(&session.directory),
+        )?;
+        if !has_user_message(&messages, message_id) {
+            return Ok(PromptDeliveryState::Pending);
+        }
+        Ok(match legacy_prompt_terminal(&messages, message_id) {
+            Some(Ok(())) => PromptDeliveryState::Acknowledged,
+            Some(Err(error)) => PromptDeliveryState::Failed {
+                error,
+                retry_ready: false,
+            },
+            None if self.session_is_active(session)? => PromptDeliveryState::Active,
+            None if has_assistant_message(&messages, message_id) => PromptDeliveryState::Failed {
+                error:
+                    "OpenCode parked without producing a response to the admitted completion prompt"
+                        .into(),
+                retry_ready: false,
+            },
+            // prompt_async persists the user message before its spawned loop
+            // necessarily becomes visible in /session/status. Treat that
+            // narrow boundary as pending, not as a permanent failure.
+            None => PromptDeliveryState::Pending,
+        })
+    }
+
+    fn require_bound_session(&self, session: &SessionRef) -> Result<(), String> {
+        self.require_compatible()?;
+        let record = self.get(
+            &format!("/session/{}", session.id),
+            Some(&session.directory),
+        )?;
+        require_bound_session(
+            parse_session_list(&Value::Array(vec![record]), true)?,
+            session,
+        )
+    }
+
+    fn usage_snapshot(&self, session: &SessionRef) -> Result<corpus_core::UsageSnapshot, String> {
+        self.require_compatible()?;
+        let record = self.get(
+            &format!("/session/{}", session.id),
+            Some(&session.directory),
+        )?;
+        require_bound_session(
+            parse_session_list(&Value::Array(vec![record.clone()]), true)?,
+            session,
+        )?;
+        usage_snapshot_from_record(&record, &session.id)
+    }
+
+    fn session_is_active(&self, session: &SessionRef) -> Result<bool, String> {
+        let statuses = self.get("/session/status", Some(&session.directory))?;
+        let statuses = statuses
+            .as_object()
+            .ok_or_else(|| "OpenCode session status response was not an object".to_string())?;
+        Ok(statuses.contains_key(&session.id))
+    }
+}
+
+fn message_failure_message(message: &Value) -> String {
+    message
+        .pointer("/info/error/data/message")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            message
+                .pointer("/info/error/message")
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| "OpenCode failed while handling the completion prompt".into())
+}
+
+fn legacy_turn_state(messages: &Value, launched_at_ms: u64) -> SessionTurnState {
+    let Some(messages) = messages.as_array() else {
+        return SessionTurnState::Pending;
+    };
+    let Some(started_at) = messages
+        .iter()
+        .filter(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("user"))
+        .filter_map(|message| {
+            message
+                .pointer("/info/time/created")
+                .and_then(Value::as_u64)
+        })
+        .filter(|created| *created >= launched_at_ms)
+        .min()
+    else {
+        return SessionTurnState::Pending;
+    };
+    let latest = messages
+        .iter()
+        .filter(|message| {
+            message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+        })
+        .filter_map(|message| {
+            message
+                .pointer("/info/time/created")
+                .and_then(Value::as_u64)
+                .filter(|created| *created >= started_at)
+                .map(|created| (created, message))
+        })
+        .max_by_key(|(created, _)| *created)
+        .map(|(_, message)| message);
+    if latest.is_some_and(|message| {
+        message
+            .pointer("/info/time/completed")
+            .and_then(Value::as_u64)
+            .is_some()
+            && message.pointer("/info/finish").and_then(Value::as_str) != Some("tool-calls")
+    }) {
+        SessionTurnState::Completed
+    } else {
+        SessionTurnState::Active
+    }
+}
+
+fn has_user_message(messages: &Value, message_id: &str) -> bool {
+    messages.as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message.pointer("/info/id").and_then(Value::as_str) == Some(message_id)
+                && message.pointer("/info/role").and_then(Value::as_str) == Some("user")
+        })
+    })
+}
+
+fn has_assistant_message(messages: &Value, message_id: &str) -> bool {
+    messages.as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+                && message.pointer("/info/parentID").and_then(Value::as_str) == Some(message_id)
+        })
+    })
+}
+
+fn legacy_prompt_terminal(messages: &Value, message_id: &str) -> Option<Result<(), String>> {
+    let latest = messages
+        .as_array()?
+        .iter()
+        .filter(|message| {
+            message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+                && message.pointer("/info/parentID").and_then(Value::as_str) == Some(message_id)
+        })
+        .max_by_key(|message| {
+            message
+                .pointer("/info/time/created")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        })?;
+    if latest.pointer("/info/error").is_some() {
+        return Some(Err(message_failure_message(latest)));
+    }
+    (latest
+        .pointer("/info/time/completed")
+        .and_then(Value::as_u64)
+        .is_some()
+        && latest.pointer("/info/finish").and_then(Value::as_str) != Some("tool-calls"))
+    .then_some(Ok(()))
+}
+
+fn legacy_prompt_body(message_id: &str, prompt: &str) -> Value {
+    serde_json::json!({
+        "messageID": message_id,
+        "parts": [{"type": "text", "text": prompt}],
+    })
 }
 
 impl SessionService for HttpSessionService {
@@ -243,7 +594,7 @@ impl SessionService for HttpSessionService {
             .to_string();
         Ok(ServiceHealth {
             backend: SessionBackend::Http,
-            compatible: version == SUPPORTED_OPENCODE_VERSION,
+            compatible: is_compatible_opencode_version(&version),
             version,
         })
     }
@@ -269,6 +620,46 @@ impl SessionService for HttpSessionService {
             &format!("/session/{}/message", session.id),
             Some(&session.directory),
         )?)
+    }
+
+    fn usage_snapshot(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        session: &SessionRef,
+    ) -> Result<corpus_core::UsageSnapshot, String> {
+        HttpSessionService::usage_snapshot(self, session)
+    }
+
+    fn queue_prompt(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        session: &SessionRef,
+        message_id: &str,
+        prompt: &str,
+    ) -> Result<(), String> {
+        HttpSessionService::queue_prompt(self, session, message_id, prompt)
+    }
+
+    fn session_turn_state(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        session: &SessionRef,
+        launched_at_ms: u64,
+    ) -> Result<SessionTurnState, String> {
+        HttpSessionService::session_turn_state(self, session, launched_at_ms)
+    }
+
+    fn prompt_delivery_state(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        session: &SessionRef,
+        message_id: &str,
+    ) -> Result<PromptDeliveryState, String> {
+        HttpSessionService::prompt_delivery_state(self, session, message_id)
     }
 }
 
@@ -347,6 +738,62 @@ impl SessionService for ConfiguredSessionService {
         self.with_fallback(|http| http.messages(session), |cli| cli.messages(session))
     }
 
+    fn usage_snapshot(
+        &self,
+        control: &corpus_core::MissionControl,
+        password: &str,
+        session: &SessionRef,
+    ) -> Result<corpus_core::UsageSnapshot, String> {
+        let http = HttpSessionService::new(
+            &format!("http://127.0.0.1:{}", control.port),
+            password.to_string(),
+        )?;
+        http.usage_snapshot(session)
+    }
+
+    fn queue_prompt(
+        &self,
+        control: &corpus_core::MissionControl,
+        password: &str,
+        session: &SessionRef,
+        message_id: &str,
+        prompt: &str,
+    ) -> Result<(), String> {
+        let http = HttpSessionService::new(
+            &format!("http://127.0.0.1:{}", control.port),
+            password.to_string(),
+        )?;
+        http.queue_prompt(session, message_id, prompt)
+    }
+
+    fn session_turn_state(
+        &self,
+        control: &corpus_core::MissionControl,
+        password: &str,
+        session: &SessionRef,
+        launched_at_ms: u64,
+    ) -> Result<SessionTurnState, String> {
+        let http = HttpSessionService::new(
+            &format!("http://127.0.0.1:{}", control.port),
+            password.to_string(),
+        )?;
+        http.session_turn_state(session, launched_at_ms)
+    }
+
+    fn prompt_delivery_state(
+        &self,
+        control: &corpus_core::MissionControl,
+        password: &str,
+        session: &SessionRef,
+        message_id: &str,
+    ) -> Result<PromptDeliveryState, String> {
+        let http = HttpSessionService::new(
+            &format!("http://127.0.0.1:{}", control.port),
+            password.to_string(),
+        )?;
+        http.prompt_delivery_state(session, message_id)
+    }
+
     fn take_warning(&self) -> Option<String> {
         self.warning.lock().ok()?.take()
     }
@@ -362,7 +809,7 @@ impl SessionService for FakeSessionService {
     fn health(&self) -> Result<ServiceHealth, String> {
         Ok(ServiceHealth {
             backend: SessionBackend::Cli,
-            version: SUPPORTED_OPENCODE_VERSION.into(),
+            version: MINIMUM_OPENCODE_VERSION.into(),
             compatible: true,
         })
     }
@@ -373,6 +820,52 @@ impl SessionService for FakeSessionService {
 
     fn messages(&self, _session: &SessionRef) -> Result<Vec<SessionMessage>, String> {
         Ok(Vec::new())
+    }
+
+    fn usage_snapshot(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        session: &SessionRef,
+    ) -> Result<corpus_core::UsageSnapshot, String> {
+        Ok(corpus_core::UsageSnapshot {
+            version: corpus_core::USAGE_SNAPSHOT_VERSION,
+            session_id: session.id.clone(),
+            captured_at: 1,
+            source: "test".into(),
+            rows: Vec::new(),
+        })
+    }
+
+    fn queue_prompt(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+        _message_id: &str,
+        _prompt: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn session_turn_state(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+        _launched_at_ms: u64,
+    ) -> Result<SessionTurnState, String> {
+        Ok(SessionTurnState::Pending)
+    }
+
+    fn prompt_delivery_state(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+        _message_id: &str,
+    ) -> Result<PromptDeliveryState, String> {
+        Ok(PromptDeliveryState::Pending)
     }
 
     fn find_for_launch(
@@ -455,6 +948,54 @@ fn parse_session_list(value: &Value, served: bool) -> Result<Vec<SessionSummary>
             })
         })
         .collect()
+}
+
+fn usage_snapshot_from_record(
+    record: &Value,
+    session_id: &str,
+) -> Result<corpus_core::UsageSnapshot, String> {
+    let number = |pointer: &str, flat: &str| {
+        record
+            .pointer(pointer)
+            .and_then(Value::as_u64)
+            .or_else(|| record.get(flat).and_then(Value::as_u64))
+            .unwrap_or(0)
+    };
+    let cost = record
+        .get("cost")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("OpenCode session {session_id} omitted cumulative cost"))?;
+    let model_id = record
+        .pointer("/model/id")
+        .and_then(Value::as_str)
+        .or_else(|| record.get("modelID").and_then(Value::as_str))
+        .unwrap_or("session-total");
+    let provider = record
+        .pointer("/model/providerID")
+        .and_then(Value::as_str)
+        .or_else(|| record.get("providerID").and_then(Value::as_str))
+        .unwrap_or("aggregate");
+    let captured_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(corpus_core::UsageSnapshot {
+        version: corpus_core::USAGE_SNAPSHOT_VERSION,
+        session_id: session_id.to_string(),
+        captured_at,
+        source: "opencode-session-aggregate".into(),
+        rows: vec![corpus_core::CostRow {
+            provider: provider.to_string(),
+            model: model_id.rsplit('/').next().unwrap_or(model_id).to_string(),
+            tokens_input: number("/tokens/input", "tokens_input"),
+            tokens_output: number("/tokens/output", "tokens_output"),
+            tokens_reasoning: number("/tokens/reasoning", "tokens_reasoning"),
+            cache_read: number("/tokens/cache/read", "tokens_cache_read"),
+            cache_write: number("/tokens/cache/write", "tokens_cache_write"),
+            cost,
+            ..corpus_core::CostRow::default()
+        }],
+    })
 }
 
 fn parse_messages(value: &Value) -> Result<Vec<SessionMessage>, String> {
@@ -591,6 +1132,29 @@ mod tests {
     }
 
     #[test]
+    fn session_aggregate_becomes_compact_usage_without_messages() {
+        let snapshot = usage_snapshot_from_record(
+            &json!({
+                "id": "ses_cost",
+                "cost": 4.4480775,
+                "tokens": {
+                    "input": 970080,
+                    "output": 28512,
+                    "reasoning": 3948,
+                    "cache": {"read": 3503125, "write": 0}
+                },
+                "model": {"id": "moonshotai/kimi-k3", "providerID": "openrouter"}
+            }),
+            "ses_cost",
+        )
+        .unwrap();
+        assert_eq!(snapshot.session_id, "ses_cost");
+        assert_eq!(snapshot.rows[0].model, "kimi-k3");
+        assert_eq!(snapshot.rows[0].tokens_input, 970080);
+        assert!((snapshot.rows[0].cost - 4.4480775).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn launch_stamp_uses_tail_after_hyphenated_agent() {
         assert_eq!(launch_stamp_ms("corpus-red-team-42"), Some(42_000));
         assert_eq!(launch_stamp_ms("not-corpus-red-team-42"), None);
@@ -602,5 +1166,107 @@ mod tests {
         assert!(HttpSessionService::new("http://127.0.0.1", "secret".into()).is_err());
         assert!(HttpSessionService::new("http://127.0.0.1:4096", String::new()).is_err());
         assert!(HttpSessionService::new("http://127.0.0.1:4096", "secret".into()).is_ok());
+    }
+
+    #[test]
+    fn queued_input_payload_uses_the_supported_async_prompt_contract() {
+        assert_eq!(
+            legacy_prompt_body("msg_corpusabc123", "children finished"),
+            json!({
+                "messageID": "msg_corpusabc123",
+                "parts": [{"type": "text", "text": "children finished"}],
+            })
+        );
+    }
+
+    #[test]
+    fn compatibility_accepts_newer_patches_on_the_measured_api_line() {
+        assert!(is_compatible_opencode_version("1.18.18"));
+        assert!(is_compatible_opencode_version("1.18.19"));
+        assert!(is_compatible_opencode_version("1.18.20-beta.1"));
+        assert!(!is_compatible_opencode_version("1.18.17"));
+        assert!(!is_compatible_opencode_version("1.19.0"));
+        assert!(!is_compatible_opencode_version("garbage"));
+    }
+
+    #[test]
+    fn turn_start_evidence_is_durable_and_scoped_after_the_exact_launch() {
+        let messages = json!([{
+            "info": {"role": "user", "time": {"created": 1_100}}
+        }]);
+        assert_eq!(
+            legacy_turn_state(&messages, 1_000),
+            SessionTurnState::Active
+        );
+        assert_eq!(
+            legacy_turn_state(&messages, 1_300),
+            SessionTurnState::Pending
+        );
+
+        // Completed assistant fragments without a user turn after the exact
+        // launch remain irrelevant.
+        let fragments = json!([{
+            "info": {"role": "assistant", "time": {"completed": 1_250}}
+        }]);
+        assert_eq!(
+            legacy_turn_state(&fragments, 1_000),
+            SessionTurnState::Pending
+        );
+    }
+
+    #[test]
+    fn tool_call_steps_do_not_complete_the_whole_agent_loop() {
+        let mut messages = json!([{
+            "info": {"role":"user", "time":{"created":1_100}}
+        }, {
+            "info": {
+                "role":"assistant", "finish":"tool-calls",
+                "time":{"created":1_101, "completed":1_200}
+            }
+        }, {
+            "info": {"role":"assistant", "time":{"created":1_201}}
+        }]);
+        assert_eq!(
+            legacy_turn_state(&messages, 1_000),
+            SessionTurnState::Active
+        );
+        messages.as_array_mut().unwrap()[2] = json!({
+            "info": {
+                "role":"assistant", "finish":"stop",
+                "time":{"created":1_201, "completed":1_300}
+            }
+        });
+        assert_eq!(
+            legacy_turn_state(&messages, 1_000),
+            SessionTurnState::Completed
+        );
+    }
+
+    #[test]
+    fn delivery_terminal_is_scoped_to_the_exact_legacy_user_message() {
+        let messages = json!([{
+            "info":{"id":"ours", "role":"user"}
+        }, {
+            "info":{"id":"step-1", "role":"assistant", "parentID":"ours", "finish":"tool-calls", "time":{"created":1, "completed":2}}
+        }, {
+            "info":{"id":"step-2", "role":"assistant", "parentID":"ours", "finish":"stop", "time":{"created":3, "completed":4}}
+        }, {
+            "info":{"id":"other-step", "role":"assistant", "parentID":"other", "error":{"data":{"message":"unrelated"}}, "time":{"created":5, "completed":6}}
+        }]);
+        assert!(has_user_message(&messages, "ours"));
+        assert!(!has_user_message(&messages, "missing"));
+        assert!(has_assistant_message(&messages, "ours"));
+        assert!(!has_assistant_message(&messages, "missing"));
+        assert_eq!(legacy_prompt_terminal(&messages, "ours"), Some(Ok(())));
+
+        let failed = json!([{
+            "info":{"id":"ours", "role":"user"}
+        }, {
+            "info":{"id":"step", "role":"assistant", "parentID":"ours", "error":{"data":{"message":"Model unavailable"}}, "time":{"created":1, "completed":2}}
+        }]);
+        assert_eq!(
+            legacy_prompt_terminal(&failed, "ours"),
+            Some(Err("Model unavailable".into()))
+        );
     }
 }

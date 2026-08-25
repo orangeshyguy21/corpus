@@ -48,9 +48,9 @@ pub fn source_dropdown(
     // Field: size to the label (min 120px), 28px tall — the plugin
     // picker's chrome at the top bar's density. Reserve an indicator slot
     // (left of the caret) when there is a match state to show.
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.clone(), egui::FontId::monospace(13.0), text_color);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.clone(), egui::FontId::monospace(13.0), text_color);
     let indicator = running_match.is_some();
     let extra = if indicator { 18.0 } else { 0.0 };
     let width = (galley.size().x + 10.0 + 28.0 + extra).max(120.0);
@@ -144,7 +144,9 @@ pub fn source_dropdown(
                 if ui
                     .selectable_label(
                         rev == selected,
-                        egui::RichText::new(rev.clone()).monospace().color(theme::TEXT),
+                        egui::RichText::new(rev.clone())
+                            .monospace()
+                            .color(theme::TEXT),
                     )
                     .clicked()
                     && rev != selected

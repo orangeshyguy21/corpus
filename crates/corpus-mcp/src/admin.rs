@@ -8,9 +8,22 @@ use crate::error::Result;
 use crate::tools::Ctx;
 
 pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
+    let origin = if name == "mission_launch" {
+        match &ctx.run_origin {
+            Ok(origin) => origin.as_ref(),
+            Err(why) => {
+                return Err(crate::error::Error::refused(
+                    corpus_core::refusal::Gate::Identity,
+                    format!("refusing mission_launch: run origin is unresolved — {why}"),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let mut admin = corpus_admin::Ctx {
         store: &ctx.store,
         pending_confirms: &mut ctx.pending_confirms,
     };
-    corpus_admin::dispatch(&mut admin, name, args)
+    corpus_admin::dispatch_with_origin(&mut admin, name, args, origin)
 }

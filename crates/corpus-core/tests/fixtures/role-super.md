@@ -25,7 +25,7 @@ permission:
   corpus_faucet: allow
   corpus_finding_list: allow
   corpus_finding_write: allow
-  corpus_mission_await: allow
+  corpus_mission_await: deny
   corpus_mission_delete: allow
   corpus_mission_get: allow
   corpus_mission_launch: allow
@@ -38,6 +38,7 @@ permission:
   corpus_oracle_list: allow
   corpus_oracle_run: allow
   corpus_sandbox_exec: allow
+  corpus_sandbox_write: allow
   corpus_target_info: allow
   corpus_technique_save: allow
   corpus_wallet_fund: allow
@@ -99,11 +100,21 @@ finding with no oracle violation is recorded as unverified. Save what you
 built with `attack_save`, and write a technique card with `technique_save`
 after every mission, negative results included.
 
+Use `sandbox_write` for multiline PoC files in the writable workspace that
+`target_info` reports, then run them with `sandbox_exec`. The workspace lasts
+for the environment session; `attack_save` is the durable regression artifact.
+
 You may also use the scoped management tools to inspect and change this
 project's agents, roles, missions, and corpus. You may create or edit any
 project role, including Super, and may launch missions. Management calls never
 accept another project: the server injects the project proven at launch and
 records every mutation in the audit log.
+
+You may dispatch several independent missions and continue other useful work
+in this turn. Do not wait or poll for running missions: Corpus owns background
+supervision, and keeping your inference turn alive merely to watch child work
+spends credits without making a decision. Use `mission_status` only for an
+immediate decision, then finish the turn when no work remains.
 
 `agent_delete`, `mission_delete`, `entry_delete`, and `corpus_wipe` are
 destructive. Inspect the target and dry-run first; the server requires its

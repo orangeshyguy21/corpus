@@ -3,8 +3,8 @@
 //! directly beneath (full lists, dim mini-headers with `+` create
 //! buttons; missions are siblings of agents, never nested under them).
 //! The selected row gets a full-width ROW_HL fill (text stays TEXT); the
-//! selected PROJECT row additionally carries a `dots_three_vertical`
-//! menu (Clone / Delete); bottom-left the fixed corpus summary (walked
+//! project, agent, and mission rows reveal a `dots_three_vertical`
+//! action menu on hover, selection, or focus; bottom-left the fixed corpus summary (walked
 //! via corpus-core `corpus_stats`, refreshed on selection change + a
 //! refresh icon).
 //!
@@ -24,7 +24,7 @@ use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
 use crate::fmt::fmt_bytes;
 use crate::nav::Screen;
-use crate::state::{AppState, MissionActivity};
+use crate::state::{AppState, MissionDisplayState};
 use crate::theme;
 use crate::views::mission_actions;
 use crate::views::plugin_picker::plugin_picker;
@@ -32,8 +32,8 @@ use crate::views::plugin_picker::plugin_picker;
 /// Row height for a sidebar list row (15px text + 5px vertical padding).
 const ROW_H: f32 = 24.0;
 
-/// Widget state for the sidebar: its three `+` create flows, the project
-/// clone dialog, and the on-demand plugin probe.
+/// Widget state for the sidebar: its three `+` create flows, row action
+/// menus and dialogs, and the on-demand plugin probe.
 pub struct Sidebar {
     create_project: bool,
     create_name: String,
@@ -55,6 +55,14 @@ pub struct Sidebar {
     /// other's text.
     rename_project: Option<String>,
     rename_project_name: String,
+    /// The row whose overflow popup is open. Keeping this explicit means
+    /// the button remains rendered while the pointer moves from the row into
+    /// the popup; hover-only widgets otherwise disappear on the next frame.
+    open_row_menu: Option<String>,
+    /// Destructive sidebar actions use the same confirm-first ritual as the
+    /// corresponding detail pages.
+    delete_project: Option<(String, String)>,
+    delete_agent: Option<(String, String, String)>,
     /// The project the new-agent modal targets (the `+` on a project's
     /// agents group sets it).
     new_agent_project: String,
@@ -80,6 +88,9 @@ impl Default for Sidebar {
             rename_name: String::new(),
             rename_project: None,
             rename_project_name: String::new(),
+            open_row_menu: None,
+            delete_project: None,
+            delete_agent: None,
             new_agent_project: String::new(),
             needs_probe: false,
         }
@@ -118,6 +129,8 @@ impl Sidebar {
         self.new_agent_window(ui, state, toasts);
         self.rename_window(ui, state, toasts);
         self.rename_project_window(ui, state, toasts);
+        self.delete_project_window(ui, state, toasts);
+        self.delete_agent_window(ui, state, toasts);
         self.clone_window(ui, state, toasts);
     }
 
@@ -126,8 +139,8 @@ impl Sidebar {
         self.section_tree(ui, state, toasts);
     }
 
-    /// The project tree: one row per project (the selected row carries
-    /// the Clone/Delete kebab), with its agents and missions nested
+    /// The project tree: one row per project (action menus reveal on hover,
+    /// selection, focus, or while open), with its agents and missions nested
     /// directly beneath — full lists, no per-group expanders. ACCORDION:
     /// only the selected project's children show; selecting another
     /// project collapses the rest. Projects sort newest-created first,
@@ -147,7 +160,7 @@ impl Sidebar {
         let trees = state.trees.clone();
         for (slug, project) in &projects {
             let open = selected.as_deref() == Some(slug.as_str());
-            self.project_row(ui, state, toasts, slug, project, open);
+            self.project_row(ui, state, slug, project, open);
             if open {
                 if let Some(tree) = trees.get(slug) {
                     self.project_children(ui, state, toasts, slug, tree);
@@ -159,24 +172,22 @@ impl Sidebar {
         }
     }
 
-    /// One project row (display name, kebab on the selected row) — the
-    /// tree's parent node.
+    /// One project row (display name, hover/selection kebab) — the tree's
+    /// parent node.
     fn project_row(
         &mut self,
         ui: &mut Ui,
         state: &mut AppState,
-        toasts: &mut Toasts,
         slug: &str,
         project: &corpus_core::Project,
         is_sel: bool,
     ) {
-        // Only the selected PROJECT row carries the Clone/Delete kebab.
         let Row {
             ui: mut rui,
             rect,
             click,
-            ..
-        } = row_ui(ui, is_sel, is_sel, slug);
+            hovered,
+        } = row_ui(ui, is_sel, true, slug);
         // Row label is the display NAME only (slug falls back when the
         // name is empty); the slug moves to the hover text (defect 1a).
         let name = if project.name.is_empty() {
@@ -184,71 +195,69 @@ impl Sidebar {
         } else {
             project.name.clone()
         };
-        let text = RichText::new(&name).size(15.0).color(theme::TEXT);
-        // The label SENSES clicks and unions with the row band: text and
-        // padding activate identically, and the pointer cursor shows over
-        // both (a hover-only label swallows hover and breaks both).
-        let (label_resp, _kebab_w) = if is_sel {
-            // Render the right-aligned kebab zone FIRST, then the
-            // truncated label so truncation measures the remaining width
-            // and never collides with the icon (defect 1d).
-            let kebab = rui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                egui::menu::menu_custom_button(
-                    ui,
-                    egui::Button::new(theme::icon_text(
-                        ph::DOTS_THREE_VERTICAL,
-                        16.0,
-                        theme::TEXT_MUTED,
-                    ))
-                    .frame(false),
-                    |ui| {
-                        if ui.button("Rename…").clicked() {
-                            self.rename_project = Some(slug.to_string());
-                            self.rename_project_name = name.clone();
-                            ui.close_menu();
-                        }
-                        if ui.button("Clone…").clicked() {
-                            self.prep_clone(slug.to_string());
-                            ui.close_menu();
-                        }
-                        if ui.button("Delete").clicked() {
-                            delete_project(state, toasts, slug);
-                            ui.close_menu();
-                        }
-                    },
-                );
-            });
-            let kebab_w = kebab.response.rect.width();
-            let fill = rect.width() - 8.0 - kebab_w - 8.0;
-            let label_rect = egui::Rect::from_min_size(
-                egui::pos2(rect.min.x, rect.min.y),
-                egui::vec2(fill.max(0.0), rect.height()),
+        let menu_key = format!("project:{slug}");
+        let show_menu = row_menu_visible(
+            is_sel,
+            hovered,
+            click.has_focus(),
+            self.open_row_menu.as_deref() == Some(menu_key.as_str()),
+        );
+        if show_menu {
+            let menu_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.max.x - KEBAB_STRIP, rect.min.y),
+                rect.max,
             );
-            let resp = rui
+            let open = rui
                 .allocate_new_ui(
                     egui::UiBuilder::new()
-                        .max_rect(label_rect)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        .max_rect(menu_rect)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
                     |ui| {
-                        ui.add_space(8.0); // left text inset
-                        ui.add(
-                            egui::Label::new(text)
-                                .sense(egui::Sense::click())
-                                .truncate(),
-                        )
+                        ui.push_id(&menu_key, |ui| {
+                            egui::menu::menu_custom_button(ui, overflow_button(), |ui| {
+                                if ui.button("Rename…").clicked() {
+                                    self.rename_project = Some(slug.to_string());
+                                    self.rename_project_name = name.clone();
+                                    ui.close_menu();
+                                }
+                                if ui.button("Clone…").clicked() {
+                                    self.prep_clone(slug.to_string());
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                                if ui
+                                    .button(RichText::new("Delete…").color(theme::SIGNAL_RED))
+                                    .clicked()
+                                {
+                                    self.delete_project = Some((slug.to_string(), name.clone()));
+                                    ui.close_menu();
+                                }
+                            })
+                            .inner
+                            .is_some()
+                        })
+                        .inner
                     },
                 )
                 .inner;
-            (resp, kebab_w)
-        } else {
-            rui.add_space(8.0); // left text inset
-            let resp = rui.add(
-                egui::Label::new(text)
-                    .sense(egui::Sense::click())
-                    .truncate(),
-            );
-            (resp, 0.0)
-        };
+            self.remember_open_menu(&menu_key, open);
+        }
+        let label_rect = row_label_rect(rect, true);
+        let label_resp = rui
+            .allocate_new_ui(
+                egui::UiBuilder::new()
+                    .max_rect(label_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(&name).size(15.0).color(theme::TEXT))
+                            .sense(egui::Sense::click())
+                            .truncate(),
+                    )
+                },
+            )
+            .inner;
         if label_resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
@@ -285,17 +294,83 @@ impl Sidebar {
         for (slug, agent) in &tree.agents {
             let is_sel = on_screen && state.selected_agent.as_deref() == Some(slug.as_str());
             let Row {
-                ui: mut rui, click, ..
-            } = row_ui(ui, is_sel, false, ("agent", project, slug));
-            rui.add_space(24.0);
+                ui: mut rui,
+                rect,
+                click,
+                hovered,
+            } = row_ui(ui, is_sel, true, ("agent", project, slug));
             // Row label is the display NAME, never the opaque slug (a UUID);
             // the slug moves to the hover text for identity.
             let name = crate::state::agent_label(&agent.meta.name, slug);
-            let label = rui.add(
-                egui::Label::new(RichText::new(name).size(13.5).color(theme::TEXT))
-                    .sense(egui::Sense::click())
-                    .truncate(),
+            let menu_key = format!("agent:{project}:{slug}");
+            let show_menu = row_menu_visible(
+                is_sel,
+                hovered,
+                click.has_focus(),
+                self.open_row_menu.as_deref() == Some(menu_key.as_str()),
             );
+            if show_menu {
+                let menu_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.max.x - KEBAB_STRIP, rect.min.y),
+                    rect.max,
+                );
+                let open = rui
+                    .allocate_new_ui(
+                        egui::UiBuilder::new()
+                            .max_rect(menu_rect)
+                            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                        |ui| {
+                            ui.push_id(&menu_key, |ui| {
+                                egui::menu::menu_custom_button(ui, overflow_button(), |ui| {
+                                    if ui.button("Clone…").clicked() {
+                                        match state.clone_agent(project, slug) {
+                                            Ok(()) => {
+                                                toast(toasts, ToastKind::Success, "agent cloned");
+                                                state.refresh();
+                                            }
+                                            Err(error) => {
+                                                toast(toasts, ToastKind::Error, error.to_string())
+                                            }
+                                        }
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
+                                    if ui
+                                        .button(RichText::new("Delete…").color(theme::SIGNAL_RED))
+                                        .clicked()
+                                    {
+                                        self.delete_agent = Some((
+                                            project.to_string(),
+                                            slug.to_string(),
+                                            name.clone(),
+                                        ));
+                                        ui.close_menu();
+                                    }
+                                })
+                                .inner
+                                .is_some()
+                            })
+                            .inner
+                        },
+                    )
+                    .inner;
+                self.remember_open_menu(&menu_key, open);
+            }
+            let label = rui
+                .allocate_new_ui(
+                    egui::UiBuilder::new()
+                        .max_rect(row_label_rect(rect, true))
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        ui.add_space(24.0);
+                        ui.add(
+                            egui::Label::new(RichText::new(&name).size(13.5).color(theme::TEXT))
+                                .sense(egui::Sense::click())
+                                .truncate(),
+                        )
+                    },
+                )
+                .inner;
             if label.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -324,10 +399,10 @@ impl Sidebar {
         for (slug, mission) in &tree.missions {
             let is_sel = on_screen && state.selected_mission.as_deref() == Some(slug.as_str());
             let label_text = crate::state::mission_label(mission.name.as_deref(), slug);
-            // The status dot: pulses only while the agent is ACTUALLY
-            // producing. A session parked at its prompt is live, not
-            // busy, and shows a steady dot instead.
-            let activity = state.mission_activity(project, slug);
+            // One static status language across lifecycle and activity.
+            // A session parked at its prompt is live, not busy, and uses
+            // the quieter green rather than a transition/warning color.
+            let display_state = state.mission_display_state(project, slug);
             // A mission row always reserves the kebab strip (⋮ shown on
             // the selected row and on row hover).
             let Row {
@@ -336,54 +411,55 @@ impl Sidebar {
                 click,
                 hovered,
             } = row_ui(ui, is_sel, true, ("mission", project, slug));
-            let (label_resp, _menu_w) = if is_sel || hovered {
-                let menu_w = rui
-                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.mission_menu(ui, state, toasts, project, slug, &label_text)
-                    })
-                    .response
-                    .rect
-                    .width();
-                let fill = (rect.width() - 24.0 - menu_w - 8.0).max(0.0);
-                let label_rect = egui::Rect::from_min_size(
-                    egui::pos2(rect.min.x, rect.min.y),
-                    egui::vec2(fill, rect.height()),
+            let menu_key = format!("mission:{project}:{slug}");
+            let show_menu = row_menu_visible(
+                is_sel,
+                hovered,
+                click.has_focus(),
+                self.open_row_menu.as_deref() == Some(menu_key.as_str()),
+            );
+            if show_menu {
+                let menu_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.max.x - KEBAB_STRIP, rect.min.y),
+                    rect.max,
                 );
-                let resp = rui
+                let open = rui
                     .allocate_new_ui(
                         egui::UiBuilder::new()
-                            .max_rect(label_rect)
-                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                            .max_rect(menu_rect)
+                            .layout(egui::Layout::right_to_left(egui::Align::Center)),
                         |ui| {
-                            // Status dot inside the 24px tree indent:
-                            // the label's x is unchanged.
-                            ui.add_space(12.0);
-                            let (dot_rect, _) = ui
-                                .allocate_exact_size(egui::vec2(12.0, ROW_H), egui::Sense::hover());
-                            status_dot(ui, dot_rect, activity);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&label_text).size(13.5).color(theme::TEXT),
-                                )
-                                .sense(egui::Sense::click())
-                                .truncate(),
-                            )
+                            ui.push_id(&menu_key, |ui| {
+                                self.mission_menu(ui, state, toasts, project, slug, &label_text)
+                            })
+                            .inner
                         },
                     )
                     .inner;
-                (resp, menu_w)
-            } else {
-                rui.add_space(12.0);
-                let (dot_rect, _) =
-                    rui.allocate_exact_size(egui::vec2(12.0, ROW_H), egui::Sense::hover());
-                status_dot(&rui, dot_rect, activity);
-                let resp = rui.add(
-                    egui::Label::new(RichText::new(&label_text).size(13.5).color(theme::TEXT))
-                        .sense(egui::Sense::click())
-                        .truncate(),
-                );
-                (resp, 0.0)
-            };
+                self.remember_open_menu(&menu_key, open);
+            }
+            let label_resp = rui
+                .allocate_new_ui(
+                    egui::UiBuilder::new()
+                        .max_rect(row_label_rect(rect, true))
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        // Status dot inside the 24px tree indent: the label's
+                        // x is unchanged when the overflow button appears.
+                        ui.add_space(12.0);
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(12.0, ROW_H), egui::Sense::hover());
+                        status_dot(ui, dot_rect, display_state);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&label_text).size(13.5).color(theme::TEXT),
+                            )
+                            .sense(egui::Sense::click())
+                            .truncate(),
+                        )
+                    },
+                )
+                .inner;
             if label_resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -393,11 +469,7 @@ impl Sidebar {
             click.on_hover_text(format!(
                 "{project} · agent={}{}",
                 mission.agent,
-                match activity {
-                    MissionActivity::Working => " · working",
-                    MissionActivity::Waiting => " · session live, waiting",
-                    MissionActivity::Idle => " · idle",
-                }
+                format!(" · {}", display_state.label())
             ));
         }
         if tree.missions.is_empty() {
@@ -460,35 +532,108 @@ impl Sidebar {
         project: &str,
         slug: &str,
         name: &str,
-    ) -> egui::Response {
-        egui::menu::menu_custom_button(
-            ui,
-            egui::Button::new(theme::icon_text(
-                ph::DOTS_THREE_VERTICAL,
-                16.0,
-                theme::TEXT_MUTED,
-            ))
-            .frame(false),
-            |ui| {
-                if ui.button("Rename…").clicked() {
-                    self.rename_mission_project = Some(project.to_string());
-                    self.rename_mission = Some(slug.to_string());
-                    self.rename_name = name.to_string();
-                    ui.close_menu();
-                }
-                if ui
-                    .add_enabled(
-                        state.mission_delete_available(project, slug),
-                        egui::Button::new("Delete"),
-                    )
-                    .clicked()
-                {
-                    mission_actions::delete(state, toasts, project, slug);
-                    ui.close_menu();
-                }
-            },
-        )
-        .response
+    ) -> bool {
+        egui::menu::menu_custom_button(ui, overflow_button(), |ui| {
+            if ui.button("Rename…").clicked() {
+                self.rename_mission_project = Some(project.to_string());
+                self.rename_mission = Some(slug.to_string());
+                self.rename_name = name.to_string();
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    state.mission_delete_available(project, slug),
+                    egui::Button::new(RichText::new("Delete…").color(theme::SIGNAL_RED)),
+                )
+                .clicked()
+            {
+                mission_actions::delete(state, toasts, project, slug);
+                ui.close_menu();
+            }
+        })
+        .inner
+        .is_some()
+    }
+
+    fn remember_open_menu(&mut self, key: &str, open: bool) {
+        if open {
+            self.open_row_menu = Some(key.to_string());
+        } else if self.open_row_menu.as_deref() == Some(key) {
+            self.open_row_menu = None;
+        }
+    }
+
+    fn delete_project_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
+        let Some((slug, name)) = self.delete_project.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut finished = false;
+        theme::dialog(ui.ctx(), "sidebar_delete_project", "Delete project")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("Delete project “{name}”?"));
+                ui.weak("Its agents, missions, runs, and corpus are removed. There is no undo.");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if theme::destructive_button(ui, "Delete project").clicked() {
+                        delete_project(state, toasts, &slug);
+                        finished = true;
+                    }
+                    if theme::house_button(ui, "Cancel").clicked() {
+                        finished = true;
+                    }
+                });
+            });
+        if !open || finished {
+            self.delete_project = None;
+        }
+    }
+
+    fn delete_agent_window(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts) {
+        let Some((project, slug, name)) = self.delete_agent.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut finished = false;
+        theme::dialog(ui.ctx(), "sidebar_delete_agent", "Delete agent")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("Delete agent “{name}”?"));
+                ui.weak("Its configuration is removed from this project. There is no undo.");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if theme::destructive_button(ui, "Delete agent").clicked() {
+                        match state.delete_agent(&project, &slug) {
+                            Ok(()) => {
+                                toast(toasts, ToastKind::Success, "agent deletion started");
+                                if state.effective_project().as_deref() == Some(project.as_str())
+                                    && state.selected_agent.as_deref() == Some(slug.as_str())
+                                {
+                                    state.selected_agent = None;
+                                }
+                                state.refresh();
+                                finished = true;
+                            }
+                            Err(error) => {
+                                toast(toasts, ToastKind::Error, error.to_string());
+                            }
+                        }
+                    }
+                    if theme::house_button(ui, "Cancel").clicked() {
+                        finished = true;
+                    }
+                });
+            });
+        if !open || finished {
+            self.delete_agent = None;
+        }
     }
 
     /// The project Rename… modal: sets the project's display LABEL. The slug
@@ -757,33 +902,33 @@ impl Sidebar {
             "sidebar_clone_project",
             format!("Clone project: {from}"),
         )
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -100.0))
-            .show(ui.ctx(), |ui| {
-                ui.label("Display name (optional — defaults to the source's)");
-                let entry = ui.text_edit_singleline(&mut self.clone_name);
-                ui.checkbox(&mut self.clone_corpus, "copy the shared corpus");
-                ui.add_space(8.0);
-                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if theme::house_button(ui, "Clone").clicked() || submit {
-                    let name = if self.clone_name.trim().is_empty() {
-                        None
-                    } else {
-                        Some(self.clone_name.trim())
-                    };
-                    match state.clone_project(&from, name, self.clone_corpus) {
-                        Ok((to, _)) => {
-                            toast(toasts, ToastKind::Success, "project cloned");
-                            state.refresh();
-                            state.select_project(&to);
-                            done = true;
-                        }
-                        Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -100.0))
+        .show(ui.ctx(), |ui| {
+            ui.label("Display name (optional — defaults to the source's)");
+            let entry = ui.text_edit_singleline(&mut self.clone_name);
+            ui.checkbox(&mut self.clone_corpus, "copy the shared corpus");
+            ui.add_space(8.0);
+            let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if theme::house_button(ui, "Clone").clicked() || submit {
+                let name = if self.clone_name.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.clone_name.trim())
+                };
+                match state.clone_project(&from, name, self.clone_corpus) {
+                    Ok((to, _)) => {
+                        toast(toasts, ToastKind::Success, "project cloned");
+                        state.refresh();
+                        state.select_project(&to);
+                        done = true;
                     }
+                    Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
                 }
-            });
+            }
+        });
         self.show_clone = open && !done;
     }
 }
@@ -827,6 +972,13 @@ fn row_ui(ui: &mut Ui, selected: bool, has_kebab: bool, id_seed: impl std::hash:
         let mut painter = ui.painter().clone();
         painter.set_clip_rect(band_rect);
         painter.rect_filled(band_rect, egui::CornerRadius::ZERO, fill);
+        if selected {
+            painter.rect_filled(
+                egui::Rect::from_min_size(band_rect.min, egui::vec2(2.0, band_rect.height())),
+                egui::CornerRadius::ZERO,
+                theme::INTERACTION,
+            );
+        }
     }
     if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -857,33 +1009,57 @@ fn row_ui(ui: &mut Ui, selected: bool, has_kebab: bool, id_seed: impl std::hash:
     }
 }
 
-/// A mission row's status dot, one glyph per activity state:
-///   - `Idle`    — steady faint dot: nothing is up.
-///   - `Waiting` — steady health-green dot, no halo: the opencode session is
-///                 live but the agent is parked at its prompt. Motion
-///                 here would claim work that isn't happening, so the
-///                 dot only says "attached".
-///   - `Working` — health-green with a soft pulsing halo: producing now.
-/// The pulse is pure paint off the app's live-producer clock — no widget,
-/// no state. `AppState::live_repaint_after` owns the 50 ms working cadence.
-fn status_dot(ui: &Ui, rect: egui::Rect, activity: MissionActivity) {
+/// The overflow strip is reserved on every actionable row, whether its
+/// button is currently visible or not. This keeps truncation and label
+/// positions stable across hover transitions.
+fn row_label_rect(rect: egui::Rect, has_kebab: bool) -> egui::Rect {
+    let right = if has_kebab {
+        rect.max.x - KEBAB_STRIP
+    } else {
+        rect.max.x
+    };
+    egui::Rect::from_min_max(rect.min, egui::pos2(right.max(rect.min.x), rect.max.y))
+}
+
+fn row_menu_visible(selected: bool, hovered: bool, focused: bool, open: bool) -> bool {
+    selected || hovered || focused || open
+}
+
+fn overflow_button() -> egui::Button<'static> {
+    egui::Button::new(theme::icon_text(
+        ph::DOTS_THREE_VERTICAL,
+        16.0,
+        theme::TEXT_MUTED,
+    ))
+    .frame(false)
+}
+
+/// Static mission status language: gray is idle, amber is a transition,
+/// bright/dim green distinguish working from waiting, and red requires
+/// attention or marks destructive teardown.
+fn status_dot(ui: &Ui, rect: egui::Rect, state: MissionDisplayState) {
     let center = rect.center();
-    match activity {
-        MissionActivity::Working => {
-            // Smooth ease-in-out pulse at ~1.4 Hz (two full breaths).
-            let t = ui.ctx().input(|i| i.time) as f32;
-            let pulse = ((t * std::f32::consts::TAU * 1.4).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-            let halo_r = 3.0 + 4.0 * pulse;
-            let core_r = 2.2 + 0.6 * (pulse - 0.5).abs() * -2.0; // slimmer at the extremes
-            let halo = theme::HEALTHY.gamma_multiply(0.10 + 0.20 * pulse);
-            ui.painter().circle_filled(center, halo_r, halo);
-            ui.painter().circle_filled(center, core_r, theme::HEALTHY);
+    match state {
+        MissionDisplayState::Working => {
+            ui.painter()
+                .circle_filled(center, 5.0, theme::HEALTHY.gamma_multiply(0.20));
+            ui.painter().circle_filled(center, 2.2, theme::HEALTHY);
         }
-        MissionActivity::Waiting => {
+        MissionDisplayState::Waiting => {
             ui.painter()
                 .circle_filled(center, 2.2, theme::HEALTHY.gamma_multiply(0.55));
         }
-        MissionActivity::Idle => {
+        MissionDisplayState::Queued
+        | MissionDisplayState::Preparing
+        | MissionDisplayState::Starting
+        | MissionDisplayState::Stopping
+        | MissionDisplayState::Exporting => {
+            ui.painter().circle_filled(center, 2.2, theme::INTERACTION);
+        }
+        MissionDisplayState::Failed | MissionDisplayState::Deleting => {
+            ui.painter().circle_filled(center, 2.2, theme::SIGNAL_RED);
+        }
+        MissionDisplayState::Idle => {
             ui.painter().circle_filled(center, 2.2, theme::TEXT_FAINT);
         }
     }
@@ -1042,12 +1218,16 @@ fn section_header(ui: &mut Ui, title: &str) -> (bool, bool) {
 /// bubbles
 /// up as a toast (the operator never loses `default`).
 fn delete_project(state: &mut AppState, toasts: &mut Toasts, slug: &str) {
+    let deleting_selected = state.effective_project().as_deref() == Some(slug);
     match state.delete_project(slug) {
         Ok(()) => {
-            toast(toasts, ToastKind::Success, "project deleted");
+            toast(toasts, ToastKind::Success, "project deletion started");
             state.refresh();
-            // ensure_selection re-picks a project next frame.
-            state.selected_project = None;
+            if deleting_selected {
+                // ensure_selection re-picks a project next frame. Deleting a
+                // different row must not move the operator off their page.
+                state.selected_project = None;
+            }
         }
         Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
     }
@@ -1061,4 +1241,41 @@ fn toast(toasts: &mut Toasts, kind: ToastKind, text: impl Into<String>) {
             .text(text.into())
             .options(ToastOptions::default().duration(Duration::from_secs(4))),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actionable_rows_reveal_overflow_for_every_interactive_state() {
+        assert!(!row_menu_visible(false, false, false, false));
+        assert!(row_menu_visible(true, false, false, false));
+        assert!(row_menu_visible(false, true, false, false));
+        assert!(row_menu_visible(false, false, true, false));
+        assert!(row_menu_visible(false, false, false, true));
+    }
+
+    #[test]
+    fn actionable_row_label_width_does_not_change_on_hover() {
+        let row = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(240.0, ROW_H));
+        let label = row_label_rect(row, true);
+        assert_eq!(label.left(), row.left());
+        assert_eq!(label.right(), row.right() - KEBAB_STRIP);
+        assert_eq!(label.height(), row.height());
+    }
+
+    #[test]
+    fn open_menu_identity_persists_until_that_menu_closes() {
+        let mut sidebar = Sidebar::default();
+        sidebar.remember_open_menu("agent:p:a", true);
+        assert_eq!(sidebar.open_row_menu.as_deref(), Some("agent:p:a"));
+
+        // A closed sibling must not clear the active popup.
+        sidebar.remember_open_menu("mission:p:m", false);
+        assert_eq!(sidebar.open_row_menu.as_deref(), Some("agent:p:a"));
+
+        sidebar.remember_open_menu("agent:p:a", false);
+        assert!(sidebar.open_row_menu.is_none());
+    }
 }

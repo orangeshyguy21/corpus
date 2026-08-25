@@ -29,6 +29,30 @@ pub fn fmt_tokens(tokens: u64) -> String {
     }
 }
 
+/// Compact wall-clock duration for project inference totals.
+pub fn fmt_duration(milliseconds: u64) -> String {
+    let seconds = milliseconds as f64 / 1_000.0;
+    if milliseconds < 60_000 {
+        format!("{seconds:.1}s")
+    } else if milliseconds < 3_600_000 {
+        format!("{:.1}m", seconds / 60.0)
+    } else {
+        format!("{:.1}h", seconds / 3_600.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_duration;
+
+    #[test]
+    fn duration_uses_a_compact_project_metric_format() {
+        assert_eq!(fmt_duration(3_250), "3.2s");
+        assert_eq!(fmt_duration(90_000), "1.5m");
+        assert_eq!(fmt_duration(7_200_000), "2.0h");
+    }
+}
+
 /// USD cost, cents precision (4 decimals below a dime so small runs stay
 /// distinguishable).
 pub fn fmt_usd(cost: f64) -> String {

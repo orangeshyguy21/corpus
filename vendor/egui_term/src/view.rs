@@ -219,6 +219,11 @@ impl<'a> TerminalView<'a> {
             }
 
             let is_app_cursor_mode = content.terminal_mode.contains(TermMode::APP_CURSOR);
+            let is_visible_cursor = cursor_is_visible_at(
+                content.terminal_mode,
+                content.grid.cursor.point,
+                indexed.point,
+            );
             let is_wide_char = flags.contains(cell::Flags::WIDE_CHAR);
             let is_inverse = flags.contains(cell::Flags::INVERSE);
             let is_dim = flags.intersects(cell::Flags::DIM | cell::Flags::DIM_BOLD);
@@ -274,7 +279,7 @@ impl<'a> TerminalView<'a> {
             }
 
             // Handle cursor rendering
-            if content.grid.cursor.point == indexed.point {
+            if is_visible_cursor {
                 let cursor_color = self.theme.get_color(content.cursor.fg);
                 shapes.push(Shape::Rect(RectShape::filled(
                     Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_width, cell_height)),
@@ -285,7 +290,7 @@ impl<'a> TerminalView<'a> {
 
             // Draw text content
             if indexed.c != ' ' && indexed.c != '\t' {
-                if content.grid.cursor.point == indexed.point && is_app_cursor_mode {
+                if is_visible_cursor && is_app_cursor_mode {
                     std::mem::swap(&mut fg, &mut bg);
                 }
 
@@ -307,6 +312,14 @@ impl<'a> TerminalView<'a> {
     }
 }
 
+fn cursor_is_visible_at(
+    terminal_mode: TermMode,
+    cursor_point: TerminalGridPoint,
+    cell_point: TerminalGridPoint,
+) -> bool {
+    terminal_mode.contains(TermMode::SHOW_CURSOR) && cursor_point == cell_point
+}
+
 fn event_requires_pointer(event: &egui::Event) -> bool {
     matches!(
         event,
@@ -318,7 +331,9 @@ fn event_requires_pointer(event: &egui::Event) -> bool {
 
 #[cfg(test)]
 mod input_tests {
-    use super::event_requires_pointer;
+    use super::{cursor_is_visible_at, event_requires_pointer};
+    use alacritty_terminal::index::{Column, Line, Point};
+    use alacritty_terminal::term::TermMode;
 
     #[test]
     fn keyboard_is_focus_gated_but_not_pointer_gated() {
@@ -332,6 +347,20 @@ mod input_tests {
             delta: egui::vec2(0.0, 1.0),
             modifiers: egui::Modifiers::NONE,
         }));
+    }
+
+    #[test]
+    fn cursor_rendering_obeys_show_cursor_mode() {
+        let cursor = Point::new(Line(2), Column(3));
+
+        assert!(cursor_is_visible_at(TermMode::SHOW_CURSOR, cursor, cursor));
+        assert!(!cursor_is_visible_at(TermMode::empty(), cursor, cursor));
+        assert!(!cursor_is_visible_at(
+            TermMode::SHOW_CURSOR,
+            cursor,
+            Point::new(Line(2), Column(4)),
+        ));
+        assert!(!cursor_is_visible_at(TermMode::APP_CURSOR, cursor, cursor));
     }
 }
 

@@ -110,10 +110,10 @@ mod live {
     use futures::StreamExt;
 
     use goose::agents::{Agent, AgentConfig, AgentEvent, GoosePlatform, SessionConfig};
-    use goose::conversation::message::{ActionRequiredData, Message, MessageContentBlock};
     use goose::config::{
         GooseMode, PermissionManager, DEFAULT_EXTENSION_DESCRIPTION, DEFAULT_EXTENSION_TIMEOUT,
     };
+    use goose::conversation::message::{ActionRequiredData, Message, MessageContentBlock};
     use goose::permission::permission_confirmation::PrincipalType;
     use goose::permission::{Permission, PermissionConfirmation};
     use goose::session::{SessionManager, SessionType};
@@ -205,7 +205,10 @@ mod live {
             .open(project_scope(&project).join("chat.log"))
             .ok()
             .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)));
-        log_line(&log, &format!("session {session_id} starting (role {role}, model {model})"));
+        log_line(
+            &log,
+            &format!("session {session_id} starting (role {role}, model {model})"),
+        );
 
         let (agent, goose_session) = match setup(&project, &model, role).await {
             Ok(pair) => pair,
@@ -255,9 +258,8 @@ mod live {
         // Confirmation-id → the agent that must receive the decision: the
         // main session OR a delegated specialist (a specialist's write tools
         // surface Approve/Reject in the panel like the main session's).
-        let pending: PendingApprovals = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        ));
+        let pending: PendingApprovals =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
         loop {
             tokio::select! {
@@ -416,7 +418,19 @@ mod live {
         let project = project.to_string();
         let model = model.to_string();
         let handle = tokio::spawn(async move {
-            translate_turn(agent, msg, session_cfg, cancel, ev, log, pending, project, model, turn).await;
+            translate_turn(
+                agent,
+                msg,
+                session_cfg,
+                cancel,
+                ev,
+                log,
+                pending,
+                project,
+                model,
+                turn,
+            )
+            .await;
             let _ = done.send(turn).await;
         });
         (token, handle)
@@ -443,7 +457,11 @@ mod live {
     /// `corpus-admin-mcp` extension with `available_tools` = its scoped
     /// domain (goose refuses anything else BY CONSTRUCTION); the Orchestrator
     /// registers NO admin extension (no tools to call).
-    async fn setup(project: &str, model: &str, role: TeamRole) -> anyhow::Result<(Arc<Agent>, String)> {
+    async fn setup(
+        project: &str,
+        model: &str,
+        role: TeamRole,
+    ) -> anyhow::Result<(Arc<Agent>, String)> {
         let scope = project_scope(project);
         // Session-scoped env: redirect all goose config/data/state into the
         // project scope, and pin the model. (Process-wide knobs —
@@ -473,8 +491,7 @@ mod live {
         let agent = Arc::new(Agent::with_config(config));
 
         let provider = goose::providers::create_with_named_model("ollama", vec![]).await?;
-        let model_config =
-            goose::model_config::model_config_from_user_config("ollama", model)?;
+        let model_config = goose::model_config::model_config_from_user_config("ollama", model)?;
 
         // Session identity is OUR term: reuse the project-scoped id. The
         // working_dir is the project SCOPE so summon's local discovery
@@ -523,7 +540,11 @@ mod live {
                 agent
                     .add_extension(build_team_extension(), &session.id)
                     .await
-                    .map_err(|e| anyhow::anyhow!("could not register the corpus-team (delegation) extension: {e}"))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "could not register the corpus-team (delegation) extension: {e}"
+                        )
+                    })?;
             }
             _ => {
                 let scoped = build_corpus_admin_extension(role)?;
@@ -662,7 +683,9 @@ Use Markdown formatting for all responses.
     /// passes exactly its scoped domain from [`crate::chat::team::TeamRole`],
     /// so goose's `is_tool_available` refuses every out-of-domain / destructive
     /// tool BY CONSTRUCTION.
-    pub(super) fn build_corpus_admin_extension(role: TeamRole) -> anyhow::Result<goose::agents::ExtensionConfig> {
+    pub(super) fn build_corpus_admin_extension(
+        role: TeamRole,
+    ) -> anyhow::Result<goose::agents::ExtensionConfig> {
         let available_tools = role.admin_tools();
         Ok(goose::agents::ExtensionConfig::Stdio {
             name: "corpus-admin".into(),
@@ -776,7 +799,12 @@ Use Markdown formatting for all responses.
                                         let tool_name = tool_name.clone();
                                         let log = log.clone();
                                         tokio::spawn(async move {
-                                            log_line(&log, &format!("auto-approved read-only tool: {tool_name}"));
+                                            log_line(
+                                                &log,
+                                                &format!(
+                                                    "auto-approved read-only tool: {tool_name}"
+                                                ),
+                                            );
                                             let _ = agent
                                                 .tool_confirmation_router
                                                 .deliver(
@@ -1027,7 +1055,10 @@ Use Markdown formatting for all responses.
     ) -> Result<String, String> {
         log_line(
             &log,
-            &format!("delegate › {role} start: {}", crate::chat::truncate(&instructions, 120)),
+            &format!(
+                "delegate › {role} start: {}",
+                crate::chat::truncate(&instructions, 120)
+            ),
         );
         let scope = project_scope(&project);
         let session_mgr = SessionManager::new(scope.join("data"));
@@ -1066,8 +1097,8 @@ Use Markdown formatting for all responses.
         agent
             .override_system_prompt(corpus_system_prompt(role, &project))
             .await;
-        let ext = build_corpus_admin_extension(role)
-            .map_err(|e| format!("specialist extension: {e}"))?;
+        let ext =
+            build_corpus_admin_extension(role).map_err(|e| format!("specialist extension: {e}"))?;
         agent
             .add_extension(ext, &session.id)
             .await
@@ -1135,7 +1166,9 @@ Use Markdown formatting for all responses.
                                     // A successful specialist WRITE mutates
                                     // the store — same nav-refresh signal.
                                     if !is_error {
-                                        if let Some(area) = crate::chat::team::mutated_area(tool_name) {
+                                        if let Some(area) =
+                                            crate::chat::team::mutated_area(tool_name)
+                                        {
                                             let _ = ev.send(ChatEvent::StoreMutated { area });
                                         }
                                     }
@@ -1172,7 +1205,12 @@ Use Markdown formatting for all responses.
                                         let agent = agent.clone();
                                         let log = log.clone();
                                         tokio::spawn(async move {
-                                            log_line(&log, &format!("auto-approved read-only tool: {tool_name}"));
+                                            log_line(
+                                                &log,
+                                                &format!(
+                                                    "auto-approved read-only tool: {tool_name}"
+                                                ),
+                                            );
                                             let _ = agent
                                                 .tool_confirmation_router
                                                 .deliver(
@@ -1208,7 +1246,10 @@ Use Markdown formatting for all responses.
         }
         log_line(
             &log,
-            &format!("delegate › {role} end ({n_calls} tool calls, {} chars)", report.len()),
+            &format!(
+                "delegate › {role} end ({n_calls} tool calls, {} chars)",
+                report.len()
+            ),
         );
         // Drop any un-resolved registrations (cancelled turn / abandoned
         // confirmation) so the router can't route a stale id to a dead agent.
@@ -1246,7 +1287,10 @@ mod injection_probe {
         assert!(!ext.is_tool_available("project_delete"));
         // And so are all the other destructive tools.
         for t in crate::chat::team::DESTRUCTIVE_TOOLS {
-            assert!(!ext.is_tool_available(t), "{t} must be withheld from inspector");
+            assert!(
+                !ext.is_tool_available(t),
+                "{t} must be withheld from inspector"
+            );
         }
         // The inspector's own read tool is available.
         assert!(ext.is_tool_available("corpus_read"));
@@ -1264,9 +1308,8 @@ mod injection_probe {
                 // Orchestrator registers NO extension; nothing to build.
                 continue;
             }
-            let ext = build_corpus_admin_extension(*role).unwrap_or_else(|_| {
-                panic!("{role} extension builds")
-            });
+            let ext = build_corpus_admin_extension(*role)
+                .unwrap_or_else(|_| panic!("{role} extension builds"));
             for t in crate::chat::team::DESTRUCTIVE_TOOLS {
                 assert!(
                     !ext.is_tool_available(t),
@@ -1285,10 +1328,15 @@ mod injection_probe {
         // extension was dropped: its subagents inherit only parent-session
         // extensions, so per-specialist scoping was impossible).
         let (name, tools, instructions) = match &ext {
-            ExtensionConfig::Frontend { name, tools, instructions, .. } => {
-                (name.as_str(), tools, instructions)
+            ExtensionConfig::Frontend {
+                name,
+                tools,
+                instructions,
+                ..
+            } => (name.as_str(), tools, instructions),
+            other => {
+                panic!("orchestrator should load the Frontend corpus-team extension, got {other:?}")
             }
-            other => panic!("orchestrator should load the Frontend corpus-team extension, got {other:?}"),
         };
         assert_eq!(name, "corpus-team");
         assert_eq!(tools.len(), 1, "exactly one tool: delegate");
@@ -1316,7 +1364,10 @@ mod injection_probe {
             assert!(instr.contains(r.label()), "instructions must name {r}");
         }
         for t in crate::chat::team::DESTRUCTIVE_TOOLS {
-            assert!(instr.contains(t), "instructions must credit {t} as impossible");
+            assert!(
+                instr.contains(t),
+                "instructions must credit {t} as impossible"
+            );
         }
     }
 
@@ -1353,7 +1404,10 @@ mod injection_probe {
             .flat_map(|g| g.models.into_iter().map(|m| m.model))
             .collect();
         if let Ok(m) = std::env::var("CORPUS_PROBE_MODEL") {
-            assert!(available.iter().any(|a| a == &m), "CORPUS_PROBE_MODEL={m} not pulled; available: {available:?}");
+            assert!(
+                available.iter().any(|a| a == &m),
+                "CORPUS_PROBE_MODEL={m} not pulled; available: {available:?}"
+            );
             return m;
         }
         for preferred in ["qwen3.5:9b", "gemma4:e4b", "qwen3.8:27b-mlx"] {
@@ -1403,7 +1457,8 @@ mod injection_probe {
         let model = probe_model();
 
         let project = "liveprobe";
-        let mut chat = ChatHandle::start_scoped(project, &model, crate::chat::team::TeamRole::Operator);
+        let mut chat =
+            ChatHandle::start_scoped(project, &model, crate::chat::team::TeamRole::Operator);
 
         // --- drive the session: wait Ready, send prompts, auto-approve ---
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
@@ -1468,7 +1523,10 @@ mod injection_probe {
             }
             std::thread::sleep(std::time::Duration::from_millis(120));
         }
-        assert!(phase_idx >= prompts.len(), "probe timed out; transcript so far:\n{transcript}");
+        assert!(
+            phase_idx >= prompts.len(),
+            "probe timed out; transcript so far:\n{transcript}"
+        );
         assert_eq!(chat.phase(), ChatPhase::Ready);
 
         // --- 1. identity: the agent is corpus's, never goose ---
@@ -1508,14 +1566,18 @@ mod injection_probe {
         use crate::chat::{Chat, ChatEvent, ChatHandle};
 
         let _guard = LIVE_PROBE_LOCK.lock().unwrap();
-        let store = std::env::temp_dir().join(format!("corpus-live-probe-orch-{}", std::process::id()));
+        let store =
+            std::env::temp_dir().join(format!("corpus-live-probe-orch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         std::fs::create_dir_all(&store).expect("probe store dir");
         std::env::set_var("CORPUS_STORE", &store);
         super::init_goose_env();
         let exe = std::env::current_exe().expect("current exe");
         let mcp = exe.parent().unwrap().join("../corpus-admin-mcp");
-        assert!(mcp.exists(), "corpus-admin-mcp not built — cargo build -p corpus-admin-mcp first");
+        assert!(
+            mcp.exists(),
+            "corpus-admin-mcp not built — cargo build -p corpus-admin-mcp first"
+        );
         std::env::set_var("CORPUS_ADMIN_MCP", &mcp);
         let model = probe_model();
 
@@ -1579,8 +1641,14 @@ mod injection_probe {
             }
             std::thread::sleep(std::time::Duration::from_millis(120));
         }
-        assert!(sent && saw_start && !turn_open, "probe timed out; transcript:\n{transcript}");
-        assert!(delegated, "orchestrator never called delegate; transcript:\n{transcript}");
+        assert!(
+            sent && saw_start && !turn_open,
+            "probe timed out; transcript:\n{transcript}"
+        );
+        assert!(
+            delegated,
+            "orchestrator never called delegate; transcript:\n{transcript}"
+        );
         assert!(
             specialist_tool,
             "specialist never used a scoped corpus-admin tool; transcript:\n{transcript}"
@@ -1590,7 +1658,9 @@ mod injection_probe {
             created.exists(),
             "delegated project_new never landed at {created:?}; transcript:\n{transcript}"
         );
-        eprintln!("[probe] OK — orchestrator delegated, specialist executed, project at {created:?}");
+        eprintln!(
+            "[probe] OK — orchestrator delegated, specialist executed, project at {created:?}"
+        );
         let _ = std::fs::remove_dir_all(&store);
     }
 
@@ -1605,23 +1675,30 @@ mod injection_probe {
         use crate::chat::{Chat, ChatEvent, ChatHandle};
 
         let _guard = LIVE_PROBE_LOCK.lock().unwrap();
-        let store = std::env::temp_dir().join(format!("corpus-live-probe-depbot-{}", std::process::id()));
+        let store =
+            std::env::temp_dir().join(format!("corpus-live-probe-depbot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         std::fs::create_dir_all(&store).expect("probe store dir");
         std::env::set_var("CORPUS_STORE", &store);
         super::init_goose_env();
         let exe = std::env::current_exe().expect("current exe");
         let mcp = exe.parent().unwrap().join("../corpus-admin-mcp");
-        assert!(mcp.exists(), "corpus-admin-mcp not built — cargo build -p corpus-admin-mcp first");
+        assert!(
+            mcp.exists(),
+            "corpus-admin-mcp not built — cargo build -p corpus-admin-mcp first"
+        );
         std::env::set_var("CORPUS_ADMIN_MCP", &mcp);
         let model = probe_model();
 
         // Seed the project so a "researcher" base exists to model on.
         let project = "liveprobe";
         let core_store = corpus_core::Store::new(store.clone());
-        core_store.create_project(project, "Live Probe", "cdk-regtest").expect("seed project");
+        core_store
+            .create_project(project, "Live Probe", "cdk-regtest")
+            .expect("seed project");
 
-        let mut chat = ChatHandle::start_scoped(project, &model, crate::chat::team::TeamRole::Operator);
+        let mut chat =
+            ChatHandle::start_scoped(project, &model, crate::chat::team::TeamRole::Operator);
         let prompt = "Create an agent called depbot that scans dependencies for vulnerabilities, \
                       modeled on the researcher agent (research role: reads sources and the web, \
                       writes findings/techniques/hypotheses, never executes). Use your tools.";
@@ -1677,15 +1754,24 @@ mod injection_probe {
             }
             std::thread::sleep(std::time::Duration::from_millis(120));
         }
-        assert!(sent && saw_start && !turn_open, "probe timed out; transcript:\n{transcript}");
+        assert!(
+            sent && saw_start && !turn_open,
+            "probe timed out; transcript:\n{transcript}"
+        );
         let doc = store
             .join("projects")
             .join(project)
             .join("agents")
             .join("depbot")
             .join("opencode.json");
-        assert!(doc.exists(), "depbot never landed at {doc:?}; transcript:\n{transcript}");
-        assert_eq!(n_errors, 0, "tool errors during creation; transcript:\n{transcript}");
+        assert!(
+            doc.exists(),
+            "depbot never landed at {doc:?}; transcript:\n{transcript}"
+        );
+        assert_eq!(
+            n_errors, 0,
+            "tool errors during creation; transcript:\n{transcript}"
+        );
         assert!(
             n_calls <= 4,
             "tool-call budget blown ({n_calls} > 4) — agent_new should make this short; transcript:\n{transcript}"
@@ -1699,7 +1785,10 @@ mod injection_probe {
         // No operator override captured in this test process (the OnceLock
         // is only set from main) — the per-model profile applies.
         assert_eq!(super::chat_input_limit("qwen3.8:27b"), "16384");
-        assert_eq!(super::chat_input_limit("hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0"), "16384");
+        assert_eq!(
+            super::chat_input_limit("hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0"),
+            "16384"
+        );
         assert_eq!(super::chat_input_limit("gpt-oss:120b"), "16384");
         assert_eq!(super::chat_input_limit("qwen3.5:9b"), "32768");
         assert_eq!(super::chat_input_limit("gemma4:e4b"), "32768");

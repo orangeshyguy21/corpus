@@ -1,7 +1,9 @@
 //! `corpus project/agent/mission/store` admin commands: the scoped
 //! store (projects, agents, missions, corpus) exposed headlessly.
 
-use corpus_core::{FindingQuery, FindingSeverity, FindingSort, Mission, Store};
+use corpus_core::{
+    FindingQuery, FindingSeverity, FindingSort, Mission, MissionDeleteRequest, Store,
+};
 
 /// `corpus project ...`
 pub fn project_cmd(args: &[String]) -> Result<(), String> {
@@ -82,8 +84,17 @@ pub fn project_cmd(args: &[String]) -> Result<(), String> {
         }
         Some("delete") => {
             let slug = args.get(1).ok_or("usage: corpus project delete <slug>")?;
-            store.delete_project(slug).map_err(|e| e.to_string())?;
-            println!("deleted project {slug}");
+            let missions = store.list_missions(slug).map_err(|e| e.to_string())?;
+            if missions
+                .iter()
+                .any(|(mission, _)| store.ensure_mission_deletable(slug, mission).is_err())
+            {
+                store.request_project_delete(slug).map_err(|e| e.to_string())?;
+                println!("requested deletion of project {slug}; the app will tear down its missions first");
+            } else {
+                store.delete_project(slug).map_err(|e| e.to_string())?;
+                println!("deleted project {slug}");
+            }
             Ok(())
         }
         Some("wipe") => {
@@ -195,10 +206,23 @@ pub fn agent_cmd(args: &[String]) -> Result<(), String> {
             let slug = args
                 .get(2)
                 .ok_or("usage: corpus agent delete <project> <slug>")?;
-            store
-                .delete_agent(project, slug)
+            let missions = store
+                .missions_for_agent(project, slug)
                 .map_err(|e| e.to_string())?;
-            println!("deleted agent {project}/{slug}");
+            if missions
+                .iter()
+                .any(|mission| store.ensure_mission_deletable(project, mission).is_err())
+            {
+                store
+                    .request_agent_delete(project, slug)
+                    .map_err(|e| e.to_string())?;
+                println!("requested deletion of agent {project}/{slug}; the app will tear down its missions first");
+            } else {
+                store
+                    .delete_agent(project, slug)
+                    .map_err(|e| e.to_string())?;
+                println!("deleted agent {project}/{slug}");
+            }
             Ok(())
         }
         "role" => {
@@ -315,7 +339,23 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
             let slug = args.get(2).ok_or("usage: corpus mission new <project> <slug> --agent <agent> [--budget <val>] [--pin <repo=rev>] <brief>")?;
             let mut agent: Option<String> = None;
             let mut budget: Option<String> = None;
-            let mut pins = std::collections::BTreeMap::new();
+            // Missions stamp the project's effective source selection. A
+            // stored project pin overrides the plugin default; --pin below
+            // is the final per-mission override.
+            let mut pins: std::collections::BTreeMap<String, String> =
+                corpus_core::plugin_sources(&store, project)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|source| {
+                        let rev = source.default_rev().to_string();
+                        (source.name, rev)
+                    })
+                    .collect();
+            pins.extend(
+                corpus_core::Project::load(&store, project)
+                    .map_err(|e| e.to_string())?
+                    .pins,
+            );
             let mut brief_words: Vec<String> = Vec::new();
             let mut i = 3;
             while i < args.len() {
@@ -367,9 +407,12 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
                     .unwrap_or(0),
                 name: None,
                 session: None,
+                control: None,
                 opencode_session: None,
                 environment_session: None,
                 launch_requested: None,
+                delete_requested: None,
+                dispatch: None,
             };
             store
                 .write_mission(project, slug, &mission, &brief_words.join(" "))
@@ -381,10 +424,27 @@ pub fn mission_cmd(args: &[String]) -> Result<(), String> {
             let slug = args
                 .get(2)
                 .ok_or("usage: corpus mission delete <project> <slug>")?;
-            store
-                .delete_mission(project, slug)
+            if store.ensure_mission_deletable(project, slug).is_ok() {
+                store.delete_mission(project, slug).map_err(|e| e.to_string())?;
+                println!("deleted mission {project}/{slug}");
+                return Ok(());
+            }
+            let mut mission = store
+                .load_mission(project, slug)
                 .map_err(|e| e.to_string())?;
-            println!("deleted mission {project}/{slug}");
+            mission.launch_requested = None;
+            mission.delete_requested.get_or_insert(MissionDeleteRequest {
+                requested_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            });
+            store
+                .update_mission(project, slug, &mission)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "deletion requested for mission {project}/{slug}; open corpus-app to complete lifecycle teardown"
+            );
             Ok(())
         }
         _ => Err("usage: corpus mission list|new|delete <project> [<slug>] ...".to_string()),

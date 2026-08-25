@@ -190,16 +190,17 @@ pub fn show_table(ui: &mut egui::Ui, table: &Table) {
     fit_widths(&mut widths, avail);
 
     // --- lay out every cell (wrapped to its final width) and measure rows ---
-    let wrap_widths: Vec<f32> = widths.iter().map(|w| (w - 2.0 * CELL_PAD_X).max(8.0)).collect();
+    let wrap_widths: Vec<f32> = widths
+        .iter()
+        .map(|w| (w - 2.0 * CELL_PAD_X).max(8.0))
+        .collect();
     let aligns = column_aligns(table, ncols);
 
     let header_galleys: Vec<Arc<egui::Galley>> = table
         .header
         .iter()
         .enumerate()
-        .map(|(ci, c)| {
-            galley_job(ui, &font, c, wrap_widths[ci], aligns[ci], header_color)
-        })
+        .map(|(ci, c)| galley_job(ui, &font, c, wrap_widths[ci], aligns[ci], header_color))
         .collect();
     let header_h = header_galleys
         .iter()
@@ -247,14 +248,22 @@ pub fn show_table(ui: &mut egui::Ui, table: &Table) {
         },
         crate::theme::PANEL,
     );
-    p.hline(rect.left()..=rect.right(), band.bottom(), egui::Stroke::new(1.0_f32, crate::theme::HAIRLINE));
+    p.hline(
+        rect.left()..=rect.right(),
+        band.bottom(),
+        egui::Stroke::new(1.0_f32, crate::theme::HAIRLINE),
+    );
 
     // Row separators.
     let mut y = band.bottom();
     for (i, (_, rh)) in row_galleys.iter().enumerate() {
         y += rh;
         if i + 1 < row_galleys.len() {
-            p.hline(rect.left()..=rect.right(), y, egui::Stroke::new(0.5_f32, crate::theme::HAIRLINE));
+            p.hline(
+                rect.left()..=rect.right(),
+                y,
+                egui::Stroke::new(0.5_f32, crate::theme::HAIRLINE),
+            );
         }
     }
 
@@ -297,7 +306,11 @@ fn column_aligns(table: &Table, ncols: usize) -> Vec<CellAlign> {
 }
 
 fn natural_w(ui: &egui::Ui, font: &egui::FontId, text: &str) -> f32 {
-    ui.fonts(|f| f.layout_no_wrap(text.to_string(), font.clone(), crate::theme::TEXT).size().x)
+    ui.fonts(|f| {
+        f.layout_no_wrap(text.to_string(), font.clone(), crate::theme::TEXT)
+            .size()
+            .x
+    })
 }
 
 fn galley_job(
