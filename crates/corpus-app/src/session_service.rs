@@ -101,6 +101,17 @@ pub(crate) trait SessionService: Send + Sync {
     #[allow(dead_code)] // Consumed by the live drawer after this boundary lands.
     fn messages(&self, session: &SessionRef) -> Result<Vec<SessionMessage>, String>;
 
+    /// Read compact cumulative accounting from the owning process. This is
+    /// intentionally independent of transcript/message export.
+    fn usage_snapshot(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+    ) -> Result<corpus_core::UsageSnapshot, String> {
+        Err("live usage requires the owning OpenCode TUI endpoint".into())
+    }
+
     /// State of the exact launch turn in its owning TUI process. The durable
     /// user message proves that the launch prompt exists; only an assistant
     /// step with a non-tool continuation finish ends the whole loop.
@@ -447,6 +458,19 @@ impl HttpSessionService {
         )
     }
 
+    fn usage_snapshot(&self, session: &SessionRef) -> Result<corpus_core::UsageSnapshot, String> {
+        self.require_compatible()?;
+        let record = self.get(
+            &format!("/session/{}", session.id),
+            Some(&session.directory),
+        )?;
+        require_bound_session(
+            parse_session_list(&Value::Array(vec![record.clone()]), true)?,
+            session,
+        )?;
+        usage_snapshot_from_record(&record, &session.id)
+    }
+
     fn session_is_active(&self, session: &SessionRef) -> Result<bool, String> {
         let statuses = self.get("/session/status", Some(&session.directory))?;
         let statuses = statuses
@@ -593,6 +617,15 @@ impl SessionService for HttpSessionService {
         )?)
     }
 
+    fn usage_snapshot(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        session: &SessionRef,
+    ) -> Result<corpus_core::UsageSnapshot, String> {
+        HttpSessionService::usage_snapshot(self, session)
+    }
+
     fn queue_prompt(
         &self,
         _control: &corpus_core::MissionControl,
@@ -700,6 +733,19 @@ impl SessionService for ConfiguredSessionService {
         self.with_fallback(|http| http.messages(session), |cli| cli.messages(session))
     }
 
+    fn usage_snapshot(
+        &self,
+        control: &corpus_core::MissionControl,
+        password: &str,
+        session: &SessionRef,
+    ) -> Result<corpus_core::UsageSnapshot, String> {
+        let http = HttpSessionService::new(
+            &format!("http://127.0.0.1:{}", control.port),
+            password.to_string(),
+        )?;
+        http.usage_snapshot(session)
+    }
+
     fn queue_prompt(
         &self,
         control: &corpus_core::MissionControl,
@@ -769,6 +815,21 @@ impl SessionService for FakeSessionService {
 
     fn messages(&self, _session: &SessionRef) -> Result<Vec<SessionMessage>, String> {
         Ok(Vec::new())
+    }
+
+    fn usage_snapshot(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        session: &SessionRef,
+    ) -> Result<corpus_core::UsageSnapshot, String> {
+        Ok(corpus_core::UsageSnapshot {
+            version: corpus_core::USAGE_SNAPSHOT_VERSION,
+            session_id: session.id.clone(),
+            captured_at: 1,
+            source: "test".into(),
+            rows: Vec::new(),
+        })
     }
 
     fn queue_prompt(
@@ -882,6 +943,54 @@ fn parse_session_list(value: &Value, served: bool) -> Result<Vec<SessionSummary>
             })
         })
         .collect()
+}
+
+fn usage_snapshot_from_record(
+    record: &Value,
+    session_id: &str,
+) -> Result<corpus_core::UsageSnapshot, String> {
+    let number = |pointer: &str, flat: &str| {
+        record
+            .pointer(pointer)
+            .and_then(Value::as_u64)
+            .or_else(|| record.get(flat).and_then(Value::as_u64))
+            .unwrap_or(0)
+    };
+    let cost = record
+        .get("cost")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("OpenCode session {session_id} omitted cumulative cost"))?;
+    let model_id = record
+        .pointer("/model/id")
+        .and_then(Value::as_str)
+        .or_else(|| record.get("modelID").and_then(Value::as_str))
+        .unwrap_or("session-total");
+    let provider = record
+        .pointer("/model/providerID")
+        .and_then(Value::as_str)
+        .or_else(|| record.get("providerID").and_then(Value::as_str))
+        .unwrap_or("aggregate");
+    let captured_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(corpus_core::UsageSnapshot {
+        version: corpus_core::USAGE_SNAPSHOT_VERSION,
+        session_id: session_id.to_string(),
+        captured_at,
+        source: "opencode-session-aggregate".into(),
+        rows: vec![corpus_core::CostRow {
+            provider: provider.to_string(),
+            model: model_id.rsplit('/').next().unwrap_or(model_id).to_string(),
+            tokens_input: number("/tokens/input", "tokens_input"),
+            tokens_output: number("/tokens/output", "tokens_output"),
+            tokens_reasoning: number("/tokens/reasoning", "tokens_reasoning"),
+            cache_read: number("/tokens/cache/read", "tokens_cache_read"),
+            cache_write: number("/tokens/cache/write", "tokens_cache_write"),
+            cost,
+            ..corpus_core::CostRow::default()
+        }],
+    })
 }
 
 fn parse_messages(value: &Value) -> Result<Vec<SessionMessage>, String> {
@@ -1015,6 +1124,25 @@ mod tests {
         assert_eq!(parsed[0].text, ["done"]);
         assert_eq!(parsed[0].output_tokens, Some(3));
         assert_eq!(parsed[0].cost, Some(0.25));
+    }
+
+    #[test]
+    fn session_aggregate_becomes_compact_usage_without_messages() {
+        let snapshot = usage_snapshot_from_record(&json!({
+            "id": "ses_cost",
+            "cost": 4.4480775,
+            "tokens": {
+                "input": 970080,
+                "output": 28512,
+                "reasoning": 3948,
+                "cache": {"read": 3503125, "write": 0}
+            },
+            "model": {"id": "moonshotai/kimi-k3", "providerID": "openrouter"}
+        }), "ses_cost").unwrap();
+        assert_eq!(snapshot.session_id, "ses_cost");
+        assert_eq!(snapshot.rows[0].model, "kimi-k3");
+        assert_eq!(snapshot.rows[0].tokens_input, 970080);
+        assert!((snapshot.rows[0].cost - 4.4480775).abs() < f64::EPSILON);
     }
 
     #[test]

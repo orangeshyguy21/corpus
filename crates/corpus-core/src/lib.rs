@@ -106,4 +106,5 @@ pub use store::{
     EntryAccess, Mission, MissionCompletion, MissionControl, MissionDeleteRequest, MissionDispatch,
     MissionLaunchRequest, MissionLog, MissionRunRef, Project, Scope, Store, CATEGORIES, AGENT_ENV, ENVIRONMENT_SESSION_ENV,
     MISSION_ENV, PROJECT_ENV, RUN_ID_ENV, RUN_LOG_ENV, RUNS, SOURCE_PINS_ENV, STORE_ENV,
+    UsageSnapshot, USAGE_SNAPSHOT_VERSION,
 };

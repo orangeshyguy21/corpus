@@ -14,6 +14,7 @@
 //!                                 #   prompts/
 //!     missions/<mission>.md       # mission records (agent ref, pins, budget,
 //!                                 #   created, sessions) + brief body
+//!     usage/<session>.json        # compact cumulative accounting snapshots
 //! ```
 //!
 //! The old flat `store/{hypotheses,techniques,findings,attacks,runs}`
@@ -297,6 +298,72 @@ impl Store {
     /// The project-local corpus (the ONLY corpus scope).
     pub fn project_corpus_dir(&self, slug: &str) -> PathBuf {
         self.project_dir(slug).join("corpus")
+    }
+
+    /// Derived accounting state. Kept outside `corpus/`: usage snapshots are
+    /// application bookkeeping, not curator-authored research artifacts.
+    pub fn project_usage_dir(&self, slug: &str) -> PathBuf {
+        self.project_dir(slug).join("usage")
+    }
+
+    pub fn write_usage_snapshot(&self, project: &str, snapshot: &UsageSnapshot) -> Result<PathBuf> {
+        validate_slug(project)?;
+        if snapshot.session_id.is_empty()
+            || snapshot.session_id.contains('/')
+            || snapshot.session_id.contains('\\')
+        {
+            return Err(Error::Store("usage snapshot has an invalid session id".into()));
+        }
+        let dir = self.project_usage_dir(project);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.json", snapshot.session_id));
+        let temporary = dir.join(format!(".{}.json.tmp", snapshot.session_id));
+        let bytes = serde_json::to_vec_pretty(snapshot)
+            .map_err(|error| Error::Store(format!("usage snapshot: {error}")))?;
+        fs::write(&temporary, bytes)?;
+        fs::rename(&temporary, &path)?;
+        Ok(path)
+    }
+
+    /// One-time compatibility migration. Existing transcript exports are
+    /// reduced to compact snapshots; message data is never needed again for
+    /// those sessions after this succeeds.
+    pub fn backfill_usage_snapshots(&self, project: &str) -> Result<usize> {
+        let runs = self.project_corpus_dir(project).join("runs");
+        if !runs.is_dir() {
+            return Ok(0);
+        }
+        let mut written = 0;
+        for entry in fs::read_dir(runs)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(session_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if path.extension().and_then(|value| value.to_str()) != Some("json")
+                || self.project_usage_dir(project).join(format!("{session_id}.json")).is_file()
+            {
+                continue;
+            }
+            let report = parse_cost_file(&path);
+            if report.rows.is_empty() {
+                continue;
+            }
+            let captured_at = entry.metadata().ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default();
+            self.write_usage_snapshot(project, &UsageSnapshot {
+                version: USAGE_SNAPSHOT_VERSION,
+                session_id: session_id.to_string(),
+                captured_at,
+                source: "legacy-transcript".into(),
+                rows: report.rows,
+            })?;
+            written += 1;
+        }
+        Ok(written)
     }
 
     pub fn project_agents_dir(&self, slug: &str) -> PathBuf {
@@ -640,7 +707,7 @@ pub fn mission_logs(store: &Store, project: &str) -> Result<Vec<MissionLog>> {
 
 /// Usage aggregation for one (provider, model) pair, summed over every
 /// exported run transcript in the project corpus.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostRow {
     pub provider: String,
     pub model: String,
@@ -661,6 +728,34 @@ pub struct CostRow {
     pub cost: f64,
 }
 
+pub const USAGE_SNAPSHOT_VERSION: u32 = 1;
+
+/// Compact cumulative accounting for one OpenCode session. It is replaced at
+/// every completed turn and is sufficient to calculate project spend without
+/// retaining or parsing message text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageSnapshot {
+    pub version: u32,
+    pub session_id: String,
+    pub captured_at: u64,
+    pub source: String,
+    pub rows: Vec<CostRow>,
+}
+
+impl UsageSnapshot {
+    pub fn report(&self) -> CostReport {
+        let mut report = CostReport::default();
+        report.rows = self.rows.clone();
+        report.tokens = report.rows.iter().map(|row| {
+            row.tokens_input.saturating_add(row.tokens_output).saturating_add(row.tokens_reasoning)
+        }).sum();
+        report.inference_ms = report.rows.iter().map(|row| row.inference_ms).sum();
+        report.timed_messages = report.rows.iter().map(|row| row.timed_messages).sum();
+        report.cost = report.rows.iter().map(|row| row.cost).sum();
+        report
+    }
+}
+
 /// The project view's Cost section: per-model rows (cost desc) + totals.
 /// Source data: `runs/<epoch>-<agent>.json` opencode exports (piped
 /// `.log` transcripts carry no usage; they are simply not counted).
@@ -671,6 +766,9 @@ pub struct CostReport {
     pub inference_ms: u64,
     pub timed_messages: u64,
     pub cost: f64,
+    pub accounted_sessions: u64,
+    pub legacy_sessions: u64,
+    pub last_updated: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -701,42 +799,89 @@ pub fn corpus_cost_cached(
     project: &str,
     cache: &mut CorpusCostCache,
 ) -> Result<CostReport> {
+    let usage = store.project_usage_dir(project);
     let runs = store.project_corpus_dir(project).join("runs");
-    if !runs.is_dir() {
+    if !usage.is_dir() && !runs.is_dir() {
         cache.files.clear();
         return Ok(CostReport::default());
     }
     let mut seen = std::collections::BTreeSet::new();
-    for entry in fs::read_dir(&runs)? {
+    // Snapshots are authoritative per session. Legacy exports remain a
+    // compatibility fallback only for session ids not yet backfilled.
+    let mut snapshotted = std::collections::BTreeSet::new();
+    let usage_entries = usage.is_dir().then(|| fs::read_dir(&usage)).transpose()?;
+    for entry in usage_entries.into_iter().flatten() {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
-        let modified = meta.modified().ok();
-        let len = meta.len();
-        seen.insert(path.clone());
-        let current = cache
-            .files
-            .get(&path)
-            .is_some_and(|cached| cached.modified == modified && cached.len == len);
-        if !current {
-            let report = parse_cost_file(&path);
-            cache.files.insert(
-                path,
-                CachedCostFile {
-                    modified,
-                    len,
-                    report,
-                },
-            );
+        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+            snapshotted.insert(stem.to_string());
         }
+        cache_cost_path(cache, &mut seen, path, parse_snapshot_file);
+    }
+    let run_entries = runs.is_dir().then(|| fs::read_dir(&runs)).transpose()?;
+    for entry in run_entries.into_iter().flatten() {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|id| snapshotted.contains(id))
+        {
+            continue;
+        }
+        cache_cost_path(cache, &mut seen, path, parse_cost_file);
     }
     cache.files.retain(|path, _| seen.contains(path));
-    Ok(merge_cost_reports(
-        cache.files.values().map(|cached| &cached.report),
-    ))
+    Ok(merge_cost_reports(cache.files.values().map(|cached| &cached.report)))
+}
+
+fn cache_cost_path(
+    cache: &mut CorpusCostCache,
+    seen: &mut std::collections::BTreeSet<PathBuf>,
+    path: PathBuf,
+    parse: fn(&Path) -> CostReport,
+) {
+    let Ok(meta) = fs::metadata(&path) else { return };
+    let modified = meta.modified().ok();
+    let len = meta.len();
+    seen.insert(path.clone());
+    let current = cache
+        .files
+        .get(&path)
+        .is_some_and(|cached| cached.modified == modified && cached.len == len);
+    if !current {
+        let report = parse(&path);
+        cache.files.insert(
+            path,
+            CachedCostFile {
+                modified,
+                len,
+                report,
+            },
+        );
+    }
+}
+
+fn parse_snapshot_file(path: &Path) -> CostReport {
+    fs::read(path).ok()
+        .and_then(|raw| serde_json::from_slice::<UsageSnapshot>(&raw).ok())
+        .filter(|snapshot| snapshot.version == USAGE_SNAPSHOT_VERSION)
+        .map(|snapshot| {
+            let legacy = snapshot.source == "legacy-transcript";
+            let captured_at = snapshot.captured_at;
+            let mut report = snapshot.report();
+            report.accounted_sessions = 1;
+            report.legacy_sessions = u64::from(legacy);
+            report.last_updated = Some(captured_at);
+            report
+        })
+        .unwrap_or_default()
 }
 
 fn parse_cost_file(path: &Path) -> CostReport {
@@ -800,6 +945,10 @@ fn parse_cost_file(path: &Path) -> CostReport {
     }
     report.rows = rows.into_values().collect();
     report.cost = report.rows.iter().map(|row| row.cost).sum();
+    if !report.rows.is_empty() {
+        report.accounted_sessions = 1;
+        report.legacy_sessions = 1;
+    }
     report
 }
 
@@ -857,6 +1006,9 @@ fn merge_cost_reports<'a>(reports: impl Iterator<Item = &'a CostReport>) -> Cost
     let mut rows = std::collections::BTreeMap::<(String, String), CostRow>::new();
     for source in reports {
         report.tokens += source.tokens;
+        report.accounted_sessions += source.accounted_sessions;
+        report.legacy_sessions += source.legacy_sessions;
+        report.last_updated = report.last_updated.max(source.last_updated);
         for source_row in &source.rows {
             let row = rows
                 .entry((source_row.provider.clone(), source_row.model.clone()))

@@ -535,6 +535,24 @@ impl ProjectsView {
         components::panel_card(ui, "Cost", "成本", |ui| match state.corpus_cost() {
             Some(report) if !report.rows.is_empty() => {
                 cost_headline(ui, report);
+                let detail = if report.legacy_sessions == 0 {
+                    "live aggregate snapshots"
+                } else {
+                    "includes migrated transcript accounting"
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "{} accounted session{} · {}{}",
+                        report.accounted_sessions,
+                        if report.accounted_sessions == 1 { "" } else { "s" },
+                        detail,
+                        report.last_updated
+                            .map(|epoch| format!(" · updated {}", fmt_epoch(epoch)))
+                            .unwrap_or_default()
+                    ))
+                    .size(11.0)
+                    .color(theme::TEXT_FAINT),
+                );
                 ui.add_space(12.0);
                 egui::ScrollArea::horizontal()
                     .id_salt("project_cost_scroll")

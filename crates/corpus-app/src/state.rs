@@ -31,8 +31,25 @@ const ACTIVITY_EVENT_MIN: Duration = Duration::from_millis(100);
 /// Notifications are hints. These slower timers reconcile startup, dropped
 /// events, watcher failure, and changes made on filesystems without native
 /// notification support.
-const ACTIVITY_BACKSTOP: Duration = Duration::from_secs(2);
-const STORE_BACKSTOP: Duration = Duration::from_secs(10);
+const ACTIVITY_BACKSTOP: Duration = Duration::from_secs(10);
+/// Native mission/run events make liveness refresh immediately. This slow
+/// subprocess backstop covers startup, watcher failure, and external tmux
+/// exits that do not touch the project tree.
+const LIVE_SESSION_BACKSTOP: Duration = Duration::from_secs(10);
+/// Expensive session reconciliation (dispatch HTTP/store walks plus optional
+/// transcript maintenance) is event-driven with this missed-event backstop.
+/// It must not inherit the two-second tmux liveness-list cadence.
+const SESSION_RECONCILE_BACKSTOP: Duration = Duration::from_secs(60);
+/// Native filesystem notifications are the primary invalidation path. When
+/// the watcher is healthy, this timer is only a dropped-event audit and can
+/// stay deliberately slow. If watcher installation failed, retain the old
+/// cadence so curator launch/delete requests remain responsive.
+const WATCHED_STORE_BACKSTOP: Duration = Duration::from_secs(60);
+const UNWATCHED_STORE_BACKSTOP: Duration = Duration::from_secs(10);
+/// PTY output wakes egui directly. This clock exists only to notice a quiet
+/// owned process exiting and to age its activity projection; it is not a
+/// terminal animation cadence.
+const OWNED_RUN_REPAINT_BACKSTOP: Duration = Duration::from_secs(1);
 /// The fallback transcript is a diagnostic tail, not an in-memory copy of
 /// the durable run log. Embedded PTY runs render directly and retain none.
 const MAX_RUN_LINES: usize = 4_000;
@@ -291,6 +308,14 @@ pub struct ProjectTree {
     pub missions: Vec<(String, Mission)>,
 }
 
+/// Lightweight counters for confirming that the cheap tmux liveness beat is
+/// no longer coupled one-for-one to expensive session reconciliation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionLifecycleStats {
+    pub live_refreshes: u64,
+    pub reconciliation_passes: u64,
+}
+
 /// A durable environment lease projected for the selected project. Every
 /// field comes from Corpus's session record; the Project view never inspects
 /// Docker, plugin state directories, or mission files while painting.
@@ -466,6 +491,14 @@ pub struct AppState {
     /// When `live_sessions` was last polled (polled on a throttle, never
     /// per frame — the poll spawns `tmux list-sessions`).
     live_sessions_polled_at: Option<std::time::Instant>,
+    live_sessions_dirty: bool,
+    /// Expensive dispatch/export reconciliation has its own event-driven
+    /// cadence and must not run after every cheap liveness listing.
+    session_reconciled_at: Option<std::time::Instant>,
+    /// Raw output events move this deadline forward. Reconciliation happens
+    /// once after output settles instead of once per filesystem write.
+    session_reconcile_due_at: Option<std::time::Instant>,
+    pub session_lifecycle_stats: SessionLifecycleStats,
     /// Per tmux session, the moment its TUI last painted anything —
     /// derived from the run's raw capture mtime and aged forward between
     /// polls, so it stays honest without re-statting every frame. This is
@@ -481,7 +514,7 @@ pub struct AppState {
     /// turn records exactly once, and a session parked quiet at its prompt
     /// is not re-exported every beat.
     last_exported_at: BTreeMap<String, std::time::Instant>,
-    /// Failed checkpoint exports are retried on a bounded cadence rather than
+    /// Failed usage checkpoints are retried on a bounded cadence rather than
     /// every liveness beat. Deletion/Stop bypasses this map and owns its final
     /// best-effort export after the writer is stopped.
     export_retry_after: BTreeMap<String, std::time::Instant>,
@@ -669,6 +702,20 @@ struct ProjectScopeSnapshot {
     findings: FindingSnapshot,
 }
 
+/// Some lifecycle jobs complete their coordinator successfully while
+/// carrying an operation-level failure that must remain visible/retryable.
+/// Treating those as resolved first produces the characteristic error flash.
+fn successful_job_resolves_notice(terminal: &JobTerminal<AppJobOutput>) -> bool {
+    match terminal {
+        JobTerminal::Success(AppJobOutput::SessionMaintenance(maintenance)) => {
+            maintenance.export_failure.is_none()
+        }
+        JobTerminal::Success(AppJobOutput::TeardownReady(teardown)) => teardown.error.is_none(),
+        JobTerminal::Success(_) => true,
+        _ => false,
+    }
+}
+
 struct LaunchRequest {
     project: String,
     slug: String,
@@ -731,7 +778,7 @@ fn should_reexport(
     }
 }
 
-/// A live transcript checkpoint is useful only after a turn has settled.
+/// A live usage checkpoint is useful only after a turn has settled.
 /// Delete owns teardown and its final best-effort export, so ordinary
 /// maintenance must never race it. A failed checkpoint is also held until
 /// its retry deadline rather than being relaunched on every two-second beat.
@@ -883,6 +930,14 @@ impl RunPhase {
 }
 
 impl AppState {
+    fn store_backstop(&self) -> Duration {
+        if self.file_invalidations.is_some() {
+            WATCHED_STORE_BACKSTOP
+        } else {
+            UNWATCHED_STORE_BACKSTOP
+        }
+    }
+
     pub fn install_job_runtime(&mut self, context: eframe::egui::Context) {
         let wake = Arc::new(context.clone());
         self.jobs = Some(JobSet::new(wake.clone()));
@@ -939,9 +994,14 @@ impl AppState {
         }
         if applies(&invalidations.metadata) {
             self.launch_requests_polled_at = None;
+            self.live_sessions_dirty = true;
         }
         if applies(&invalidations.activity) {
             self.session_activity_dirty = true;
+            self.session_reconcile_due_at = Some(
+                self.clock.monotonic_now()
+                    + Duration::from_secs(corpus_core::WORKING_WINDOW_SECS),
+            );
         }
         warning
     }
@@ -998,7 +1058,7 @@ impl AppState {
             if self.retry_stale_corpus_job(result.kind, &result.scope) {
                 continue;
             }
-            if matches!(&result.terminal, JobTerminal::Success(_)) {
+            if successful_job_resolves_notice(&result.terminal) {
                 notices.push(BackgroundNotice::resolved(result.kind));
             }
             match result.terminal {
@@ -1100,13 +1160,7 @@ impl AppState {
                     self.corpus_polled_at = Some(self.clock.monotonic_now());
                 }
                 JobTerminal::Success(AppJobOutput::LiveSessions(sessions)) => {
-                    self.live_sessions = sessions;
-                    self.live_sessions_polled_at = Some(self.clock.monotonic_now());
-                    self.reconcile_mission_dispatches();
-                    self.schedule_dispatch_deliveries();
-                    if let Some(project) = self.effective_project() {
-                        self.schedule_session_maintenance(&project);
-                    }
+                    self.apply_live_sessions(sessions);
                 }
                 JobTerminal::Success(AppJobOutput::SessionMaintenance(maintenance)) => {
                     let project = result.scope.project;
@@ -1115,6 +1169,13 @@ impl AppState {
                     }
                     let mut missions_changed = false;
                     for (slug, tmux, conversation) in maintenance.conversations {
+                        let lease = self.session_operation_leases.claim(&project, &slug);
+                        let Ok(_ownership) = lease.try_lock() else {
+                            // Teardown owns this mission. Discovery is
+                            // optional bookkeeping and must never stall the
+                            // UI or write across that destructive boundary.
+                            continue;
+                        };
                         // The project generation guard is not enough: a
                         // mission can stop and relaunch within one project
                         // generation. Bind only if this is still the exact
@@ -1163,7 +1224,7 @@ impl AppState {
                         );
                         notices.push(BackgroundNotice::error(
                             result.kind,
-                            format!("transcript checkpoint failed: {error}"),
+                            format!("usage checkpoint failed: {error}"),
                         ));
                     }
                     if missions_changed {
@@ -1590,6 +1651,10 @@ impl AppState {
             run_exit: None,
             live_sessions: Vec::new(),
             live_sessions_polled_at: None,
+            live_sessions_dirty: true,
+            session_reconciled_at: None,
+            session_reconcile_due_at: None,
+            session_lifecycle_stats: SessionLifecycleStats::default(),
             session_activity: BTreeMap::new(),
             session_activity_polled_at: None,
             session_activity_dirty: false,
@@ -1756,6 +1821,9 @@ impl AppState {
         let plugin = plugin_id.to_string();
         let key = session_key.to_string();
         let project = record.id.project;
+        let session_operation = self
+            .session_operation_leases
+            .claim(&project, &record.id.mission);
         let scope = self.job_scope(&project, None);
         let jobs = self.jobs.as_mut().expect("checked above");
         Ok(matches!(
@@ -1764,6 +1832,9 @@ impl AppState {
                 scope,
                 Duration::from_secs(30),
                 move |_| {
+                    let _ownership = session_operation
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     corpus_core::close_environment_session_key(&store, &plugin, &key)
                         .map_err(|error| error.to_string())?;
                     Ok(AppJobOutput::OrphanCleanup { project, plugin })
@@ -2018,6 +2089,7 @@ impl AppState {
             self.schedule_corpus_refresh(project, true);
             return;
         }
+        let _ = self.store.backfill_usage_snapshots(project);
         self.corpus_stats = corpus_core::corpus_stats(&self.store, project).ok();
         self.mission_logs = corpus_core::mission_logs(&self.store, project).unwrap_or_default();
         self.corpus_cost =
@@ -2062,6 +2134,9 @@ impl AppState {
             scope,
             Duration::from_secs(30),
             move |token| {
+                store
+                    .backfill_usage_snapshots(&project)
+                    .map_err(|error| error.to_string())?;
                 let stats = corpus_core::corpus_stats(&store, &project)
                     .map_err(|error| error.to_string())?;
                 let logs = corpus_core::mission_logs(&store, &project)
@@ -3126,6 +3201,7 @@ impl AppState {
     /// Re-list the live corpus tmux sessions (the re-attach list shown
     /// when the app was relaunched over a surviving run).
     pub fn refresh_live_sessions(&mut self) {
+        self.live_sessions_dirty = false;
         if self.jobs.is_some() {
             self.live_sessions_polled_at = Some(self.clock.monotonic_now());
             let catalog = self.session_catalog.clone();
@@ -3144,6 +3220,39 @@ impl AppState {
         }
         self.live_sessions = self.session_catalog.live_tui_sessions();
         self.live_sessions_polled_at = Some(self.clock.monotonic_now());
+    }
+
+    fn apply_live_sessions(&mut self, sessions: Vec<String>) {
+        let liveness_changed = self.live_sessions != sessions;
+        self.live_sessions = sessions;
+        self.live_sessions_polled_at = Some(self.clock.monotonic_now());
+        self.session_lifecycle_stats.live_refreshes = self
+            .session_lifecycle_stats
+            .live_refreshes
+            .saturating_add(1);
+        if liveness_changed {
+            self.schedule_session_reconciliation(true);
+        }
+    }
+
+    /// The single owner of expensive session follow-up. A liveness edge runs
+    /// immediately; raw-capture filesystem events use the same path; a slow
+    /// timed backstop covers missed notifications. The cheap tmux listing is
+    /// deliberately not itself a reason to rescan dispatch/store state.
+    fn schedule_session_reconciliation(&mut self, liveness_changed: bool) {
+        self.session_reconciled_at = Some(self.clock.monotonic_now());
+        self.session_reconcile_due_at = None;
+        self.session_lifecycle_stats.reconciliation_passes = self
+            .session_lifecycle_stats
+            .reconciliation_passes
+            .saturating_add(1);
+        if liveness_changed {
+            self.reconcile_mission_dispatches();
+        }
+        self.schedule_dispatch_deliveries();
+        if let Some(project) = self.effective_project() {
+            self.schedule_session_maintenance(&project);
+        }
     }
 
     fn schedule_session_maintenance(&mut self, project: &str) {
@@ -3169,10 +3278,13 @@ impl AppState {
                     mission.delete_requested.is_some(),
                     mission.opencode_session.clone()?,
                     mission.session.clone()?,
+                    mission.control.clone()?,
                 ))
             })
-            .filter(|(_, _, _, tmux)| live.iter().any(|session| session == tmux))
-            .filter(|(slug, deleting, _, tmux)| {
+            .filter(|(_, _, _, tmux, control)| {
+                control.run_id == *tmux && live.iter().any(|session| session == tmux)
+            })
+            .filter(|(slug, deleting, _, tmux, _)| {
                 checkpoint_export_due(
                     *deleting,
                     self.mission_activity(project, slug),
@@ -3186,9 +3298,9 @@ impl AppState {
             // conversation waits for the next maintenance beat instead of
             // turning one job into an unbounded batch of CLI subprocesses.
             .take(1)
-            .map(|(slug, _, conversation, tmux)| {
+            .map(|(slug, _, conversation, tmux, control)| {
                 let lease = self.session_operation_leases.claim(project, &slug);
-                (slug, conversation, tmux, lease)
+                (slug, conversation, tmux, control, lease)
             })
             .collect::<Vec<_>>();
         if pending_conversations.is_empty() && pending_exports.is_empty() {
@@ -3197,7 +3309,6 @@ impl AppState {
         let scope = self.job_scope(project, None);
         let store = self.store.clone();
         let service = self.session_service.clone();
-        let backend = self.run_backend.clone();
         let project_owned = project.to_string();
         let Some(jobs) = self.jobs.as_mut() else {
             return;
@@ -3227,7 +3338,7 @@ impl AppState {
                 }
                 let mut exported_tmux = Vec::new();
                 let mut export_failure = None;
-                for (slug, conversation, tmux, lease) in pending_exports {
+                for (slug, conversation, tmux, control, lease) in pending_exports {
                     let _ownership = lease
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3243,9 +3354,22 @@ impl AppState {
                     if !still_current {
                         continue;
                     }
-                    match backend.export_session(&project_owned, &conversation) {
-                        Ok(_) => exported_tmux.push(tmux),
-                        Err(error) => export_failure = Some((tmux, error.to_string())),
+                    let session = SessionRef {
+                        id: conversation.clone(),
+                        directory: store.project_run_dir(&project_owned),
+                    };
+                    let exported = corpus_core::opencode_control_password(&store, &control.run_id)
+                        .map_err(|error| error.to_string())
+                        .and_then(|password| {
+                            service.usage_snapshot(&control, &password, &session)
+                        })
+                        .and_then(|snapshot| store
+                            .write_usage_snapshot(&project_owned, &snapshot)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string()));
+                    match exported {
+                        Ok(()) => exported_tmux.push(tmux),
+                        Err(error) => export_failure = Some((tmux, error)),
                     }
                 }
                 Ok(AppJobOutput::SessionMaintenance(SessionMaintenance {
@@ -3285,11 +3409,10 @@ impl AppState {
         );
     }
 
-    /// Poll live sessions on a throttle (2 s): the poll spawns a `tmux
-    /// list-sessions` subprocess, so never per frame — and only when a
-    /// live session can even matter (a run is up, or some mission record
-    /// still holds a session). This keeps the sidebar's activity dots
-    /// fresh without polling an idle app forever.
+    /// Refresh liveness immediately after a relevant filesystem mutation and
+    /// otherwise on a slow safety backstop. Each refresh launches `tmux
+    /// list-sessions`, so a static live session must not imply a subprocess
+    /// every repaint or every activity-dot transition.
     pub fn poll_live_sessions(&mut self) {
         let relevant = self.run_active()
             || self
@@ -3300,9 +3423,10 @@ impl AppState {
             return;
         }
         let now = self.clock.monotonic_now();
-        let due = self
-            .live_sessions_polled_at
-            .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(2));
+        let due = self.live_sessions_dirty
+            || self
+                .live_sessions_polled_at
+                .is_none_or(|t| now.saturating_duration_since(t) >= LIVE_SESSION_BACKSTOP);
         if due {
             self.refresh_live_sessions();
             if self.jobs.is_none() {
@@ -3334,6 +3458,17 @@ impl AppState {
                 self.capture_opencode_session();
             }
         }
+        if self.jobs.is_some() {
+            let settled = self
+                .session_reconcile_due_at
+                .is_some_and(|deadline| now >= deadline);
+            let backstop_due = self.session_reconciled_at.is_none_or(|at| {
+                now.saturating_duration_since(at) >= SESSION_RECONCILE_BACKSTOP
+            });
+            if settled || backstop_due {
+                self.schedule_session_reconciliation(false);
+            }
+        }
     }
 
     /// Honor any launch the CURATOR requested (its `mission_launch` tool
@@ -3351,9 +3486,10 @@ impl AppState {
     /// operator need not be viewing when the launch fires.
     pub fn poll_launch_requests(&mut self) {
         let now = self.clock.monotonic_now();
+        let backstop = self.store_backstop();
         let due = self
             .launch_requests_polled_at
-            .is_none_or(|t| now.saturating_duration_since(t) >= STORE_BACKSTOP);
+            .is_none_or(|t| now.saturating_duration_since(t) >= backstop);
         if !due {
             return;
         }
@@ -3777,9 +3913,10 @@ impl AppState {
             return;
         };
         let now = self.clock.monotonic_now();
+        let backstop = self.store_backstop();
         let due = self
             .corpus_polled_at
-            .is_none_or(|t| now.saturating_duration_since(t) >= STORE_BACKSTOP);
+            .is_none_or(|t| now.saturating_duration_since(t) >= backstop);
         if due {
             if self.jobs.is_some() {
                 self.corpus_polled_at = Some(now);
@@ -3933,10 +4070,10 @@ impl AppState {
             // PTY/file/job producers wake egui when new data arrives. The
             // clock is only a bounded liveness fallback for an app-owned
             // process, not an animation timer.
-            MissionActivity::Working if self.run_active() => Some(Duration::from_millis(250)),
+            MissionActivity::Working if self.run_active() => Some(OWNED_RUN_REPAINT_BACKSTOP),
             MissionActivity::Working => Some(Duration::from_secs(2)),
             MissionActivity::Waiting => Some(Duration::from_secs(2)),
-            MissionActivity::Idle if self.run_active() => Some(Duration::from_millis(250)),
+            MissionActivity::Idle if self.run_active() => Some(OWNED_RUN_REPAINT_BACKSTOP),
             // A just-discovered session may precede the mission cache that
             // names it. Keep the slow ownership beat until the cache lands.
             MissionActivity::Idle if !self.live_sessions.is_empty() => Some(Duration::from_secs(2)),
@@ -4749,8 +4886,8 @@ impl AppState {
     /// working, parked at the prompt). This is what keeps the Cost panel
     /// honest for an ACTIVE conversation: usage updates at each turn
     /// boundary, not only at Stop (which a run killed with the app never
-    /// reaches). Keyed by opencode session id, the export overwrites in
-    /// place, so the file just grows more accurate turn by turn.
+    /// reaches). Keyed by opencode session id, the compact snapshot
+    /// overwrites in place without reading message-level data.
     ///
     /// Fires at most once per completed turn: the guard is the session's
     /// last paint (`session_activity`) being newer than our last export
@@ -4758,8 +4895,7 @@ impl AppState {
     /// has nothing new to record and is skipped; a failed export leaves the
     /// stamp untouched, so the next beat simply retries.
     fn sweep_usage_exports(&mut self, project: &str) {
-        // (slug, opencode_session, tmux_session) for missions we could export.
-        let pending: Vec<(String, String, String)> = self
+        let pending: Vec<(String, String, String, corpus_core::MissionControl)> = self
             .missions
             .iter()
             .filter_map(|(slug, m)| {
@@ -4767,15 +4903,19 @@ impl AppState {
                     slug.clone(),
                     m.opencode_session.clone()?,
                     m.session.clone()?,
+                    m.control.clone()?,
                 ))
             })
-            .filter(|(slug, _, _)| {
+            .filter(|(slug, _, _, _)| {
                 matches!(
                     self.mission_activity(project, slug),
                     MissionActivity::Waiting
                 )
             })
-            .filter(|(_, _, tmux)| {
+            .filter(|(_, _, tmux, control)| {
+                if control.run_id != *tmux {
+                    return false;
+                }
                 // New output since our last export (or never exported) ⇒ a
                 // turn happened. No activity reading ⇒ nothing to record.
                 should_reexport(
@@ -4788,8 +4928,18 @@ impl AppState {
             return;
         }
         let mut changed = false;
-        for (_slug, opencode, tmux) in pending {
-            if self.run_backend.export_session(project, &opencode).is_ok() {
+        for (_slug, opencode, tmux, control) in pending {
+            let session = SessionRef {
+                id: opencode,
+                directory: self.store.project_run_dir(project),
+            };
+            let captured = corpus_core::opencode_control_password(&self.store, &control.run_id)
+                .map_err(|error| error.to_string())
+                .and_then(|password| self.session_service.usage_snapshot(&control, &password, &session))
+                .and_then(|snapshot| self.store.write_usage_snapshot(project, &snapshot)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()));
+            if captured.is_ok() {
                 self.last_exported_at
                     .insert(tmux, self.clock.monotonic_now());
                 changed = true;
@@ -6195,6 +6345,88 @@ mod tests {
         }
     }
 
+    struct BlockingExportService {
+        block: AtomicBool,
+        in_progress: AtomicBool,
+    }
+
+    impl SessionService for BlockingExportService {
+        fn health(
+            &self,
+        ) -> Result<crate::session_service::ServiceHealth, String> {
+            Ok(crate::session_service::ServiceHealth {
+                backend: crate::session_service::SessionBackend::Http,
+                version: crate::session_service::MINIMUM_OPENCODE_VERSION.into(),
+                compatible: true,
+            })
+        }
+
+        fn list(
+            &self,
+            _directory: &std::path::Path,
+        ) -> Result<Vec<crate::session_service::SessionSummary>, String> {
+            Ok(Vec::new())
+        }
+
+        fn messages(
+            &self,
+            _session: &SessionRef,
+        ) -> Result<Vec<crate::session_service::SessionMessage>, String> {
+            Ok(Vec::new())
+        }
+
+        fn usage_snapshot(
+            &self,
+            _control: &corpus_core::MissionControl,
+            _password: &str,
+            session: &SessionRef,
+        ) -> Result<corpus_core::UsageSnapshot, String> {
+            self.in_progress.store(true, Ordering::Release);
+            while self.block.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.in_progress.store(false, Ordering::Release);
+            Ok(corpus_core::UsageSnapshot {
+                version: corpus_core::USAGE_SNAPSHOT_VERSION,
+                session_id: session.id.clone(),
+                captured_at: 1,
+                source: "test".into(),
+                rows: Vec::new(),
+            })
+        }
+
+        fn queue_prompt(
+            &self,
+            _control: &corpus_core::MissionControl,
+            _password: &str,
+            _session: &SessionRef,
+            _message_id: &str,
+            _prompt: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn session_turn_state(
+            &self,
+            _control: &corpus_core::MissionControl,
+            _password: &str,
+            _session: &SessionRef,
+            _launched_at_ms: u64,
+        ) -> Result<SessionTurnState, String> {
+            Ok(SessionTurnState::Completed)
+        }
+
+        fn prompt_delivery_state(
+            &self,
+            _control: &corpus_core::MissionControl,
+            _password: &str,
+            _session: &SessionRef,
+            _message_id: &str,
+        ) -> Result<PromptDeliveryState, String> {
+            Ok(PromptDeliveryState::Acknowledged)
+        }
+    }
+
     struct FakeRun {
         lines: VecDeque<RunLine>,
         exit: Option<i32>,
@@ -6374,6 +6606,19 @@ mod tests {
 
     impl SessionCatalog for FakeSessionCatalog {
         fn live_tui_sessions(&self) -> Vec<String> {
+            vec!["fake-run".into()]
+        }
+
+        fn raw_log(&self, _store: &Store, _project: &str, _session: &str) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    struct CountingSessionCatalog(Arc<AtomicUsize>);
+
+    impl SessionCatalog for CountingSessionCatalog {
+        fn live_tui_sessions(&self) -> Vec<String> {
+            self.0.fetch_add(1, Ordering::Relaxed);
             vec!["fake-run".into()]
         }
 
@@ -6664,7 +6909,7 @@ mod tests {
             stop_cleanup_error: false,
             stops: Arc::new(AtomicUsize::new(0)),
         }));
-        assert_eq!(state.live_repaint_after(), Some(Duration::from_millis(250)));
+        assert_eq!(state.live_repaint_after(), Some(OWNED_RUN_REPAINT_BACKSTOP));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6698,6 +6943,161 @@ mod tests {
             .insert("external-run".into(), clock.monotonic_now());
 
         assert_eq!(state.live_repaint_after(), Some(Duration::from_secs(2)));
+
+        // Once this process owns the same working run, PTY output remains
+        // the prompt repaint source. The clock is only the quiet exit audit.
+        state.owned_run_id = Some(RunId {
+            project: "p".into(),
+            mission: "mission".into(),
+            generation: 1,
+        });
+        state.run = Some(Box::new(FakeRun {
+            lines: VecDeque::new(),
+            exit: None,
+            stop_export_error: false,
+            stop_cleanup_error: false,
+            stops: Arc::new(AtomicUsize::new(0)),
+        }));
+        assert_eq!(state.live_repaint_after(), Some(OWNED_RUN_REPAINT_BACKSTOP));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unchanged_liveness_refresh_does_not_repeat_expensive_reconciliation() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-session-supervisor-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let mut state = AppState::with_runtime(
+            Store::new(root.clone()),
+            Arc::new(ManualClock::new(1_700_000_123)),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+
+        state.apply_live_sessions(vec!["fake-run".into()]);
+        assert_eq!(
+            state.session_lifecycle_stats,
+            SessionLifecycleStats {
+                live_refreshes: 1,
+                reconciliation_passes: 1,
+            }
+        );
+        state.apply_live_sessions(vec!["fake-run".into()]);
+        assert_eq!(
+            state.session_lifecycle_stats,
+            SessionLifecycleStats {
+                live_refreshes: 2,
+                reconciliation_passes: 1,
+            }
+        );
+        state.apply_live_sessions(Vec::new());
+        assert_eq!(
+            state.session_lifecycle_stats,
+            SessionLifecycleStats {
+                live_refreshes: 3,
+                reconciliation_passes: 2,
+            }
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn liveness_listing_is_event_driven_with_a_slow_backstop() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-liveness-cadence-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let clock = Arc::new(ManualClock::new(1_700_000_123));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut state = AppState::with_runtime(
+            Store::new(root.clone()),
+            clock.clone(),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(CountingSessionCatalog(calls.clone())),
+        );
+        let mut record = mission(1);
+        record.session = Some("fake-run".into());
+        state.trees.insert(
+            "p".into(),
+            ProjectTree {
+                agents: Vec::new(),
+                missions: vec![("mission".into(), record)],
+            },
+        );
+
+        state.poll_live_sessions();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        clock.advance(LIVE_SESSION_BACKSTOP - Duration::from_millis(1));
+        state.poll_live_sessions();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        state.live_sessions_dirty = true;
+        state.poll_live_sessions();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        clock.advance(LIVE_SESSION_BACKSTOP);
+        state.poll_live_sessions();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn raw_output_events_debounce_to_one_settled_reconciliation() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-session-debounce-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let clock = Arc::new(ManualClock::new(1_700_000_123));
+        let store = Store::new(root.clone());
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        let mut state = AppState::with_runtime(
+            store,
+            clock.clone(),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+        state.refresh();
+        let mut record = mission(1);
+        record.session = Some("fake-run".into());
+        state.trees.insert(
+            "p".into(),
+            ProjectTree {
+                agents: Vec::new(),
+                missions: vec![("mission".into(), record)],
+            },
+        );
+        state.live_sessions = vec!["fake-run".into()];
+        state.live_sessions_dirty = false;
+        state.live_sessions_polled_at = Some(clock.monotonic_now());
+        state.session_activity_polled_at = Some(clock.monotonic_now());
+        state.session_reconciled_at = Some(clock.monotonic_now());
+        state.install_job_runtime(eframe::egui::Context::default());
+
+        let activity = || crate::file_watch::FileInvalidations {
+            activity: BTreeSet::from(["p".into()]),
+            ..crate::file_watch::FileInvalidations::default()
+        };
+        state.file_invalidations = Some(Box::new(
+            crate::file_watch::FakeFileInvalidationSource::new(activity()),
+        ));
+        state.poll_file_invalidations();
+        clock.advance(Duration::from_secs(corpus_core::WORKING_WINDOW_SECS - 1));
+        state.poll_live_sessions();
+        assert_eq!(state.session_lifecycle_stats.reconciliation_passes, 0);
+
+        state.file_invalidations = Some(Box::new(
+            crate::file_watch::FakeFileInvalidationSource::new(activity()),
+        ));
+        state.poll_file_invalidations();
+        clock.advance(Duration::from_secs(corpus_core::WORKING_WINDOW_SECS - 1));
+        state.poll_live_sessions();
+        assert_eq!(state.session_lifecycle_stats.reconciliation_passes, 0);
+        clock.advance(Duration::from_secs(1));
+        state.poll_live_sessions();
+        assert_eq!(state.session_lifecycle_stats.reconciliation_passes, 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6737,12 +7137,49 @@ mod tests {
 
         state.poll_launch_requests();
         let first_poll = state.launch_requests_polled_at.unwrap();
-        clock.advance(STORE_BACKSTOP - Duration::from_millis(1));
+        clock.advance(UNWATCHED_STORE_BACKSTOP - Duration::from_millis(1));
         state.poll_launch_requests();
         assert_eq!(state.launch_requests_polled_at, Some(first_poll));
         clock.advance(Duration::from_millis(1));
         state.poll_launch_requests();
         assert!(state.launch_requests_polled_at.unwrap() > first_poll);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn store_audit_backstop_slows_only_while_notifications_are_healthy() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-adaptive-store-backstop-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let clock = Arc::new(ManualClock::new(1_700_000_123));
+        let mut state = AppState::with_runtime(
+            Store::new(root.clone()),
+            clock.clone(),
+            Arc::new(FakeRunBackend::default()),
+            Arc::new(FakeSessionCatalog),
+        );
+
+        state.poll_launch_requests();
+        let initial = state.launch_requests_polled_at.unwrap();
+        clock.advance(UNWATCHED_STORE_BACKSTOP);
+        state.poll_launch_requests();
+        let fallback_audit = state.launch_requests_polled_at.unwrap();
+        assert!(fallback_audit > initial);
+
+        state.file_invalidations = Some(Box::new(
+            crate::file_watch::FakeFileInvalidationSource::new(
+                crate::file_watch::FileInvalidations::default(),
+            ),
+        ));
+        clock.advance(WATCHED_STORE_BACKSTOP - Duration::from_millis(1));
+        state.poll_launch_requests();
+        assert_eq!(state.launch_requests_polled_at, Some(fallback_audit));
+        clock.advance(Duration::from_millis(1));
+        state.poll_launch_requests();
+        assert!(state.launch_requests_polled_at.unwrap() > fallback_audit);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -7280,10 +7717,10 @@ mod tests {
         state.poll_project_scope();
         wait_for_finding_titles(&mut state, &["One edited"]);
 
-        // No event: the existing ten-second project reconciliation still
-        // discovers the change, without a findings-specific timer.
+        // No event: the slow watched-store audit still discovers the change,
+        // without a findings-specific timer.
         write_finding_fixture(&store, "p", "three.md", "Three");
-        clock.advance(STORE_BACKSTOP);
+        clock.advance(WATCHED_STORE_BACKSTOP);
         state.poll_project_scope();
         wait_for_finding_titles(&mut state, &["One edited", "Three"]);
 
@@ -8230,6 +8667,52 @@ mod tests {
     }
 
     #[test]
+    fn usage_snapshot_makes_cost_independent_of_large_transcript() {
+        let root = std::env::temp_dir().join(format!(
+            "corpus-app-large-cost-checkpoint-{}-{}",
+            std::process::id(),
+            new_uuid_id()
+        ));
+        let store = Store::new(root.clone());
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        let document = serde_json::json!({
+            "info": {"id": "ses_large"},
+            "messages": [{
+                "info": {
+                    "role": "assistant",
+                    "providerID": "openrouter",
+                    "modelID": "moonshotai/kimi-k3",
+                    "cost": 4.4480775,
+                    "tokens": {
+                        "input": 970080,
+                        "output": 28512,
+                        "reasoning": 3948,
+                        "cache": {"read": 3503125, "write": 0}
+                    }
+                },
+                "parts": [{"type": "text", "text": "x".repeat(140 * 1024)}]
+            }]
+        });
+
+        let path = store
+            .project_corpus_dir("p")
+            .join("runs/ses_large.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        assert!(std::fs::metadata(path).unwrap().len() > 128 * 1024);
+        store.backfill_usage_snapshots("p").unwrap();
+        std::fs::remove_file(
+            store.project_corpus_dir("p").join("runs/ses_large.json")
+        ).unwrap();
+        let report = corpus_core::corpus_cost(&store, "p").unwrap();
+        assert_eq!(report.rows.len(), 1);
+        assert!((report.cost - 4.4480775).abs() < f64::EPSILON);
+        assert_eq!(report.tokens, 1_002_540);
+        assert_eq!(report.accounted_sessions, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn checkpoint_export_waits_for_quiet_and_yields_to_deletion_and_backoff() {
         use std::time::{Duration, Instant};
         let now = Instant::now();
@@ -8271,6 +8754,35 @@ mod tests {
     }
 
     #[test]
+    fn structured_lifecycle_failure_is_not_reported_as_resolved_first() {
+        let failed_export = JobTerminal::Success(AppJobOutput::SessionMaintenance(
+            SessionMaintenance {
+                conversations: Vec::new(),
+                exported_tmux: Vec::new(),
+                export_failure: Some(("tmux".into(), "failed".into())),
+                warning: None,
+            },
+        ));
+        assert!(!successful_job_resolves_notice(&failed_export));
+
+        let failed_teardown = JobTerminal::Success(AppJobOutput::TeardownReady(TeardownReady {
+            transcript: None,
+            error: Some("failed".into()),
+            cleanup_complete: false,
+            retained: None,
+        }));
+        assert!(!successful_job_resolves_notice(&failed_teardown));
+
+        let clean = JobTerminal::Success(AppJobOutput::SessionMaintenance(SessionMaintenance {
+            conversations: Vec::new(),
+            exported_tmux: Vec::new(),
+            export_failure: None,
+            warning: None,
+        }));
+        assert!(successful_job_resolves_notice(&clean));
+    }
+
+    #[test]
     fn session_operation_leases_are_shared_only_within_one_mission() {
         let leases = SessionOperationLeases::default();
         let first = leases.claim("p", "mission");
@@ -8297,6 +8809,10 @@ mod tests {
             .unwrap();
         let mut record = mission(1);
         record.session = Some("fake-run".into());
+        record.control = Some(corpus_core::MissionControl {
+            run_id: "fake-run".into(),
+            port: 43_111,
+        });
         record.opencode_session = Some("fake-conversation".into());
         store
             .write_mission("p", "mission", &record, "brief")
@@ -8359,19 +8875,27 @@ mod tests {
             .unwrap();
         let mut record = mission(1);
         record.session = Some("fake-run".into());
+        record.control = Some(corpus_core::MissionControl {
+            run_id: "fake-run".into(),
+            port: 43_111,
+        });
         record.opencode_session = Some("fake-conversation".into());
         store
             .write_mission("p", "mission", &record, "brief")
             .unwrap();
         let clock = Arc::new(ManualClock::new(2));
         let backend = Arc::new(FakeRunBackend::default());
-        backend.block_export.store(true, Ordering::Release);
+        let export = Arc::new(BlockingExportService {
+            block: AtomicBool::new(true),
+            in_progress: AtomicBool::new(false),
+        });
         let mut state = AppState::with_runtime(
             store.clone(),
             clock.clone(),
             backend.clone(),
             Arc::new(FakeSessionCatalog),
         );
+        state.session_service = export.clone();
         state.refresh();
         state.live_sessions = vec!["fake-run".into()];
         state.session_activity.insert(
@@ -8382,12 +8906,12 @@ mod tests {
         state.install_job_runtime(eframe::egui::Context::default());
         state.schedule_session_maintenance("p");
         for _ in 0..200 {
-            if backend.export_in_progress.load(Ordering::Acquire) {
+            if export.in_progress.load(Ordering::Acquire) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(backend.export_in_progress.load(Ordering::Acquire));
+        assert!(export.in_progress.load(Ordering::Acquire));
 
         state.delete_project("p").unwrap();
         state.poll_launch_requests();
@@ -8402,7 +8926,7 @@ mod tests {
         assert_eq!(backend.kills.load(Ordering::Relaxed), 0);
         assert!(!backend.teardown_overlap.load(Ordering::Acquire));
 
-        backend.block_export.store(false, Ordering::Release);
+        export.block.store(false, Ordering::Release);
         for _ in 0..300 {
             state.poll_background_jobs();
             if store.load_mission("p", "mission").is_err() {
@@ -8414,7 +8938,7 @@ mod tests {
         assert_eq!(backend.kills.load(Ordering::Relaxed), 1);
         assert!(!backend.teardown_overlap.load(Ordering::Acquire));
 
-        clock.advance(STORE_BACKSTOP);
+        clock.advance(WATCHED_STORE_BACKSTOP);
         state.poll_launch_requests();
         for _ in 0..200 {
             state.poll_background_jobs();

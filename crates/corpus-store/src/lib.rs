@@ -37,5 +37,5 @@ pub use store::{
     CostReport, CostRow, EntryAccess, Mission, MissionCompletion, MissionControl, MissionDeleteRequest,
     MissionDispatch, MissionLaunchRequest, MissionLog, MissionRunRef, Project, Scope, Store, AGENT_ENV, CATEGORIES,
     ENVIRONMENT_SESSION_ENV, MISSION_ENV, PROJECT_ENV, RUNS, RUN_ID_ENV, RUN_LOG_ENV,
-    SOURCE_PINS_ENV, STORE_ENV,
+    SOURCE_PINS_ENV, STORE_ENV, UsageSnapshot, USAGE_SNAPSHOT_VERSION,
 };
