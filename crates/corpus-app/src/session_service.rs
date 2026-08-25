@@ -20,7 +20,10 @@ use serde_json::Value;
 pub(crate) const MINIMUM_OPENCODE_VERSION: &str = "1.18.18";
 
 fn is_compatible_opencode_version(version: &str) -> bool {
-    let core = version.trim().split_once('-').map_or(version.trim(), |(core, _)| core);
+    let core = version
+        .trim()
+        .split_once('-')
+        .map_or(version.trim(), |(core, _)| core);
     let mut parts = core.split('.');
     let parsed = (
         parts.next().and_then(|part| part.parse::<u64>().ok()),
@@ -81,10 +84,7 @@ pub(crate) enum PromptDeliveryState {
     Pending,
     Active,
     Acknowledged,
-    Failed {
-        error: String,
-        retry_ready: bool,
-    },
+    Failed { error: String, retry_ready: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,10 +371,7 @@ impl HttpSessionService {
 
         let response = self
             .client
-            .post(format!(
-                "{}/session/{}/prompt_async",
-                self.base, session.id
-            ))
+            .post(format!("{}/session/{}/prompt_async", self.base, session.id))
             .basic_auth("opencode", Some(&self.password))
             .query(&[("directory", session.directory.to_string_lossy().as_ref())])
             .json(&legacy_prompt_body(message_id, prompt))
@@ -484,7 +481,11 @@ fn message_failure_message(message: &Value) -> String {
     message
         .pointer("/info/error/data/message")
         .and_then(Value::as_str)
-        .or_else(|| message.pointer("/info/error/message").and_then(Value::as_str))
+        .or_else(|| {
+            message
+                .pointer("/info/error/message")
+                .and_then(Value::as_str)
+        })
         .map(str::to_string)
         .unwrap_or_else(|| "OpenCode failed while handling the completion prompt".into())
 }
@@ -496,7 +497,11 @@ fn legacy_turn_state(messages: &Value, launched_at_ms: u64) -> SessionTurnState 
     let Some(started_at) = messages
         .iter()
         .filter(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("user"))
-        .filter_map(|message| message.pointer("/info/time/created").and_then(Value::as_u64))
+        .filter_map(|message| {
+            message
+                .pointer("/info/time/created")
+                .and_then(Value::as_u64)
+        })
         .filter(|created| *created >= launched_at_ms)
         .min()
     else {
@@ -1128,17 +1133,21 @@ mod tests {
 
     #[test]
     fn session_aggregate_becomes_compact_usage_without_messages() {
-        let snapshot = usage_snapshot_from_record(&json!({
-            "id": "ses_cost",
-            "cost": 4.4480775,
-            "tokens": {
-                "input": 970080,
-                "output": 28512,
-                "reasoning": 3948,
-                "cache": {"read": 3503125, "write": 0}
-            },
-            "model": {"id": "moonshotai/kimi-k3", "providerID": "openrouter"}
-        }), "ses_cost").unwrap();
+        let snapshot = usage_snapshot_from_record(
+            &json!({
+                "id": "ses_cost",
+                "cost": 4.4480775,
+                "tokens": {
+                    "input": 970080,
+                    "output": 28512,
+                    "reasoning": 3948,
+                    "cache": {"read": 3503125, "write": 0}
+                },
+                "model": {"id": "moonshotai/kimi-k3", "providerID": "openrouter"}
+            }),
+            "ses_cost",
+        )
+        .unwrap();
         assert_eq!(snapshot.session_id, "ses_cost");
         assert_eq!(snapshot.rows[0].model, "kimi-k3");
         assert_eq!(snapshot.rows[0].tokens_input, 970080);
@@ -1185,15 +1194,24 @@ mod tests {
         let messages = json!([{
             "info": {"role": "user", "time": {"created": 1_100}}
         }]);
-        assert_eq!(legacy_turn_state(&messages, 1_000), SessionTurnState::Active);
-        assert_eq!(legacy_turn_state(&messages, 1_300), SessionTurnState::Pending);
+        assert_eq!(
+            legacy_turn_state(&messages, 1_000),
+            SessionTurnState::Active
+        );
+        assert_eq!(
+            legacy_turn_state(&messages, 1_300),
+            SessionTurnState::Pending
+        );
 
         // Completed assistant fragments without a user turn after the exact
         // launch remain irrelevant.
         let fragments = json!([{
             "info": {"role": "assistant", "time": {"completed": 1_250}}
         }]);
-        assert_eq!(legacy_turn_state(&fragments, 1_000), SessionTurnState::Pending);
+        assert_eq!(
+            legacy_turn_state(&fragments, 1_000),
+            SessionTurnState::Pending
+        );
     }
 
     #[test]
@@ -1208,14 +1226,20 @@ mod tests {
         }, {
             "info": {"role":"assistant", "time":{"created":1_201}}
         }]);
-        assert_eq!(legacy_turn_state(&messages, 1_000), SessionTurnState::Active);
+        assert_eq!(
+            legacy_turn_state(&messages, 1_000),
+            SessionTurnState::Active
+        );
         messages.as_array_mut().unwrap()[2] = json!({
             "info": {
                 "role":"assistant", "finish":"stop",
                 "time":{"created":1_201, "completed":1_300}
             }
         });
-        assert_eq!(legacy_turn_state(&messages, 1_000), SessionTurnState::Completed);
+        assert_eq!(
+            legacy_turn_state(&messages, 1_000),
+            SessionTurnState::Completed
+        );
     }
 
     #[test]
@@ -1233,10 +1257,7 @@ mod tests {
         assert!(!has_user_message(&messages, "missing"));
         assert!(has_assistant_message(&messages, "ours"));
         assert!(!has_assistant_message(&messages, "missing"));
-        assert_eq!(
-            legacy_prompt_terminal(&messages, "ours"),
-            Some(Ok(()))
-        );
+        assert_eq!(legacy_prompt_terminal(&messages, "ours"), Some(Ok(())));
 
         let failed = json!([{
             "info":{"id":"ours", "role":"user"}

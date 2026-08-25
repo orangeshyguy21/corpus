@@ -16,7 +16,7 @@ use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 use corpus_core::FindingSeverity;
 
 use crate::fmt::fmt_bytes;
-use crate::state::{AppState, FindingDiscovery};
+use crate::state::{AppState, FindingDiscovery, MissionDisplayState};
 use crate::theme;
 use crate::views::components;
 use crate::views::plugin_picker::plugin_picker;
@@ -156,11 +156,7 @@ impl ProjectsView {
                     components::StatusTone::Danger,
                     Some(env.notes.as_str()),
                 ),
-                None => (
-                    "probe unavailable",
-                    components::StatusTone::Warning,
-                    None,
-                ),
+                None => ("probe unavailable", components::StatusTone::Warning, None),
             };
             let metrics = [
                 ("source pins", state.source_pins.len().to_string()),
@@ -196,13 +192,7 @@ impl ProjectsView {
 
     /// Two operational columns on a full command canvas; one predictable
     /// reading order when the chat panel or a narrow window reduces space.
-    fn dashboard(
-        &mut self,
-        ui: &mut Ui,
-        state: &mut AppState,
-        toasts: &mut Toasts,
-        slug: &str,
-    ) {
+    fn dashboard(&mut self, ui: &mut Ui, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
         if dashboard_columns(ui.available_width()) == 2 {
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.x = theme::CARD_GUTTER;
@@ -397,8 +387,14 @@ impl ProjectsView {
             for (slug, agent) in agents {
                 let name = crate::state::agent_label(&agent.meta.name, &slug);
                 let role = agent.meta.role().as_str();
-                if command_row(ui, ("project-agent", &slug), &name, role, components::StatusTone::Interaction)
-                    .clicked()
+                if command_row(
+                    ui,
+                    ("project-agent", &slug),
+                    &name,
+                    role,
+                    components::StatusTone::Interaction,
+                )
+                .clicked()
                 {
                     state.selected_agent = Some(slug);
                     state.current_screen = crate::nav::Screen::Agents;
@@ -416,7 +412,7 @@ impl ProjectsView {
             }
             for (slug, mission) in missions {
                 let name = crate::state::mission_label(mission.name.as_deref(), &slug);
-                let activity = state.mission_activity(project, &slug);
+                let display_state = state.mission_display_state(project, &slug);
                 let old_repo_revision = state.plugin_leases().iter().any(|environment| {
                     environment.mission == slug
                         && environment.drift.iter().any(|detail| {
@@ -424,28 +420,34 @@ impl ProjectsView {
                                 && detail.contains(" but lease runs ")
                         })
                 });
-                let (activity_status, activity_tone) = match activity {
-                    crate::state::MissionActivity::Working => {
-                        ("working", components::StatusTone::Healthy)
+                let activity_tone = match display_state {
+                    MissionDisplayState::Working => components::StatusTone::Healthy,
+                    MissionDisplayState::Waiting => components::StatusTone::HealthyMuted,
+                    MissionDisplayState::Queued
+                    | MissionDisplayState::Preparing
+                    | MissionDisplayState::Starting
+                    | MissionDisplayState::Stopping
+                    | MissionDisplayState::Exporting => components::StatusTone::Interaction,
+                    MissionDisplayState::Failed | MissionDisplayState::Deleting => {
+                        components::StatusTone::Danger
                     }
-                    crate::state::MissionActivity::Waiting => {
-                        ("waiting", components::StatusTone::Warning)
-                    }
-                    crate::state::MissionActivity::Idle => {
-                        ("idle", components::StatusTone::Neutral)
-                    }
+                    MissionDisplayState::Idle => components::StatusTone::Neutral,
                 };
+                let activity_status = display_state.label();
                 let status = if old_repo_revision {
                     format!("{activity_status} · old repo revision")
                 } else {
                     activity_status.to_string()
                 };
-                let tone = if old_repo_revision {
-                    components::StatusTone::Warning
-                } else {
-                    activity_tone
-                };
-                if command_row(ui, ("project-mission", &slug), &name, &status, tone).clicked() {
+                if command_row(
+                    ui,
+                    ("project-mission", &slug),
+                    &name,
+                    &status,
+                    activity_tone,
+                )
+                .clicked()
+                {
                     state.select_mission(project, &slug);
                 }
             }
@@ -544,9 +546,14 @@ impl ProjectsView {
                     RichText::new(format!(
                         "{} accounted session{} · {}{}",
                         report.accounted_sessions,
-                        if report.accounted_sessions == 1 { "" } else { "s" },
+                        if report.accounted_sessions == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
                         detail,
-                        report.last_updated
+                        report
+                            .last_updated
                             .map(|epoch| format!(" · updated {}", fmt_epoch(epoch)))
                             .unwrap_or_default()
                     ))
@@ -789,33 +796,33 @@ impl ProjectsView {
             "project_view_clone",
             format!("Clone project: {from}"),
         )
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
-            .show(ui.ctx(), |ui| {
-                ui.label("Display name (optional — defaults to the source's)");
-                let entry = ui.text_edit_singleline(&mut self.clone_name);
-                ui.checkbox(&mut self.clone_corpus, "copy the corpus");
-                ui.add_space(8.0);
-                let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if theme::house_button(ui, "Clone").clicked() || submit {
-                    let name = if self.clone_name.trim().is_empty() {
-                        None
-                    } else {
-                        Some(self.clone_name.trim())
-                    };
-                    match state.clone_project(from, name, self.clone_corpus) {
-                        Ok((to, _)) => {
-                            toast(toasts, ToastKind::Success, "project cloned");
-                            state.refresh();
-                            state.select_project(&to);
-                            cloned = true;
-                        }
-                        Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
+        .show(ui.ctx(), |ui| {
+            ui.label("Display name (optional — defaults to the source's)");
+            let entry = ui.text_edit_singleline(&mut self.clone_name);
+            ui.checkbox(&mut self.clone_corpus, "copy the corpus");
+            ui.add_space(8.0);
+            let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if theme::house_button(ui, "Clone").clicked() || submit {
+                let name = if self.clone_name.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.clone_name.trim())
+                };
+                match state.clone_project(from, name, self.clone_corpus) {
+                    Ok((to, _)) => {
+                        toast(toasts, ToastKind::Success, "project cloned");
+                        state.refresh();
+                        state.select_project(&to);
+                        cloned = true;
                     }
+                    Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
                 }
-            });
+            }
+        });
         self.show_clone = open && !cloned;
     }
 
@@ -980,13 +987,7 @@ fn finding_tile_width(available: f32) -> f32 {
     }
 }
 
-fn finding_count_tile(
-    ui: &mut Ui,
-    width: f32,
-    label: &str,
-    count: usize,
-    color: egui::Color32,
-) {
+fn finding_count_tile(ui: &mut Ui, width: f32, label: &str, count: usize, color: egui::Color32) {
     egui::Frame::default()
         .fill(color.gamma_multiply(0.08))
         .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.90)))
@@ -1305,10 +1306,8 @@ fn command_row(
     status: &str,
     tone: components::StatusTone,
 ) -> egui::Response {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 34.0),
-        egui::Sense::click(),
-    );
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
     let response = ui.interact(rect, ui.make_persistent_id(id), egui::Sense::click());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1319,9 +1318,9 @@ fn command_row(
         egui::Stroke::new(1.0_f32, theme::KEYLINE_SOFT),
     );
     let status = status.to_uppercase();
-    let status_galley = ui
-        .painter()
-        .layout_no_wrap(status.clone(), theme::mono(10.5), tone.color());
+    let status_galley =
+        ui.painter()
+            .layout_no_wrap(status.clone(), theme::mono(10.5), tone.color());
     let label_clip = egui::Rect::from_min_max(
         rect.min,
         egui::pos2(
@@ -1351,7 +1350,11 @@ fn binding_is_dirty(edit: &str, saved: &str) -> bool {
 }
 
 fn dashboard_columns(available_width: f32) -> usize {
-    if available_width >= TWO_COLUMN_AT { 2 } else { 1 }
+    if available_width >= TWO_COLUMN_AT {
+        2
+    } else {
+        1
+    }
 }
 
 /// The corpus visual: a full-width strip segmented by each category's
@@ -1385,11 +1388,11 @@ fn corpus_visual(ui: &mut Ui, categories: &[corpus_core::CategoryStat]) {
         );
         ui.allocate_rect(seg, egui::Sense::hover())
             .on_hover_text(format!(
-            "{} — {} files, {}",
-            category.name,
-            category.files,
-            fmt_bytes(category.bytes)
-        ));
+                "{} — {} files, {}",
+                category.name,
+                category.files,
+                fmt_bytes(category.bytes)
+            ));
         x += w;
     }
     ui.add_space(8.0);
@@ -1421,60 +1424,83 @@ fn corpus_visual(ui: &mut Ui, categories: &[corpus_core::CategoryStat]) {
 /// tail line — the newest runs are the ones anyone reads.
 const MISSION_LOG_ROWS: usize = 12;
 
-/// The Mission Logs list: one row per transcript (newest first) — mission
-/// agent label, run stamp, file name, size, and a bar sized to its share of the
-/// logs total, so a runaway run is obvious at a glance.
+/// The Mission Logs list: one row per transcript (newest first). Durable file
+/// names remain storage detail rather than leaking IDs into the UI. The share
+/// bar keeps runaway captures obvious at a glance.
 fn mission_log_list(ui: &mut Ui, state: &AppState, total: u64) {
-    let width = ui.available_width().min(760.0);
+    use egui_extras::{Column, TableBuilder};
+
     let logs = state.mission_logs();
-    for log in logs.iter().take(MISSION_LOG_ROWS) {
-        // Fixed row width so the right-aligned file name tracks the strip
-        // above it instead of the window edge.
-        ui.allocate_ui(egui::vec2(width, 16.0), |ui| {
-            ui.horizontal(|ui| {
-                let (bar, _) = ui.allocate_exact_size(egui::vec2(90.0, 10.0), egui::Sense::hover());
-                let painter = ui.painter_at(bar);
-                painter.rect_filled(bar, 1.0, theme::PLATE_FRONT);
-                let share = log.bytes as f32 / total.max(1) as f32;
-                let filled = egui::Rect::from_min_size(
-                    bar.min,
-                    egui::vec2((bar.width() * share).max(1.0), bar.height()),
-                );
-                painter.rect_filled(filled, 1.0, theme::MISSION_LOG);
-                let agent = log
-                    .agent
-                    .as_deref()
-                    .map(|slug| state.agent_label(slug))
-                    .unwrap_or_else(|| "unknown agent".to_string());
-                ui.label(RichText::new(agent).size(12.0).color(theme::TEXT));
-                ui.label(
-                    RichText::new(fmt_bytes(log.bytes))
-                        .size(12.0)
-                        .monospace()
-                        .color(theme::TEXT_MUTED),
-                );
-                if log.started > 0 {
-                    ui.label(
-                        RichText::new(fmt_epoch(log.started))
-                            .size(12.0)
-                            .color(theme::TEXT_FAINT),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(&log.name)
-                                .size(11.0)
-                                .monospace()
-                                .color(theme::TEXT_FAINT),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(format!("corpus/runs/{}", log.name));
+    let heading = |text: &str| RichText::new(text).size(11.5).color(theme::TEXT_FAINT);
+    let cell = |text: String| RichText::new(text).size(12.5).color(theme::TEXT);
+    let secondary = |text: String| {
+        RichText::new(text)
+            .size(12.0)
+            .monospace()
+            .color(theme::TEXT_MUTED)
+    };
+
+    TableBuilder::new(ui)
+        .id_salt("project_mission_logs_table")
+        .column(Column::initial(180.0).at_least(110.0)) // agent
+        .column(Column::initial(155.0).at_least(120.0)) // started
+        .column(Column::exact(72.0)) // format
+        .column(Column::exact(82.0)) // size
+        .column(Column::remainder().at_least(90.0)) // share
+        .header(22.0, |mut header| {
+            for title in ["agent", "started", "format", "size", "share"] {
+                header.col(|ui| {
+                    ui.label(heading(title));
                 });
-            });
+            }
+        })
+        .body(|mut body| {
+            for log in logs.iter().take(MISSION_LOG_ROWS) {
+                body.row(24.0, |mut row| {
+                    row.col(|ui| {
+                        let agent = log
+                            .agent
+                            .as_deref()
+                            .map(|slug| state.mission_log_agent_label(slug))
+                            .unwrap_or_else(|| "—".to_string());
+                        ui.label(cell(agent));
+                    });
+                    row.col(|ui| {
+                        let started = (log.started > 0)
+                            .then(|| fmt_epoch(log.started))
+                            .unwrap_or_else(|| "—".to_string());
+                        ui.label(secondary(started));
+                    });
+                    row.col(|ui| {
+                        let (format, detail) = match log.kind.as_str() {
+                            "raw" => ("capture", "Raw terminal capture"),
+                            "json" => ("export", "Structured session export"),
+                            _ => ("other", "Other run artifact"),
+                        };
+                        ui.label(RichText::new(format).size(12.0).color(theme::TEXT_MUTED))
+                            .on_hover_text(detail);
+                    });
+                    row.col(|ui| {
+                        ui.label(secondary(fmt_bytes(log.bytes)));
+                    });
+                    row.col(|ui| {
+                        let share = log.bytes as f32 / total.max(1) as f32;
+                        let width = ui.available_width().min(140.0);
+                        let (bar, response) =
+                            ui.allocate_exact_size(egui::vec2(width, 8.0), egui::Sense::hover());
+                        let painter = ui.painter_at(bar);
+                        painter.rect_filled(bar, 1.0, theme::PLATE_FRONT);
+                        let filled = egui::Rect::from_min_size(
+                            bar.min,
+                            egui::vec2((bar.width() * share).max(1.0), bar.height()),
+                        );
+                        painter.rect_filled(filled, 1.0, theme::MISSION_LOG);
+                        response
+                            .on_hover_text(format!("{:.1}% of mission-log storage", share * 100.0));
+                    });
+                });
+            }
         });
-    }
     if logs.len() > MISSION_LOG_ROWS {
         ui.add_space(4.0);
         ui.label(

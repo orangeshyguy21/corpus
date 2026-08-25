@@ -514,7 +514,9 @@ impl AgentsView {
     }
 
     fn description_card(&mut self, ui: &mut Ui) {
-        components::panel_card(ui, "Description", "描述", |ui| self.description_section(ui));
+        components::panel_card(ui, "Description", "描述", |ui| {
+            self.description_section(ui)
+        });
     }
 
     fn prompt_card(&mut self, ui: &mut Ui) {

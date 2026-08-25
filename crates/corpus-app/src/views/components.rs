@@ -17,6 +17,7 @@ pub enum StatusTone {
     Neutral,
     Interaction,
     Healthy,
+    HealthyMuted,
     Warning,
     Danger,
 }
@@ -27,6 +28,7 @@ impl StatusTone {
             Self::Neutral => theme::TEXT_MUTED,
             Self::Interaction => theme::INTERACTION,
             Self::Healthy => theme::HEALTHY,
+            Self::HealthyMuted => theme::HEALTHY.gamma_multiply(0.55),
             Self::Warning => theme::WARN,
             Self::Danger => theme::SIGNAL_RED,
         }
@@ -60,12 +62,7 @@ pub fn page_header_with_context<C, R>(
         .horizontal(|ui| {
             let context_result = ui
                 .horizontal(|ui| {
-                    ui.label(theme::display_text(
-                        kind,
-                        24.0,
-                        true,
-                        theme::INTERACTION,
-                    ));
+                    ui.label(theme::display_text(kind, 24.0, true, theme::INTERACTION));
                     ui.label(RichText::new("/").size(24.0).color(theme::TEXT_FAINT));
                     ui.add(
                         egui::Label::new(theme::display_text(name, 24.0, true, theme::TEXT))
@@ -132,7 +129,7 @@ pub fn panel_card<R>(
 pub fn status_badge(ui: &mut Ui, text: &str, tone: StatusTone) -> egui::Response {
     let color = tone.color();
     let icon = match tone {
-        StatusTone::Healthy => ph::CHECK_CIRCLE,
+        StatusTone::Healthy | StatusTone::HealthyMuted => ph::CHECK_CIRCLE,
         StatusTone::Warning => ph::WARNING,
         StatusTone::Danger => ph::X_CIRCLE,
         StatusTone::Neutral | StatusTone::Interaction => ph::DOT_OUTLINE,
@@ -335,13 +332,9 @@ pub fn ascii_rule(ui: &mut Ui) -> egui::Response {
     let columns = (ui.available_width() / glyph_w).floor() as usize;
     let rail = format!("+{}+", "-".repeat(columns.saturating_sub(2)));
     ui.add(
-        egui::Label::new(
-            RichText::new(rail)
-                .font(font)
-                .color(theme::TEXT_FAINT),
-        )
-        .selectable(false)
-        .truncate(),
+        egui::Label::new(RichText::new(rail).font(font).color(theme::TEXT_FAINT))
+            .selectable(false)
+            .truncate(),
     )
 }
 
@@ -463,6 +456,10 @@ mod tests {
         assert_ne!(StatusTone::Interaction.color(), StatusTone::Danger.color());
         assert_ne!(theme::INTERACTION, theme::SIGNAL_RED);
         assert_eq!(StatusTone::Healthy.color(), theme::HEALTHY);
+        assert_eq!(
+            StatusTone::HealthyMuted.color(),
+            theme::HEALTHY.gamma_multiply(0.55)
+        );
     }
 
     #[test]

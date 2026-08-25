@@ -10,8 +10,8 @@
 //! module per screen; no business logic in widgets.
 
 mod chat;
-mod fmt;
 mod file_watch;
+mod fmt;
 mod jobs;
 mod nav;
 mod session_service;
@@ -148,8 +148,7 @@ impl BackgroundToastCondenser {
         if self.pending.is_empty() {
             self.pending_since = None;
         }
-        self.last_emitted
-            .retain(|key, _| key.job_kind != job_kind);
+        self.last_emitted.retain(|key, _| key.job_kind != job_kind);
     }
 
     fn time_until_flush(&self, now: Instant) -> Option<Duration> {
@@ -165,9 +164,8 @@ impl BackgroundToastCondenser {
         }
         self.pending_since = None;
 
-        self.last_emitted.retain(|_, emitted| {
-            now.duration_since(*emitted) < BACKGROUND_TOAST_COOLDOWN
-        });
+        self.last_emitted
+            .retain(|_, emitted| now.duration_since(*emitted) < BACKGROUND_TOAST_COOLDOWN);
 
         let mut signatures = BTreeMap::<BackgroundToastKey, usize>::new();
         for notice in std::mem::take(&mut self.pending) {
@@ -249,8 +247,8 @@ struct DividerDrag {
 fn dragged_width(target: Divider, drag: DividerDrag, pointer_x: f32, min: f32, max: f32) -> f32 {
     let dx = pointer_x - drag.start_x;
     let delta = match target {
-        Divider::Sidebar => dx,   // a left panel widens as you pull right
-        Divider::Chat => -dx,     // a right panel widens as you pull left
+        Divider::Sidebar => dx, // a left panel widens as you pull right
+        Divider::Chat => -dx,   // a right panel widens as you pull left
     };
     (drag.start_width + delta).clamp(min, max)
 }
@@ -292,8 +290,7 @@ impl eframe::App for App {
                     .kind(egui_toast::ToastKind::Error)
                     .text(message)
                     .options(
-                        egui_toast::ToastOptions::default()
-                            .duration(BACKGROUND_TOAST_DURATION),
+                        egui_toast::ToastOptions::default().duration(BACKGROUND_TOAST_DURATION),
                     ),
             );
         } else if let Some(after) = self.background_toasts.time_until_flush(notice_time) {
@@ -355,28 +352,28 @@ impl eframe::App for App {
             .frame(egui::Frame::default().fill(theme::BG))
             .show(ctx, |ui| {
                 components::paint_command_canvas(ui);
-            // Chunk 5: the run lives in the Missions view — no `Launch`
-            // takeover of the main column. The mission view renders the
-            // terminal edge-to-edge (zero margin); Projects/Agents pad
-            // themselves with the old 24/18 inset.
-            match self.state.current_screen {
-                Screen::Projects => {
-                    padded(ui, |ui| {
-                        self.projects.show(ui, &mut self.state, &mut self.toasts);
-                    });
+                // Chunk 5: the run lives in the Missions view — no `Launch`
+                // takeover of the main column. The mission view renders the
+                // terminal edge-to-edge (zero margin); Projects/Agents pad
+                // themselves with the old 24/18 inset.
+                match self.state.current_screen {
+                    Screen::Projects => {
+                        padded(ui, |ui| {
+                            self.projects.show(ui, &mut self.state, &mut self.toasts);
+                        });
+                    }
+                    Screen::Agents => {
+                        padded(ui, |ui| {
+                            self.agents.show(ui, &mut self.state, &mut self.toasts);
+                        });
+                    }
+                    Screen::Missions => {
+                        self.missions.show(ui, &mut self.state, &mut self.toasts);
+                    }
                 }
-                Screen::Agents => {
-                    padded(ui, |ui| {
-                        self.agents.show(ui, &mut self.state, &mut self.toasts);
-                    });
-                }
-                Screen::Missions => {
-                    self.missions.show(ui, &mut self.state, &mut self.toasts);
-                }
-            }
-        })
-        .response
-        .rect;
+            })
+            .response
+            .rect;
 
         // Drag dividers LAST: the grab zone paints/interacts over the edge
         // band, so it must come after the panels whose borders it straddles.
@@ -434,15 +431,10 @@ impl App {
             return;
         };
         let (kind, text) = exit_notice(&exit);
-        self.toasts.add(
-            egui_toast::Toast::new()
-                .kind(kind)
-                .text(text)
-                .options(
-                    egui_toast::ToastOptions::default()
-                        .duration(std::time::Duration::from_secs(8)),
-                ),
-        );
+        self.toasts
+            .add(egui_toast::Toast::new().kind(kind).text(text).options(
+                egui_toast::ToastOptions::default().duration(std::time::Duration::from_secs(8)),
+            ));
     }
 
     /// Announce each launch the curator carried out this beat. A success is
@@ -461,23 +453,18 @@ impl App {
                     format!("curator launch of {} failed: {error}", notice.mission),
                 ),
             };
-            self.toasts.add(
-                egui_toast::Toast::new()
-                    .kind(kind)
-                    .text(text)
-                    .options(
-                        egui_toast::ToastOptions::default()
-                            .duration(std::time::Duration::from_secs(8)),
-                    ),
-            );
+            self.toasts
+                .add(egui_toast::Toast::new().kind(kind).text(text).options(
+                    egui_toast::ToastOptions::default().duration(std::time::Duration::from_secs(8)),
+                ));
         }
     }
 
     /// The top bar (spec §3): wordmark left, per-source rev dropdowns +
     /// the live env dot center, chat toggle far right.
     fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top_bar")
-            .show_separator_line(true)
+        let bar = egui::TopBottomPanel::top("top_bar")
+            .show_separator_line(false)
             .frame(
                 egui::Frame::default()
                     .fill(theme::BG)
@@ -485,11 +472,16 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // LEFT: the wordmark, height 20px, aspect maintained
-                    // (source 1072×325 -> ~66px wide).
+                    // A full-size macOS content view places the native
+                    // traffic lights over this bar. Keep their leading zone
+                    // clear, then let the ordinary Corpus header continue.
+                    #[cfg(target_os = "macos")]
+                    ui.add_space(76.0);
+                    // LEFT: the wordmark, height 23px, aspect maintained
+                    // (source 1072×325 -> ~76px wide).
                     ui.add(
                         egui::Image::new(egui::include_image!("../assets/logo.png"))
-                            .fit_to_exact_size(egui::vec2(66.0, 20.0)),
+                            .fit_to_exact_size(egui::vec2(76.0, 23.0)),
                     );
                     ui.add_space(theme::SPACING);
                     self.breadcrumb(ui);
@@ -505,9 +497,8 @@ impl App {
                     // Right zone (right_to_left places rightmost first): the
                     // chat toggle far right, the env status to its left.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let toggle =
-                            theme::icon_button(ui, ph::CHATS_CIRCLE, 18.0)
-                                .on_hover_text("toggle the chat panel (content lands at chunk 6)");
+                        let toggle = theme::icon_button(ui, ph::CHATS_CIRCLE, 18.0)
+                            .on_hover_text("toggle the chat panel (content lands at chunk 6)");
                         if toggle.clicked() {
                             self.state.chat_open = !self.state.chat_open;
                         }
@@ -516,6 +507,7 @@ impl App {
                     });
                 });
             });
+        paint_header_caution_border(ctx, bar.response.rect);
     }
 
     /// The nav breadcrumb: `project > agent > mission` from the current
@@ -526,7 +518,13 @@ impl App {
                 .projects
                 .iter()
                 .find(|(s, _)| s == &slug)
-                .map(|(_, p)| if p.name.is_empty() { slug.clone() } else { p.name.clone() })
+                .map(|(_, p)| {
+                    if p.name.is_empty() {
+                        slug.clone()
+                    } else {
+                        p.name.clone()
+                    }
+                })
                 .unwrap_or(slug)
         });
         // Match the nesting project > agent > mission, but only as deep as
@@ -568,10 +566,19 @@ impl App {
             }
             first = false;
             let active = self.state.current_screen == screen;
-            let color = if active { theme::TEXT } else { theme::TEXT_FAINT };
+            let color = if active {
+                theme::TEXT
+            } else {
+                theme::TEXT_FAINT
+            };
             let response = ui.add(
-                egui::Label::new(egui::RichText::new(label).size(12.0).monospace().color(color))
-                    .sense(egui::Sense::click()),
+                egui::Label::new(
+                    egui::RichText::new(label)
+                        .size(12.0)
+                        .monospace()
+                        .color(color),
+                )
+                .sense(egui::Sense::click()),
             );
             if response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -611,9 +618,9 @@ impl App {
             // pass it only when it's a rev this source could hold (its tag
             // set, or already selected). Otherwise the spec repo would flash
             // a false mismatch against a mint version that isn't its own.
-            let source_running = running_rev.as_deref().filter(|r| {
-                source.revs.iter().any(|x| x == r) || selected == **r
-            });
+            let source_running = running_rev
+                .as_deref()
+                .filter(|r| source.revs.iter().any(|x| x == r) || selected == **r);
             if let Some(rev) = crate::views::source_dropdown::source_dropdown(
                 ui,
                 &format!("top_source_{}", source.name),
@@ -670,49 +677,55 @@ impl App {
             )
         } else {
             match self.state.env_status(&project) {
-            Some(env) if env.ready => {
-                // Ready: name + the version the mint is actually running,
-                // so "what's up" is legible at a glance, not buried.
-                let label = match &env.running_version {
-                    Some(ver) => format!("{}  {ver}", env.name),
-                    None => env.name.clone(),
-                };
-                (
-                    theme::HEALTHY,
-                    label,
-                    "environment ready — click to re-probe".to_string(),
-                )
-            }
-            Some(env) => {
-                // Short inline reason: the first probe-note clause, capped —
-                // the full notes stay on hover.
-                let short: String = env.notes.chars().take(48).collect();
-                let short = short.trim_end_matches([' ', ',', ';', '—', '(']).to_string();
-                (
-                    theme::SIGNAL_RED,
-                    if short.is_empty() {
-                        format!("{} — not ready", env.name)
-                    } else {
-                        format!("{} — {short}", env.name)
-                    },
-                    if env.notes.is_empty() {
-                        "environment not ready — click to re-probe".to_string()
-                    } else {
-                        format!("not ready — {}", env.notes)
-                    },
-                )
-            }
-            None => (
-                theme::TEXT_MUTED,
-                "probe…".to_string(),
-                "no probe yet — click to probe".to_string(),
-            ),
+                Some(env) if env.ready => {
+                    // Ready: name + the version the mint is actually running,
+                    // so "what's up" is legible at a glance, not buried.
+                    let label = match &env.running_version {
+                        Some(ver) => format!("{}  {ver}", env.name),
+                        None => env.name.clone(),
+                    };
+                    (
+                        theme::HEALTHY,
+                        label,
+                        "environment ready — click to re-probe".to_string(),
+                    )
+                }
+                Some(env) => {
+                    // Short inline reason: the first probe-note clause, capped —
+                    // the full notes stay on hover.
+                    let short: String = env.notes.chars().take(48).collect();
+                    let short = short
+                        .trim_end_matches([' ', ',', ';', '—', '('])
+                        .to_string();
+                    (
+                        theme::SIGNAL_RED,
+                        if short.is_empty() {
+                            format!("{} — not ready", env.name)
+                        } else {
+                            format!("{} — {short}", env.name)
+                        },
+                        if env.notes.is_empty() {
+                            "environment not ready — click to re-probe".to_string()
+                        } else {
+                            format!("not ready — {}", env.notes)
+                        },
+                    )
+                }
+                None => (
+                    theme::TEXT_MUTED,
+                    "probe…".to_string(),
+                    "no probe yet — click to probe".to_string(),
+                ),
             }
         };
         // A compact clickable row: dot + 13px label. FIX 2d — the whole
         // region is click-sensitive with a pointing-hand cursor, and the
         // label brightens TEXT_MUTED → TEXT on hover.
-                let galley = ui.painter().layout_no_wrap(label.clone(), egui::FontId::proportional(13.0), theme::TEXT);
+        let galley = ui.painter().layout_no_wrap(
+            label.clone(),
+            egui::FontId::proportional(13.0),
+            theme::TEXT,
+        );
         let size = egui::vec2(8.0 + 6.0 + galley.size().x, 24.0);
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
         response
@@ -721,13 +734,13 @@ impl App {
         if response.clicked() {
             self.state.refresh_env(&project);
         }
-        let color = if response.hovered() { theme::TEXT } else { theme::TEXT_MUTED };
+        let color = if response.hovered() {
+            theme::TEXT
+        } else {
+            theme::TEXT_MUTED
+        };
         let painter = ui.painter_at(rect);
-        painter.circle_filled(
-            egui::pos2(rect.left() + 4.0, rect.center().y),
-            4.0,
-            dot,
-        );
+        painter.circle_filled(egui::pos2(rect.left() + 4.0, rect.center().y), 4.0, dot);
         painter.text(
             egui::pos2(rect.left() + 12.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -855,12 +868,8 @@ impl App {
         }
         self.chat_role = role;
         self.chat_model = model.clone();
-        self.chat = chat::ChatHandle::start_scoped_with_wake(
-            &project,
-            &model,
-            role,
-            Arc::new(ctx.clone()),
-        );
+        self.chat =
+            chat::ChatHandle::start_scoped_with_wake(&project, &model, role, Arc::new(ctx.clone()));
     }
 
     /// Keep the app-owned panel widths inside their live bounds (the
@@ -970,6 +979,40 @@ impl App {
     }
 }
 
+/// The header's compact caution-tape keyline. Each mark is painted as a
+/// clipped parallelogram so the pattern remains crisp and seamless at any
+/// viewport width without carrying a bitmap asset.
+fn paint_header_caution_border(ctx: &egui::Context, header: egui::Rect) {
+    const HEIGHT: f32 = 4.0;
+    const MARK_WIDTH: f32 = 18.0;
+    const GAP: f32 = 10.0;
+    const SLANT: f32 = 4.0;
+
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("header_caution_border"),
+    ));
+    let band = egui::Rect::from_min_max(
+        egui::pos2(header.left(), header.bottom() - HEIGHT),
+        header.right_bottom(),
+    );
+    let painter = painter.with_clip_rect(band);
+    let mut x = band.left() - MARK_WIDTH;
+    while x < band.right() + SLANT {
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(x + SLANT, band.top()),
+                egui::pos2(x + MARK_WIDTH + SLANT, band.top()),
+                egui::pos2(x + MARK_WIDTH, band.bottom()),
+                egui::pos2(x, band.bottom()),
+            ],
+            theme::SIGNAL_RED,
+            egui::Stroke::NONE,
+        ));
+        x += MARK_WIDTH + GAP;
+    }
+}
+
 /// How an unasked-for run exit reads to the operator. Split from the
 /// toast plumbing so the rule itself is testable: a crash must not be
 /// mistakable for a session the operator closed.
@@ -980,7 +1023,10 @@ fn exit_notice(exit: &state::RunExit) -> (egui_toast::ToastKind, String) {
         .map(|label| format!("mission {label}"))
         .unwrap_or_else(|| "the run".to_string());
     if exit.code == 0 {
-        (egui_toast::ToastKind::Info, format!("{who} ended — session closed"))
+        (
+            egui_toast::ToastKind::Info,
+            format!("{who} ended — session closed"),
+        )
     } else {
         (
             egui_toast::ToastKind::Error,
@@ -1005,7 +1051,14 @@ fn main() -> eframe::Result {
     chat::init_goose_env();
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 900.0])
-        .with_title("corpus-app");
+        .with_title("Corpus")
+        // macOS consumes these fields; other window backends ignore them.
+        // The native traffic-light buttons stay functional while Corpus's
+        // own top bar replaces the opaque system title-bar surface.
+        .with_fullsize_content_view(true)
+        .with_title_shown(false)
+        .with_titlebar_shown(false)
+        .with_titlebar_buttons_shown(true);
     // Application icon for the OS dock/taskbar (logo-icon.png), decoded at
     // startup before the window exists.
     let viewport = match app_icon() {
@@ -1016,11 +1069,7 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
-    eframe::run_native(
-        "corpus-app",
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+    eframe::run_native("Corpus", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
 #[cfg(test)]
@@ -1028,7 +1077,11 @@ mod tests {
     use super::*;
 
     fn drag(width: f32, x: f32) -> DividerDrag {
-        DividerDrag { target: Divider::Sidebar, start_width: width, start_x: x }
+        DividerDrag {
+            target: Divider::Sidebar,
+            start_width: width,
+            start_x: x,
+        }
     }
 
     fn background_error(kind: JobKind, message: &str) -> BackgroundNotice {
@@ -1131,19 +1184,28 @@ mod tests {
 
     #[test]
     fn a_crash_is_reported_as_an_error_and_names_the_mission() {
-        let crashed = state::RunExit { mission: Some("recon".into()), code: 1 };
+        let crashed = state::RunExit {
+            mission: Some("recon".into()),
+            code: 1,
+        };
         let (kind, text) = exit_notice(&crashed);
         assert_eq!(kind, egui_toast::ToastKind::Error);
         assert!(text.contains("recon"), "names the mission: {text}");
         assert!(text.contains("code 1"), "names the code: {text}");
 
         // A session the operator closed is not an alarm.
-        let closed = state::RunExit { mission: Some("recon".into()), code: 0 };
+        let closed = state::RunExit {
+            mission: Some("recon".into()),
+            code: 0,
+        };
         let (kind, _) = exit_notice(&closed);
         assert_eq!(kind, egui_toast::ToastKind::Info);
 
         // A run with no mission behind it still gets reported.
-        let orphan = state::RunExit { mission: None, code: 137 };
+        let orphan = state::RunExit {
+            mission: None,
+            code: 137,
+        };
         let (kind, text) = exit_notice(&orphan);
         assert_eq!(kind, egui_toast::ToastKind::Error);
         assert!(text.contains("the run"), "{text}");
@@ -1151,8 +1213,7 @@ mod tests {
 
     #[test]
     fn toast_anchor_stays_inside_the_workspace() {
-        let viewport =
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1440.0, 900.0));
+        let viewport = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1440.0, 900.0));
         let workspace =
             egui::Rect::from_min_max(egui::pos2(200.0, 56.0), egui::pos2(1080.0, 900.0));
         let offset = toast_anchor_offset(workspace, viewport);
@@ -1167,18 +1228,39 @@ mod tests {
         let d = drag(200.0, 100.0);
         let chat = drag(300.0, 100.0);
         // Sidebar (left panel): pull right = widen.
-        assert_eq!(dragged_width(Divider::Sidebar, d, 130.0, 160.0, 480.0), 230.0);
+        assert_eq!(
+            dragged_width(Divider::Sidebar, d, 130.0, 160.0, 480.0),
+            230.0
+        );
         // Chat (right panel): pull LEFT = widen (opposite sign).
-        assert_eq!(dragged_width(Divider::Chat, chat, 70.0, 280.0, 520.0), 330.0);
+        assert_eq!(
+            dragged_width(Divider::Chat, chat, 70.0, 280.0, 520.0),
+            330.0
+        );
         // Clamps hold while the pointer keeps travelling past them —
         // anchored (not integrated), so a long overrun never "sticks".
-        assert_eq!(dragged_width(Divider::Sidebar, d, 5000.0, 160.0, 480.0), 480.0);
-        assert_eq!(dragged_width(Divider::Chat, chat, -5000.0, 280.0, 520.0), 520.0);
-        assert_eq!(dragged_width(Divider::Sidebar, d, -5000.0, 160.0, 480.0), 160.0);
+        assert_eq!(
+            dragged_width(Divider::Sidebar, d, 5000.0, 160.0, 480.0),
+            480.0
+        );
+        assert_eq!(
+            dragged_width(Divider::Chat, chat, -5000.0, 280.0, 520.0),
+            520.0
+        );
+        assert_eq!(
+            dragged_width(Divider::Sidebar, d, -5000.0, 160.0, 480.0),
+            160.0
+        );
         // ...and releasing the clamp returns the width to the pointer with
         // no accumulated error (the jitter-killer).
-        assert_eq!(dragged_width(Divider::Sidebar, d, 110.0, 160.0, 480.0), 210.0);
-        assert_eq!(dragged_width(Divider::Chat, chat, 110.0, 280.0, 520.0), 290.0);
+        assert_eq!(
+            dragged_width(Divider::Sidebar, d, 110.0, 160.0, 480.0),
+            210.0
+        );
+        assert_eq!(
+            dragged_width(Divider::Chat, chat, 110.0, 280.0, 520.0),
+            290.0
+        );
     }
 }
 

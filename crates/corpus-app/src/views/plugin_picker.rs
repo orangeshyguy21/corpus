@@ -59,7 +59,12 @@ pub fn plugin_picker(
         egui::StrokeKind::Inside,
     );
     // Probe badge + plugin name (monospace 14px) + caret.
-    paint_badge(&painter, egui::pos2(rect.left() + 16.0, rect.center().y), current, plugins);
+    paint_badge(
+        &painter,
+        egui::pos2(rect.left() + 16.0, rect.center().y),
+        current,
+        plugins,
+    );
     painter.text(
         egui::pos2(rect.left() + 30.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -104,7 +109,9 @@ fn row(ui: &mut Ui, status: &PluginStatus, current: &mut String) {
         let selected = *current == status.name;
         let resp = ui.selectable_label(
             selected,
-            egui::RichText::new(&status.name).monospace().color(theme::TEXT),
+            egui::RichText::new(&status.name)
+                .monospace()
+                .color(theme::TEXT),
         );
         if resp.clicked() {
             *current = status.name.clone();
@@ -136,9 +143,5 @@ fn paint_badge(painter: &egui::Painter, center: egui::Pos2, name: &str, plugins:
         .find(|plugin| plugin.name == name)
         .map(badge_color)
         .unwrap_or(theme::TEXT_FAINT);
-    painter.circle_filled(
-        center,
-        4.0,
-        color,
-    );
+    painter.circle_filled(center, 4.0, color);
 }

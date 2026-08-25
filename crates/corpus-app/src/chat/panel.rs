@@ -272,7 +272,12 @@ impl ChatPanelView {
                         }),
                     }
                 }
-                ChatEvent::ToolCallStart { id, name, args_json, .. } => {
+                ChatEvent::ToolCallStart {
+                    id,
+                    name,
+                    args_json,
+                    ..
+                } => {
                     self.set_activity(Activity::Tool(name.clone()));
                     self.messages.push(Rendered {
                         text: String::new(),
@@ -287,7 +292,12 @@ impl ChatPanelView {
                         queued: false,
                     });
                 }
-                ChatEvent::ToolCallResult { id, is_error, output, .. } => {
+                ChatEvent::ToolCallResult {
+                    id,
+                    is_error,
+                    output,
+                    ..
+                } => {
                     self.set_activity(Activity::Thinking);
                     // A resolved permission request's tool result arriving
                     // clears its card (backstop to the click path below).
@@ -327,7 +337,13 @@ impl ChatPanelView {
                         card.is_error = is_error;
                     }
                 }
-                ChatEvent::PermissionRequest { id, tool, args_json, summary, .. } => {
+                ChatEvent::PermissionRequest {
+                    id,
+                    tool,
+                    args_json,
+                    summary,
+                    ..
+                } => {
                     self.pending.push(PendingPermission {
                         id,
                         tool,
@@ -364,12 +380,16 @@ impl ChatPanelView {
                         queued: false,
                     });
                 }
-                ChatEvent::Usage { input_tokens, output_tokens, .. } => {
+                ChatEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => {
                     self.usage.0 += input_tokens.unwrap_or(0) as i64;
                     self.usage.1 += output_tokens.unwrap_or(0) as i64;
                 }
                 ChatEvent::StoreMutated { .. } => {} // the app reacts (nav refresh)
-                 ChatEvent::Error(e) => {
+                ChatEvent::Error(e) => {
                     self.set_activity(Activity::Idle);
                     self.last_error = Some(e.clone());
                     self.messages.push(Rendered {
@@ -382,7 +402,8 @@ impl ChatPanelView {
             }
         }
         if self.messages.len() > MAX_VISIBLE_MESSAGES {
-            self.messages.drain(..self.messages.len() - MAX_VISIBLE_MESSAGES);
+            self.messages
+                .drain(..self.messages.len() - MAX_VISIBLE_MESSAGES);
         }
         events
     }
@@ -426,9 +447,10 @@ impl ChatPanelView {
                 // Before the first token the model is loading/prefilling the
                 // (often large) context — say so instead of "thinking", which
                 // read as a hang when nothing moved for minutes.
-                Activity::Thinking if !self.turn_saw_output => {
-                    Some((format!("preparing · prefilling context{dots} {timer}"), busy))
-                }
+                Activity::Thinking if !self.turn_saw_output => Some((
+                    format!("preparing · prefilling context{dots} {timer}"),
+                    busy,
+                )),
                 Activity::Thinking => {
                     let (rate, _) = throughput(busy);
                     Some((format!("thinking{dots} {timer}{rate}"), busy))
@@ -620,21 +642,26 @@ impl ChatPanelView {
         ui.add_space((h * 0.34).max(12.0));
         ui.vertical_centered(|ui| {
             let (title, sub) = if self.model.is_empty() {
-                ("choose a model to begin", "the picker sits below, in the composer")
+                (
+                    "choose a model to begin",
+                    "the picker sits below, in the composer",
+                )
             } else {
                 ("no messages yet", "ask for a project, an agent, a mission…")
             };
-            ui.label(
-                crate::theme::icon_text(
-                    egui_phosphor::regular::CHATS_CIRCLE,
-                    26.0,
-                    crate::theme::HAIRLINE,
-                ),
-            );
+            ui.label(crate::theme::icon_text(
+                egui_phosphor::regular::CHATS_CIRCLE,
+                26.0,
+                crate::theme::HAIRLINE,
+            ));
             ui.add_space(6.0);
             ui.label(egui::RichText::new(title).color(crate::theme::TEXT_MUTED));
             ui.add_space(2.0);
-            ui.label(egui::RichText::new(sub).small().color(crate::theme::TEXT_FAINT));
+            ui.label(
+                egui::RichText::new(sub)
+                    .small()
+                    .color(crate::theme::TEXT_FAINT),
+            );
         });
     }
 
@@ -872,16 +899,16 @@ impl ChatPanelView {
         // The full id is never truncated away: it is the first line of the
         // tooltip, with the backend phase below it.
         if !current.is_empty() {
-            output
-                .response
-                .on_hover_text(format!("{current}\n{phase}"));
+            output.response.on_hover_text(format!("{current}\n{phase}"));
         } else {
             output.response.on_hover_text(phase);
         }
     }
 
     fn start_ollama_discovery(&mut self, refresh: bool) {
-        let Some(jobs) = self.ollama_jobs.as_mut() else { return };
+        let Some(jobs) = self.ollama_jobs.as_mut() else {
+            return;
+        };
         jobs.start(
             crate::jobs::JobKind::ModelDiscovery,
             crate::jobs::JobScope {
@@ -891,9 +918,7 @@ impl ChatPanelView {
                 run_id: None,
             },
             std::time::Duration::from_secs(15),
-            move |_| {
-                corpus_core::ollama_models_refresh(refresh).map_err(|error| error.to_string())
-            },
+            move |_| corpus_core::ollama_models_refresh(refresh).map_err(|error| error.to_string()),
         );
     }
 
@@ -916,48 +941,48 @@ impl ChatPanelView {
                 .corner_radius(egui::CornerRadius::same(6))
                 .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(crate::theme::icon_text(
-                        egui_phosphor::regular::SHIELD_WARNING,
-                        14.0,
-                        crate::theme::INTERACTION,
-                    ));
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!(
-                                "approval needed · {}",
-                                human_tool_name(&p.tool)
-                            ))
-                            .color(crate::theme::TEXT),
-                        )
-                        .truncate(),
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(crate::theme::icon_text(
+                            egui_phosphor::regular::SHIELD_WARNING,
+                            14.0,
+                            crate::theme::INTERACTION,
+                        ));
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "approval needed · {}",
+                                    human_tool_name(&p.tool)
+                                ))
+                                .color(crate::theme::TEXT),
+                            )
+                            .truncate(),
+                        );
+                    });
+                    if !p.summary.is_empty() {
+                        ui.label(egui::RichText::new(&p.summary).monospace().small());
+                    }
+                    // One-line args summary (the raw JSON blob is in the tool
+                    // card above if the operator wants it).
+                    let args: String = p.args.chars().take(120).collect();
+                    ui.label(
+                        egui::RichText::new(args)
+                            .monospace()
+                            .small()
+                            .color(crate::theme::TEXT_MUTED),
                     );
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        if crate::theme::house_button(ui, "approve").clicked() {
+                            chat.approve(&p.id);
+                            resolved = true;
+                        }
+                        if crate::theme::destructive_button(ui, "reject").clicked() {
+                            chat.reject(&p.id);
+                            resolved = true;
+                        }
+                    });
                 });
-                if !p.summary.is_empty() {
-                    ui.label(egui::RichText::new(&p.summary).monospace().small());
-                }
-                // One-line args summary (the raw JSON blob is in the tool
-                // card above if the operator wants it).
-                let args: String = p.args.chars().take(120).collect();
-                ui.label(
-                    egui::RichText::new(args)
-                        .monospace()
-                        .small()
-                        .color(crate::theme::TEXT_MUTED),
-                );
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    if crate::theme::house_button(ui, "approve").clicked() {
-                        chat.approve(&p.id);
-                        resolved = true;
-                    }
-                    if crate::theme::destructive_button(ui, "reject").clicked() {
-                        chat.reject(&p.id);
-                        resolved = true;
-                    }
-                });
-            });
             if !resolved {
                 self.pending.push(p);
             }
@@ -995,9 +1020,7 @@ fn fit_picker_label(
         );
         job
     };
-    let fits = |j: &egui::text::LayoutJob| {
-        ui.fonts(|f| f.layout_job(j.clone())).size().x <= budget
-    };
+    let fits = |j: &egui::text::LayoutJob| ui.fonts(|f| f.layout_job(j.clone())).size().x <= budget;
     let full = job(model);
     if fits(&full) {
         return full;
@@ -1089,14 +1112,10 @@ fn tool_cards(ui: &mut egui::Ui, cards: &[ToolCard]) {
                 egui_phosphor::regular::CIRCLE_DASHED,
                 crate::theme::rgb(200, 150, 80),
             ),
-            Some(_) if card.is_error => (
-                egui_phosphor::regular::X_CIRCLE,
-                crate::theme::SIGNAL_RED,
-            ),
-            Some(_) => (
-                egui_phosphor::regular::CHECK_CIRCLE,
-                crate::theme::HEALTHY,
-            ),
+            Some(_) if card.is_error => {
+                (egui_phosphor::regular::X_CIRCLE, crate::theme::SIGNAL_RED)
+            }
+            Some(_) => (egui_phosphor::regular::CHECK_CIRCLE, crate::theme::HEALTHY),
         };
         egui::CollapsingHeader::new(crate::theme::icon_label(
             glyph,
@@ -1136,13 +1155,17 @@ mod tests {
     #[test]
     fn visible_history_has_an_explicit_bound() {
         let mut panel = ChatPanelView::default();
-        panel.messages.extend((0..MAX_VISIBLE_MESSAGES + 5).map(|i| Rendered {
-            text: i.to_string(),
-            tools: Vec::new(),
-            kind: BubbleKind::Notice,
-            queued: false,
-        }));
-        panel.messages.drain(..panel.messages.len() - MAX_VISIBLE_MESSAGES);
+        panel
+            .messages
+            .extend((0..MAX_VISIBLE_MESSAGES + 5).map(|i| Rendered {
+                text: i.to_string(),
+                tools: Vec::new(),
+                kind: BubbleKind::Notice,
+                queued: false,
+            }));
+        panel
+            .messages
+            .drain(..panel.messages.len() - MAX_VISIBLE_MESSAGES);
         assert_eq!(panel.messages.len(), MAX_VISIBLE_MESSAGES);
         assert_eq!(panel.messages.first().unwrap().text, "5");
     }
@@ -1173,8 +1196,14 @@ mod tests {
     fn human_tool_names_cover_the_catalog_and_roles() {
         assert_eq!(human_tool_name("corpus-admin__agent_list"), "list agents");
         assert_eq!(human_tool_name("agent_new"), "create agent");
-        assert_eq!(human_tool_name("corpus-admin__mission_set_budget"), "set mission budget");
-        assert_eq!(human_tool_name("delegate › agent-builder"), "delegate to agent-builder");
+        assert_eq!(
+            human_tool_name("corpus-admin__mission_set_budget"),
+            "set mission budget"
+        );
+        assert_eq!(
+            human_tool_name("delegate › agent-builder"),
+            "delegate to agent-builder"
+        );
         assert_eq!(
             human_tool_name("project-manager›corpus-admin__project_new"),
             "project-manager › create project"
@@ -1182,7 +1211,10 @@ mod tests {
         assert_eq!(human_tool_name("corpus_wipe"), "WIPE corpus");
         assert_eq!(human_tool_name("finding_list"), "list findings");
         // Fallback: unknown names strip the extension prefix and underscores.
-        assert_eq!(human_tool_name("corpus-admin__future_thing"), "future thing");
+        assert_eq!(
+            human_tool_name("corpus-admin__future_thing"),
+            "future thing"
+        );
         // Every catalog tool has a non-empty human name.
         for t in crate::chat::team::ALL_ADMIN_TOOLS {
             assert!(!human_tool_name(t).is_empty(), "{t} must render");
