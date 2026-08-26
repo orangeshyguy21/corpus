@@ -32,7 +32,7 @@ impl JobSpawner for ThreadJobSpawner {
     }
 }
 
-pub(crate) trait RepaintWake: Send + Sync {
+pub trait RepaintWake: Send + Sync {
     fn request_repaint(&self);
 }
 
@@ -46,7 +46,7 @@ impl RepaintWake for eframe::egui::Context {
 pub(crate) struct JobId(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum JobKind {
+pub enum JobKind {
     PluginProbe,
     PluginInstall,
     PluginSetup,
@@ -93,7 +93,7 @@ impl JobKind {
         }
     }
 
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::PluginProbe => "plugin probe",
             Self::PluginInstall => "plugin install",
@@ -119,7 +119,7 @@ impl JobKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JobScope {
+pub struct JobScope {
     pub project: String,
     pub project_generation: u64,
     /// Corpus invalidation revision captured when a corpus-reading job starts.

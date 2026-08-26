@@ -16,7 +16,7 @@ pub enum Error {
 
     /// YAML (de)serialization failure.
     #[error("yaml error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] crate::yaml::Error),
 
     /// TOML (de)serialization failure.
     #[error("toml error: {0}")]

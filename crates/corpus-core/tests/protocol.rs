@@ -49,10 +49,8 @@ fn sandbox_exec_returns_output_and_exit_code() {
 #[test]
 fn sandbox_exec_forwards_source_pins() {
     let mut plugin = spawn_echo();
-    let pins: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
-        r#"{"cdk":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#,
-    )
-    .unwrap();
+    let pins: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(r#"{"cdk":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#).unwrap();
     let result = plugin
         .sandbox_exec_with_sources("ls", Some(&pins))
         .expect("sandbox_exec_with_sources");
@@ -74,8 +72,7 @@ fn sources_report_default_and_override_pins() {
     assert_eq!(default.len(), 1);
     assert_eq!(default[0].name, "cdk");
     assert_eq!(
-        default[0].sha,
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        default[0].sha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "no pins -> the plugin's default pin"
     );
     // Forwarding the mission's resolved pins must change the reported
@@ -133,7 +130,11 @@ fn faucet_invoice_returns_invoice_text() {
 fn protocol_error_round_trips_as_plugin_error() {
     let mut plugin = spawn_echo();
     let result = plugin.call("definitely-not-a-method", None);
-    let Err(corpus_core::Error::Plugin { plugin: name, message }) = result else {
+    let Err(corpus_core::Error::Plugin {
+        plugin: name,
+        message,
+    }) = result
+    else {
         panic!("expected Plugin error, got {result:?}");
     };
     assert_eq!(name, "echo-plugin");
@@ -151,16 +152,17 @@ fn v1_hello_negotiates_the_declared_protocol() {
 #[test]
 fn v1_hello_refuses_manifest_executable_capability_drift() {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/v1-echo-plugin");
-    let dir = std::env::temp_dir().join(format!(
-        "corpus-v1-hello-drift-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("corpus-v1-hello-drift-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let source_exec = source.join("plugin.sh");
     let exec = dir.join("plugin.sh");
     std::fs::copy(&source_exec, &exec).unwrap();
-    std::fs::set_permissions(&exec, std::fs::metadata(&source_exec).unwrap().permissions()).unwrap();
+    std::fs::set_permissions(
+        &exec,
+        std::fs::metadata(&source_exec).unwrap().permissions(),
+    )
+    .unwrap();
     std::fs::write(
         dir.join("plugin.toml"),
         r#"
@@ -200,12 +202,7 @@ fn v1_setup_streams_progress_then_one_terminal_result() {
 fn v1_lifecycle_errors_keep_stable_code_and_retryability() {
     let mut plugin = spawn_v1_echo();
     let error = plugin
-        .lifecycle_call(
-            "doctor",
-            None,
-            std::time::Duration::from_secs(2),
-            |_| {},
-        )
+        .lifecycle_call("doctor", None, std::time::Duration::from_secs(2), |_| {})
         .unwrap_err()
         .to_string();
     assert!(error.contains("docker_unavailable"), "{error}");
@@ -225,12 +222,7 @@ fn v1_operation_status_makes_retry_decisions_explicit() {
 fn v1_lifecycle_rejects_a_mismatched_reply_id() {
     let mut plugin = spawn_v1_echo();
     let error = plugin
-        .lifecycle_call(
-            "status",
-            None,
-            std::time::Duration::from_secs(2),
-            |_| {},
-        )
+        .lifecycle_call("status", None, std::time::Duration::from_secs(2), |_| {})
         .unwrap_err()
         .to_string();
     assert!(error.contains("does not match request id"), "{error}");
@@ -259,12 +251,7 @@ fn v1_lifecycle_outer_deadline_kills_a_silent_child() {
     let mut plugin = spawn_v1_echo();
     let started = std::time::Instant::now();
     let error = plugin
-        .lifecycle_call(
-            "stop",
-            None,
-            std::time::Duration::from_millis(50),
-            |_| {},
-        )
+        .lifecycle_call("stop", None, std::time::Duration::from_millis(50), |_| {})
         .unwrap_err()
         .to_string();
     assert!(error.contains("timed out"), "{error}");

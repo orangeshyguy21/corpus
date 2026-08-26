@@ -13,12 +13,11 @@ use std::time::Duration;
 use egui::{Align2, RichText, Ui};
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
-use corpus_core::FindingSeverity;
-
 use crate::fmt::fmt_bytes;
-use crate::state::{AppState, FindingDiscovery, MissionDisplayState};
+use crate::state::{AppState, MissionDisplayState};
 use crate::theme;
 use crate::views::components;
+use crate::views::finding_summary::FindingSummary;
 use crate::views::plugin_picker::plugin_picker;
 
 const TWO_COLUMN_AT: f32 = 940.0;
@@ -26,6 +25,7 @@ const TWO_COLUMN_AT: f32 = 940.0;
 /// Widget state for the Project view: the plugin picker in progress, the
 /// wipe confirm, and the clone dialog. The selected project itself lives on
 /// `AppState`.
+#[derive(Default)]
 pub struct ProjectsView {
     /// The slug this view is bound to (drives `edit_plugin` re-sync on
     /// project switch).
@@ -50,26 +50,6 @@ pub struct ProjectsView {
     show_install: bool,
     install_path: String,
     plugin_details_open: bool,
-}
-
-impl Default for ProjectsView {
-    fn default() -> Self {
-        Self {
-            project: None,
-            edit_plugin: String::new(),
-            confirm_wipe: false,
-            show_clone: false,
-            clone_name: String::new(),
-            clone_corpus: false,
-            show_rename: false,
-            rename_name: String::new(),
-            confirm_delete: false,
-            needs_probe: false,
-            show_install: false,
-            install_path: String::new(),
-            plugin_details_open: false,
-        }
-    }
 }
 
 impl ProjectsView {
@@ -455,7 +435,7 @@ impl ProjectsView {
     }
 
     fn corpus_card(&mut self, ui: &mut Ui, state: &AppState) {
-        let findings = finding_summary_model(state.finding_discovery());
+        let findings = FindingSummary::from_discovery(state.finding_discovery());
         components::panel_card(ui, "Corpus signal", "语料库信号", |ui| {
             ui.horizontal(|ui| {
                 match state.corpus_stats() {
@@ -494,13 +474,13 @@ impl ProjectsView {
                     );
                 }
             }
-            if finding_summary_visible(&findings) {
+            if findings.is_visible() {
                 ui.add_space(14.0);
                 components::soft_rule(ui);
                 ui.add_space(10.0);
                 ui.label(command_label("Findings"));
                 ui.add_space(8.0);
-                finding_summary(ui, &findings);
+                findings.show(ui);
             }
         });
     }
@@ -572,6 +552,7 @@ impl ProjectsView {
     /// Fixed Project command rail. Save exists only while the plugin binding
     /// is dirty; record-level secondary and destructive actions live in the
     /// overflow menu.
+    #[allow(clippy::too_many_arguments)]
     fn header(
         &mut self,
         ui: &mut Ui,
@@ -881,138 +862,6 @@ impl ProjectsView {
             });
         self.show_install = open && !started;
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct FindingCounts {
-    critical: usize,
-    high: usize,
-    medium: usize,
-    low: usize,
-    unrated: usize,
-}
-
-impl FindingCounts {
-    fn from_cards(cards: &[corpus_core::FindingCard]) -> Self {
-        let mut counts = Self::default();
-        for card in cards {
-            match card.severity {
-                Some(FindingSeverity::Critical) => counts.critical += 1,
-                Some(FindingSeverity::High) => counts.high += 1,
-                Some(FindingSeverity::Medium) => counts.medium += 1,
-                Some(FindingSeverity::Low) => counts.low += 1,
-                None => counts.unrated += 1,
-            }
-        }
-        counts
-    }
-
-    fn total(self) -> usize {
-        self.critical + self.high + self.medium + self.low + self.unrated
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FindingSummaryModel {
-    Loading,
-    Ready(FindingCounts),
-    Failed {
-        message: String,
-        last_good: FindingCounts,
-    },
-}
-
-fn finding_summary_model(discovery: &FindingDiscovery) -> FindingSummaryModel {
-    match discovery {
-        FindingDiscovery::Loading => FindingSummaryModel::Loading,
-        FindingDiscovery::Ready(cards) => {
-            FindingSummaryModel::Ready(FindingCounts::from_cards(cards))
-        }
-        FindingDiscovery::Failed { message, last_good } => FindingSummaryModel::Failed {
-            message: message.clone(),
-            last_good: FindingCounts::from_cards(last_good),
-        },
-    }
-}
-
-fn finding_summary_visible(model: &FindingSummaryModel) -> bool {
-    !matches!(model, FindingSummaryModel::Ready(counts) if counts.total() == 0)
-}
-
-fn finding_summary(ui: &mut Ui, model: &FindingSummaryModel) {
-    let counts = match model {
-        FindingSummaryModel::Loading => {
-            empty_hint(ui, "loading findings…");
-            return;
-        }
-        FindingSummaryModel::Ready(counts) => counts,
-        FindingSummaryModel::Failed { message, last_good } => {
-            components::status_badge(ui, "refresh failed", components::StatusTone::Danger)
-                .on_hover_text(message);
-            ui.add_space(8.0);
-            last_good
-        }
-    };
-    let width = finding_tile_width(ui.available_width());
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(theme::CARD_GUTTER, theme::CARD_GUTTER);
-        ui.horizontal_wrapped(|ui| {
-            for (label, count, color) in finding_count_entries(*counts) {
-                if count == 0 {
-                    continue;
-                }
-                finding_count_tile(ui, width, label, count, color);
-            }
-        });
-    });
-}
-
-fn finding_count_entries(counts: FindingCounts) -> [(&'static str, usize, egui::Color32); 5] {
-    [
-        ("CRITICAL", counts.critical, theme::FINDING_CRITICAL),
-        ("HIGH", counts.high, theme::FINDING_HIGH),
-        ("MEDIUM", counts.medium, theme::FINDING_MEDIUM),
-        ("LOW", counts.low, theme::FINDING_LOW),
-        ("UNRATED", counts.unrated, theme::FINDING_UNRATED),
-    ]
-}
-
-fn finding_tile_width(available: f32) -> f32 {
-    if available >= 480.0 {
-        ((available - 32.0) / 5.0).max(72.0)
-    } else if available >= 240.0 {
-        ((available - 8.0) / 2.0).max(96.0)
-    } else {
-        available.max(96.0)
-    }
-}
-
-fn finding_count_tile(ui: &mut Ui, width: f32, label: &str, count: usize, color: egui::Color32) {
-    egui::Frame::default()
-        .fill(color.gamma_multiply(0.08))
-        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.90)))
-        .corner_radius(egui::CornerRadius::same(2))
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_width((width - 20.0).max(52.0));
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new(label)
-                        .size(10.5)
-                        .monospace()
-                        .strong()
-                        .color(color),
-                );
-                ui.add_space(3.0);
-                ui.label(
-                    RichText::new(count.to_string())
-                        .size(24.0)
-                        .monospace()
-                        .strong()
-                        .color(color),
-                );
-            });
-        });
 }
 
 fn card_gap(ui: &mut Ui) {
@@ -1466,9 +1315,11 @@ fn mission_log_list(ui: &mut Ui, state: &AppState, total: u64) {
                         ui.label(cell(agent));
                     });
                     row.col(|ui| {
-                        let started = (log.started > 0)
-                            .then(|| fmt_epoch(log.started))
-                            .unwrap_or_else(|| "—".to_string());
+                        let started = if log.started > 0 {
+                            fmt_epoch(log.started)
+                        } else {
+                            "—".to_string()
+                        };
                         ui.label(secondary(started));
                     });
                     row.col(|ui| {
@@ -1724,23 +1575,6 @@ fn civil_from_days(z: i64) -> (i64, u64, u64) {
 mod tests {
     use super::*;
 
-    fn finding_card(severity: Option<FindingSeverity>) -> corpus_core::FindingCard {
-        corpus_core::FindingCard {
-            path: std::path::PathBuf::from("findings/f.md"),
-            title: "Finding".into(),
-            title_source: corpus_core::FindingTitleSource::Title,
-            severity,
-            timestamp: None,
-            time_source: None,
-            reference: "F-1".into(),
-            reference_source: corpus_core::FindingReferenceSource::Id,
-            status: None,
-            oracle_verified: None,
-            sensitivity: None,
-            warnings: Vec::new(),
-        }
-    }
-
     #[test]
     fn project_save_is_visible_only_for_a_dirty_plugin_binding() {
         assert!(!binding_is_dirty("cdk-regtest", "cdk-regtest"));
@@ -1752,85 +1586,5 @@ mod tests {
         assert_eq!(dashboard_columns(TWO_COLUMN_AT - 1.0), 1);
         assert_eq!(dashboard_columns(TWO_COLUMN_AT), 2);
         assert_eq!(dashboard_columns(1_440.0), 2);
-    }
-
-    #[test]
-    fn finding_summary_preserves_loading_failure_and_empty_counts() {
-        assert_eq!(
-            finding_summary_model(&FindingDiscovery::Loading),
-            FindingSummaryModel::Loading
-        );
-        assert_eq!(
-            finding_summary_model(&FindingDiscovery::Ready(Vec::new())),
-            FindingSummaryModel::Ready(FindingCounts::default())
-        );
-        let failed = FindingDiscovery::Failed {
-            message: "watch failed".into(),
-            last_good: vec![finding_card(Some(FindingSeverity::High))],
-        };
-        match finding_summary_model(&failed) {
-            FindingSummaryModel::Failed { message, last_good } => {
-                assert_eq!(message, "watch failed");
-                assert_eq!(last_good.high, 1);
-            }
-            other => panic!("expected failed model, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn finding_summary_counts_every_severity_and_keeps_unrated_visible() {
-        let cards = vec![
-            finding_card(Some(FindingSeverity::Critical)),
-            finding_card(Some(FindingSeverity::High)),
-            finding_card(Some(FindingSeverity::High)),
-            finding_card(Some(FindingSeverity::Medium)),
-            finding_card(Some(FindingSeverity::Low)),
-            finding_card(None),
-            finding_card(None),
-        ];
-        let FindingSummaryModel::Ready(counts) =
-            finding_summary_model(&FindingDiscovery::Ready(cards))
-        else {
-            panic!("expected ready counts")
-        };
-        assert_eq!(
-            counts,
-            FindingCounts {
-                critical: 1,
-                high: 2,
-                medium: 1,
-                low: 1,
-                unrated: 2,
-            }
-        );
-    }
-
-    #[test]
-    fn empty_summary_is_hidden_and_zero_severity_boxes_are_omitted() {
-        let empty = FindingSummaryModel::Ready(FindingCounts::default());
-        assert!(!finding_summary_visible(&empty));
-        assert!(finding_summary_visible(&FindingSummaryModel::Loading));
-        assert!(finding_summary_visible(&FindingSummaryModel::Failed {
-            message: "unknown".into(),
-            last_good: FindingCounts::default(),
-        }));
-
-        let counts = FindingCounts {
-            critical: 2,
-            low: 1,
-            ..FindingCounts::default()
-        };
-        let visible = finding_count_entries(counts)
-            .into_iter()
-            .filter_map(|(label, count, _)| (count > 0).then_some((label, count)))
-            .collect::<Vec<_>>();
-        assert_eq!(visible, [("CRITICAL", 2), ("LOW", 1)]);
-    }
-
-    #[test]
-    fn finding_tiles_wrap_without_becoming_tiny() {
-        assert!(finding_tile_width(900.0) >= 160.0);
-        assert!(finding_tile_width(479.0) >= 96.0);
-        assert_eq!(finding_tile_width(200.0), 200.0);
     }
 }

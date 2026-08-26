@@ -213,7 +213,12 @@ mod tests {
 
     #[test]
     fn markdown_highlighting_preserves_source_and_uses_palette() {
-        let source = "# Heading\n\n- first\n\nPlain `code`.";
+        let source = concat!(
+            "# Heading\n\n",
+            "- **first** with [link](https://example.invalid)\n\n",
+            "```json\n{\"enabled\": true, \"limit\": 3}\n```\n\n",
+            "Plain `code`."
+        );
         let job = highlight(source, SyntaxKind::Markdown);
         let colors: Vec<_> = job
             .sections
@@ -225,6 +230,28 @@ mod tests {
         assert!(colors.contains(&theme::HEALTHY));
         assert!(colors.contains(&theme::SIGNAL_RED), "colors: {colors:?}");
         assert!(colors.contains(&theme::PROSE));
+    }
+
+    #[test]
+    fn json_highlighting_preserves_agent_config_and_uses_palette() {
+        let source = concat!(
+            "{\n",
+            "  \"model\": \"mlx-community/Qwen3.8\",\n",
+            "  \"temperature\": 0.2,\n",
+            "  \"tools\": {\"write\": false}\n",
+            "}"
+        );
+        let job = highlight(source, SyntaxKind::Json);
+        let colors: Vec<_> = job
+            .sections
+            .iter()
+            .map(|section| section.format.color)
+            .collect();
+
+        assert_eq!(job.text, source);
+        assert!(colors.contains(&theme::rgb(0x98, 0xc3, 0x79)));
+        assert!(colors.contains(&theme::rgb(0xd1, 0x9a, 0x66)));
+        assert!(colors.contains(&theme::TEXT_MUTED));
     }
 
     #[test]

@@ -1,5 +1,4 @@
-//! The left sidebar (app-flow chunk 1, app-parity-spec §4): a project
-//! TREE — one row per project with its agents and missions nested
+//! The left project tree: one row per project with its agents and missions nested
 //! directly beneath (full lists, dim mini-headers with `+` create
 //! buttons; missions are siblings of agents, never nested under them).
 //! The selected row gets a full-width ROW_HL fill (text stays TEXT); the
@@ -467,9 +466,9 @@ impl Sidebar {
                 state.select_mission(project, slug);
             }
             click.on_hover_text(format!(
-                "{project} · agent={}{}",
+                "{project} · agent={} · {}",
                 mission.agent,
-                format!(" · {}", display_state.label())
+                display_state.label()
             ));
         }
         if tree.missions.is_empty() {

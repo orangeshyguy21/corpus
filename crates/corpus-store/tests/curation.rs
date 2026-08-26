@@ -53,7 +53,9 @@ fn traversal_and_absolutes_are_refused() {
         "   ",
     ] {
         assert!(
-            store.resolve_corpus_entry("p", bad, EntryAccess::Mutate).is_err(),
+            store
+                .resolve_corpus_entry("p", bad, EntryAccess::Mutate)
+                .is_err(),
             "must refuse {bad:?}"
         );
     }
@@ -76,10 +78,17 @@ fn a_symlink_planted_inside_the_corpus_does_not_widen_it() {
         .unwrap();
     let sidecar = store.project_agent_dir("p", "keeper").join("agent.yaml");
     assert!(sidecar.is_file(), "the escape target exists");
-    std::os::unix::fs::symlink(store.project_agents_dir("p"), corpus.join("findings/escape"))
-        .unwrap();
+    std::os::unix::fs::symlink(
+        store.project_agents_dir("p"),
+        corpus.join("findings/escape"),
+    )
+    .unwrap();
     let error = store
-        .resolve_corpus_entry("p", "findings/escape/keeper/agent.yaml", EntryAccess::Mutate)
+        .resolve_corpus_entry(
+            "p",
+            "findings/escape/keeper/agent.yaml",
+            EntryAccess::Mutate,
+        )
         .unwrap_err()
         .to_string();
     assert!(error.contains("outside"), "{error}");
@@ -115,12 +124,17 @@ fn run_transcripts_are_not_curatable() {
     store
         .resolve_corpus_entry("p", "runs/1786-op.raw", EntryAccess::Read)
         .expect("a transcript is readable");
-    assert!(store.delete_corpus_entry("p", "runs/1786-op.raw", false).is_err());
+    assert!(store
+        .delete_corpus_entry("p", "runs/1786-op.raw", false)
+        .is_err());
     assert!(store
         .move_corpus_entry("p", "runs/1786-op.raw", "findings/stolen.raw", false)
         .is_err());
     assert!(
-        store.project_corpus_dir("p").join("runs/1786-op.raw").is_file(),
+        store
+            .project_corpus_dir("p")
+            .join("runs/1786-op.raw")
+            .is_file(),
         "the transcript survives every attempt"
     );
     let _ = fs::remove_dir_all(&world);
@@ -139,7 +153,9 @@ fn a_bare_category_is_not_an_entry() {
         assert!(error.contains("whole category"), "{path}: {error}");
     }
     // And a path naming no category at all.
-    assert!(store.resolve_corpus_entry("p", "notes/x.md", EntryAccess::Mutate).is_err());
+    assert!(store
+        .resolve_corpus_entry("p", "notes/x.md", EntryAccess::Mutate)
+        .is_err());
     let _ = fs::remove_dir_all(&world);
 }
 
@@ -153,15 +169,28 @@ fn deleting_a_directory_needs_saying_so() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("recursive"), "{error}");
-    assert!(store.project_corpus_dir("p").join("attacks/replay").is_dir());
+    assert!(store
+        .project_corpus_dir("p")
+        .join("attacks/replay")
+        .is_dir());
 
-    let freed = store.delete_corpus_entry("p", "attacks/replay", true).unwrap();
+    let freed = store
+        .delete_corpus_entry("p", "attacks/replay", true)
+        .unwrap();
     assert!(freed > 0, "reports the bytes it freed");
-    assert!(!store.project_corpus_dir("p").join("attacks/replay").exists());
+    assert!(!store
+        .project_corpus_dir("p")
+        .join("attacks/replay")
+        .exists());
 
     // A file needs no flag.
-    store.delete_corpus_entry("p", "findings/f1.md", false).unwrap();
-    assert!(!store.project_corpus_dir("p").join("findings/f1.md").exists());
+    store
+        .delete_corpus_entry("p", "findings/f1.md", false)
+        .unwrap();
+    assert!(!store
+        .project_corpus_dir("p")
+        .join("findings/f1.md")
+        .exists());
     let _ = fs::remove_dir_all(&world);
 }
 
@@ -227,7 +256,11 @@ fn the_guard_is_per_project() {
         "p's guard resolves inside p"
     );
     assert!(store
-        .resolve_corpus_entry("p", "../../other/corpus/findings/secret.md", EntryAccess::Mutate)
+        .resolve_corpus_entry(
+            "p",
+            "../../other/corpus/findings/secret.md",
+            EntryAccess::Mutate
+        )
         .is_err());
     let _ = fs::remove_dir_all(&world);
 }

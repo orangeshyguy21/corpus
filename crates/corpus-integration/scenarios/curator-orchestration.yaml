@@ -1,0 +1,35 @@
+id: curator-orchestration
+tier: model-qwen38
+model_env: CORPUS_QWEN38_MODEL
+global_lock_env: CORPUS_QWEN38_LOCK
+scenario_deadline_secs: 1800
+turn_deadline_secs: 600
+requirements:
+  - new_isolated_project
+  - real_test_plugin_binding
+  - curator_and_research_agents
+  - explicit_parent_model_pins_and_run_identity
+  - multiple_child_launch_requests
+  - exact_origin_routing
+  - completion_with_and_without_artifact
+  - grouped_exact_curator_notifications
+  - failed_delivery_remains_retryable
+  - duplicate_reconciliation_is_idempotent
+  - restart_before_delivery_recovers
+  - launch_failure_and_unexpected_exit_notify_once
+  - completion_drives_follow_up_mission
+artifacts:
+  - manifest.json
+  - scenario.yaml
+  - events.jsonl
+  - transcript.md
+  - tool-calls.jsonl
+  - approvals.jsonl
+  - app.log
+  - mcp.log
+  - ollama.log
+  - process-tree.txt
+  - store-before
+  - store-after
+  - failure.txt
+

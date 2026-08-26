@@ -1,0 +1,46 @@
+name: local model integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-qwen38-single-model-runner
+  cancel-in-progress: false
+
+jobs:
+  model-qwen38:
+    runs-on: [self-hosted, corpus-model, qwen38]
+    timeout-minutes: 90
+    env:
+      CORPUS_QWEN38_MODEL: qwen3.8:27b-mlx
+      CORPUS_QWEN38_LOCK: /tmp/corpus-qwen38-integration.lock
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Build real MCP and application artifacts
+        run: cargo build --locked -p corpus-admin-mcp -p corpus-mcp -p corpus-app
+      - name: Verify configured model under the global lease
+        run: >-
+          cargo test --locked -p corpus-integration --test model_qwen38
+          configured_qwen38_model_runs_under_the_global_lease --
+          --ignored --exact --nocapture --test-threads=1
+      - name: Run embedded management model scenarios serially
+        run: >-
+          cargo test --locked -p corpus-app --lib injection_probe::live_ --
+          --ignored --nocapture --test-threads=1
+      - name: Run full curator orchestration serially
+        run: >-
+          cargo test --locked -p corpus-integration --test curator_system_qwen38
+          curator_launches_children_serially_and_receives_exact_completions --
+          --ignored --exact --nocapture --test-threads=1
+      - name: Preserve failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qwen38-integration-failure
+          path: target/corpus-integration-artifacts/
+          if-no-files-found: warn

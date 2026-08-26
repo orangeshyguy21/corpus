@@ -1,5 +1,5 @@
-//! The management-chat TEAM shape: per-specialist scoped tool sets
-//! (dev/decisions.md chunk 2). This module is **pure data** — it holds NO
+//! Management-chat team shape and per-specialist scoped tool sets. This module
+//! is pure data and holds no
 //! goose/GDK type, so it lives outside the goose quarantine. The backend
 //! (`embedded.rs`, the one goose-aware file) maps each role onto an
 //! `ExtensionConfig::Stdio` whose `available_tools` is exactly
@@ -15,7 +15,7 @@
 //! - The destructive set is excluded from EVERY specialist scope: destruction
 //!   (`corpus_wipe` / project, agent, mission, and corpus-entry deletion) is
 //!   operator-only, and even there it is gated by the inline approval
-//!   (decision 5) + the corpus-mcp server-side confirm-token backstop.
+//!   plus the corpus-admin server-side confirm-token backstop.
 
 use std::fmt;
 
@@ -116,7 +116,7 @@ pub fn mutated_area(tool: &str) -> Option<&'static str> {
 }
 
 /// Whether a tool call needs the operator's inline Approve before dispatch.
-/// Policy (dev/chat-harness-plan.md): reads never gate; writes gate while
+/// Reads never gate; writes gate while
 /// `CORPUS_CHAT_APPROVE_WRITES` is unset/non-"0"; the destructive set ALWAYS
 /// gates — the kill-switch never covers it. Whitelists are the pure-data
 /// tables above: adding/removing a tool is a one-line edit (the

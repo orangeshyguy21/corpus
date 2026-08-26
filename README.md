@@ -72,12 +72,16 @@ desktop UI), the plugin
 protocol and conformance fixtures, and the model registry
 (`benchmarks/models.yaml`).
 
-See [PLUGINS.md](PLUGINS.md) for installation, upgrade/rollback, release locks,
-and the environment-plugin authoring contract.
-
-(Design context — architecture, research landscape, decisions, and the
-live roadmap — lives in `dev/`, which is machine-local scratch and not
-included in this repository.)
+See [the architecture guide](docs/architecture.md) for the shipped crate and
+runtime boundaries, [the security invariants](docs/threat-model.md) for trust
+and failure policy, [the operator guide](docs/operator-guide.md) for routine
+workflows, [the troubleshooting guide](docs/troubleshooting.md) for recovery,
+and [the testing guide](docs/testing.md) for verification. [PLUGINS.md](PLUGINS.md)
+owns plugin installation, upgrade/rollback, release locks, and the
+environment-plugin authoring contract. Durable rationale is recorded in
+[the architectural decisions](docs/decisions.md); historical refactor evidence
+and the remaining closeout roadmap are tracked in
+[the senior-developer refactor plan](docs/senior-developer-refactor-plan.md).
 
 ## Authorized use
 

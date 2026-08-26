@@ -436,7 +436,9 @@ impl Plugin {
                 self.kill_tree();
                 return Err(Error::Plugin {
                     plugin: self.manifest.name.clone(),
-                    message: format!("lifecycle call {method} cancelled — plugin process tree killed"),
+                    message: format!(
+                        "lifecycle call {method} cancelled — plugin process tree killed"
+                    ),
                 });
             }
             let Some(remaining) = deadline.checked_sub(started.elapsed()) else {
@@ -573,10 +575,7 @@ impl Plugin {
             "idempotency_key".to_string(),
             Value::String(idempotency_key.to_string()),
         );
-        let value = self.call_v1(
-            "operation_status",
-            Some(Value::Object(params)),
-        )?;
+        let value = self.call_v1("operation_status", Some(Value::Object(params)))?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -584,10 +583,14 @@ impl Plugin {
     pub fn hello(&mut self) -> Result<HelloResult, Error> {
         let value = self.call_v1("hello", None)?;
         let hello: HelloResult = serde_json::from_value(value)?;
-        let expected_protocol = self.manifest.protocol.as_deref().ok_or_else(|| Error::Plugin {
-            plugin: self.manifest.name.clone(),
-            message: "hello requires a protocol-v1 manifest".to_string(),
-        })?;
+        let expected_protocol = self
+            .manifest
+            .protocol
+            .as_deref()
+            .ok_or_else(|| Error::Plugin {
+                plugin: self.manifest.name.clone(),
+                message: "hello requires a protocol-v1 manifest".to_string(),
+            })?;
         if hello.protocol != expected_protocol {
             return Err(Error::Plugin {
                 plugin: self.manifest.name.clone(),
@@ -613,15 +616,25 @@ impl Plugin {
     }
 
     pub fn describe_v1(&mut self, session_id: &str) -> Result<EnvironmentDescription, Error> {
-        let value = self.call_v1("describe", Some(serde_json::json!({"session_id": session_id})))?;
+        let value = self.call_v1(
+            "describe",
+            Some(serde_json::json!({"session_id": session_id})),
+        )?;
         Ok(serde_json::from_value(value)?)
     }
 
     pub fn session_probe_v1(&mut self, session_id: &str) -> Result<Value, Error> {
-        self.call_v1("session_probe", Some(serde_json::json!({"session_id": session_id})))
+        self.call_v1(
+            "session_probe",
+            Some(serde_json::json!({"session_id": session_id})),
+        )
     }
 
-    pub fn sandbox_exec_v1(&mut self, session_id: &str, command: &str) -> Result<SandboxExecResult, Error> {
+    pub fn sandbox_exec_v1(
+        &mut self,
+        session_id: &str,
+        command: &str,
+    ) -> Result<SandboxExecResult, Error> {
         let value = self.call_v1(
             "sandbox_exec",
             Some(serde_json::json!({"session_id": session_id, "command": command})),
@@ -629,7 +642,12 @@ impl Plugin {
         Ok(serde_json::from_value(value)?)
     }
 
-    pub fn faucet_v1(&mut self, session_id: &str, op: &str, call: &FaucetCall) -> Result<FaucetResult, Error> {
+    pub fn faucet_v1(
+        &mut self,
+        session_id: &str,
+        op: &str,
+        call: &FaucetCall,
+    ) -> Result<FaucetResult, Error> {
         let value = self.call_v1(
             "faucet",
             Some(serde_json::json!({"session_id": session_id, "op": op, "call": call})),
@@ -644,7 +662,10 @@ impl Plugin {
     }
 
     pub fn oracles_v1(&mut self, session_id: &str) -> Result<Vec<OracleInfo>, Error> {
-        let value = self.call_v1("oracles", Some(serde_json::json!({"session_id": session_id})))?;
+        let value = self.call_v1(
+            "oracles",
+            Some(serde_json::json!({"session_id": session_id})),
+        )?;
         Ok(serde_json::from_value(value)?)
     }
 

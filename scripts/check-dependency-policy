@@ -17,6 +17,53 @@ with open(sys.argv[1], encoding="utf-8") as stream:
     metadata = json.load(stream)
 
 packages = {package["name"]: package for package in metadata["packages"]}
+
+# Exact normal-dependency edges between workspace packages. Test-only support
+# edges are excluded; corpus-integration is itself a test harness, so its
+# normal edges are part of the checked graph.
+expected_edges = {
+    "corpus-admin": {"corpus-observe", "corpus-store"},
+    "corpus-admin-mcp": {"corpus-admin"},
+    "corpus-app": {"corpus-core", "corpus-observe"},
+    "corpus-cli": {"corpus-core"},
+    "corpus-core": {"corpus-observe", "corpus-store"},
+    "corpus-integration": {
+        "corpus-admin",
+        "corpus-app",
+        "corpus-core",
+        "corpus-mcp",
+        "corpus-model-test",
+        "corpus-store",
+    },
+    "corpus-mcp": {"corpus-admin", "corpus-core"},
+    "corpus-model-test": set(),
+    "corpus-observe": {"corpus-store"},
+    "corpus-store": set(),
+}
+
+workspace_names = set(packages)
+if workspace_names != set(expected_edges):
+    missing = sorted(set(expected_edges) - workspace_names)
+    unexpected = sorted(workspace_names - set(expected_edges))
+    raise SystemExit(
+        "dependency policy: workspace package inventory changed; "
+        f"missing={missing}, unexpected={unexpected}"
+    )
+
+for package_name, package in sorted(packages.items()):
+    actual = {
+        dependency["name"]
+        for dependency in package["dependencies"]
+        if dependency["name"] in workspace_names
+        and dependency.get("kind") in (None, "normal")
+    }
+    expected = expected_edges[package_name]
+    if actual != expected:
+        raise SystemExit(
+            f"dependency policy: {package_name} workspace edges changed; "
+            f"expected={sorted(expected)}, actual={sorted(actual)}"
+        )
+
 admin = packages.get("corpus-admin-mcp")
 if admin is None:
     raise SystemExit(
@@ -31,6 +78,8 @@ if [target["name"] for target in binary_targets] != ["corpus-admin-mcp"]:
     raise SystemExit(
         "dependency policy: corpus-admin-mcp must expose exactly its own binary target"
     )
+
+print("dependency policy: workspace architecture graph is exact")
 PY
 
 cargo tree -p corpus-admin-mcp --edges normal --prefix none >"$tree_file"

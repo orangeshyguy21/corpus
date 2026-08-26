@@ -3,9 +3,8 @@
 These files are for the optional `scripts/goose-chat` fallback and are not
 loaded or packaged by `corpus-app`; the app uses its embedded chat runtime.
 
-The corpus-admin management recipe (dev/gdk-chat-plan chunk 2). The role
-prompts live inline in each recipe YAML (`instructions`); this README is the
-human-facing overview. If prose here drifts from the YAML, the YAML wins.
+Role prompts live inline in each recipe YAML (`instructions`); this README is
+the human-facing overview. If prose here drifts from the YAML, the YAML wins.
 
 ## THE ENFORCEMENT VERDICT (D1) — read this first
 
@@ -14,9 +13,8 @@ In goose CLI 1.46.0, a subrecipe's `extensions:` block (including
 `available_tools`) is NOT applied to the subagent it spawns — a delegated
 subagent receives only the `summon` tools (`load` / `delegate`). Evidence:
 the orchestrator catalog surfaces only `delegate`+`load`, and every delegated
-subagent's catalog is only `load`, across all probe runs (transcripts + LLM
-request logs in `store/projects/<p>/var/chat/`, session ids in dev/gdk-chat-plan
-Task-2).
+subagent's catalog is only `load` across the original probe runs. Current
+application behavior is locked by the embedded-chat scope tests.
 
 Consequence per the plan: the team design **degrades to a flat single agent
 with the full admin catalog, with the confirm-token gate as the sole hard
@@ -27,8 +25,8 @@ becomes internal routing on that single agent.
 `available_tools` filtering IS real at the **recipe-as-main** level (positive
 control: running `subrecipes/corpus-inspector.yaml` as its own main recipe
 loaded exactly its 6 read-only tools). So real per-domain isolation remains
-possible if chunk 3 runs each specialist as its OWN separately-scoped goose
-session rather than as a goose subrecipe. The subrecipe files below document
+possible if each specialist runs as its own separately scoped Goose session
+rather than as a Goose subrecipe. The subrecipe files below document
 those grants for that option.
 
 ## Layout
@@ -40,7 +38,7 @@ those grants for that option.
   recipe. Kept as the team-spec + a fallback for per-domain scoped sessions.
 - `prompts/README.md` — this file.
 
-## Team (per dev/gdk-chat-plan §"The agent team")
+## Team
 
 | role | owns | intended tool grant (`available_tools`) |
 |---|---|---|

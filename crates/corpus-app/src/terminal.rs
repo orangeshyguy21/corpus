@@ -1,4 +1,4 @@
-//! TerminalPane (app-flow chunk 7): the embedded terminal wrapping
+//! The embedded terminal wraps
 //! `egui_term` (alacritty_terminal PTY backend). The pane NEVER spawns
 //! opencode — it runs `tmux attach -t <run session>` inside the
 //! embedded PTY, so tmux stays the supervisor: closing or crashing the

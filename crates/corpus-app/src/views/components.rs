@@ -403,7 +403,7 @@ pub fn paint_command_canvas(ui: &Ui) {
     let mut x = first_x;
     let mut column = 0_u32;
     while x <= rect.right() {
-        let color = if column % 3 == 0 {
+        let color = if column.is_multiple_of(3) {
             theme::GRID_MARK
         } else {
             theme::GRID_LINE
@@ -419,7 +419,7 @@ pub fn paint_command_canvas(ui: &Ui) {
     let mut y = first_y;
     let mut row = 0_u32;
     while y <= rect.bottom() {
-        let color = if row % 3 == 0 {
+        let color = if row.is_multiple_of(3) {
             theme::GRID_MARK
         } else {
             theme::GRID_LINE

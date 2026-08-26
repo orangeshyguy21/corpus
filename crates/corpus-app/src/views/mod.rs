@@ -4,6 +4,7 @@
 
 pub mod agents;
 pub mod components;
+mod finding_summary;
 pub mod mission_actions;
 pub mod missions;
 pub mod model_picker;

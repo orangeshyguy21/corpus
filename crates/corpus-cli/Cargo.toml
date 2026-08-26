@@ -9,5 +9,6 @@ name = "corpus"
 path = "src/main.rs"
 
 [dependencies]
+clap = { workspace = true }
 corpus-core = { path = "../corpus-core" }
 serde_json = { workspace = true }

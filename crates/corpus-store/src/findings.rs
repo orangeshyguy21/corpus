@@ -14,8 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::corpus_entries::EntryAccess;
 use crate::frontmatter;
-use crate::store::{slugify, EntryAccess};
+use crate::store::slugify;
 use crate::{Error, Result, Sensitivity, Store};
 
 /// Maximum bytes read from one finding during index projection. Full bodies
@@ -320,11 +321,11 @@ impl Store {
             (None, _) => PathBuf::from("findings").join(&generated_name),
         };
 
-        let mut frontmatter = serde_yaml::Mapping::new();
+        let mut frontmatter = crate::yaml::Mapping::new();
         for (key, value) in &finding.metadata {
             frontmatter.insert(
-                serde_yaml::Value::String(key.clone()),
-                serde_yaml::to_value(value)?,
+                crate::yaml::Value::String(key.clone()),
+                crate::yaml::to_value(value)?,
             );
         }
         insert_yaml(&mut frontmatter, "title", title)?;
@@ -356,7 +357,7 @@ impl Store {
             insert_yaml(&mut frontmatter, "source_pins", source_pins)?;
         }
 
-        let yaml = serde_yaml::to_string(&frontmatter)?;
+        let yaml = crate::yaml::to_string(&frontmatter)?;
         let mut body = format!("---\n{yaml}---\n\n## Detail\n\n{}\n", finding.detail);
         if !finding.oracle_output.is_empty() {
             body.push_str("\n## Oracle output at report time\n\n");
@@ -384,10 +385,10 @@ impl Store {
     }
 }
 
-fn insert_yaml(mapping: &mut serde_yaml::Mapping, key: &str, value: impl Serialize) -> Result<()> {
+fn insert_yaml(mapping: &mut crate::yaml::Mapping, key: &str, value: impl Serialize) -> Result<()> {
     mapping.insert(
-        serde_yaml::Value::String(key.to_string()),
-        serde_yaml::to_value(value)?,
+        crate::yaml::Value::String(key.to_string()),
+        crate::yaml::to_value(value)?,
     );
     Ok(())
 }
@@ -427,14 +428,13 @@ fn write_finding_exclusive(
                 candidate.display()
             ))
         })?;
-        let mut destination =
-            store.resolve_corpus_entry(project, &rel, EntryAccess::Destination)?;
+        let mut destination = store.resolve_corpus_entry(project, rel, EntryAccess::Destination)?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
         // Re-resolve after parent creation so a pre-existing/planted link is
         // checked at the deepest possible boundary before opening the file.
-        destination = store.resolve_corpus_entry(project, &rel, EntryAccess::Destination)?;
+        destination = store.resolve_corpus_entry(project, rel, EntryAccess::Destination)?;
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -789,7 +789,7 @@ fn project_card(
     let oracle_verified = mapping
         .as_ref()
         .and_then(|fm| frontmatter::get(fm, "oracle_verified"))
-        .and_then(serde_yaml::Value::as_bool);
+        .and_then(crate::yaml::Value::as_bool);
     let sensitivity =
         mapping
             .as_ref()
@@ -839,7 +839,7 @@ fn body_after_fence(prefix: &str) -> &str {
         .unwrap_or(prefix)
 }
 
-fn frontmatter_u64(mapping: &serde_yaml::Mapping, key: &str) -> Option<u64> {
+fn frontmatter_u64(mapping: &crate::yaml::Mapping, key: &str) -> Option<u64> {
     let value = frontmatter::get(mapping, key)?;
     value
         .as_u64()

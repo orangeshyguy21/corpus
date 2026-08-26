@@ -1,0 +1,82 @@
+name: workspace quality
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+      - run: cargo fmt --all -- --check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy
+      - name: Lint headless workspace
+        run: cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
+      - name: Lint default-feature workspace
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Build headless workspace
+        run: cargo build --locked --workspace --no-default-features
+      - name: Build default application and companion binaries
+        run: cargo build --locked --workspace
+
+  test-hermetic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Run hermetic headless tests
+        run: cargo test --locked --workspace --all-targets --no-default-features
+      - name: Run hermetic workspace tests
+        run: cargo test --locked --workspace --all-targets
+
+  dependency-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Enforce package boundaries
+        run: ./scripts/check-dependency-policy
+      - name: Enforce supply-chain policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --locked
+
+  platform-tmux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install --yes tmux
+      - name: Run tmux platform tests serially
+        run: >-
+          cargo test --locked -p corpus-core --lib
+          launch::tests::tui_raw_capture_is_durable_in_project_corpus --
+          --ignored --exact --test-threads=1

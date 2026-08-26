@@ -9,17 +9,8 @@
 //! House rules: corpus-core calls live behind `AppState` (state.rs); one
 //! module per screen; no business logic in widgets.
 
-mod chat;
-mod file_watch;
-mod fmt;
-mod jobs;
-mod nav;
-mod session_service;
-mod sidebar;
-mod state;
-mod terminal;
-mod theme;
-mod views;
+// Shell-level tests remain beside the application composition root.
+#![allow(clippy::items_after_test_module)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,12 +19,14 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui_phosphor::regular as ph;
 
-use crate::chat::Chat as _;
-use crate::jobs::JobKind;
-use crate::nav::Screen;
-use crate::sidebar::Sidebar;
-use crate::state::{AppState, BackgroundNotice, BackgroundNoticeSeverity};
-use crate::views::{agents, components, missions, projects};
+use corpus_app::chat::{self, Chat as _};
+use corpus_app::diagnostics::{self, DiagnosticsGuard};
+use corpus_app::jobs::JobKind;
+use corpus_app::nav::Screen;
+use corpus_app::sidebar::Sidebar;
+use corpus_app::state::{self, AppState, BackgroundNotice, BackgroundNoticeSeverity};
+use corpus_app::theme;
+use corpus_app::views::{self, agents, components, missions, projects};
 
 /// corpus-app application state: the app's state layer, per-screen widget
 /// state, and the toast overlay. The active screen and chat toggle live on
@@ -49,13 +42,12 @@ struct App {
     missions: missions::MissionsView,
     toasts: egui_toast::Toasts,
     background_toasts: BackgroundToastCondenser,
-    /// The management chat (dev/decisions.md + dev/decisions.md): a native egui
-    /// panel backed by the EMBEDDED goose runtime (`chat/embedded.rs`). All
-    /// GDK lives in `chat`.
+    /// Native management chat backed by the embedded Goose adapter. All Goose
+    /// types remain quarantined in `chat/embedded.rs`.
     chat: chat::ChatHandle,
     chat_panel: chat::panel::ChatPanelView,
-    /// The team role the current chat backend was launched as
-    /// (dev/decisions.md chunk 3); a change restarts the scoped session.
+    /// The team role the current chat backend was launched as; a change
+    /// restarts the scoped session.
     chat_role: chat::team::TeamRole,
     /// The model the current chat backend was launched with; a picker change
     /// restarts the session (the old code kept the old model silently).
@@ -498,7 +490,7 @@ impl App {
                     // chat toggle far right, the env status to its left.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let toggle = theme::icon_button(ui, ph::CHATS_CIRCLE, 18.0)
-                            .on_hover_text("toggle the chat panel (content lands at chunk 6)");
+                            .on_hover_text("toggle the management chat panel");
                         if toggle.clicked() {
                             self.state.chat_open = !self.state.chat_open;
                         }
@@ -621,7 +613,7 @@ impl App {
             let source_running = running_rev
                 .as_deref()
                 .filter(|r| source.revs.iter().any(|x| x == r) || selected == **r);
-            if let Some(rev) = crate::views::source_dropdown::source_dropdown(
+            if let Some(rev) = views::source_dropdown::source_dropdown(
                 ui,
                 &format!("top_source_{}", source.name),
                 source,
@@ -751,8 +743,8 @@ impl App {
         response.on_hover_text(notes);
     }
 
-    /// The left sidebar (app-flow chunk 1): the three scoped sections
-    /// (Projects / Agents / Missions) with `+` create flows, the selected
+    /// The left sidebar: Projects, Agents, and Missions with create flows,
+    /// the selected
     /// project's dots-three-vertical menu, and the bottom corpus summary.
     /// Rendered by the `sidebar` module; this wrapper only owns the panel
     /// chrome. The width is APP-OWNED (`exact_width`): egui's native
@@ -774,8 +766,8 @@ impl App {
             .rect
     }
 
-    /// The management chat panel (dev/decisions.md chunk 3, native egui):
-    /// attributed message bubbles (you / corpus / tool cards), a
+    /// The native management chat panel: attributed message bubbles
+    /// (you / corpus / tool cards), a
     /// chronological activity tail in the log, and the footer row — model
     /// picker by the input, then the input + phase status. The picker is
     /// driven by corpus-core's `ollama_models()` (the GDK chat talks to
@@ -1045,6 +1037,7 @@ fn padded<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 fn main() -> eframe::Result {
+    let _diagnostics = keep_diagnostics_or_warn(diagnostics::install_local_subscriber());
     // Process-wide goose env (stream timeout, input limit, telemetry) —
     // ONCE, before any goose call can lock Config::global(). No-op values
     // when the operator already set them.
@@ -1070,6 +1063,18 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("Corpus", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+fn keep_diagnostics_or_warn(
+    diagnostics: Result<DiagnosticsGuard, String>,
+) -> Option<DiagnosticsGuard> {
+    match diagnostics {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("Corpus diagnostics disabled: {error}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1262,19 +1267,26 @@ mod tests {
             290.0
         );
     }
+
+    #[test]
+    fn bundled_app_icon_decodes_to_complete_rgba_pixels() {
+        let icon = app_icon().expect("bundled application icon should decode");
+        assert_eq!((icon.width, icon.height), (250, 250));
+        assert_eq!(
+            icon.rgba.len(),
+            icon.width as usize * icon.height as usize * 4
+        );
+    }
+
+    #[test]
+    fn unavailable_diagnostics_never_block_application_startup() {
+        assert!(keep_diagnostics_or_warn(Err("read-only sink".into())).is_none());
+    }
 }
 
 /// Decode `assets/logo-icon.png` into the RGBA [`egui::IconData`] eframe
 /// expects for the OS dock icon. `None` if the asset is missing or
 /// undecodable (the app still runs, just with the default icon).
 fn app_icon() -> Option<egui::IconData> {
-    let bytes = include_bytes!("../assets/logo-icon.png");
-    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?;
-    let rgba = img.to_rgba8();
-    let (width, height) = rgba.dimensions();
-    Some(egui::IconData {
-        rgba: rgba.into_raw(),
-        width,
-        height,
-    })
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/logo-icon.png")).ok()
 }

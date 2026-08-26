@@ -94,10 +94,9 @@ fn generic_tools_forward_the_durable_v1_session_and_typed_description() {
     assert!(paid.contains("Payment succeeded (7 sat"), "{paid}");
     assert_eq!(ctx.faucet_spent_sats, 17);
 
-    let oracle_catalog: serde_json::Value = serde_json::from_str(
-        &tools::dispatch(&mut ctx, "oracle_list", &json!({})).unwrap(),
-    )
-    .unwrap();
+    let oracle_catalog: serde_json::Value =
+        serde_json::from_str(&tools::dispatch(&mut ctx, "oracle_list", &json!({})).unwrap())
+            .unwrap();
     assert_eq!(
         oracle_catalog,
         json!({"oracles":[{"name":"fixture-invariant","description":"fixture"}]})
@@ -195,12 +194,10 @@ fn oracle_tools_require_dynamic_discovery() {
         .find(|tool| tool["name"] == "oracle_list")
         .expect("oracle_list is advertised");
     assert_eq!(list["inputSchema"]["required"], json!([]));
-    assert!(
-        list["description"]
-            .as_str()
-            .unwrap()
-            .contains("decide which oracle")
-    );
+    assert!(list["description"]
+        .as_str()
+        .unwrap()
+        .contains("decide which oracle"));
     let run = tools
         .iter()
         .find(|tool| tool["name"] == "oracle_run")
@@ -215,7 +212,10 @@ fn oracle_tools_require_dynamic_discovery() {
         ),
         ("agent guidance", include_str!("../../../AGENTS.md")),
     ] {
-        assert!(!text.contains(stale), "{name} contains stale oracle example");
+        assert!(
+            !text.contains(stale),
+            "{name} contains stale oracle example"
+        );
     }
 }
 

@@ -72,7 +72,8 @@ fn contract() -> Contract {
     let path = fixture_dir().join("contract.yaml");
     let raw = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    serde_yaml::from_str(&raw).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+    corpus_store::yaml::from_str(&raw)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
 }
 
 fn markdown_files(dir: &Path) -> Vec<PathBuf> {
