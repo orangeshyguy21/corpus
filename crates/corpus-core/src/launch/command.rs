@@ -97,7 +97,9 @@ pub(super) fn opencode_command(
     if !plan.mission().trim().is_empty() {
         command.arg(plan.mission());
     }
-    command.current_dir(store.provision_run_dir(plan.project())?);
+    command.current_dir(
+        store.provision_run_dir_with_sources(plan.project(), plan.source_pins_json())?,
+    );
     for (key, value) in environment.iter() {
         command.env(key, value);
     }

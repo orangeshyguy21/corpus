@@ -5,6 +5,7 @@
 //! catalog. It cannot execute a plugin, fetch source, launch or stop a run,
 //! call an oracle, or touch a sandbox.
 
+pub mod dependencies;
 pub mod models;
 pub mod plugins;
 
@@ -16,9 +17,12 @@ use std::sync::OnceLock;
 
 use corpus_store::{Error, Mission, Store};
 
+pub use dependencies::{
+    is_compatible_opencode_version, probe_opencode, OpenCodeReadiness, MINIMUM_OPENCODE_VERSION,
+};
 pub use models::{
-    model_list, ollama_models, ollama_models_refresh, ModelEntry, ModelList, ModelOption,
-    ModelProviderGroup, ModelRegistry,
+    model_list, ollama_endpoint, ollama_models, ollama_models_refresh, ModelEntry, ModelList,
+    ModelOption, ModelProviderGroup, ModelRegistry,
 };
 pub use plugins::{
     catalog_plugin, discover_plugins, plugin_by_name, plugin_catalog, EnvironmentDependency,

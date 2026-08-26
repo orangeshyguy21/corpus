@@ -649,10 +649,18 @@ mod tests {
             .join(".git")
             .is_dir());
 
-        let run = store.provision_run_dir("p").unwrap();
+        let resolved_json = serde_json::to_string(&resolved).unwrap();
+        let run = store
+            .provision_run_dir_with_sources("p", Some(&resolved_json))
+            .unwrap();
         assert_eq!(
-            fs::read_link(run.join("sources")).unwrap(),
-            store.source_cache_dir()
+            fs::read_link(run.join("sources/target").join(&sha)).unwrap(),
+            store
+                .source_cache_dir()
+                .join("target")
+                .join(&sha)
+                .canonicalize()
+                .unwrap()
         );
         let _ = std::fs::remove_dir_all(&root);
     }

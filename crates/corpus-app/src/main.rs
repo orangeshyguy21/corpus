@@ -32,6 +32,7 @@ use corpus_app::views::{self, agents, components, missions, projects};
 /// state, and the toast overlay. The active screen and chat toggle live on
 /// `AppState` (they reflect the sidebar/top-bar chrome).
 struct App {
+    opencode_gate: OpenCodeGate,
     state: AppState,
     /// The screen shown last frame — screen-change hooks (fresh project
     /// list before Agents/Missions render) fire on transitions only.
@@ -80,13 +81,13 @@ impl App {
         // Restore the remembered chat model (store/app.yaml). Only the
         // PICKER is restored, not a session: the backend starts on the first
         // frame the chat panel actually renders, so a launch with the panel
-        // closed still spawns nothing. A model that ollama no longer has
-        // fails visibly on that first start rather than being silently
-        // dropped here — checking would mean probing ollama during boot.
+        // closed still spawns nothing. The panel confirms the remembered
+        // model through Ollama's API before it can start the backend.
         let remembered = state.prefs().chat_model;
         let mut chat_panel = chat::panel::ChatPanelView::default();
         chat_panel.set_model(&remembered);
         Self {
+            opencode_gate: OpenCodeGate::start(cc.egui_ctx.clone()),
             chat_model_saved: remembered,
             last_screen: state.current_screen,
             sidebar: Sidebar::default(),
@@ -105,6 +106,139 @@ impl App {
             divider_drag: None,
             state,
         }
+    }
+}
+
+#[derive(Clone)]
+enum OpenCodeGateState {
+    Checking,
+    Resolved(corpus_observe::OpenCodeReadiness),
+}
+
+struct OpenCodeGate {
+    state: OpenCodeGateState,
+    result: std::sync::mpsc::Receiver<corpus_observe::OpenCodeReadiness>,
+}
+
+impl OpenCodeGate {
+    fn start(ctx: egui::Context) -> Self {
+        let (tx, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let readiness = corpus_observe::probe_opencode();
+            let _ = tx.send(readiness);
+            ctx.request_repaint();
+        });
+        Self {
+            state: OpenCodeGateState::Checking,
+            result,
+        }
+    }
+
+    fn poll(&mut self) {
+        if let Ok(readiness) = self.result.try_recv() {
+            self.state = OpenCodeGateState::Resolved(readiness);
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        matches!(
+            self.state,
+            OpenCodeGateState::Resolved(corpus_observe::OpenCodeReadiness::Ready { .. })
+        )
+    }
+
+    fn retry(&mut self, ctx: egui::Context) {
+        *self = Self::start(ctx);
+    }
+
+    fn show(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(theme::BG))
+            .show(ctx, |ui| {
+                let width = ui.available_width().min(520.0);
+                ui.add_space((ui.available_height() * 0.22).max(32.0));
+                ui.vertical_centered(|ui| {
+                    ui.set_max_width(width);
+                    ui.label(
+                        egui::RichText::new("CORPUS")
+                            .size(28.0)
+                            .strong()
+                            .color(theme::TEXT),
+                    );
+                    ui.add_space(24.0);
+                    match self.state.clone() {
+                        OpenCodeGateState::Checking => {
+                            ui.spinner();
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new("Checking OpenCode…")
+                                    .size(14.0)
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            ctx.request_repaint_after(Duration::from_millis(100));
+                        }
+                        OpenCodeGateState::Resolved(readiness) => {
+                            let (title, detail, path) = match readiness {
+                                corpus_observe::OpenCodeReadiness::Missing { message } => (
+                                    "OpenCode is required",
+                                    format!(
+                                        "Corpus uses OpenCode to run and supervise research missions. Install OpenCode, then check again.\n\n{message}"
+                                    ),
+                                    None,
+                                ),
+                                corpus_observe::OpenCodeReadiness::Incompatible {
+                                    path,
+                                    version,
+                                    expected,
+                                } => (
+                                    "This OpenCode version is not supported",
+                                    format!(
+                                        "Found {version}. Corpus currently requires {expected} or a newer 1.18.x patch."
+                                    ),
+                                    Some(path),
+                                ),
+                                corpus_observe::OpenCodeReadiness::Failed { path, message } => (
+                                    "OpenCode could not be verified",
+                                    message,
+                                    Some(path),
+                                ),
+                                corpus_observe::OpenCodeReadiness::Ready { .. } => return,
+                            };
+                            ui.label(
+                                egui::RichText::new(title)
+                                    .size(20.0)
+                                    .strong()
+                                    .color(theme::SIGNAL_RED),
+                            );
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(detail)
+                                    .size(13.0)
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            if let Some(path) = path {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(path.display().to_string())
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(theme::TEXT_FAINT),
+                                );
+                            }
+                            ui.add_space(18.0);
+                            ui.horizontal(|ui| {
+                                if theme::primary_button(ui, "Check again").clicked() {
+                                    self.retry(ctx.clone());
+                                }
+                                ui.hyperlink_to(
+                                    "Installation guide",
+                                    "https://opencode.ai/docs",
+                                );
+                            });
+                        }
+                    }
+                });
+            });
     }
 }
 
@@ -254,6 +388,11 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.opencode_gate.poll();
+        if !self.opencode_gate.is_ready() {
+            self.opencode_gate.show(ctx);
+            return;
+        }
         let notice_time = Instant::now();
         for notice in self.state.poll_background_jobs() {
             match notice.severity {
@@ -809,7 +948,6 @@ impl App {
                         self.state.refresh_corpus_stats(&p);
                     }
                 }
-                self.ensure_chat_started(ui.ctx());
                 // Juice the session with the operator's current position
                 // (re-pushed only when it changes).
                 let ctx = self.chat_context();
@@ -818,6 +956,10 @@ impl App {
                     self.last_chat_context = ctx;
                 }
                 self.chat_panel.show(ui, &mut self.chat);
+                // Model discovery is drained by `show`; only after Ollama's
+                // API confirms the exact selection may a remembered model
+                // start a backend.
+                self.ensure_chat_started(ui.ctx());
                 // Persist a picker change (store/app.yaml). Guarded by the
                 // in-memory copy so the steady state is a comparison, not a
                 // file read every frame. Saved on the PICK, not on session
@@ -836,8 +978,8 @@ impl App {
     /// The role + model the current chat backend was launched with; a change
     /// in either (or a Finished backend) restarts the scoped session.
     fn ensure_chat_started(&mut self, ctx: &egui::Context) {
-        if self.chat_panel.model().is_empty() {
-            return; // no model -> panel stays idle (refuses to start)
+        if !self.chat_panel.can_start_backend() {
+            return; // Ollama/model unavailable -> visible disabled panel
         }
         let Some(project) = self.state.effective_project() else {
             return;

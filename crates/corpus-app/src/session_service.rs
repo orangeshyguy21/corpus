@@ -17,22 +17,8 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 use serde_json::Value;
 
-pub(crate) const MINIMUM_OPENCODE_VERSION: &str = "1.18.18";
-
-fn is_compatible_opencode_version(version: &str) -> bool {
-    let core = version
-        .trim()
-        .split_once('-')
-        .map_or(version.trim(), |(core, _)| core);
-    let mut parts = core.split('.');
-    let parsed = (
-        parts.next().and_then(|part| part.parse::<u64>().ok()),
-        parts.next().and_then(|part| part.parse::<u64>().ok()),
-        parts.next().and_then(|part| part.parse::<u64>().ok()),
-        parts.next(),
-    );
-    matches!(parsed, (Some(1), Some(18), Some(patch), None) if patch >= 18)
-}
+use corpus_observe::is_compatible_opencode_version;
+pub(crate) use corpus_observe::MINIMUM_OPENCODE_VERSION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionBackend {

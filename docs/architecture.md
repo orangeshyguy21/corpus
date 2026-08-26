@@ -184,6 +184,11 @@ must never be inferred from one another.
   cache/sources/<source>/<sha>/
   plugins/<plugin>/<version>/
   var/run/<project>/
+    .opencode/agent/                  project-stable render staging
+    views/sources-<sha256>/           launch cwd for one exact pin set
+      store/projects/<project>        sole project link
+      sources/<source>/<sha>          exact read-only pin links
+      .opencode/                      snapshotted agents + local MCP config
   var/chat/<project>/
   var/plugins/
   var/audit/<project>.jsonl
@@ -195,12 +200,15 @@ must never be inferred from one another.
 The resource root contains shipped assets such as `benchmarks/models.yaml` and
 optional OpenCode skills. It is read-only and replaceable during an upgrade.
 
-Before launch, the store provisions `var/run/<project>` outside the repository.
-That namespace contains exactly one linked project, the Corpus source cache,
-generated project-level OpenCode configuration, and rendered agents. Per-run
-identity stays in the child/tmux environment. An unexpected second project,
-symlinked boundary component, unresolved source revision, or absent explicit
-model aborts launch.
+Before launch, the store renders project-stable agents beneath
+`var/run/<project>`, then provisions a pin-keyed launch view beneath
+`views/sources-<sha256>`. The launch cwd contains exactly one linked project
+and only the exact `<source>/<sha>` trees from its immutable launch plan; the
+shared source cache remains host-only. Different pin sets therefore cannot
+race over one `sources` link. Per-run identity stays in the child/tmux
+environment. An unexpected project or source entry, symlinked boundary or
+source-tree component, unresolved source revision, or absent explicit model
+aborts launch.
 
 ## Mission and curator lifecycle
 

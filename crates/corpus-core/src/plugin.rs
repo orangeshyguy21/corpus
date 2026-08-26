@@ -23,6 +23,14 @@ use serde_json::Value;
 use crate::error::Error;
 pub use corpus_observe::PluginManifest;
 
+/// Raw protocol framing is bounded before UTF-8 or JSON parsing. Tool-level
+/// truncation happens later and cannot protect the host from an oversized
+/// newline-delimited reply.
+const MAX_PROTOCOL_FRAME_BYTES: usize = 1024 * 1024;
+const PROTOCOL_QUEUE_CAPACITY: usize = 8;
+const MAX_LIFECYCLE_STREAM_BYTES: usize = 4 * MAX_PROTOCOL_FRAME_BYTES;
+const MAX_LIFECYCLE_PROGRESS_EVENTS: usize = 1024;
+
 /// Result of a `probe` call: is the environment usable right now?
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeResult {
@@ -242,13 +250,19 @@ pub struct Plugin {
     dir: PathBuf,
     child: Child,
     stdin: ChildStdin,
-    /// Reply lines from the reader thread; a bounded `recv_timeout` in
-    /// `call` is what keeps a wedged plugin (unbounded nix eval, hung
-    /// docker exec) from freezing the whole MCP server.
-    replies: std::sync::mpsc::Receiver<String>,
+    /// Bounded reply frames from the reader thread; `recv_timeout` in `call`
+    /// keeps a wedged plugin from freezing the server, while the synchronous
+    /// queue keeps unsolicited output from growing the heap.
+    replies: std::sync::mpsc::Receiver<ProtocolFrame>,
     next_id: AtomicU64,
     /// Maximum time to wait for one reply before killing the plugin tree.
     call_timeout: std::time::Duration,
+}
+
+#[derive(Debug)]
+enum ProtocolFrame {
+    Line(String),
+    Violation(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -307,19 +321,24 @@ impl Plugin {
         })?;
         // Reader thread → channel: `call` can then wait with a deadline
         // instead of blocking forever on a wedged plugin.
-        let (tx, replies) = std::sync::mpsc::channel::<String>();
+        // A bounded queue applies backpressure when a plugin emits
+        // unsolicited or excessively rapid output. The pipe then provides
+        // the remaining finite kernel buffer instead of host heap growth.
+        let (tx, replies) = std::sync::mpsc::sync_channel::<ProtocolFrame>(PROTOCOL_QUEUE_CAPACITY);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break, // EOF: plugin exited
-                    Ok(_) => {
-                        if tx.send(line).is_err() {
+                match read_protocol_frame(&mut reader) {
+                    Ok(None) => break, // EOF: plugin exited
+                    Ok(Some(line)) => {
+                        if tx.send(ProtocolFrame::Line(line)).is_err() {
                             break; // receiver gone
                         }
                     }
-                    Err(_) => break,
+                    Err(error) => {
+                        let _ = tx.send(ProtocolFrame::Violation(error.to_string()));
+                        break;
+                    }
                 }
             }
         });
@@ -354,7 +373,7 @@ impl Plugin {
         let id = self.send_request(method, params)?;
 
         let reply_line = match self.replies.recv_timeout(self.call_timeout) {
-            Ok(line) => line,
+            Ok(frame) => self.accept_protocol_frame(frame)?,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 self.kill_tree();
                 return Err(Error::Plugin {
@@ -372,15 +391,20 @@ impl Plugin {
         if reply_line.trim().is_empty() {
             return Err(Error::PluginClosed(self.manifest.name.clone()));
         }
-        let reply: Reply = serde_json::from_str(reply_line.trim()).map_err(|e| Error::Plugin {
-            plugin: self.manifest.name.clone(),
-            message: format!("malformed reply {:?}: {e}", reply_line.trim()),
-        })?;
+        let reply: Reply = match serde_json::from_str(reply_line.trim()) {
+            Ok(reply) => reply,
+            Err(error) => {
+                return self.protocol_violation(format!(
+                    "malformed reply {:?}: {error}",
+                    reply_line.trim()
+                ))
+            }
+        };
         if reply.id != id {
-            return Err(Error::Plugin {
-                plugin: self.manifest.name.clone(),
-                message: format!("reply id {} does not match request id {id}", reply.id),
-            });
+            return self.protocol_violation(format!(
+                "reply id {} does not match request id {id}",
+                reply.id
+            ));
         }
         if !reply.ok {
             return Err(Error::Plugin {
@@ -431,6 +455,8 @@ impl Plugin {
         }
         let id = self.send_request(method, params)?;
         let started = std::time::Instant::now();
+        let mut stream_bytes = 0_usize;
+        let mut progress_events = 0_usize;
         loop {
             if is_cancelled() {
                 self.kill_tree();
@@ -453,7 +479,7 @@ impl Plugin {
             };
             let poll = remaining.min(std::time::Duration::from_millis(100));
             let line = match self.replies.recv_timeout(poll) {
-                Ok(line) => line,
+                Ok(frame) => self.accept_protocol_frame(frame)?,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if poll < remaining {
                         continue;
@@ -471,47 +497,55 @@ impl Plugin {
                     return Err(Error::PluginClosed(self.manifest.name.clone()));
                 }
             };
-            let parsed: LifecycleLine =
-                serde_json::from_str(line.trim()).map_err(|error| Error::Plugin {
-                    plugin: self.manifest.name.clone(),
-                    message: format!("malformed lifecycle reply {:?}: {error}", line.trim()),
-                })?;
+            stream_bytes = stream_bytes.saturating_add(line.len());
+            if stream_bytes > MAX_LIFECYCLE_STREAM_BYTES {
+                return self.protocol_violation(format!(
+                    "lifecycle call {method} exceeded {MAX_LIFECYCLE_STREAM_BYTES} protocol bytes"
+                ));
+            }
+            let parsed: LifecycleLine = match serde_json::from_str(line.trim()) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return self.protocol_violation(format!(
+                        "malformed lifecycle reply {:?}: {error}",
+                        line.trim()
+                    ))
+                }
+            };
             match parsed {
                 LifecycleLine::Progress(progress) => {
+                    progress_events += 1;
+                    if progress_events > MAX_LIFECYCLE_PROGRESS_EVENTS {
+                        return self.protocol_violation(format!(
+                            "lifecycle call {method} exceeded {MAX_LIFECYCLE_PROGRESS_EVENTS} progress events"
+                        ));
+                    }
                     if progress.id != id || progress.event != "progress" {
-                        return Err(Error::Plugin {
-                            plugin: self.manifest.name.clone(),
-                            message: format!(
-                                "invalid lifecycle progress id/event: expected id {id} and event progress"
-                            ),
-                        });
+                        return self.protocol_violation(format!(
+                            "invalid lifecycle progress id/event: expected id {id} and event progress"
+                        ));
                     }
                     on_progress(&progress);
                 }
                 LifecycleLine::Reply(reply) => {
                     if reply.id != id {
-                        return Err(Error::Plugin {
-                            plugin: self.manifest.name.clone(),
-                            message: format!(
-                                "reply id {} does not match request id {id}",
-                                reply.id
-                            ),
-                        });
+                        return self.protocol_violation(format!(
+                            "reply id {} does not match request id {id}",
+                            reply.id
+                        ));
                     }
                     if reply.ok {
                         if reply.error.is_some() {
-                            return Err(Error::Plugin {
-                                plugin: self.manifest.name.clone(),
-                                message: "successful lifecycle reply carried an error".to_string(),
-                            });
+                            return self.protocol_violation(
+                                "successful lifecycle reply carried an error".to_string(),
+                            );
                         }
                         return Ok(reply.result.unwrap_or(Value::Null));
                     }
                     if reply.result.is_some() {
-                        return Err(Error::Plugin {
-                            plugin: self.manifest.name.clone(),
-                            message: "failed lifecycle reply carried a result".to_string(),
-                        });
+                        return self.protocol_violation(
+                            "failed lifecycle reply carried a result".to_string(),
+                        );
                     }
                     let error = reply.error.unwrap_or(ProtocolError {
                         code: "unknown".to_string(),
@@ -535,7 +569,7 @@ impl Plugin {
     pub fn call_v1(&mut self, method: &str, params: Option<Value>) -> Result<Value, Error> {
         let id = self.send_request(method, params)?;
         let line = match self.replies.recv_timeout(self.call_timeout) {
-            Ok(line) => line,
+            Ok(frame) => self.accept_protocol_frame(frame)?,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 self.kill_tree();
                 return Err(Error::Plugin {
@@ -550,11 +584,25 @@ impl Plugin {
                 return Err(Error::PluginClosed(self.manifest.name.clone()));
             }
         };
-        let reply: ProtocolV1Reply =
-            serde_json::from_str(line.trim()).map_err(|error| Error::Plugin {
-                plugin: self.manifest.name.clone(),
-                message: format!("malformed v1 reply {:?}: {error}", line.trim()),
-            })?;
+        let reply: ProtocolV1Reply = match serde_json::from_str(line.trim()) {
+            Ok(reply) => reply,
+            Err(error) => {
+                return self
+                    .protocol_violation(format!("malformed v1 reply {:?}: {error}", line.trim()))
+            }
+        };
+        if reply.id != id {
+            return self.protocol_violation(format!(
+                "reply id {} does not match request id {id}",
+                reply.id
+            ));
+        }
+        if reply.ok && reply.error.is_some() {
+            return self.protocol_violation("successful v1 reply carried an error".to_string());
+        }
+        if !reply.ok && reply.result.is_some() {
+            return self.protocol_violation("failed v1 reply carried a result".to_string());
+        }
         self.finish_v1_reply(id, reply)
     }
 
@@ -729,6 +777,21 @@ impl Plugin {
         Ok(id)
     }
 
+    fn accept_protocol_frame(&mut self, frame: ProtocolFrame) -> Result<String, Error> {
+        match frame {
+            ProtocolFrame::Line(line) => Ok(line),
+            ProtocolFrame::Violation(message) => self.protocol_violation(message),
+        }
+    }
+
+    fn protocol_violation<T>(&mut self, message: String) -> Result<T, Error> {
+        self.kill_tree();
+        Err(Error::Plugin {
+            plugin: self.manifest.name.clone(),
+            message: format!("protocol violation: {message}; plugin process tree killed"),
+        })
+    }
+
     /// `probe`: is the environment usable right now?
     pub fn probe(&mut self) -> Result<ProbeResult, Error> {
         let value = self.call("probe", None)?;
@@ -878,5 +941,50 @@ impl Drop for Plugin {
         // Plugins must handle SIGTERM/SIGKILL by releasing the environment
         // only when they own it; see the plugin authoring guide.
         self.kill_tree();
+    }
+}
+
+fn read_protocol_frame(reader: &mut impl BufRead) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    let mut limited = std::io::Read::take(&mut *reader, (MAX_PROTOCOL_FRAME_BYTES + 1) as u64);
+    let read = limited.read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if bytes.len() > MAX_PROTOCOL_FRAME_BYTES || bytes.last() != Some(&b'\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "plugin reply exceeded the {MAX_PROTOCOL_FRAME_BYTES}-byte frame limit or was not newline terminated"
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map(Some).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("plugin reply is not UTF-8: {error}"),
+        )
+    })
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+
+    #[test]
+    fn protocol_frames_are_bounded_before_string_allocation_and_require_newlines() {
+        let valid = b"{\"id\":1}\n";
+        assert_eq!(
+            read_protocol_frame(&mut &valid[..]).unwrap().as_deref(),
+            Some("{\"id\":1}\n")
+        );
+
+        let oversized = vec![b'x'; MAX_PROTOCOL_FRAME_BYTES + 1];
+        let error = read_protocol_frame(&mut &oversized[..]).unwrap_err();
+        assert!(error.to_string().contains("frame limit"), "{error}");
+
+        let unterminated = b"{\"id\":1}";
+        let error = read_protocol_frame(&mut &unterminated[..]).unwrap_err();
+        assert!(error.to_string().contains("newline terminated"), "{error}");
     }
 }

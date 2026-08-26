@@ -326,7 +326,7 @@ impl RunSession {
             .map(|_| opencode_control_password(store, &session))
             .transpose()?;
 
-        let repo = store.provision_run_dir(project)?; // the run's cwd
+        let repo = store.provision_run_dir_with_sources(project, plan.source_pins_json())?;
         let prompt = if mission.trim().is_empty() {
             None
         } else {

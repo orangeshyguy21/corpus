@@ -183,6 +183,7 @@ pub(crate) fn catalog_entries() -> impl Iterator<Item = Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn every_definition_is_unique_and_policy_complete() {
@@ -193,6 +194,62 @@ mod tests {
             assert_eq!(catalog["name"], tool.name);
             assert!(catalog["inputSchema"].is_object());
             assert!(definition(tool.name).is_some());
+        }
+    }
+
+    #[test]
+    fn every_project_bearing_tool_refuses_path_shaped_identity_before_dispatch() {
+        let store = corpus_store::Store::new(std::env::temp_dir().join(format!(
+            "corpus-admin-project-boundary-{}",
+            std::process::id()
+        )));
+        let mut confirms = HashMap::new();
+        let mut ctx = crate::Ctx {
+            store: &store,
+            pending_confirms: &mut confirms,
+        };
+        let cases = [
+            ("project_new", json!({"slug": "/tmp/escape"})),
+            ("project_clone", json!({"from": "../escape", "to": "copy"})),
+            (
+                "project_clone",
+                json!({"from": "source", "to": "a/../escape"}),
+            ),
+            ("project_delete", json!({"slug": "../escape"})),
+            (
+                "project_rebind",
+                json!({"slug": "/tmp/escape", "plugin": "p"}),
+            ),
+            ("agent_list", json!({"project": "../escape"})),
+            (
+                "agent_copy",
+                json!({
+                    "from_project": "/tmp/escape",
+                    "from": "a",
+                    "to_project": "safe",
+                    "to": "b"
+                }),
+            ),
+            ("mission_list", json!({"project": "a\\..\\escape"})),
+            ("corpus_stats", json!({"project": "/tmp/escape"})),
+            (
+                "entry_write",
+                json!({
+                    "project": "../escape",
+                    "path": "findings/a.md",
+                    "content": "body"
+                }),
+            ),
+        ];
+
+        for (tool, args) in cases {
+            let error = crate::dispatch(&mut ctx, tool, &args)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("invalid slug"),
+                "{tool} reached its handler instead of rejecting the project identity: {error}"
+            );
         }
     }
 }

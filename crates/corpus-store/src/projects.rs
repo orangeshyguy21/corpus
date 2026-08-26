@@ -39,6 +39,7 @@ pub struct Project {
 
 impl Project {
     pub fn load(store: &Store, slug: &str) -> Result<Self> {
+        validate_slug(slug)?;
         let path = store.project_dir(slug).join("project.yaml");
         let raw = fs::read_to_string(&path)
             .map_err(|_| Error::Store(format!("project not found: {slug}")))?;
@@ -46,6 +47,7 @@ impl Project {
     }
 
     fn save(&self, store: &Store, slug: &str) -> Result<()> {
+        validate_slug(slug)?;
         let path = store.project_dir(slug).join("project.yaml");
         atomic_write(&path, yaml::to_string(self)?)
     }
@@ -139,6 +141,7 @@ impl Store {
         with_corpus: bool,
     ) -> Result<Project> {
         let source = Project::load(self, from)?;
+        validate_slug(to)?;
         if source.delete_requested.is_some()
             || self
                 .list_agents(from)?
@@ -149,22 +152,42 @@ impl Store {
                 "project {from} or one of its agents is pending deletion"
             )));
         }
-        self.create_project(to, name.unwrap_or(&source.name), &source.plugin)?;
+        let agents = self.project_agents_dir(from);
+        let missions = self.project_missions_dir(from);
+        let corpus = self.project_corpus_dir(from);
+        validate_copy_tree(&agents)?;
+        validate_copy_tree(&missions)?;
+        if with_corpus {
+            validate_copy_tree(&corpus)?;
+        }
+
+        // Claim the final destination atomically, but publish project.yaml
+        // last. Project discovery and every scoped launch require that file,
+        // so a concurrent reader cannot mistake an in-progress tree for a
+        // usable project. The guard removes the complete destination on every
+        // failure path.
+        fs::create_dir_all(self.projects_dir())?;
+        let mut pending = PendingProjectDir::create(self.project_dir(to))?;
+        fs::create_dir(pending.path.join("agents"))?;
+        fs::create_dir(pending.path.join("missions"))?;
+        fs::create_dir(pending.path.join("corpus"))?;
+        for category in CATEGORIES {
+            fs::create_dir(pending.path.join("corpus").join(category))?;
+        }
+
         let project = Project {
             name: name.unwrap_or(&source.name).to_string(),
             cloned_from: Some(from.to_string()),
             delete_requested: None,
             ..source
         };
-        project.save(self, to)?;
-        copy_tree(&self.project_agents_dir(from), &self.project_agents_dir(to))?;
-        copy_tree(
-            &self.project_missions_dir(from),
-            &self.project_missions_dir(to),
-        )?;
+        copy_tree(&agents, &pending.path.join("agents"))?;
+        copy_tree(&missions, &pending.path.join("missions"))?;
         if with_corpus {
-            copy_tree(&self.project_corpus_dir(from), &self.project_corpus_dir(to))?;
+            copy_tree(&corpus, &pending.path.join("corpus"))?;
         }
+        project.save(self, to)?;
+        pending.commit();
         Ok(project)
     }
 
@@ -222,20 +245,116 @@ fn ensure_corpus_categories(corpus: &Path) -> Result<()> {
 mod tests;
 
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
-    if !src.is_dir() {
-        fs::create_dir_all(dst)?;
-        return Ok(());
+    let root = fs::symlink_metadata(src)?;
+    if root.file_type().is_symlink() || !root.is_dir() {
+        return Err(Error::Store(format!(
+            "project clone source must be a real directory: {}",
+            src.display()
+        )));
     }
-    fs::create_dir_all(dst)?;
+    if !dst.is_dir() {
+        fs::create_dir(dst)?;
+    }
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
-        if from.is_dir() {
+        let metadata = fs::symlink_metadata(&from)?;
+        if metadata.file_type().is_symlink() {
+            return Err(Error::Store(format!(
+                "project clone refuses symlink {}",
+                from.display()
+            )));
+        }
+        if metadata.is_dir() {
+            match fs::symlink_metadata(&to) {
+                Ok(existing) if existing.is_dir() && !existing.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return Err(Error::Store(format!(
+                        "project clone destination is not a real directory: {}",
+                        to.display()
+                    )))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&to)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
             copy_tree(&from, &to)?;
-        } else {
+        } else if metadata.is_file() {
             fs::copy(&from, &to)?;
+        } else {
+            return Err(Error::Store(format!(
+                "project clone refuses special file {}",
+                from.display()
+            )));
         }
     }
     Ok(())
+}
+
+fn validate_copy_tree(root: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Store(format!(
+            "project clone source must be a real directory: {}",
+            root.display()
+        )));
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(Error::Store(format!(
+                    "project clone refuses symlink {}",
+                    path.display()
+                )));
+            }
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if !metadata.is_file() {
+                return Err(Error::Store(format!(
+                    "project clone refuses special file {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct PendingProjectDir {
+    path: std::path::PathBuf,
+    committed: bool,
+}
+
+impl PendingProjectDir {
+    fn create(path: std::path::PathBuf) -> Result<Self> {
+        fs::create_dir(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::Store(format!("project already exists: {}", path.display()))
+            } else {
+                error.into()
+            }
+        })?;
+        Ok(Self {
+            path,
+            committed: false,
+        })
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PendingProjectDir {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }

@@ -215,6 +215,16 @@ impl ChatPanelView {
         &self.model
     }
 
+    /// A remembered model must never start a backend until Ollama's API has
+    /// confirmed that exact model is available from the configured service.
+    pub fn can_start_backend(&self) -> bool {
+        if self.model.is_empty() {
+            return false;
+        }
+        matches!(&self.ollama_models, crate::state::ModelDiscovery::Ready(list)
+            if list.groups.iter().flat_map(|group| &group.models).any(|model| model.model == self.model))
+    }
+
     /// The team role this session runs as. The operator can switch to
     /// `Operator` (full catalog,
     /// destructive gated by Approve/Reject) or a specialist.
@@ -408,7 +418,9 @@ impl ChatPanelView {
     }
 
     fn can_send(&self, chat: &dyn Chat) -> bool {
-        !self.model.is_empty() && chat.phase() == ChatPhase::Ready && !self.input.trim().is_empty()
+        self.can_start_backend()
+            && chat.phase() == ChatPhase::Ready
+            && !self.input.trim().is_empty()
     }
 
     /// The agent's live activity, rendered IN the log (chronologically after
@@ -500,7 +512,11 @@ impl ChatPanelView {
             .auto_shrink([true, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                if self.messages.is_empty() {
+                let ollama_error = match &self.ollama_models {
+                    crate::state::ModelDiscovery::Failed(error) => Some(error.clone()),
+                    _ => None,
+                };
+                if self.messages.is_empty() && ollama_error.is_none() {
                     self.empty_state(ui, scroll_h);
                 }
                 let messages = &self.messages;
@@ -597,6 +613,9 @@ impl ChatPanelView {
                         }
                     });
                 }
+                if let Some(error) = ollama_error {
+                    self.ollama_dependency_notice(ui, &error);
+                }
                 // Inline approve/reject cards.
                 self.permission_cards(ui, chat);
                 // Live activity tail: the agent's current action reads
@@ -664,6 +683,37 @@ impl ChatPanelView {
         });
     }
 
+    fn ollama_dependency_notice(&self, ui: &mut egui::Ui, detail: &str) {
+        ui.add_space(8.0);
+        egui::Frame::default()
+            .fill(crate::theme::EDITOR_BG)
+            .stroke(egui::Stroke::new(1.0_f32, crate::theme::SIGNAL_RED))
+            .corner_radius(crate::theme::CONTROL_RADIUS)
+            .inner_margin(egui::Margin::symmetric(10, 10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    egui::RichText::new("Embedded chat requires Ollama")
+                        .strong()
+                        .color(crate::theme::SIGNAL_RED),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(detail)
+                        .small()
+                        .color(crate::theme::TEXT_MUTED),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Projects and missions using other providers are unaffected.",
+                    )
+                    .small()
+                    .color(crate::theme::TEXT_FAINT),
+                );
+            });
+    }
+
     /// The composer: ONE bordered card — the auto-growing input on top, then
     /// a rail carrying the model picker, the session's token usage and the
     /// transforming send/stop button — plus the keyboard contract (Enter
@@ -702,6 +752,7 @@ impl ChatPanelView {
             // paste scrolls instead of eating the log. Frameless — the card
             // IS its frame — and full width, so a wrapped line is never
             // clipped by a button sitting beside it.
+            let chat_available = self.can_start_backend();
             let text_w = ui.available_width();
             let mut layouter = crate::views::syntax_editor::markdown_layouter;
             let editor = egui::TextEdit::multiline(&mut self.input)
@@ -719,7 +770,7 @@ impl ChatPanelView {
                 .max_height(150.0)
                 .auto_shrink([false, true])
                 .id_salt("chat_input_scroll")
-                .show(ui, |ui| ui.add_enabled(!self.model.is_empty(), editor))
+                .show(ui, |ui| ui.add_enabled(chat_available, editor))
                 .inner;
             self.input_focused = response.has_focus();
 
@@ -812,8 +863,8 @@ impl ChatPanelView {
         user_bubble(ui, text, queued)
     }
 
-    /// The chat model picker (the GDK chat's OWN source: `ollama list` via
-    /// corpus-core, never opencode's catalog), in the composer's bottom rail.
+    /// The chat model picker (the GDK chat's OWN source: Ollama `/api/tags`
+    /// via corpus-core, never opencode's catalog), in the composer's bottom rail.
     ///
     /// It carries the backend status as a coloured dot in its own field: the
     /// phase is a property OF the chosen model's session, and the picker is
@@ -1167,6 +1218,29 @@ mod tests {
             .drain(..panel.messages.len() - MAX_VISIBLE_MESSAGES);
         assert_eq!(panel.messages.len(), MAX_VISIBLE_MESSAGES);
         assert_eq!(panel.messages.first().unwrap().text, "5");
+    }
+
+    #[test]
+    fn chat_backend_waits_for_the_selected_model_from_ollama() {
+        let mut panel = ChatPanelView::default();
+        panel.set_model("qwen3:8b");
+        assert!(!panel.can_start_backend());
+
+        panel.ollama_models = crate::state::ModelDiscovery::Ready(corpus_core::ModelList {
+            groups: vec![corpus_core::ModelProviderGroup {
+                id: "ollama".into(),
+                label: "Ollama (local)".into(),
+                models: vec![corpus_core::ModelOption {
+                    id: "qwen3:8b".into(),
+                    model: "qwen3:8b".into(),
+                    name: "qwen3:8b".into(),
+                }],
+            }],
+        });
+        assert!(panel.can_start_backend());
+
+        panel.set_model("not-installed:latest");
+        assert!(!panel.can_start_backend());
     }
 
     #[test]

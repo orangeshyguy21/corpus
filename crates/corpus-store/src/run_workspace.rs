@@ -3,6 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::error::{Error, Result};
 use crate::filesystem::atomic_write;
 use crate::projects::Project;
@@ -37,22 +39,44 @@ impl Store {
         self.var_dir().join("chat").join(slug)
     }
 
-    /// Materialize the directory boundary for one project's launches.
+    /// Materialize a launch workspace with no source trees exposed.
+    pub fn provision_run_dir(&self, slug: &str) -> Result<PathBuf> {
+        self.provision_run_dir_with_sources(slug, None)
+    }
+
+    /// Materialize the directory boundary for one project's exact source
+    /// pins. Views are immutable-by-identity and separate concurrent launches
+    /// whose pins differ, while the fetched cache remains host-only.
     ///
-    /// The workspace exposes only the selected project and the source cache;
+    /// The workspace exposes only the selected project and exact pinned trees;
     /// it deliberately lives beside the store so linking the project into the
     /// workspace cannot form a recursive directory cycle.
-    pub fn provision_run_dir(&self, slug: &str) -> Result<PathBuf> {
+    pub fn provision_run_dir_with_sources(
+        &self,
+        slug: &str,
+        source_pins_json: Option<&str>,
+    ) -> Result<PathBuf> {
         Project::load(self, slug)?;
+        let pins = parse_source_pins(source_pins_json)?;
         let var_dir = self.var_dir();
         ensure_real_dir(&var_dir)?;
         let run_base = var_dir.join("run");
         ensure_real_dir(&run_base)?;
-        let run_dir = run_base.join(slug);
+        let project_run = run_base.join(slug);
+        ensure_real_dir(&project_run)?;
+        // Agent rendering remains a project-stable staging operation. Each
+        // pin-specific view receives a snapshot below.
+        let views = project_run.join("views");
+        ensure_real_dir(&views)?;
+        let run_dir = views.join(source_view_key(&pins));
         ensure_real_dir(&run_dir)?;
         let opencode = run_dir.join(".opencode");
         ensure_real_dir(&opencode)?;
         ensure_real_dir(&opencode.join("agent"))?;
+        sync_rendered_agents(
+            &project_run.join(".opencode/agent"),
+            &opencode.join("agent"),
+        )?;
         let store_dir = run_dir.join("store");
         ensure_real_dir(&store_dir)?;
         let projects_dir = store_dir.join("projects");
@@ -61,11 +85,9 @@ impl Store {
 
         relink(&self.project_dir(slug), &projects_dir.join(slug))?;
 
-        // Source custody is corpus data. The cache may be empty on a fresh
-        // machine, but the link must always exist before a launch proceeds.
-        let sources = self.source_cache_dir();
-        fs::create_dir_all(&sources)?;
-        relink(&sources, &run_dir.join("sources"))?;
+        let sources = run_dir.join("sources");
+        ensure_real_dir(&sources)?;
+        provision_source_view(self, &sources, &pins)?;
 
         // Skills are optional because not every installation ships them.
         if let Some(resources) = crate::paths::resource_root_opt() {
@@ -78,6 +100,159 @@ impl Store {
         write_run_opencode_config(self, slug, &opencode)?;
         Ok(run_dir)
     }
+}
+
+fn parse_source_pins(raw: Option<&str>) -> Result<std::collections::BTreeMap<String, String>> {
+    let Some(raw) = raw else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let pins: std::collections::BTreeMap<String, String> = serde_json::from_str(raw)
+        .map_err(|error| Error::Store(format!("source pins are not a string map: {error}")))?;
+    for (source, sha) in &pins {
+        if source.is_empty()
+            || source.len() > 64
+            || !source
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        {
+            return Err(Error::Store(format!(
+                "invalid source id in launch pins: {source:?}"
+            )));
+        }
+        if sha.len() != 40
+            || !sha
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Error::Store(format!(
+                "invalid source sha for {source}: {sha:?}"
+            )));
+        }
+    }
+    Ok(pins)
+}
+
+fn source_view_key(pins: &std::collections::BTreeMap<String, String>) -> String {
+    let canonical = serde_json::to_vec(pins).expect("a string map always serializes");
+    let digest = Sha256::digest(canonical);
+    format!("sources-{:x}", digest)
+}
+
+fn provision_source_view(
+    store: &Store,
+    view: &Path,
+    pins: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    ensure_exact_names(view, pins.keys().map(String::as_str))?;
+    let cache = store.source_cache_dir();
+    fs::create_dir_all(&cache)?;
+    let cache = cache.canonicalize()?;
+    for (source, sha) in pins {
+        let source_view = view.join(source);
+        ensure_real_dir(&source_view)?;
+        ensure_exact_names(&source_view, std::iter::once(sha.as_str()))?;
+        let target = cache.join(source).join(sha);
+        let target = target.canonicalize().map_err(|error| {
+            Error::Store(format!(
+                "pinned source {source}@{sha} is unavailable: {error}"
+            ))
+        })?;
+        if !target.starts_with(&cache) {
+            return Err(Error::Store(format!(
+                "pinned source {source}@{sha} resolves outside the source cache"
+            )));
+        }
+        validate_regular_tree(&target, "pinned source")?;
+        relink(&target, &source_view.join(sha))?;
+    }
+    Ok(())
+}
+
+fn ensure_exact_names<'a>(dir: &Path, expected: impl Iterator<Item = &'a str>) -> Result<()> {
+    let expected: std::collections::BTreeSet<&str> = expected.collect();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(Error::Store(format!(
+                "run source view contains a non-UTF-8 entry: {}",
+                entry.path().display()
+            )));
+        };
+        if !expected.contains(name) {
+            return Err(Error::Store(format!(
+                "run source view {} contains unexpected entry {}",
+                dir.display(),
+                entry.path().display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_regular_tree(root: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Store(format!(
+            "{label} root is not a real directory: {}",
+            root.display()
+        )));
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+                return Err(Error::Store(format!(
+                    "{label} contains a symlink or special file: {}",
+                    path.display()
+                )));
+            }
+            if metadata.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sync_rendered_agents(source: &Path, destination: &Path) -> Result<()> {
+    for entry in fs::read_dir(destination)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("md") {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(Error::Store(format!(
+                    "run agent destination contains an unsupported entry: {}",
+                    path.display()
+                )));
+            }
+            fs::remove_file(path)?;
+        }
+    }
+    if !source.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(Error::Store(format!(
+                "rendered agent is not a regular file: {}",
+                path.display()
+            )));
+        }
+        let contents = fs::read(&path)?;
+        atomic_write(&destination.join(entry.file_name()), contents)?;
+    }
+    Ok(())
 }
 
 fn sibling_dir(root: &Path, child: &str) -> PathBuf {
@@ -282,8 +457,8 @@ mod tests {
         store.create_project("a", "A", "cdk-regtest").unwrap();
         store.create_project("b", "B", "cdk-regtest").unwrap();
 
-        let run = store.project_run_dir("a");
-        fs::create_dir_all(&run).unwrap();
+        let run = store.provision_run_dir("a").unwrap();
+        fs::remove_dir_all(run.join("store")).unwrap();
         let outside = store.root().join("outside-workspace");
         fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, run.join("store")).unwrap();
@@ -306,5 +481,57 @@ mod tests {
             "{error}"
         );
         assert!(!projects.join("a").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_source_view_exposes_only_exact_pins_and_refuses_nested_symlinks() {
+        let store = tmp_store("source-view");
+        store.create_project("a", "A", "cdk-regtest").unwrap();
+        let cache = store.source_cache_dir();
+        let selected_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let other_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        fs::create_dir_all(cache.join("selected").join(selected_sha)).unwrap();
+        fs::write(
+            cache.join("selected").join(selected_sha).join("lib.rs"),
+            "selected\n",
+        )
+        .unwrap();
+        fs::create_dir_all(cache.join("other").join(other_sha)).unwrap();
+        fs::write(
+            cache.join("other").join(other_sha).join("secret.rs"),
+            "other\n",
+        )
+        .unwrap();
+
+        let pins = format!(r#"{{"selected":"{selected_sha}"}}"#);
+        let run = store
+            .provision_run_dir_with_sources("a", Some(&pins))
+            .unwrap();
+        let sources = run.join("sources");
+        assert!(sources.symlink_metadata().unwrap().is_dir());
+        assert!(!sources.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(sources.join("selected").join(selected_sha)).unwrap(),
+            cache
+                .join("selected")
+                .join(selected_sha)
+                .canonicalize()
+                .unwrap()
+        );
+        assert!(!sources.join("other").exists());
+
+        let outside = store.root().join("outside-source");
+        fs::write(&outside, "secret\n").unwrap();
+        let linked_sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let linked = cache.join("linked").join(linked_sha);
+        fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&outside, linked.join("leak.rs")).unwrap();
+        let linked_pins = format!(r#"{{"linked":"{linked_sha}"}}"#);
+        let error = store
+            .provision_run_dir_with_sources("a", Some(&linked_pins))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink or special file"), "{error}");
     }
 }
