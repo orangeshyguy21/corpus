@@ -1,7 +1,7 @@
 //! The model registry: open-weight models as tagged, benchmarked
 //! equipment. See docs/architecture.md ("The model lab").
 //!
-//! Also home of `model_list()` (app-flow chunk 8): the AVAILABLE
+//! Also home of `model_list()`: the available
 //! models from `opencode models --verbose`, parsed, provider-grouped,
 //! and TTL-cached — the app's model pickers render this.
 
@@ -54,7 +54,7 @@ impl ModelRegistry {
             return Ok(Self { models: Vec::new() });
         }
         let raw = fs::read_to_string(path)?;
-        let registry: Self = serde_yaml::from_str(&raw)?;
+        let registry: Self = corpus_store::yaml::from_str(&raw)?;
         Ok(registry)
     }
 
@@ -77,7 +77,7 @@ impl ModelRegistry {
     }
 }
 
-// --- model_list(): opencode's available models, grouped (chunk 8) ---
+// --- model_list(): OpenCode's available models, grouped ---
 
 /// How long the process-global model-list cache is trusted. The
 /// shell-out costs ~0.6s and the app renders pickers every frame;
@@ -115,6 +115,9 @@ pub struct ModelList {
     pub groups: Vec<ModelProviderGroup>,
 }
 
+type CachedModelList = Option<(Instant, Result<ModelList, String>)>;
+type ModelListCache = OnceLock<Mutex<CachedModelList>>;
+
 impl ModelList {
     /// A model's display name by full id (the picker's button label).
     pub fn display_name(&self, id: &str) -> Option<&str> {
@@ -133,7 +136,7 @@ impl ModelList {
 /// opencode is missing, errors, or returns nothing — callers degrade
 /// to free text.
 pub fn model_list(refresh: bool) -> Result<ModelList, Error> {
-    static CACHE: OnceLock<Mutex<Option<(Instant, Result<ModelList, String>)>>> = OnceLock::new();
+    static CACHE: ModelListCache = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     if !refresh {
         let hit = cache
@@ -299,7 +302,7 @@ pub fn ollama_models() -> Result<ModelList, Error> {
 /// missing local server cannot turn a picker paint into a subprocess loop.
 /// Explicit refresh bypasses the cache.
 pub fn ollama_models_refresh(refresh: bool) -> Result<ModelList, Error> {
-    static CACHE: OnceLock<Mutex<Option<(Instant, Result<ModelList, String>)>>> = OnceLock::new();
+    static CACHE: ModelListCache = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     if !refresh {
         let hit = cache
@@ -372,6 +375,53 @@ fn parse_ollama_list(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registry_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "corpus-model-registry-{tag}-{}-{}.yaml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    #[test]
+    fn registry_yaml_accepts_unknown_fields_and_typed_scalars() {
+        let path = registry_path("compatibility");
+        std::fs::write(
+            &path,
+            concat!(
+                "models:\n",
+                "  - tag: qwen3.8:27b\n",
+                "    name: Qwen 3.8\n",
+                "    provider: mlx\n",
+                "    params_b: 27.0\n",
+                "    context_k: 262\n",
+                "    capabilities: [coding, tool-use]\n",
+                "    notes: 'yes: keep this string'\n",
+                "    future_registry_field: ignored\n",
+            ),
+        )
+        .unwrap();
+
+        let registry = ModelRegistry::load(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(registry.models.len(), 1);
+        assert_eq!(registry.models[0].provider, "mlx");
+        assert_eq!(registry.models[0].params_b, Some(27.0));
+        assert_eq!(registry.models[0].notes, "yes: keep this string");
+    }
+
+    #[test]
+    fn malformed_registry_yaml_reports_its_source_location() {
+        let path = registry_path("malformed");
+        std::fs::write(&path, "models: [\n").unwrap();
+
+        let error = ModelRegistry::load(&path).unwrap_err();
+        let _ = std::fs::remove_file(path);
+
+        assert!(error.to_string().contains("line 2 column 1"), "{error}");
+    }
 
     /// A trimmed-down but shape-exact sample of `opencode models
     /// --verbose`: bare `provider/model` record lines, JSON blocks with

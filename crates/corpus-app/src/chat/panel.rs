@@ -1,6 +1,5 @@
-//! The native egui management-chat panel (dev/decisions.md chunk 3, per the
-//! app-parity spec): streaming markdown messages, collapsible tool-call cards,
-//! and the confirm-token ritual as an INLINE Approve/Reject affordance.
+//! Native Egui management-chat panel: streaming Markdown messages,
+//! collapsible tool-call cards, and inline Approve/Reject controls.
 #![allow(dead_code)]
 //!
 //! GUI-agnostic: it consumes only [`crate::chat`]'s public [`ChatEvent`]s and
@@ -216,8 +215,8 @@ impl ChatPanelView {
         &self.model
     }
 
-    /// The team role this session runs as (dev/decisions.md chunk 3). Default
-    /// `Orchestrator`; the operator can switch to `Operator` (full catalog,
+    /// The team role this session runs as. The operator can switch to
+    /// `Operator` (full catalog,
     /// destructive gated by Approve/Reject) or a specialist.
     pub fn set_role(&mut self, role: crate::chat::team::TeamRole) {
         self.role = role;

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{Error, PluginManifest, PluginManifestVersion, Result};
 
@@ -63,10 +63,7 @@ pub fn install_plugin_bundle(bundle: &Path) -> Result<InstallReceipt> {
         }
     } else {
         let nonce = INSTALL_NONCE.fetch_add(1, Ordering::Relaxed);
-        let staging = versions.join(format!(
-            ".{version}.staging-{}-{nonce}",
-            std::process::id()
-        ));
+        let staging = versions.join(format!(".{version}.staging-{}-{nonce}", std::process::id()));
         fs::create_dir(&staging)?;
         if let Err(error) = copy_bundle(bundle, bundle, &staging) {
             let _ = fs::remove_dir_all(&staging);
@@ -96,8 +93,12 @@ pub fn installed_record(id: &str, version: &str) -> Result<InstallRecord> {
         .join("metadata")
         .join(format!("{version}.json"));
     let raw = fs::read_to_string(&path)?;
-    serde_json::from_str(&raw)
-        .map_err(|error| Error::Store(format!("invalid install record {}: {error}", path.display())))
+    serde_json::from_str(&raw).map_err(|error| {
+        Error::Store(format!(
+            "invalid install record {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 /// Verify the selected bundle against its immutable installation receipt.
@@ -105,16 +106,12 @@ pub fn installed_record(id: &str, version: &str) -> Result<InstallRecord> {
 /// directly. Call this immediately before executing plugin code.
 pub fn verify_plugin_installation(plugin: &crate::PluginDir) -> Result<String> {
     if plugin.origin == crate::PluginOrigin::Installed {
-        let version = plugin
-            .manifest
-            .version
-            .as_deref()
-            .ok_or_else(|| {
-                Error::Store(format!(
-                    "installed plugin {} has no version",
-                    plugin.manifest.name
-                ))
-            })?;
+        let version = plugin.manifest.version.as_deref().ok_or_else(|| {
+            Error::Store(format!(
+                "installed plugin {} has no version",
+                plugin.manifest.name
+            ))
+        })?;
         let expected = installed_record(&plugin.manifest.name, version)?.digest;
         let verified =
             VERIFIED_INSTALLS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
@@ -164,7 +161,11 @@ pub fn select_plugin_version(id: &str, version: &str) -> Result<()> {
 
 pub fn selected_version(id: &str) -> Result<Option<String>> {
     validate_component("plugin id", id)?;
-    match fs::read_to_string(crate::paths::plugin_install_root().join(id).join("selected")) {
+    match fs::read_to_string(
+        crate::paths::plugin_install_root()
+            .join(id)
+            .join("selected"),
+    ) {
         Ok(value) => Ok(Some(value.trim().to_string())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
@@ -319,11 +320,16 @@ fn validate_exec(bundle: &Path, exec: &str) -> Result<()> {
             .components()
             .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
-        return Err(Error::Store(format!("plugin exec must stay inside its bundle: {exec:?}")));
+        return Err(Error::Store(format!(
+            "plugin exec must stay inside its bundle: {exec:?}"
+        )));
     }
     let executable = bundle.join(relative);
     if !executable.is_file() {
-        return Err(Error::Store(format!("plugin exec is not a file: {}", executable.display())));
+        return Err(Error::Store(format!(
+            "plugin exec is not a file: {}",
+            executable.display()
+        )));
     }
     #[cfg(unix)]
     {
@@ -442,7 +448,10 @@ fn collect_files(root: &Path, current: &Path, files: &mut Vec<PathBuf>) -> Resul
         }
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
-            return Err(Error::Store(format!("unsupported bundle entry: {}", path.display())));
+            return Err(Error::Store(format!(
+                "unsupported bundle entry: {}",
+                path.display()
+            )));
         }
         if metadata.is_dir() {
             collect_files(root, &path, files)?;
@@ -476,8 +485,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir.join("bin/plugin"), fs::Permissions::from_mode(0o755))
-                .unwrap();
+            fs::set_permissions(dir.join("bin/plugin"), fs::Permissions::from_mode(0o755)).unwrap();
         }
         dir
     }
@@ -495,7 +503,10 @@ mod tests {
         fs::write(v1.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let first = install_plugin_bundle(&v1).unwrap();
         assert_eq!(first.previous, None);
-        assert_eq!(selected_version("fixture-regtest").unwrap().as_deref(), Some("1.0.0"));
+        assert_eq!(
+            selected_version("fixture-regtest").unwrap().as_deref(),
+            Some("1.0.0")
+        );
         assert_eq!(
             installed_record("fixture-regtest", "1.0.0").unwrap().digest,
             first.digest
@@ -517,7 +528,10 @@ mod tests {
             Some("2.0.0")
         );
         select_plugin_version("fixture-regtest", "1.0.0").unwrap();
-        assert_eq!(selected_version("fixture-regtest").unwrap().as_deref(), Some("1.0.0"));
+        assert_eq!(
+            selected_version("fixture-regtest").unwrap().as_deref(),
+            Some("1.0.0")
+        );
 
         // Reinstalling identical bytes is idempotent; changing the bytes of
         // an already-installed version cannot replace its evidence identity.
@@ -565,8 +579,11 @@ mod tests {
         let _override = EnvVarGuard::set("CORPUS_PLUGINS_DIR", "");
 
         let bad_exec = bundle(&root, "1.0.0", "#!/bin/sh\n");
-        fs::set_permissions(bad_exec.join("bin/plugin"), fs::Permissions::from_mode(0o644))
-            .unwrap();
+        fs::set_permissions(
+            bad_exec.join("bin/plugin"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
         assert!(install_plugin_bundle(&bad_exec)
             .unwrap_err()
             .to_string()

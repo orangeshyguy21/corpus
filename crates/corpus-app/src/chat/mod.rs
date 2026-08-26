@@ -1,5 +1,4 @@
-//! The management-chat module (dev/decisions.md chunk 3; backend is
-//! dev/decisions.md chunk 1).
+//! Corpus-owned management-chat boundary.
 #![allow(dead_code)]
 //!
 //! This is the ONE place in corpus-app that knows the GDK runtime. The
@@ -10,8 +9,7 @@
 //! is ever swapped again, it is a transport refactor behind this same seam,
 //! not a redesign.
 //!
-//! The runtime is the **embedded goose Agent** (operator decision 2026-08-14;
-//! dev/decisions.md): `crates/corpus-app/src/chat/embedded.rs` compiles
+//! The runtime is an embedded Goose agent: `chat/embedded.rs` compiles
 //! goose's `Agent` in-process and drives it on a background thread, spinning up
 //! `corpus-admin-mcp` as its (our) tool extension. `scripts/goose-chat` is
 //! NOT used by the app — it stays the headless debug fallback.
@@ -184,15 +182,14 @@ impl ChatHandle {
     /// Start a backend for `project`, scoped via `GOOSE_PATH_ROOT`, as the
     /// unfiltered **Operator** (all admin tools, still approval-gated). `model`
     /// must be Some — there is never an ambient default. The transcript is
-    /// written to `<project scope>/var/chat/<session>.md` (chunk-1 redirect).
-    /// For the chunk-2 team shape, use [`ChatHandle::start_scoped`].
+    /// written to `<project scope>/var/chat/<session>.md`. For an explicit
+    /// team role, use [`ChatHandle::start_scoped`].
     pub fn start(project: &str, model: &str) -> ChatHandle {
         Self::start_scoped(project, model, team::TeamRole::Operator)
     }
 
-    /// Start a backend as a specific team role (dev/decisions.md chunk 2):
-    /// a specialist registers only its scoped admin domain (by construction),
-    /// an `Orchestrator` registers no admin tools.
+    /// Start a backend as a specific team role. A specialist registers only
+    /// its scoped admin domain; an `Orchestrator` registers no admin tools.
     pub fn start_scoped(project: &str, model: &str, role: team::TeamRole) -> ChatHandle {
         Self::start_scoped_inner(project, model, role, None)
     }
@@ -200,7 +197,7 @@ impl ChatHandle {
     /// Production entry point: every backend event is placed in the UI
     /// inbox before egui is woken. Without this bridge streamed replies can
     /// sit invisible until unrelated pointer input or an ambient repaint.
-    pub(crate) fn start_scoped_with_wake(
+    pub fn start_scoped_with_wake(
         project: &str,
         model: &str,
         role: team::TeamRole,
@@ -376,10 +373,7 @@ impl Chat for ChatHandle {
                 }
                 _ => {}
             }
-            // Make the transcript durable as each turn completes: write
-            // `<project scope>/var/chat/<session>.md` (chunk-3 transcript
-            // story — resume-if-cheap is a later decision; the file is the
-            // durable memory).
+            // Make the transcript durable as each turn completes.
             if matches!(&ev, ChatEvent::TurnEnd { .. } | ChatEvent::Error(_)) {
                 flush_transcript(
                     &inner.project,
@@ -394,9 +388,9 @@ impl Chat for ChatHandle {
 }
 
 /// Write the accumulated in-memory transcript to the project scope
-/// `<store parent>/var/chat/<project>/<session>.md` (dev/decisions.md
-/// chunk 3) — outside the project subtree, so a launched agent cannot read
-/// the operator's cross-project notes. Non-fatal: the durable memory
+/// `<store parent>/var/chat/<project>/<session>.md`, outside the project
+/// subtree so a launched agent cannot read the operator's management notes.
+/// Non-fatal: the durable memory
 /// degrades to in-memory only if the path is unwritable.
 fn flush_transcript(project: &str, session_id: Option<&str>, transcript: &[String]) {
     let Some(session_id) = session_id else { return };
@@ -421,8 +415,8 @@ pub fn truncate(s: &str, max: usize) -> String {
 /// The corpus-admin destructive tool set. The embedded backend gates/// execution in-process: a mutating tool call is surfaced to the operator as
 /// an inline [`ChatEvent::PermissionRequest`] and only runs when the operator
 /// Approves (goose's `tool_confirmation_router` releases it before dispatch).
-/// See dev/decisions.md decision 5. This list keeps the gate explicit for
-/// tests/UI emphasis; enforcement rides goose's `GooseMode::Approve`.
+/// This list keeps the gate explicit for tests and UI emphasis; enforcement
+/// rides Goose's confirmation router.
 pub fn is_destructive(tool: &str) -> bool {
     matches!(
         tool,
@@ -435,8 +429,8 @@ pub fn is_destructive(tool: &str) -> bool {
 /// (or approving an unknown/expired id) is a no-op. The model never holds an
 /// unapproved grant — the operator sees the dry-run summary first.
 ///
-/// (dev/decisions.md decision 5) The embedded backend enforces the gate
-/// IN-PROCESS via goose's `tool_confirmation_router` before dispatch; this
+/// The embedded backend enforces the gate in-process via Goose's
+/// `tool_confirmation_router` before dispatch; this
 /// struct keeps the corpus-mcp server-side token-gate contract as the
 /// defense-in-depth backstop and a unit-testable spec of the semantics.
 #[derive(Debug, Default)]

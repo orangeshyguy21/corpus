@@ -44,8 +44,5 @@ fn dedicated_binary_advertises_the_admin_catalog() {
         responses[0]["result"]["serverInfo"]["name"],
         "corpus-admin-mcp"
     );
-    assert_eq!(
-        responses[1]["result"]["tools"],
-        corpus_admin::catalog()
-    );
+    assert_eq!(responses[1]["result"]["tools"], corpus_admin::catalog());
 }

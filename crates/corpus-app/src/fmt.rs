@@ -1,5 +1,8 @@
 //! Small shared display helpers (no corpus-core business logic here).
 
+// Duration tests sit beside the formatter; USD formatting follows them.
+#![allow(clippy::items_after_test_module)]
+
 /// Human-readable byte size (`1.4mb`), matching the mock's casing.
 /// Used by the sidebar's corpus summary and the project view's Corpus
 /// panel.

@@ -731,6 +731,7 @@ impl AgentsView {
 
     /// Subagents: add and remove, each editable with the same controls via
     /// the entry picker above.
+    #[allow(clippy::too_many_arguments)]
     fn subagents_section(
         &mut self,
         ui: &mut Ui,
@@ -829,15 +830,15 @@ impl AgentsView {
                     });
                 if submit {
                     let form = self.new_subagent.take().unwrap_or_default();
-                    match state.add_subagent(
-                        project,
-                        slug,
-                        form.name.trim(),
-                        form.description.trim(),
-                        form.prompt.trim(),
-                        None,
-                        None,
-                    ) {
+                    match state.add_subagent(corpus_core::AddSubagentRequest {
+                        project: project.to_owned(),
+                        agent: slug.to_owned(),
+                        name: form.name.trim().to_owned(),
+                        description: form.description.trim().to_owned(),
+                        prompt: form.prompt.trim().to_owned(),
+                        model: None,
+                        role: None,
+                    }) {
                         Ok(()) => {
                             toast(
                                 toasts,

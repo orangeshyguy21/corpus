@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::filesystem::atomic_write;
 use crate::{Error, Result, Store};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -85,9 +86,7 @@ impl Store {
     pub fn save_environment_session(&self, record: &EnvironmentSessionRecord) -> Result<()> {
         let path = self.environment_session_path(&record.plugin_id, &record.id)?;
         std::fs::create_dir_all(path.parent().expect("session path has parent"))?;
-        let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
-        std::fs::write(&temporary, serde_json::to_vec_pretty(record)?)?;
-        std::fs::rename(temporary, path)?;
+        atomic_write(&path, serde_json::to_vec_pretty(record)?)?;
         Ok(())
     }
 
@@ -190,10 +189,8 @@ mod tests {
 
     #[test]
     fn session_record_round_trips_outside_the_project_tree() {
-        let root = std::env::temp_dir().join(format!(
-            "corpus-environment-record-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("corpus-environment-record-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = Store::new(root.join("store"));
         let id = EnvironmentSessionId {
@@ -217,7 +214,9 @@ mod tests {
         };
         store.save_environment_session(&record).unwrap();
         assert_eq!(
-            store.load_environment_session("nutshell-regtest", &id).unwrap(),
+            store
+                .load_environment_session("nutshell-regtest", &id)
+                .unwrap(),
             record
         );
         let path = store

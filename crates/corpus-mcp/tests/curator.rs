@@ -33,7 +33,9 @@ fn rig(tag: &str, role: AgentRole) -> Rig {
     // this process changes carries the name of the agent that changed it.
     let store = Store::new(world.join("store")).with_actor("curator:keeper");
     for slug in ["alpha", "beta"] {
-        store.create_project(slug, slug, "echo-plugin").expect("project");
+        store
+            .create_project(slug, slug, "echo-plugin")
+            .expect("project");
     }
     store
         .create_agent_with_role("alpha", "keeper", role)
@@ -47,7 +49,11 @@ fn rig(tag: &str, role: AgentRole) -> Rig {
         Scope::new("alpha"),
         role,
     );
-    Rig { ctx, store, root: world }
+    Rig {
+        ctx,
+        store,
+        root: world,
+    }
 }
 
 impl Drop for Rig {
@@ -155,7 +161,10 @@ fn super_merges_the_two_scoped_catalogs() {
         assert!(super_tools.contains(&sandbox.trim_start_matches("corpus_").to_string()));
     }
     for admin in corpus_core::SUPER_ADMIN_TOOLS {
-        assert!(super_tools.contains(&admin.to_string()), "super lacks {admin}");
+        assert!(
+            super_tools.contains(&admin.to_string()),
+            "super lacks {admin}"
+        );
     }
     for operator_only in [
         "project_new",
@@ -164,7 +173,10 @@ fn super_merges_the_two_scoped_catalogs() {
         "project_delete",
         "agent_copy",
     ] {
-        assert!(!super_tools.contains(&operator_only.to_string()), "{operator_only}");
+        assert!(
+            !super_tools.contains(&operator_only.to_string()),
+            "{operator_only}"
+        );
     }
 }
 
@@ -213,12 +225,8 @@ fn scoped_finding_list_uses_the_proven_project_and_is_read_only() {
     )
     .unwrap();
 
-    let out = tools::dispatch(
-        &mut rig.ctx,
-        "finding_list",
-        &json!({"project": "beta"}),
-    )
-    .expect("scoped finding list");
+    let out = tools::dispatch(&mut rig.ctx, "finding_list", &json!({"project": "beta"}))
+        .expect("scoped finding list");
     let value: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(value["project"], "alpha");
     assert_eq!(value["count"], 1);
@@ -376,11 +384,16 @@ fn a_curator_writes_corpus_entries_by_relative_path() {
         .join("techniques/plan.md");
     assert!(written.exists(), "the write landed in the scoped corpus");
     assert!(
-        !rig.store.project_corpus_dir("beta").join("techniques/plan.md").exists(),
+        !rig.store
+            .project_corpus_dir("beta")
+            .join("techniques/plan.md")
+            .exists(),
         "nothing may be written into another project's corpus"
     );
     assert!(
-        std::fs::read_to_string(&written).unwrap().contains("team plan"),
+        std::fs::read_to_string(&written)
+            .unwrap()
+            .contains("team plan"),
         "the content is the body we passed"
     );
 
@@ -440,7 +453,11 @@ fn a_curator_requests_a_launch_by_flagging_the_record() {
 
     // Before launch: no request pending.
     assert!(
-        rig.store.load_mission("alpha", "m1").unwrap().launch_requested.is_none(),
+        rig.store
+            .load_mission("alpha", "m1")
+            .unwrap()
+            .launch_requested
+            .is_none(),
         "a fresh mission carries no launch request"
     );
 
@@ -476,7 +493,10 @@ fn a_curator_requests_a_launch_by_flagging_the_record() {
     tools::dispatch(&mut rig.ctx, "mission_launch", &json!({ "mission": "m1" }))
         .expect("a second request is fine");
     assert_eq!(
-        rig.store.load_mission("alpha", "m1").unwrap().launch_requested,
+        rig.store
+            .load_mission("alpha", "m1")
+            .unwrap()
+            .launch_requested,
         first,
         "a pending request is left as it is"
     );
@@ -506,12 +526,7 @@ fn simultaneous_curator_missions_keep_distinct_return_addresses() {
         )
         .unwrap();
         rig.ctx.run_origin = Ok(Some(origin.clone()));
-        tools::dispatch(
-            &mut rig.ctx,
-            "mission_launch",
-            &json!({"mission": child}),
-        )
-        .unwrap();
+        tools::dispatch(&mut rig.ctx, "mission_launch", &json!({"mission": child})).unwrap();
         let stored = rig.store.load_mission("alpha", &child).unwrap();
         assert_eq!(
             stored.launch_requested.unwrap().requested_by,
@@ -529,23 +544,19 @@ fn a_partial_launcher_identity_refuses_dispatch_instead_of_losing_the_return_pat
         &json!({"slug": "child", "agent": "keeper", "brief": "work"}),
     )
     .unwrap();
-    rig.ctx.run_origin = Err(
-        "CORPUS_MISSION and CORPUS_RUN_ID must be set together".into(),
-    );
-    let error = tools::dispatch(
-        &mut rig.ctx,
-        "mission_launch",
-        &json!({"mission": "child"}),
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("run origin is unresolved"), "{error}");
+    rig.ctx.run_origin = Err("CORPUS_MISSION and CORPUS_RUN_ID must be set together".into());
+    let error =
+        tools::dispatch(&mut rig.ctx, "mission_launch", &json!({"mission": "child"})).unwrap_err();
     assert!(
-        rig.store
-            .load_mission("alpha", "child")
-            .unwrap()
-            .launch_requested
-            .is_none()
+        error.to_string().contains("run origin is unresolved"),
+        "{error}"
     );
+    assert!(rig
+        .store
+        .load_mission("alpha", "child")
+        .unwrap()
+        .launch_requested
+        .is_none());
 }
 
 /// `mission_status` reports the live run state. A mission with no session
@@ -647,7 +658,9 @@ fn every_mutation_is_recorded_and_reads_are_not() {
         tools::dispatch(&mut rig.ctx, tool, &json!({})).expect("reads work");
     }
     assert!(
-        corpus_core::audit::tail(&rig.store, "alpha", 100).unwrap().is_empty(),
+        corpus_core::audit::tail(&rig.store, "alpha", 100)
+            .unwrap()
+            .is_empty(),
         "looking is not an act"
     );
 
@@ -697,7 +710,12 @@ fn every_mutation_is_recorded_and_reads_are_not() {
     // so an operator can see who made it without reading the log.
     let built = rig.store.load_agent("alpha", "built").unwrap();
     assert!(
-        built.meta.modified_by.as_deref().unwrap_or("").starts_with("curator:"),
+        built
+            .meta
+            .modified_by
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("curator:"),
         "{:?}",
         built.meta
     );
@@ -727,8 +745,12 @@ fn curator_delete_preserves_a_live_mission_as_a_lifecycle_request() {
     mission.session = Some("corpus-live-session".into());
     rig.store.update_mission("alpha", "live", &mission).unwrap();
 
-    let dry = tools::dispatch(&mut rig.ctx, "mission_delete", &json!({ "mission": "live" }))
-        .expect("mission dry run");
+    let dry = tools::dispatch(
+        &mut rig.ctx,
+        "mission_delete",
+        &json!({ "mission": "live" }),
+    )
+    .expect("mission dry run");
     let requested = tools::dispatch(
         &mut rig.ctx,
         "mission_delete",
@@ -788,7 +810,10 @@ fn a_curator_can_confirm_scoped_deletions() {
 
     let dry = tools::dispatch(&mut rig.ctx, "agent_delete", &json!({ "agent": "victim" }))
         .expect("agent dry run");
-    assert!(dry.contains("1 assigned mission(s): owned-by-victim"), "{dry}");
+    assert!(
+        dry.contains("1 assigned mission(s): owned-by-victim"),
+        "{dry}"
+    );
     let deleted = tools::dispatch(
         &mut rig.ctx,
         "agent_delete",
@@ -841,13 +866,19 @@ fn super_can_manage_and_wipe_only_its_scoped_project() {
     )
     .expect("Super may author any project role");
     assert_eq!(
-        rig.store.load_agent("alpha", "another-super").unwrap().meta.role(),
+        rig.store
+            .load_agent("alpha", "another-super")
+            .unwrap()
+            .meta
+            .role(),
         AgentRole::Super
     );
 
     let finding = rig.store.project_corpus_dir("alpha").join("findings/f1.md");
     std::fs::write(&finding, "evidence\n").unwrap();
-    let before = Project::load(&rig.store, "alpha").unwrap().corpus_generation;
+    let before = Project::load(&rig.store, "alpha")
+        .unwrap()
+        .corpus_generation;
     let dry = tools::dispatch(&mut rig.ctx, "corpus_wipe", &json!({})).expect("wipe dry run");
     tools::dispatch(
         &mut rig.ctx,
@@ -857,7 +888,9 @@ fn super_can_manage_and_wipe_only_its_scoped_project() {
     .expect("confirmed scoped wipe");
     assert!(!finding.exists());
     assert_eq!(
-        Project::load(&rig.store, "alpha").unwrap().corpus_generation,
+        Project::load(&rig.store, "alpha")
+            .unwrap()
+            .corpus_generation,
         before + 1
     );
 
@@ -901,14 +934,20 @@ fn a_curator_cannot_grant_or_repurpose_super() {
             }),
         ),
         ("agent_clone", json!({ "from": "root", "to": "root-copy" })),
-        ("agent_set_role", json!({ "agent": "keeper", "role": "super" })),
+        (
+            "agent_set_role",
+            json!({ "agent": "keeper", "role": "super" }),
+        ),
         (
             "agent_subagent_add",
             json!({
                 "agent": "keeper", "name": "wide", "description": "d", "prompt": "p", "role": "super"
             }),
         ),
-        ("agent_set_role", json!({ "agent": "root", "role": "researcher" })),
+        (
+            "agent_set_role",
+            json!({ "agent": "root", "role": "researcher" }),
+        ),
     ];
     for (tool, args) in attempts {
         let error = tools::dispatch(&mut rig.ctx, tool, &args)
@@ -932,7 +971,11 @@ fn a_curator_cannot_grant_or_repurpose_super() {
     )
     .expect("explicitly narrowed copy");
     assert_eq!(
-        rig.store.load_agent("alpha", "narrow-copy").unwrap().meta.role(),
+        rig.store
+            .load_agent("alpha", "narrow-copy")
+            .unwrap()
+            .meta
+            .role(),
         AgentRole::Researcher
     );
 }

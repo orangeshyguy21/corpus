@@ -68,8 +68,7 @@ pub fn store_root() -> PathBuf {
 /// Installed plugins and fetched sources deliberately are not markers: a
 /// clean corpus build must resolve its optional assets before either exists.
 fn is_resource_root(dir: &Path) -> bool {
-    dir.join("benchmarks/models.yaml").is_file()
-        || dir.join(".opencode/skills").is_dir()
+    dir.join("benchmarks/models.yaml").is_file() || dir.join(".opencode/skills").is_dir()
 }
 
 static RESOURCE_ROOT: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();

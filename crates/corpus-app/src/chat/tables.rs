@@ -269,10 +269,10 @@ pub fn show_table(ui: &mut egui::Ui, table: &Table) {
 
     // Paint cells.
     let mut y = rect.min.y;
-    paint_row(&p, rect.min.x, y, &widths, &header_galleys, header_h);
+    paint_row(p, rect.min.x, y, &widths, &header_galleys, header_h);
     y += header_h;
     for (galleys, rh) in &row_galleys {
-        paint_row(&p, rect.min.x, y, &widths, galleys, *rh);
+        paint_row(p, rect.min.x, y, &widths, galleys, *rh);
         y += rh;
     }
 }

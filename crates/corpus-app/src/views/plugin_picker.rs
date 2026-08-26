@@ -1,4 +1,4 @@
-//! The shared plugin picker (app-flow chunks 1+3, app-parity-spec §5): a
+//! The shared plugin picker: a
 //! hand-rolled flat dropdown over the discovered environment plugins with a
 //! probe badge per entry — health-green when ready, signal-red when a probe
 //! failed, and muted when discovered but not probed (painted with the painter,
@@ -60,7 +60,7 @@ pub fn plugin_picker(
     );
     // Probe badge + plugin name (monospace 14px) + caret.
     paint_badge(
-        &painter,
+        painter,
         egui::pos2(rect.left() + 16.0, rect.center().y),
         current,
         plugins,
@@ -119,7 +119,7 @@ fn row(ui: &mut Ui, status: &PluginStatus, current: &mut String) {
         if status.probed && !status.ready && !status.notes.is_empty() {
             resp.on_hover_text(&status.notes);
             let short: String = status.notes.chars().take(48).collect();
-            ui.weak(format!("{short}"));
+            ui.weak(short.to_string());
         }
     });
 }

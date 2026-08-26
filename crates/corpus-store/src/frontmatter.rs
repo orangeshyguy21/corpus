@@ -4,9 +4,8 @@
 //! helpers split and mutate that block WITHOUT reformatting the page body —
 //! the store's "relocation, not reformat" rule is enforced here.
 
-use serde_yaml::Mapping;
-
 use crate::error::Error;
+use crate::yaml::{self, Mapping, Value};
 
 /// Split a wiki page into its frontmatter mapping and body.
 ///
@@ -22,13 +21,13 @@ pub fn split(text: &str) -> Result<(Option<Mapping>, &str), Error> {
     };
     let fm_text = &after_open[..rest];
     let body = &after_open[rest + "\n---\n".len()..];
-    let mapping: Mapping = serde_yaml::from_str(fm_text)?;
+    let mapping: Mapping = yaml::from_str(fm_text)?;
     Ok((Some(mapping), body))
 }
 
 /// Read a value from a frontmatter mapping.
-pub fn get<'a>(fm: &'a Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
-    fm.get(serde_yaml::Value::String(key.to_string()))
+pub fn get<'a>(fm: &'a Mapping, key: &str) -> Option<&'a Value> {
+    fm.get(Value::String(key.to_string()))
 }
 
 /// Get a string value from a frontmatter mapping.
@@ -56,12 +55,12 @@ pub fn insert_into_frontmatter(text: &str, additions: &[(&str, &str)]) -> Result
             // Existing fence: splice additions right after the opening fence.
             Some(pos) => {
                 let fm_text = &after_open[..pos];
-                let existing: Mapping = serde_yaml::from_str(fm_text)?;
+                let existing: Mapping = yaml::from_str(fm_text)?;
                 let close_start = pos + "\n---\n".len();
                 let mut out = String::with_capacity(text.len() + 64);
                 out.push_str("---\n");
                 for (key, value) in additions {
-                    if existing.contains_key(serde_yaml::Value::String(key.to_string())) {
+                    if existing.contains_key(Value::String(key.to_string())) {
                         continue; // never duplicate a declared key
                     }
                     out.push_str(key);

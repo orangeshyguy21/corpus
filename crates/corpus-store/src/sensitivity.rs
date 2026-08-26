@@ -55,7 +55,7 @@ impl Sensitivity {
     /// An invalid `sensitivity:` value fails loud rather than silently
     /// downgrading an embargoed entry to internal.
     pub fn from_frontmatter(
-        fm: &serde_yaml::Mapping,
+        fm: &crate::yaml::Mapping,
         category: &str,
     ) -> crate::error::Result<Self> {
         match crate::frontmatter::get_str(fm, "sensitivity") {

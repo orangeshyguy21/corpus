@@ -35,20 +35,20 @@ fn render_role(store: &Store, project: &str, role: AgentRole) -> String {
     fs::read_to_string(store.opencode_agent_dir(project).join(format!("{slug}.md"))).unwrap()
 }
 
-fn frontmatter(agent_raw: &str) -> serde_yaml::Mapping {
+fn frontmatter(agent_raw: &str) -> corpus_store::yaml::Mapping {
     let (fm, _body) = corpus_core::frontmatter::split(agent_raw).expect("parse frontmatter");
     fm.expect("agent file has frontmatter")
 }
 
-fn perm(agent_raw: &str) -> serde_yaml::Mapping {
+fn perm(agent_raw: &str) -> corpus_store::yaml::Mapping {
     frontmatter(agent_raw)["permission"]
         .as_mapping()
         .cloned()
         .expect("permission is a mapping")
 }
 
-fn action(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    map.get(serde_yaml::Value::String(key.into()))
+fn action(map: &corpus_store::yaml::Mapping, key: &str) -> Option<String> {
+    map.get(corpus_store::yaml::Value::String(key.into()))
         .and_then(|v| v.as_str())
         .map(str::to_string)
 }
@@ -69,7 +69,7 @@ fn matches(pattern: &str, text: &str) -> bool {
 
 /// Evaluate a rule map the way opencode does: last match wins, over the
 /// keys in the order the rendered file lists them.
-fn permission_for(map: &serde_yaml::Mapping, path: &str) -> Option<String> {
+fn permission_for(map: &corpus_store::yaml::Mapping, path: &str) -> Option<String> {
     let mut out = None;
     for (k, v) in map {
         let (Some(pattern), Some(act)) = (k.as_str(), v.as_str()) else {
@@ -172,7 +172,10 @@ fn roles_bind_their_trust_domains() {
         assert_eq!(action(&res, denied).as_deref(), Some("deny"), "{denied}");
     }
     assert_eq!(action(&res, "corpus_target_info").as_deref(), Some("allow"));
-    assert_eq!(action(&res, "corpus_technique_save").as_deref(), Some("allow"));
+    assert_eq!(
+        action(&res, "corpus_technique_save").as_deref(),
+        Some("allow")
+    );
     assert_eq!(action(&res, "webfetch").as_deref(), Some("allow"));
     assert_eq!(action(&res, "websearch").as_deref(), Some("allow"));
     // A host shell would let it forge the identity the server's role gate
@@ -190,7 +193,11 @@ fn roles_bind_their_trust_domains() {
         "corpus_oracle_run",
         "corpus_finding_write",
     ] {
-        assert_eq!(action(&tester, allowed).as_deref(), Some("allow"), "{allowed}");
+        assert_eq!(
+            action(&tester, allowed).as_deref(),
+            Some("allow"),
+            "{allowed}"
+        );
     }
     assert_eq!(action(&tester, "webfetch").as_deref(), Some("deny"));
     assert_eq!(action(&tester, "websearch").as_deref(), Some("deny"));
@@ -198,11 +205,12 @@ fn roles_bind_their_trust_domains() {
     // Neither may delegate to anything, since neither declares a subagent.
     for map in [&res, &tester] {
         let task = map
-            .get(serde_yaml::Value::String("task".into()))
+            .get(corpus_store::yaml::Value::String("task".into()))
             .and_then(|v| v.as_mapping())
             .expect("task is always written");
         assert_eq!(
-            task.get(serde_yaml::Value::String("*".into())).and_then(|v| v.as_str()),
+            task.get(corpus_store::yaml::Value::String("*".into()))
+                .and_then(|v| v.as_str()),
             Some("deny")
         );
     }
@@ -246,17 +254,23 @@ fn a_stored_block_cannot_widen_what_the_role_denies() {
         )
         .unwrap();
     store.render_project_agents("p").unwrap();
-    let rendered =
-        fs::read_to_string(store.opencode_agent_dir("p").join("researcher.md")).unwrap();
+    let rendered = fs::read_to_string(store.opencode_agent_dir("p").join("researcher.md")).unwrap();
     let perms = perm(&rendered);
 
-    assert_eq!(action(&perms, "bash").as_deref(), Some("deny"), "stored shell");
+    assert_eq!(
+        action(&perms, "bash").as_deref(),
+        Some("deny"),
+        "stored shell"
+    );
     assert_eq!(
         action(&perms, "corpus_sandbox_exec").as_deref(),
         Some("deny"),
         "a researcher executes nothing, whatever its block says"
     );
-    assert_eq!(action(&perms, "corpus_finding_write").as_deref(), Some("deny"));
+    assert_eq!(
+        action(&perms, "corpus_finding_write").as_deref(),
+        Some("deny")
+    );
     assert_eq!(
         action(&perms, "external_directory").as_deref(),
         Some("deny"),
@@ -268,7 +282,10 @@ fn a_stored_block_cannot_widen_what_the_role_denies() {
     for (path, why) in [
         ("benchmarks/CDK-BENCH-0001.yaml", "the answer key"),
         ("plugins/cdk-regtest/setup.sh", "harness internals"),
-        ("store/projects/other/corpus/findings/x.md", "another project"),
+        (
+            "store/projects/other/corpus/findings/x.md",
+            "another project",
+        ),
     ] {
         assert_eq!(
             permission_for(&read, path).as_deref(),
@@ -341,8 +358,16 @@ fn a_stored_block_may_tighten_within_the_role() {
         Some("allow"),
         "the rest of the ceiling is untouched"
     );
-    assert_eq!(action(&perms, "glob").as_deref(), Some("allow"), "passthrough");
-    assert_eq!(action(&perms, "grep").as_deref(), Some("deny"), "passthrough");
+    assert_eq!(
+        action(&perms, "glob").as_deref(),
+        Some("allow"),
+        "passthrough"
+    );
+    assert_eq!(
+        action(&perms, "grep").as_deref(),
+        Some("deny"),
+        "passthrough"
+    );
 }
 
 /// The contamination rule and the project boundary, evaluated as opencode
@@ -360,8 +385,16 @@ fn the_boundary_holds_by_evaluation() {
     for (path, expected, why) in [
         ("benchmarks/CDK-BENCH-0001.yaml", "deny", "the answer key"),
         ("plugins/cdk-regtest/setup.sh", "deny", "harness internals"),
-        ("store/projects/p/corpus/hypotheses/x.md", "allow", "own corpus"),
-        ("store/projects/other/corpus/findings/x.md", "deny", "another project"),
+        (
+            "store/projects/p/corpus/hypotheses/x.md",
+            "allow",
+            "own corpus",
+        ),
+        (
+            "store/projects/other/corpus/findings/x.md",
+            "deny",
+            "another project",
+        ),
         (
             &format!("{root}/projects/other/corpus/findings/x.md"),
             "deny",
@@ -376,14 +409,34 @@ fn the_boundary_holds_by_evaluation() {
     }
 
     for (path, expected, why) in [
-        ("store/projects/p/corpus/findings/x.md", "allow", "own corpus"),
-        ("store/projects/p/agents/researcher/agent.yaml", "deny", "own sidecars"),
-        ("store/projects/other/corpus/findings/x.md", "deny", "another project"),
-        ("store/hypotheses/legacy-flat-path.md", "deny", "the legacy flat store"),
+        (
+            "store/projects/p/corpus/findings/x.md",
+            "allow",
+            "own corpus",
+        ),
+        (
+            "store/projects/p/agents/researcher/agent.yaml",
+            "deny",
+            "own sidecars",
+        ),
+        (
+            "store/projects/other/corpus/findings/x.md",
+            "deny",
+            "another project",
+        ),
+        (
+            "store/hypotheses/legacy-flat-path.md",
+            "deny",
+            "the legacy flat store",
+        ),
         // Transcripts are inside the corpus and still not writable: cards
         // cite them by name, the cost report counts them, and they are the
         // provenance an operator audits.
-        ("store/projects/p/corpus/runs/1786-x.raw", "deny", "a run transcript"),
+        (
+            "store/projects/p/corpus/runs/1786-x.raw",
+            "deny",
+            "a run transcript",
+        ),
         (
             &format!("{root}/projects/p/corpus/runs/1786-x.raw"),
             "deny",

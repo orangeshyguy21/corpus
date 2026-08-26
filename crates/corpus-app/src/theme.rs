@@ -244,7 +244,6 @@ pub fn house_icon_button(ui: &mut Ui, icon: &str, text: &str) -> egui::Response 
 
 /// Primary amber action. The larger padding is intentional: this is the
 /// command the page wants the operator to see first.
-#[allow(dead_code)] // Agent New Mission adopts it in chunk 3
 pub fn primary_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
     ui.scope(|ui| {
         let style = ui.style_mut();

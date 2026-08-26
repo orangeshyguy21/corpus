@@ -55,7 +55,11 @@ fn proj_corpus(store: &Store) -> PathBuf {
 #[test]
 fn roundtrip_project_scoped_writes_and_wipe() {
     let rig = rig("roundtrip");
-    let TestRig { mut ctx, store, root } = rig;
+    let TestRig {
+        mut ctx,
+        store,
+        root,
+    } = rig;
 
     // A run transcript the technique card must cite (in the project corpus).
     let runs = proj_corpus(&store).join("runs");
@@ -116,7 +120,9 @@ fn roundtrip_project_scoped_writes_and_wipe() {
         }),
     )
     .expect_err("missing run_log must be refused");
-    assert!(err.to_string().contains("run_log must name an existing file"));
+    assert!(err
+        .to_string()
+        .contains("run_log must name an existing file"));
 
     // run_log defaults to CORPUS_RUN_LOG (ctx.run_log) when omitted.
     ctx.run_log = Some("1700000000-op-run.log".to_string());
@@ -131,10 +137,8 @@ fn roundtrip_project_scoped_writes_and_wipe() {
     )
     .expect("technique_save with default run_log");
     assert!(out.contains("technique card saved"), "{out}");
-    let card = std::fs::read_to_string(
-        proj_corpus(&store).join("techniques/default-log-card.md"),
-    )
-    .unwrap();
+    let card = std::fs::read_to_string(proj_corpus(&store).join("techniques/default-log-card.md"))
+        .unwrap();
     assert!(card.contains("run_log: 1700000000-op-run.log"), "{card}");
 
     // run_log omitted AND no ctx.run_log -> helpful error.
@@ -154,8 +158,13 @@ fn roundtrip_project_scoped_writes_and_wipe() {
     // Wipe the project corpus: generation bumps, corpus gone, agents survive.
     let p = store.wipe_project_corpus("proj").expect("wipe");
     assert_eq!(p.corpus_generation, 1);
-    assert!(!proj_corpus(&store).join("techniques/quote-front-run.md").exists());
-    assert!(store.project_agent_dir("proj", "operator").join("opencode.json").is_file());
+    assert!(!proj_corpus(&store)
+        .join("techniques/quote-front-run.md")
+        .exists());
+    assert!(store
+        .project_agent_dir("proj", "operator")
+        .join("opencode.json")
+        .is_file());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -163,7 +172,11 @@ fn roundtrip_project_scoped_writes_and_wipe() {
 #[test]
 fn finding_write_validates_before_persistence_and_preserves_project_agency() {
     let rig = rig("finding-writer");
-    let TestRig { mut ctx, store, root } = rig;
+    let TestRig {
+        mut ctx,
+        store,
+        root,
+    } = rig;
     ctx.run_log = Some("1787091000-operator.raw".to_string());
     ctx.source_pins = Some(serde_json::Map::from_iter([(
         "cdk".to_string(),
@@ -283,7 +296,9 @@ fn attack_save_project_scope() {
     .expect("attack_save");
     assert!(out.contains("attack saved"), "{out}");
 
-    let dest = proj_corpus(&store).join("attacks").join("quote-id-front-run");
+    let dest = proj_corpus(&store)
+        .join("attacks")
+        .join("quote-id-front-run");
     assert!(dest.join("attack.md").is_file());
     assert!(dest.join("run.sh").is_file());
     let attack_text = std::fs::read_to_string(dest.join("attack.md")).unwrap();
@@ -362,7 +377,10 @@ fn source_paths_are_reported_per_role_not_per_sandbox() {
     // A tester or super holds `sandbox_exec`, so BOTH are true — and each
     // is labelled with the tool it belongs to rather than left to be
     // guessed at.
-    for role in [corpus_core::AgentRole::Tester, corpus_core::AgentRole::Super] {
+    for role in [
+        corpus_core::AgentRole::Tester,
+        corpus_core::AgentRole::Super,
+    ] {
         ctx.role = Ok(role);
         let out = tools::dispatch(&mut ctx, "target_info", &json!({})).expect("target_info");
         assert!(
@@ -399,7 +417,10 @@ fn researcher_role_is_refused_execution_and_publication_tools() {
             "wallet_fund",
             json!({"work_dir": "/tmp/w", "amount_sat": 10, "idempotency_key": "fund-1"}),
         ),
-        ("attack_save", json!({"name": "a", "description": "d", "script": "s"})),
+        (
+            "attack_save",
+            json!({"name": "a", "description": "d", "script": "s"}),
+        ),
         (
             "finding_write",
             json!({"title": "t", "severity": "high", "detail": "d"}),
@@ -413,8 +434,7 @@ fn researcher_role_is_refused_execution_and_publication_tools() {
     }
 
     // ...and still gets the two tools its role does grant.
-    tools::dispatch(&mut ctx, "target_info", &json!({}))
-        .expect("a researcher reads its target");
+    tools::dispatch(&mut ctx, "target_info", &json!({})).expect("a researcher reads its target");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -424,10 +444,18 @@ fn researcher_role_is_refused_execution_and_publication_tools() {
 fn unresolved_role_denies_every_tool() {
     let TestRig { mut ctx, root, .. } = rig("role-unresolved");
     ctx.role = Err("CORPUS_OPENCODE_AGENT is unset".to_string());
-    for tool in ["target_info", "technique_save", "sandbox_exec", "finding_write"] {
+    for tool in [
+        "target_info",
+        "technique_save",
+        "sandbox_exec",
+        "finding_write",
+    ] {
         let err = tools::dispatch(&mut ctx, tool, &json!({}))
             .expect_err("an unresolved role denies everything");
-        assert!(err.to_string().contains("no resolved agent role"), "{tool}: {err}");
+        assert!(
+            err.to_string().contains("no resolved agent role"),
+            "{tool}: {err}"
+        );
     }
     // And it advertises nothing, so the agent isn't invited to try.
     let catalog = tools::catalog_for(&ctx.role);
@@ -448,8 +476,14 @@ fn advertised_catalog_matches_the_role() {
             .collect()
     };
     let researcher = names(corpus_core::AgentRole::Researcher);
-    assert!(researcher.contains(&"target_info".to_string()), "{researcher:?}");
-    assert!(researcher.contains(&"technique_save".to_string()), "{researcher:?}");
+    assert!(
+        researcher.contains(&"target_info".to_string()),
+        "{researcher:?}"
+    );
+    assert!(
+        researcher.contains(&"technique_save".to_string()),
+        "{researcher:?}"
+    );
     for hidden in [
         "sandbox_exec",
         "sandbox_write",
@@ -471,7 +505,10 @@ fn advertised_catalog_matches_the_role() {
         "{sup:?}"
     );
     for tool in corpus_core::SUPER_ADMIN_TOOLS {
-        assert!(sup.contains(&tool.to_string()), "super lacks {tool}: {sup:?}");
+        assert!(
+            sup.contains(&tool.to_string()),
+            "super lacks {tool}: {sup:?}"
+        );
     }
 }
 

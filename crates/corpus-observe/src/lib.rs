@@ -139,8 +139,7 @@ pub fn validate_pin(store: &Store, project: &str, source: &str, rev: &str) -> Re
         return Err(Error::Store(format!("pin {source}: rev is empty")));
     }
     let project = corpus_store::Project::load(store, project)?;
-    let Some(plugin) = catalog_plugin(&project.plugin)?
-    else {
+    let Some(plugin) = catalog_plugin(&project.plugin)? else {
         return Ok(());
     };
     if plugin.manifest.manifest_version == PluginManifestVersion::V1 {

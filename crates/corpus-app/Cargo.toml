@@ -9,10 +9,9 @@ name = "corpus-app"
 path = "src/main.rs"
 
 [features]
-# The embedded goose runtime backend for the management chat (dev/decisions.md).
-# Default ON for operator builds (the app's native chat); headless builds opt out
-# with `--no-default-features`, which ALSO drops the heavyweight goose dep tree
-# (goose is an `optional = true` dependency below, gated behind this feature).
+# Embedded Goose runtime for management chat; see `docs/decisions.md`.
+# Default ON for operator builds; headless builds opt out with
+# `--no-default-features`, which also drops the Goose dependency tree.
 # With the feature OFF the chat backend is a no-op stub that reports a clear error.
 default = ["chat-embed"]
 chat-embed = [
@@ -34,7 +33,10 @@ corpus-observe = { path = "../corpus-observe" }
 notify = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
-# The embedded goose runtime (dev/decisions.md). Optional + gated on
+tracing = { workspace = true }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "registry"] }
+# The embedded Goose runtime (`docs/decisions.md`). Optional and gated on
 # `chat-embed` so a headless `--no-default-features` build never compiles the
 # goose tree. All goose types are quarantined inside `src/chat/embedded.rs`;
 # the rest of the app sees only our own ChatEvent/ChatCommand/Chat types.
@@ -44,7 +46,7 @@ goose = { workspace = true, optional = true }
 # "=2.1.1"`; a FRESH resolve drags in `idna_adapter 1.2.2` → `icu_normalizer
 # 2.2` → `icu_collections 2.2`, which conflicts with `icu_locale =2.1.1`.
 # These exact pins force Cargo to the same ICU generation goose's lock uses.
-# Revisit on a deliberate goose bump (dev/decisions.md "bumps are events").
+# Revisit only as part of a deliberate Goose revision change.
 idna_adapter = { version = "=1.2.1", optional = true }
 icu_normalizer = { version = "=2.1.1", optional = true }
 icu_collections = { version = "=2.1.1", optional = true }
@@ -62,10 +64,8 @@ futures = { version = "0.3", optional = true }
 rmcp = { version = "3.0.0", default-features = false, optional = true }
 eframe = { workspace = true }
 egui = { workspace = true }
-# Vendored per the deck-flow-plan table: egui_extras + egui-toast at
-# chunk 1, egui_commonmark at chunk 4 (markdown preview), egui_term at
-# chunk 7 (embedded terminal — published 0.1.0 matches workspace egui
-# 0.31 exactly; no vendoring/patching needed).
+# Egui extensions for Markdown, tables, notifications, and the embedded
+# terminal. `egui_term` 0.1 matches the workspace's Egui 0.31 line.
 egui_commonmark = { workspace = true }
 egui_extras = { workspace = true }
 egui-toast = { workspace = true }
@@ -74,18 +74,19 @@ egui_term = { workspace = true }
 # reports): must stay version-locked with egui_term's alacritty_terminal.
 alacritty_terminal = "0.25"
 egui-phosphor.workspace = true
-image.workspace = true
-# JSON and Markdown syntax highlighting in editable text areas: a
-# layouter maps syntect token styles onto the theme's token colours. The
-# degrade arm (plain monospace TextEdit) stays if syntect fights egui 0.31
+# JSON and Markdown syntax highlighting in editable text areas: a layouter
+# maps syntect token styles onto the theme's token colours. Use Syntect's
+# pure-Rust regex engine so this UI feature does not compile or link Oniguruma.
+# The degrade arm (plain monospace TextEdit) stays if Syntect fights egui 0.31
 # — see views/syntax_editor.rs.
-syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes"] }
+syntect = { version = "5", default-features = false, features = ["regex-fancy", "default-syntaxes"] }
 # GFM table splitting for the chat log (chat/tables.rs): pinned to the SAME
 # 0.12 line egui_commonmark 0.20 parses with, so a segment boundary is exactly
 # where that renderer would have drawn its own table.
 pulldown-cmark = { version = "0.12", default-features = false }
 
 [dev-dependencies]
+corpus-model-test = { path = "../corpus-model-test" }
 # TEST-ONLY: the chat's tool tables (team.rs) must stay in step with the
 # real admin catalog. The app spawns corpus-admin-mcp as a subprocess at
 # runtime — the library is NOT a runtime dependency — but without this

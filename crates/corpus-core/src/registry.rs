@@ -239,9 +239,8 @@ fn string_at(value: &serde_json::Value, pointer: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// One source repo a project's plugin mounts, with its selectable revs —
-/// the top bar's per-source dropdowns (data-model v2 decision 6: missions
-/// carry per-source repo→rev pins, defaulting to the plugin's pin).
+/// One source repository a project's plugin mounts, with selectable revisions.
+/// Missions carry per-source pins that default to the plugin manifest's pin.
 #[derive(Debug, Clone)]
 pub struct SourceRevs {
     /// Repository name (`cdk`, `nuts`).
@@ -266,7 +265,10 @@ impl SourceRevs {
     /// The rev a fresh picker selects: the first list entry. `main` when
     /// resolvable, else the manifest pin.
     pub fn default_rev(&self) -> &str {
-        self.revs.first().map(String::as_str).unwrap_or(&self.pinned)
+        self.revs
+            .first()
+            .map(String::as_str)
+            .unwrap_or(&self.pinned)
     }
 }
 
@@ -279,8 +281,7 @@ impl SourceRevs {
 /// failing. A missing project is an error.
 pub fn plugin_sources(store: &Store, project: &str) -> Result<Vec<SourceRevs>, Error> {
     let spec = crate::store::Project::load(store, project)?;
-    let Some(pdir) = find_plugin(&spec.plugin)?
-    else {
+    let Some(pdir) = find_plugin(&spec.plugin)? else {
         return Ok(Vec::new());
     };
     let entries = source_entries_for_plugin(&pdir, &spec.plugin)?;
@@ -362,8 +363,7 @@ pub fn prepare_source_pins(
         return Ok(resolved);
     }
     let spec = crate::store::Project::load(store, project)?;
-    let Some(pdir) = find_plugin(&spec.plugin)?
-    else {
+    let Some(pdir) = find_plugin(&spec.plugin)? else {
         return Err(Error::Store(format!(
             "mission carries source pins but plugin {} is not discovered",
             spec.plugin
@@ -483,9 +483,29 @@ mod tests {
         // Let a bare-sha fetch work from this LOCAL fixture the way GitHub
         // serves one (the sha-direct path in ensure_source_tree).
         run(&["config", "uploadpack.allowAnySHA1InWant", "true"]);
-        run(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "--allow-empty", "-m", "one"]);
+        run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "one",
+        ]);
         run(&["tag", "v0.1.0"]);
-        run(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "--allow-empty", "-m", "two"]);
+        run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "two",
+        ]);
         run(&["tag", extra_tag]);
         let sha = std::process::Command::new("git")
             .args(["rev-parse", extra_tag])
@@ -503,7 +523,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
 
         let pdir = root.join("plugins").join("cdk-regtest");
-        write(&pdir.join("plugin.toml"), "name = \"cdk-regtest\"\nexec = \"plugin\"\n");
+        write(
+            &pdir.join("plugin.toml"),
+            "name = \"cdk-regtest\"\nexec = \"plugin\"\n",
+        );
         write(
             &pdir.join("config.toml"),
             "[sources]\ncdk_sha = \"86a7c6\"\nnuts_sha = \"3bc8b6\"\n",
@@ -579,7 +602,10 @@ mod tests {
         let mut default = BTreeMap::new();
         default.insert("nuts".to_string(), "main".to_string());
         let resolved = prepare_source_pins(&store, "p", &default).unwrap();
-        assert_eq!(resolved["nuts"], tag_sha, "offline default degrades to the audited sha");
+        assert_eq!(
+            resolved["nuts"], tag_sha,
+            "offline default degrades to the audited sha"
+        );
         let mut other = BTreeMap::new();
         other.insert("nuts".to_string(), "push".to_string());
         assert!(prepare_source_pins(&store, "p", &other).is_err());
@@ -616,10 +642,18 @@ mod tests {
         pins.insert("target".to_string(), "v1.0.0".to_string());
         let resolved = prepare_source_pins(&store, "p", &pins).unwrap();
         assert_eq!(resolved["target"], sha);
-        assert!(store.source_cache_dir().join("target").join(&sha).join(".git").is_dir());
+        assert!(store
+            .source_cache_dir()
+            .join("target")
+            .join(&sha)
+            .join(".git")
+            .is_dir());
 
         let run = store.provision_run_dir("p").unwrap();
-        assert_eq!(fs::read_link(run.join("sources")).unwrap(), store.source_cache_dir());
+        assert_eq!(
+            fs::read_link(run.join("sources")).unwrap(),
+            store.source_cache_dir()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

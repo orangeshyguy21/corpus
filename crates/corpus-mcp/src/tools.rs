@@ -221,7 +221,9 @@ impl Ctx {
         // Probe the environment once at startup; the result gates every
         // tool call (version-pin mismatch included).
         let probe = match plugin.as_mut() {
-            Ok(plugin) if plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1 => {
+            Ok(plugin)
+                if plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1 =>
+            {
                 let result = environment_session
                     .as_deref()
                     .ok_or_else(|| corpus_core::Error::Store("v1 plugin run has no CORPUS_ENVIRONMENT_SESSION".into()))
@@ -272,11 +274,26 @@ impl Ctx {
                 match result {
                     Ok(value) => ProbeResult {
                         ready: value.get("ready").and_then(Value::as_bool).unwrap_or(false),
-                        notes: value.get("notes").and_then(Value::as_str).unwrap_or("session probed").to_string(),
-                        running_version: value.get("running_version").and_then(Value::as_str).map(str::to_string),
-                        expected_tag: value.get("expected_tag").and_then(Value::as_str).map(str::to_string),
+                        notes: value
+                            .get("notes")
+                            .and_then(Value::as_str)
+                            .unwrap_or("session probed")
+                            .to_string(),
+                        running_version: value
+                            .get("running_version")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        expected_tag: value
+                            .get("expected_tag")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                     },
-                    Err(e) => ProbeResult { ready: false, notes: format!("session probe failed: {e}"), running_version: None, expected_tag: None },
+                    Err(e) => ProbeResult {
+                        ready: false,
+                        notes: format!("session probe failed: {e}"),
+                        running_version: None,
+                        expected_tag: None,
+                    },
                 }
             }
             Ok(plugin) => plugin.probe().unwrap_or_else(|e| ProbeResult {
@@ -296,7 +313,9 @@ impl Ctx {
             .ok()
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .and_then(|v| v.as_object().cloned());
-        let run_log = std::env::var(corpus_core::RUN_LOG_ENV).ok().filter(|s| !s.is_empty());
+        let run_log = std::env::var(corpus_core::RUN_LOG_ENV)
+            .ok()
+            .filter(|s| !s.is_empty());
         let mission_env = std::env::var(corpus_core::MISSION_ENV)
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -371,7 +390,12 @@ impl Ctx {
     /// but a project can be deleted under a live server.
     fn write_scope(&self, _args: &Value) -> Result<Scope> {
         let scope = self.scope.clone().map_err(Error::Scope)?;
-        if !self.store.project_dir(&scope.project).join("project.yaml").is_file() {
+        if !self
+            .store
+            .project_dir(&scope.project)
+            .join("project.yaml")
+            .is_file()
+        {
             return Err(Error::Scope(format!(
                 "project {:?} does not exist under {} — projects come into being deliberately, \
                  never as a side effect of a tool call",
@@ -402,7 +426,10 @@ fn resolve_plugin_dir(
     store: &Store,
     scope: &std::result::Result<Scope, String>,
 ) -> Result<PathBuf> {
-    if let Some(dir) = std::env::var("CORPUS_PLUGIN_DIR").ok().filter(|s| !s.is_empty()) {
+    if let Some(dir) = std::env::var("CORPUS_PLUGIN_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         return Ok(PathBuf::from(dir));
     }
     if let Ok(scope) = scope {
@@ -442,9 +469,7 @@ fn resolve_role(store: &Store, scope: &Scope) -> std::result::Result<AgentRole, 
     if let Some(pos) = argv.iter().position(|a| a == "--role") {
         let raw = argv.get(pos + 1).ok_or("--role needs a value")?;
         return AgentRole::parse(raw)
-            .ok_or_else(|| {
-                format!("--role {raw:?} is not one of {}", AgentRole::names())
-            });
+            .ok_or_else(|| format!("--role {raw:?} is not one of {}", AgentRole::names()));
     }
     let agent = std::env::var(corpus_core::AGENT_ENV)
         .ok()
@@ -708,12 +733,7 @@ const AGENT_MUTATORS: [&str; 8] = [
 /// A curator manages ordinary project agents but cannot mint or repurpose a
 /// `super` identity. Super agents can reach every research capability, so
 /// authoring one is reserved to an existing Super or the host operator.
-fn enforce_curator_agent_ceiling(
-    ctx: &Ctx,
-    name: &str,
-    args: &Value,
-    project: &str,
-) -> Result<()> {
+fn enforce_curator_agent_ceiling(ctx: &Ctx, name: &str, args: &Value, project: &str) -> Result<()> {
     let requested_role = args.get("role").and_then(Value::as_str);
     if requested_role == Some(AgentRole::Super.as_str()) {
         return Err(Error::refused(
@@ -761,7 +781,10 @@ fn enforce_curator_agent_ceiling(
             | "agent_subagent_remove"
     );
     if mutates_existing {
-        let agent = args.get("agent").and_then(Value::as_str).unwrap_or_default();
+        let agent = args
+            .get("agent")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if !agent.is_empty()
             && ctx
                 .store
@@ -976,10 +999,7 @@ fn dispatch_inner(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
                     plugin
                         .call_v1("session_probe", Some(params))
                         .map(|value| ProbeResult {
-                            ready: value
-                                .get("ready")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
+                            ready: value.get("ready").and_then(Value::as_bool).unwrap_or(false),
                             notes: value
                                 .get("notes")
                                 .and_then(Value::as_str)
@@ -1129,11 +1149,9 @@ fn source_paths(ctx: &Ctx, sources: &[corpus_core::SourceInfo]) -> Value {
 }
 
 fn target_info(ctx: &mut Ctx) -> Result<String> {
-    if ctx
-        .plugin
-        .as_ref()
-        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
-    {
+    if ctx.plugin.as_ref().is_some_and(|plugin| {
+        plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1
+    }) {
         let (session, params) = v1_call_params(ctx, json!({}))?;
         let declared = ctx
             .plugin
@@ -1189,11 +1207,9 @@ fn target_info(ctx: &mut Ctx) -> Result<String> {
 }
 
 fn run_sandbox_command(ctx: &mut Ctx, command: &str) -> Result<corpus_core::SandboxExecResult> {
-    if ctx
-        .plugin
-        .as_ref()
-        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
-    {
+    if ctx.plugin.as_ref().is_some_and(|plugin| {
+        plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1
+    }) {
         let (_, params) = v1_call_params(ctx, json!({"command": command}))?;
         resilient(ctx, |plugin| {
             let value = plugin.call_v1("sandbox_exec", Some(params))?;
@@ -1264,9 +1280,13 @@ fn sandbox_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
         )));
     }
     if content.contains('\0') {
-        return Err(Error::Args("sandbox_write content may not contain NUL".into()));
+        return Err(Error::Args(
+            "sandbox_write content may not contain NUL".into(),
+        ));
     }
-    let parent = path.parent().ok_or_else(|| Error::Args("invalid sandbox path".into()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Args("invalid sandbox path".into()))?;
     let executable = args
         .get("executable")
         .and_then(Value::as_bool)
@@ -1296,11 +1316,9 @@ fn sandbox_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
 }
 
 fn oracle_catalog(ctx: &mut Ctx) -> Result<Vec<OracleInfo>> {
-    let oracles = if ctx
-        .plugin
-        .as_ref()
-        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
-    {
+    let oracles = if ctx.plugin.as_ref().is_some_and(|plugin| {
+        plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1
+    }) {
         let (_, params) = v1_call_params(ctx, json!({}))?;
         resilient(ctx, |plugin| {
             let value = plugin.call_v1("oracles", Some(params))?;
@@ -1322,11 +1340,9 @@ fn oracle_run(ctx: &mut Ctx, name: &str) -> Result<String> {
     if !valid_oracle_name(name) {
         return Err(Error::Args("bad oracle name".to_string()));
     }
-    let result = if ctx
-        .plugin
-        .as_ref()
-        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
-    {
+    let result = if ctx.plugin.as_ref().is_some_and(|plugin| {
+        plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1
+    }) {
         let (_, params) = v1_call_params(ctx, json!({"name": name}))?;
         resilient(ctx, |plugin| {
             let value = plugin.call_v1("call_oracle", Some(params))?;
@@ -1349,7 +1365,10 @@ fn faucet(ctx: &mut Ctx, args: &Value) -> Result<String> {
             .map(str::to_string),
     };
     let call = FaucetCall {
-        invoice: args.get("invoice").and_then(Value::as_str).map(str::to_string),
+        invoice: args
+            .get("invoice")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         amount_sat: args.get("amount_sat").and_then(Value::as_u64),
         memo: args.get("memo").and_then(Value::as_str).map(str::to_string),
         idempotency_key,
@@ -1366,11 +1385,9 @@ fn faucet(ctx: &mut Ctx, args: &Value) -> Result<String> {
         "invoice" | "balance" => {}
         other => return Err(Error::Args(format!("unknown faucet op: {other}"))),
     }
-    let result = if ctx
-        .plugin
-        .as_ref()
-        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
-    {
+    let result = if ctx.plugin.as_ref().is_some_and(|plugin| {
+        plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1
+    }) {
         let (_, params) = v1_call_params(ctx, json!({"op": op, "call": call}))?;
         resilient(ctx, |plugin| {
             let value = plugin.call_v1("faucet", Some(params))?;
@@ -1413,11 +1430,9 @@ fn wallet_fund(ctx: &mut Ctx, args: &Value) -> Result<String> {
             ctx.faucet_budget_sats
         ));
     }
-    if ctx
-        .plugin
-        .as_ref()
-        .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
-    {
+    if ctx.plugin.as_ref().is_some_and(|plugin| {
+        plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1
+    }) {
         let (_, params) = v1_call_params(ctx, args.clone())?;
         let result = resilient(ctx, |plugin| plugin.call_v1("wallet_fund", Some(params)))?;
         let charged = result
@@ -1435,7 +1450,9 @@ fn wallet_fund(ctx: &mut Ctx, args: &Value) -> Result<String> {
     }
     let params = args.as_object().cloned().unwrap_or_default();
     let pins = ctx.source_pins.clone();
-    let result = resilient(ctx, |plugin| plugin.wallet_fund_legacy(params, pins.as_ref()))?;
+    let result = resilient(ctx, |plugin| {
+        plugin.wallet_fund_legacy(params, pins.as_ref())
+    })?;
     if result.get("funded").and_then(Value::as_bool) == Some(true) {
         ctx.faucet_spent_sats = ctx.faucet_spent_sats.saturating_add(amount);
     }
@@ -1525,11 +1542,9 @@ fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
     match oracle_catalog(ctx) {
         Ok(oracles) => {
             for oracle in &oracles {
-                let result = if ctx
-                    .plugin
-                    .as_ref()
-                    .is_some_and(|plugin| plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1)
-                {
+                let result = if ctx.plugin.as_ref().is_some_and(|plugin| {
+                    plugin.manifest().manifest_version == corpus_core::PluginManifestVersion::V1
+                }) {
                     v1_call_params(ctx, json!({"name": oracle.name})).and_then(|(_, params)| {
                         resilient(ctx, |plugin| {
                             let value = plugin.call_v1("call_oracle", Some(params))?;
@@ -1661,7 +1676,10 @@ fn technique_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
         })?;
     let scope = ctx.write_scope(args)?;
 
-    if !matches!(status.as_str(), "fired" | "analyzed-only" | "unresolved-lead") {
+    if !matches!(
+        status.as_str(),
+        "fired" | "analyzed-only" | "unresolved-lead"
+    ) {
         return Err(Error::Args(
             "status must be fired | analyzed-only | unresolved-lead".to_string(),
         ));
@@ -1715,13 +1733,7 @@ fn technique_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
 fn slugify(raw: &str) -> String {
     raw.to_lowercase()
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c
-            } else {
-                '-'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())

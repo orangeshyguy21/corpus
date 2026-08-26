@@ -1,0 +1,124 @@
+[graph]
+all-features = true
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "all"
+maximum-db-staleness = "P30D"
+ignore = [
+    # Linux accessibility reaches quick-xml 0.30 through Egui's zbus 4 line.
+    # Remove both exceptions when that platform stack accepts quick-xml >=0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+
+[licenses]
+confidence-threshold = 0.93
+include-dev = true
+unused-allowed-license = "allow"
+unused-license-exception = "deny"
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "NCSA",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[[licenses.exceptions]]
+name = "epaint_default_fonts"
+version = "=0.31.1"
+allow = ["OFL-1.1", "Ubuntu-font-1.0"]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "deny"
+# Git and registry provenance is enforced below. cargo-deny 0.20.2 cannot
+# resolve the optional, workspace-inherited Goose Git dependency while running
+# its wildcard lint, so that redundant lint remains disabled.
+wildcards = "allow"
+highlight = "simplest-path"
+skip = [
+    # Goose and Corpus currently consume different protocol/network generations.
+    { crate = "base64@0.23.1", reason = "Goose protocol stack; remove on its crate migration" },
+    { crate = "reqwest@0.13.4", reason = "Goose network stack; Corpus directly uses 0.12" },
+    { crate = "tower-http@0.7.0", reason = "Goose ACP stack; remove on upstream convergence" },
+
+    # Egui, terminal, clipboard, accessibility, and Goose image/platform stacks.
+    { crate = "bitflags@1.3.2", reason = "legacy image and CoreGraphics transitive line" },
+    { crate = "calloop@0.13.0", reason = "winit and clipboard require distinct Wayland lines" },
+    { crate = "calloop-wayland-source@0.3.0", reason = "winit and clipboard Wayland split" },
+    { crate = "core-foundation@0.9.4", reason = "GUI and TLS stacks use distinct macOS bindings" },
+    { crate = "image@0.24.9", reason = "Goose remains on image 0.24; Corpus UI uses 0.25" },
+    { crate = "linux-raw-sys@0.4.15", reason = "legacy rustix line in the Linux GUI stack" },
+    { crate = "nix@0.29.0", reason = "Linux accessibility and process stacks have distinct requirements" },
+    { crate = "objc2@0.5.2", reason = "GUI dependencies span two objc2 generations" },
+    { crate = "objc2-app-kit@0.2.2", reason = "GUI dependencies span two objc2 generations" },
+    { crate = "objc2-foundation@0.2.2", reason = "GUI dependencies span two objc2 generations" },
+    { crate = "png@0.17.16", reason = "Goose image 0.24 and Corpus image 0.25 split" },
+    { crate = "quick-xml@0.30.0", reason = "Egui Linux accessibility zbus 4 line; see RustSec exceptions" },
+    { crate = "rustix@0.38.44", reason = "Wayland stack has not converged on rustix 1" },
+    { crate = "smithay-client-toolkit@0.19.2", reason = "winit and clipboard require distinct Wayland lines" },
+
+    # Cryptography, randomness, and collection ecosystems are mid-generation.
+    { crate = "block-buffer@0.12.1", reason = "Goose crypto line; Corpus remains on digest 0.10" },
+    { crate = "cpufeatures@0.3.0", reason = "Goose crypto line; Corpus remains on sha2 0.10" },
+    { crate = "crypto-common@0.2.2", reason = "Goose crypto line; Corpus remains on digest 0.10" },
+    { crate = "digest@0.11.3", reason = "Goose crypto line; Corpus remains on digest 0.10" },
+    { crate = "foldhash@0.1.5", reason = "transitive collection generations have not converged" },
+    { crate = "getrandom@0.2.17", reason = "legacy transitive randomness API" },
+    { crate = "getrandom@0.4.3", reason = "new transitive randomness API; Corpus directly uses 0.3" },
+    { crate = "hashbrown@0.15.5", reason = "transitive collection generations have not converged" },
+    { crate = "hashbrown@0.17.1", reason = "transitive collection generations have not converged" },
+    { crate = "rand@0.8.7", reason = "legacy transitive randomness API" },
+    { crate = "rand@0.9.5", reason = "transitive consumers span rand generations" },
+    { crate = "rand_chacha@0.3.1", reason = "legacy rand 0.8 implementation" },
+    { crate = "rand_core@0.6.4", reason = "legacy rand 0.8 implementation" },
+    { crate = "rand_core@0.9.5", reason = "transitive consumers span rand generations" },
+    { crate = "sha2@0.11.0", reason = "Goose crypto line; Corpus directly uses 0.10" },
+
+    # Serialization, macros, and parser consumers pin incompatible generations.
+    { crate = "darling@0.20.11", reason = "transitive derive stacks span three generations" },
+    { crate = "darling@0.23.0", reason = "transitive derive stacks span three generations" },
+    { crate = "darling_core@0.20.11", reason = "transitive derive stacks span three generations" },
+    { crate = "darling_core@0.23.0", reason = "transitive derive stacks span three generations" },
+    { crate = "darling_macro@0.20.11", reason = "transitive derive stacks span three generations" },
+    { crate = "darling_macro@0.23.0", reason = "transitive derive stacks span three generations" },
+    { crate = "fancy-regex@0.16.2", reason = "syntax and schema stacks span three parser generations" },
+    { crate = "fancy-regex@0.17.0", reason = "syntax and schema stacks span three parser generations" },
+    { crate = "phf@0.11.3", reason = "syntax and timezone stacks require distinct PHF lines" },
+    { crate = "phf_shared@0.11.3", reason = "syntax and timezone stacks require distinct PHF lines" },
+    { crate = "strum@0.27.2", reason = "transitive macro consumers span two Strum lines" },
+    { crate = "strum_macros@0.27.2", reason = "transitive macro consumers span two Strum lines" },
+    { crate = "syn@3.0.3", reason = "new Goose transitive macros; workspace macros remain on syn 2" },
+    { crate = "thiserror@1.0.69", reason = "legacy GUI transitive dependencies; workspace uses 2" },
+    { crate = "thiserror-impl@1.0.69", reason = "legacy GUI transitive dependencies; workspace uses 2" },
+    { crate = "toml_datetime@1.1.1+spec-1.1.0", reason = "zbus macros and Corpus TOML use distinct parser lines" },
+    { crate = "toml_edit@0.25.13+spec-1.1.0", reason = "zbus macros and Corpus TOML use distinct parser lines" },
+    { crate = "winnow@1.0.4", reason = "zbus macros and Corpus TOML use distinct parser lines" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+unused-allowed-source = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/aaif-goose/goose"]

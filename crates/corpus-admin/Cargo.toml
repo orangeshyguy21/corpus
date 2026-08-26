@@ -7,5 +7,7 @@ publish = false
 [dependencies]
 corpus-observe = { path = "../corpus-observe" }
 corpus-store = { path = "../corpus-store" }
+schemars = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

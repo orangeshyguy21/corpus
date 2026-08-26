@@ -1,15 +1,10 @@
-//! The EMBEDDED goose runtime backend for the management chat
-//! (dev/decisions.md chunk 1) — the ONLY place in corpus-app that names a
-//! goose/GDK type. Quarantined behind `crate::chat`'s public event/command
-//! types; nothing in this module is exported.
+//! Embedded Goose runtime backend for management chat. This is the only place
+//! in corpus-app that names a Goose/GDK type; it is quarantined behind
+//! `crate::chat`'s public event and command types.
 //!
-//! Runtime (operator decision 2026-08-14): goose's `Agent` runs IN-PROCESS as
-//! a source-level dependency (git-dep at a pinned rev — see
-//! dev/decisions.md "Bumps are deliberate events"). It replaces the old
-//! `chat/acp.rs`, which spawned a managed `goose acp` subprocess and spoke
-//! Agent Client Protocol. The [`Chat`] seam (`crate::chat`) is UNCHANGED; only
-//! this transport swapped. Git history keeps acp.rs; the fallback story lives
-//! in dev/decisions.md's record.
+//! Goose's `Agent` runs in-process as a source-pinned dependency. Revision
+//! changes are deliberate dependency events. The [`Chat`] seam owns the
+//! transport boundary; the optional CLI fallback is documented separately.
 //!
 //! Tool source: `corpus-admin-mcp` is spawned DIRECTLY as a stdio MCP
 //! extension (a CORPUS subprocess, our own protocol — not a goose subprocess).
@@ -75,7 +70,7 @@ fn chat_input_limit(model: &str) -> String {
 /// Spawn the backend for `project` on a background thread, returning our
 /// project-scoped session id. `role` selects the team shape: an
 /// `Operator`/`Orchestrator` runs all-or-none admin tools; a specialist
-/// (`CorpusInspector`, …) registers ONLY its scoped domain (chunk 2). With the
+/// (`CorpusInspector`, …) registers only its scoped domain. With the
 /// `chat-embed` feature OFF this is a no-op stub that reports a clear error
 /// (headless `--no-default-features` build).
 pub fn spawn_backend(
@@ -451,9 +446,8 @@ mod live {
     }
 
     /// Build the agent, provider, session, and (per `role`) the corpus-admin
-    /// stdio extension — the chunk-1 setup sequence, mirroring goose's own
-    /// example (Agent::with_config not Agent::new, to avoid config-file
-    /// construction). Team shape (chunk 2): a specialist registers the
+    /// stdio extension using `Agent::with_config` to avoid ambient config-file
+    /// construction. A specialist registers the
     /// `corpus-admin-mcp` extension with `available_tools` = its scoped
     /// domain (goose refuses anything else BY CONSTRUCTION); the Orchestrator
     /// registers NO admin extension (no tools to call).
@@ -713,6 +707,9 @@ Use Markdown formatting for all responses.
     /// [`AgentEvent`]s into our [`ChatEvent`]s. Does NOT emit `TurnEnd` —
     /// the command loop owns turn lifecycle (serialization + queued
     /// handoff); this task only streams content.
+    // Keep the adapter signature explicit until the intended upstream Goose
+    // crate can replace the source dependency without changing this boundary.
+    #[allow(clippy::too_many_arguments)]
     async fn translate_turn(
         agent: Arc<Agent>,
         message: String,
@@ -966,6 +963,9 @@ Use Markdown formatting for all responses.
     /// in-process, then answer the orchestrator's parked turn via
     /// `handle_tool_result`. The specialist runs on a CHILD cancellation
     /// token — the panel's stop button cuts both.
+    // Keep the adapter stable until the intended upstream Goose crate is
+    // available.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_delegate(
         orchestrator: Arc<Agent>,
         parent_cancel: &CancellationToken,
@@ -1042,6 +1042,8 @@ Use Markdown formatting for all responses.
     /// destructive set is unreachable by construction. Its tool calls stream
     /// to the panel as `role›tool` cards keyed under the parent delegate
     /// call.
+    // Goose remains isolated here pending its intended upstream crate.
+    #[allow(clippy::too_many_arguments)]
     async fn run_specialist(
         role: TeamRole,
         instructions: String,
@@ -1268,7 +1270,7 @@ Use Markdown formatting for all responses.
 
 #[cfg(all(test, feature = "chat-embed"))]
 mod injection_probe {
-    //! The deciding chunk-2 evidence: the scoped `corpus-admin` extension
+    //! The scoped `corpus-admin` extension
     //! refuses an out-of-domain / destructive tool BY CONSTRUCTION — goose's
     //! own `ExtensionConfig::is_tool_available` returns false for a tool that
     //! is not listed in the scope's `available_tools`, independent of anything
@@ -1387,35 +1389,29 @@ mod injection_probe {
         assert!(t.contains("{{extension.name}}"));
     }
 
-    /// Serializes the live probes: they mutate PROCESS-GLOBAL env
-    /// (CORPUS_STORE, CORPUS_ADMIN_MCP, GOOSE_PATH_ROOT) and would stomp each
-    /// other under cargo's parallel test threads.
-    static LIVE_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// The probe chat model: `CORPUS_PROBE_MODEL` wins; else the first of
-    /// the preferred small models the local Ollama actually has (the
-    /// operator's model garden changes — a hardcoded name made the probes
-    /// rot). Panics with the available list when none fits.
+    /// The exact Qwen3.8 model selected by the shared integration harness.
+    /// Discovery happens only after the cross-process model lease is held.
     fn probe_model() -> String {
-        let available: Vec<String> = corpus_core::ollama_models()
-            .expect("ollama must be running for the live probe")
-            .groups
-            .into_iter()
-            .flat_map(|g| g.models.into_iter().map(|m| m.model))
-            .collect();
-        if let Ok(m) = std::env::var("CORPUS_PROBE_MODEL") {
-            assert!(
-                available.iter().any(|a| a == &m),
-                "CORPUS_PROBE_MODEL={m} not pulled; available: {available:?}"
-            );
-            return m;
-        }
-        for preferred in ["qwen3.5:9b", "gemma4:e4b", "qwen3.8:27b-mlx"] {
-            if available.iter().any(|a| a == preferred) {
-                return preferred.to_string();
-            }
-        }
-        panic!("no preferred probe model pulled; set CORPUS_PROBE_MODEL to one of: {available:?}");
+        let model =
+            std::env::var("CORPUS_QWEN38_MODEL").unwrap_or_else(|_| "qwen3.8:27b-mlx".into());
+        assert!(
+            model.contains("qwen3.8") && model.ends_with("-mlx"),
+            "live tests require a Qwen3.8 MLX model"
+        );
+        let output = std::process::Command::new("ollama")
+            .arg("list")
+            .output()
+            .expect("ollama list must run");
+        assert!(output.status.success(), "ollama list must succeed");
+        let installed = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            installed
+                .lines()
+                .skip(1)
+                .any(|line| line.split_whitespace().next() == Some(model.as_str())),
+            "Ollama must expose {model}"
+        );
+        model
     }
 
     /// END-TO-END LIVE PROBE (opt-in; needs Ollama + a built corpus-admin-mcp):
@@ -1432,11 +1428,12 @@ mod injection_probe {
     /// Uses a throwaway CORPUS_STORE in the temp dir (never the real store)
     /// and the fast qwen3.5:9b chat model.
     #[test]
-    #[ignore = "live probe: needs Ollama (qwen3.5:9b) and a built corpus-admin-mcp"]
+    #[ignore = "model-qwen38: needs Ollama and a built corpus-admin-mcp"]
     fn live_end_to_end_operator_creates_project() {
         use crate::chat::{Chat, ChatEvent, ChatHandle, ChatPhase};
 
-        let _guard = LIVE_PROBE_LOCK.lock().unwrap();
+        let _model_lease =
+            corpus_model_test::ModelLease::acquire("embedded-operator-creates-project").unwrap();
         // --- preconditions (skip loudly, don't fail the suite) ---
         let store = std::env::temp_dir().join(format!("corpus-live-probe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
@@ -1561,11 +1558,12 @@ mod injection_probe {
     /// its scoped corpus-admin tools (the thing summon could never do), and
     /// the mutation must land. Same preconditions as probe 1.
     #[test]
-    #[ignore = "live probe: needs Ollama (qwen3.5:9b) and a built corpus-admin-mcp"]
+    #[ignore = "model-qwen38: needs Ollama and a built corpus-admin-mcp"]
     fn live_end_to_end_orchestrator_delegates() {
         use crate::chat::{Chat, ChatEvent, ChatHandle};
 
-        let _guard = LIVE_PROBE_LOCK.lock().unwrap();
+        let _model_lease =
+            corpus_model_test::ModelLease::acquire("embedded-orchestrator-delegates").unwrap();
         let store =
             std::env::temp_dir().join(format!("corpus-live-probe-orch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
@@ -1670,11 +1668,12 @@ mod injection_probe {
     /// burned ~10 calls and three failures on clone-then-save + JSON-in-
     /// JSON). Budget: ≤ 4 tool calls, 0 errors, doc on disk.
     #[test]
-    #[ignore = "live probe: needs Ollama (qwen3.5:9b) and a built corpus-admin-mcp"]
+    #[ignore = "model-qwen38: needs Ollama and a built corpus-admin-mcp"]
     fn live_regression_depbot_agent_creation() {
         use crate::chat::{Chat, ChatEvent, ChatHandle};
 
-        let _guard = LIVE_PROBE_LOCK.lock().unwrap();
+        let _model_lease =
+            corpus_model_test::ModelLease::acquire("embedded-depbot-regression").unwrap();
         let store =
             std::env::temp_dir().join(format!("corpus-live-probe-depbot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);

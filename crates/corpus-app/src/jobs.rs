@@ -32,7 +32,7 @@ impl JobSpawner for ThreadJobSpawner {
     }
 }
 
-pub(crate) trait RepaintWake: Send + Sync {
+pub trait RepaintWake: Send + Sync {
     fn request_repaint(&self);
 }
 
@@ -46,7 +46,7 @@ impl RepaintWake for eframe::egui::Context {
 pub(crate) struct JobId(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum JobKind {
+pub enum JobKind {
     PluginProbe,
     PluginInstall,
     PluginSetup,
@@ -61,6 +61,7 @@ pub(crate) enum JobKind {
     DispatchDelivery,
     SessionTeardown,
     OrphanCleanup,
+    ProjectIndex,
     ProjectScope,
     ProjectAgents,
     ProjectMissions,
@@ -85,6 +86,7 @@ impl JobKind {
             Self::DispatchDelivery => "corpus-dispatch-delivery",
             Self::SessionTeardown => "corpus-session-teardown",
             Self::OrphanCleanup => "corpus-orphan-cleanup",
+            Self::ProjectIndex => "corpus-project-index",
             Self::ProjectScope => "corpus-project-scope",
             Self::ProjectAgents => "corpus-project-agents",
             Self::ProjectMissions => "corpus-project-missions",
@@ -93,7 +95,7 @@ impl JobKind {
         }
     }
 
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::PluginProbe => "plugin probe",
             Self::PluginInstall => "plugin install",
@@ -109,6 +111,7 @@ impl JobKind {
             Self::DispatchDelivery => "mission completion delivery",
             Self::SessionTeardown => "session teardown",
             Self::OrphanCleanup => "orphan environment cleanup",
+            Self::ProjectIndex => "project index refresh",
             Self::ProjectScope => "project scope refresh",
             Self::ProjectAgents => "agent list refresh",
             Self::ProjectMissions => "mission list refresh",
@@ -119,7 +122,7 @@ impl JobKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JobScope {
+pub struct JobScope {
     pub project: String,
     pub project_generation: u64,
     /// Corpus invalidation revision captured when a corpus-reading job starts.

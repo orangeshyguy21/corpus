@@ -48,7 +48,10 @@ pub enum Error {
 impl Error {
     /// Build a refusal. The message is what the caller sees, verbatim.
     pub fn refused(gate: corpus_store::refusal::Gate, message: impl Into<String>) -> Self {
-        Self::Refused { gate, message: message.into() }
+        Self::Refused {
+            gate,
+            message: message.into(),
+        }
     }
 
     /// Which gate this error belongs to, for the refusal log.

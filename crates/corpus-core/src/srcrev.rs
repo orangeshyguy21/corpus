@@ -35,10 +35,8 @@ struct EmptyGitConfig(PathBuf);
 impl EmptyGitConfig {
     fn new() -> Self {
         let id = NEXT_GIT_CONFIG.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "corpus-gitconfig-{}-{id}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("corpus-gitconfig-{}-{id}", std::process::id()));
         let _ = fs::write(&path, "");
         Self(path)
     }
@@ -64,7 +62,10 @@ struct RevCache {
 /// fetches it directly. Abbreviated shas are rejected on purpose (ambiguous,
 /// and not fetchable by `git fetch <sha>`).
 pub fn is_commit_sha(rev: &str) -> bool {
-    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    rev.len() == 40
+        && rev
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The clone URL for a manifest `repo` value: `owner/name` shorthand goes
@@ -110,7 +111,8 @@ fn ls_remote(repo: &str) -> Result<BTreeMap<String, String>, Error> {
             if let Some(peeled) = tag.strip_suffix("^{}") {
                 refs.insert(peeled.to_string(), sha.to_string()); // annotated: commit sha wins
             } else {
-                refs.entry(tag.to_string()).or_insert_with(|| sha.to_string());
+                refs.entry(tag.to_string())
+                    .or_insert_with(|| sha.to_string());
             }
         } else if reference == "refs/heads/main" || reference == "refs/heads/master" {
             let name = reference.trim_start_matches("refs/heads/");
@@ -196,7 +198,7 @@ pub fn selectable_revs(sources_dir: &Path, name: &str, repo: &str, pinned: &str)
         .keys()
         .filter(|k| k.as_str() != "main" && k.as_str() != "master")
         .collect();
-    tags.sort_by(|a, b| version_key(b).cmp(&version_key(a))); // newest first
+    tags.sort_by_key(|tag| std::cmp::Reverse(version_key(tag))); // newest first
     out.extend(tags.into_iter().filter(|t| *t != pinned).cloned());
     out
 }
@@ -204,12 +206,7 @@ pub fn selectable_revs(sources_dir: &Path, name: &str, repo: &str, pinned: &str)
 /// Resolve a rev label to the commit sha it currently points at.
 /// `main`/`master` resolve to the cached/discovered head — recorded on
 /// the mission at launch, so a moving branch is pinned at pick time.
-pub fn resolve_rev(
-    sources_dir: &Path,
-    name: &str,
-    repo: &str,
-    rev: &str,
-) -> Result<String, Error> {
+pub fn resolve_rev(sources_dir: &Path, name: &str, repo: &str, rev: &str) -> Result<String, Error> {
     let refs = cached_refs(sources_dir, name, repo).ok_or_else(|| {
         Error::Store(format!(
             "no rev data for {name} (offline and no cache) — cannot resolve {rev:?}"
@@ -262,7 +259,9 @@ pub fn ensure_source_tree(
         let ok = fs::create_dir_all(&tmp).is_ok()
             && git(&["-C", &dir, "init", "--quiet"])
             && git(&["-C", &dir, "remote", "add", "origin", &remote_url(repo)])
-            && git(&["-C", &dir, "fetch", "--quiet", "--depth", "1", "origin", sha])
+            && git(&[
+                "-C", &dir, "fetch", "--quiet", "--depth", "1", "origin", sha,
+            ])
             && git(&["-C", &dir, "checkout", "--quiet", "--detach", sha]);
         if !ok || !head_matches(&tmp, sha) {
             let _ = fs::remove_dir_all(&tmp);
@@ -291,8 +290,9 @@ pub fn ensure_source_tree(
             // The rev moved between resolve and clone (a branch tip) — fetch
             // the recorded sha itself and check it out.
             let dir = tmp.to_string_lossy().into_owned();
-            let fetched = git(&["-C", &dir, "fetch", "--quiet", "--depth", "1", "origin", sha])
-                && git(&["-C", &dir, "checkout", "--quiet", "--detach", sha]);
+            let fetched = git(&[
+                "-C", &dir, "fetch", "--quiet", "--depth", "1", "origin", sha,
+            ]) && git(&["-C", &dir, "checkout", "--quiet", "--detach", sha]);
             if !fetched || !head_matches(&tmp, sha) {
                 let got = head(&tmp).unwrap_or_else(|| "unknown".into());
                 let _ = fs::remove_dir_all(&tmp);
@@ -380,9 +380,29 @@ mod tests {
             assert!(status.success(), "git {args:?} failed");
         };
         git(&["init", "--quiet", "-b", "main"]);
-        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "--allow-empty", "-m", "one"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "one",
+        ]);
         git(&["tag", tag]);
-        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "--allow-empty", "-m", "two"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "two",
+        ]);
         git(&["tag", "-a", tag2, "-m", "annotated"]);
         work
     }

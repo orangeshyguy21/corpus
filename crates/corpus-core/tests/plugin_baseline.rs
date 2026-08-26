@@ -89,7 +89,11 @@ fn selected_probe_and_warm_launch_preparation() {
     println!(
         "fixture: commit={} profile={} os={} cpus={} samples={} source_cache=warm",
         command_output("git", &["rev-parse", "HEAD"]),
-        if cfg!(debug_assertions) { "debug" } else { "release" },
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
         command_output("uname", &["-a"]),
         std::thread::available_parallelism()
             .map(|count| count.get())
@@ -107,7 +111,11 @@ fn selected_probe_and_warm_launch_preparation() {
             .find(|status| status.name == "cdk-regtest")
             .expect("selected plugin remains discoverable");
         assert!(selected.probed, "selected plugin was not probed");
-        assert!(selected.ready, "selected plugin is not ready: {}", selected.notes);
+        assert!(
+            selected.ready,
+            "selected plugin is not ready: {}",
+            selected.notes
+        );
     }
 
     let mut preparation_samples = Vec::with_capacity(SAMPLES);

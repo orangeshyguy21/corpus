@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+expected_version="cargo-deny 0.20.2"
+
+if ! command -v cargo-deny >/dev/null 2>&1; then
+    echo "supply-chain policy: cargo-deny 0.20.2 is required" >&2
+    echo "install with: cargo install --locked cargo-deny --version 0.20.2" >&2
+    exit 1
+fi
+
+actual_version="$(cargo-deny --version)"
+if [[ "$actual_version" != "$expected_version" ]]; then
+    echo "supply-chain policy: expected $expected_version, found $actual_version" >&2
+    exit 1
+fi
+
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_dir"
+
+cargo-deny --locked check
