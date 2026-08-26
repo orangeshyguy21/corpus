@@ -1,5 +1,149 @@
 use super::*;
 
+fn project_state(name: &str, projects: &[&str]) -> (PathBuf, AppState) {
+    let root = std::env::temp_dir().join(format!(
+        "corpus-app-{name}-{}-{}",
+        std::process::id(),
+        new_uuid_id()
+    ));
+    let store = Store::new(root.clone());
+    for project in projects {
+        store
+            .create_project(project, project, "cdk-regtest")
+            .unwrap();
+    }
+    (root, AppState::from_store_headless(store))
+}
+
+#[test]
+fn completed_project_delete_prunes_render_state_immediately() {
+    let (root, mut state) = project_state("project-delete-prune", &["keep", "remove"]);
+    state.select_project("remove");
+
+    assert_eq!(
+        state.delete_project("remove").unwrap(),
+        DeleteProjectResult::Completed
+    );
+    assert!(!state.projects.iter().any(|(slug, _)| slug == "remove"));
+    assert!(!state.trees.contains_key("remove"));
+    assert_eq!(state.effective_project().as_deref(), Some("keep"));
+    assert!(!state.store.project_dir("remove").exists());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn deleting_the_last_project_produces_an_empty_selection() {
+    let (root, mut state) = project_state("last-project-delete", &["only"]);
+    state.select_project("only");
+
+    assert_eq!(
+        state.delete_project("only").unwrap(),
+        DeleteProjectResult::Completed
+    );
+    assert!(state.projects.is_empty());
+    assert_eq!(state.effective_project(), None);
+    assert_eq!(state.selected_project, None);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn scheduled_project_delete_is_retained_but_not_selectable() {
+    let (root, mut state) = project_state("scheduled-project-delete", &["keep", "remove"]);
+    state
+        .store
+        .create_agent_with_role("remove", "runner", corpus_core::AgentRole::Tester)
+        .unwrap();
+    let mut record = mission(1);
+    record.agent = "runner".into();
+    record.session = Some("live-session".into());
+    state
+        .store
+        .write_mission("remove", "mission", &record, "brief")
+        .unwrap();
+    state.refresh();
+
+    assert_eq!(
+        state.delete_project("remove").unwrap(),
+        DeleteProjectResult::Scheduled
+    );
+    assert!(state
+        .projects
+        .iter()
+        .find(|(slug, _)| slug == "remove")
+        .is_some_and(|(_, project)| project.delete_requested.is_some()));
+    state.select_project("remove");
+    assert_ne!(state.effective_project().as_deref(), Some("remove"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn ghost_project_selection_prunes_the_stale_cache() {
+    let (root, mut state) = project_state("ghost-project-click", &["ghost", "keep"]);
+    state.store.delete_project("ghost").unwrap();
+
+    state.select_project("ghost");
+
+    assert!(!state.projects.iter().any(|(slug, _)| slug == "ghost"));
+    assert_ne!(state.selected_project.as_deref(), Some("ghost"));
+    assert_eq!(state.effective_project().as_deref(), Some("keep"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn stale_project_index_snapshot_cannot_restore_removed_project() {
+    let (root, mut state) = project_state("stale-project-index", &["keep"]);
+    let stale_projects = state.projects.clone();
+    let stale_trees = state.trees.clone();
+    state.project_index_revision = 2;
+    state.projects.clear();
+    state.trees.clear();
+
+    assert!(!state.apply_project_index(1, stale_projects, stale_trees));
+    assert!(state.projects.is_empty());
+    assert!(state.trees.is_empty());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn refresh_requested_during_active_index_gets_one_current_follow_up() {
+    let (root, mut state) = project_state("coalesced-project-index", &["first"]);
+    state.install_job_runtime(eframe::egui::Context::default());
+    state.refresh();
+    state
+        .store
+        .create_project("second", "second", "cdk-regtest")
+        .unwrap();
+    state.refresh();
+    let requested = state.project_index_revision;
+
+    for _ in 0..300 {
+        state.poll_background_jobs();
+        if state.projects.iter().any(|(slug, _)| slug == "second")
+            && state
+                .jobs
+                .as_ref()
+                .is_some_and(|jobs| !jobs.is_kind_active(JobKind::ProjectIndex))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    assert_eq!(state.project_index_revision, requested);
+    assert!(state.projects.iter().any(|(slug, _)| slug == "second"));
+    assert!(state
+        .jobs
+        .as_ref()
+        .is_some_and(|jobs| !jobs.is_kind_active(JobKind::ProjectIndex)));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn generated_ids_are_formatted_uuids_and_valid_slugs() {
     for _ in 0..100 {

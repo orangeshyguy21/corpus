@@ -126,6 +126,12 @@ pub struct AppState {
     file_invalidations: Option<Box<dyn FileInvalidationSource>>,
     file_watch_warning: Option<String>,
     jobs: Option<JobSet<AppJobOutput>>,
+    /// Monotonic identity for full project-index requests. Requests made
+    /// during an active scan coalesce behind it; only the latest revision may
+    /// replace the render cache.
+    project_index_revision: u64,
+    project_index_active_revision: Option<u64>,
+    pending_background_notices: Vec<BackgroundNotice>,
     /// The screen the sidebar selection points at (Projects / Agents /
     /// Missions). Live runs remain inside the Missions screen.
     pub current_screen: Screen,
@@ -313,7 +319,11 @@ enum AppJobOutput {
         agent_deletions: Vec<AgentDeletionRequest>,
         project_deletions: Vec<String>,
     },
-    ProjectIndex(Vec<(String, Project)>, BTreeMap<String, ProjectTree>),
+    ProjectIndex {
+        revision: u64,
+        projects: Vec<(String, Project)>,
+        trees: BTreeMap<String, ProjectTree>,
+    },
     Agents(Vec<(String, AgentConfig)>),
     Missions(Vec<(String, Mission)>),
 }
@@ -454,6 +464,9 @@ impl AppState {
             file_invalidations: None,
             file_watch_warning: None,
             jobs: None,
+            project_index_revision: 0,
+            project_index_active_revision: None,
+            pending_background_notices: Vec::new(),
             current_screen: Screen::Projects,
             chat_open: false,
             projects: Vec::new(),

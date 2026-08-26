@@ -147,6 +147,14 @@ pub enum DeleteMissionResult {
     Completed,
 }
 
+/// Whether a project disappeared immediately or remains durably marked for
+/// deletion while child mission teardown finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteProjectResult {
+    Scheduled,
+    Completed,
+}
+
 /// The compact operator-facing state used by mission lists and status dots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissionDisplayState {

@@ -130,6 +130,16 @@ impl AppState {
         self.jobs = Some(jobs);
         let mut notices = Vec::new();
         for result in results {
+            if result.kind == JobKind::ProjectIndex {
+                let completed_revision = self.project_index_active_revision.take();
+                if completed_revision != Some(self.project_index_revision) {
+                    // A refresh was requested while this scan was active. The
+                    // old snapshot is never applied; now that its key has
+                    // been drained, start one scan for the newest revision.
+                    self.schedule_project_index();
+                    continue;
+                }
+            }
             if self.retry_stale_corpus_job(result.kind, &result.scope) {
                 continue;
             }
@@ -349,9 +359,13 @@ impl AppState {
                         launches,
                     );
                 }
-                JobTerminal::Success(AppJobOutput::ProjectIndex(projects, trees)) => {
-                    self.projects = projects;
-                    self.trees = trees;
+                JobTerminal::Success(AppJobOutput::ProjectIndex {
+                    revision,
+                    projects,
+                    trees,
+                }) => {
+                    let applied = self.apply_project_index(revision, projects, trees);
+                    debug_assert!(applied);
                 }
                 JobTerminal::Success(AppJobOutput::Agents(agents)) => {
                     let project = result.scope.project;
@@ -452,6 +466,7 @@ impl AppState {
                 }
             }
         }
+        notices.append(&mut self.pending_background_notices);
         notices
     }
 

@@ -447,8 +447,19 @@ impl AppState {
                 .list_missions(&project)
                 .is_ok_and(|missions| missions.is_empty())
             {
-                let _ = self.store.delete_project(&project);
-                self.refresh();
+                match self.store.delete_project(&project) {
+                    Ok(()) => {
+                        self.prune_project_cache(&project);
+                        self.refresh();
+                    }
+                    Err(error) => {
+                        self.pending_background_notices
+                            .push(crate::state::BackgroundNotice::error(
+                                JobKind::LaunchRequests,
+                                format!("could not finish deleting project {project}: {error}"),
+                            ))
+                    }
+                }
             }
         }
     }

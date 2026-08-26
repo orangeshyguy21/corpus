@@ -6,11 +6,11 @@ use std::time::Duration;
 use corpus_core::{Error, FindingIndexCache, Mission, MissionDeleteRequest, Project};
 
 use super::{
-    new_uuid_id, AppJobOutput, AppState, DeleteMissionResult, EnvStatus, FindingDiscovery,
-    FindingSnapshot, ModelDiscovery, ProjectScopeSnapshot, ProjectTree, RunPhase,
+    new_uuid_id, AppJobOutput, AppState, DeleteMissionResult, DeleteProjectResult, EnvStatus,
+    FindingDiscovery, FindingSnapshot, ModelDiscovery, ProjectScopeSnapshot, ProjectTree, RunPhase,
     StopMissionResult,
 };
-use crate::jobs::{JobKind, JobScope};
+use crate::jobs::{JobKind, JobScope, StartOutcome};
 use crate::nav::Screen;
 
 impl AppState {
@@ -18,42 +18,77 @@ impl AppState {
     /// Newest-created first — the tree's default-open project is the most
     /// recent (the selection fallback takes `projects.first()`).
     pub fn refresh(&mut self) {
-        if let Some(jobs) = self.jobs.as_mut() {
-            let store = self.store.clone();
-            jobs.start(
-                JobKind::ProjectScope,
-                JobScope {
-                    project: String::new(),
-                    project_generation: 0,
-                    corpus_revision: None,
-                    run_id: None,
-                },
-                Duration::from_secs(30),
-                move |_| {
-                    let mut projects = store.list_projects().map_err(|error| error.to_string())?;
-                    projects.sort_by_key(|entry| std::cmp::Reverse(entry.1.created));
-                    let trees = projects
-                        .iter()
-                        .map(|(slug, _)| {
-                            let agents =
-                                store.list_agents(slug).map_err(|error| error.to_string())?;
-                            let missions = sort_missions(
-                                store
-                                    .list_missions(slug)
-                                    .map_err(|error| error.to_string())?,
-                            );
-                            Ok((slug.clone(), ProjectTree { agents, missions }))
-                        })
-                        .collect::<Result<BTreeMap<_, _>, String>>()?;
-                    Ok(AppJobOutput::ProjectIndex(projects, trees))
-                },
-            );
+        self.project_index_revision = self.project_index_revision.saturating_add(1);
+        if self.jobs.is_some() {
+            self.schedule_project_index();
             return;
         }
         self.projects = self.store.list_projects().unwrap_or_default();
         self.projects
             .sort_by_key(|entry| std::cmp::Reverse(entry.1.created));
         self.refresh_trees();
+    }
+
+    /// Start the latest requested full index if one is not already active.
+    /// The job key deliberately omits the revision, so event bursts collapse
+    /// to one active scan and at most one follow-up scan.
+    pub(super) fn schedule_project_index(&mut self) {
+        let revision = self.project_index_revision;
+        let Some(jobs) = self.jobs.as_mut() else {
+            return;
+        };
+        let store = self.store.clone();
+        let outcome = jobs.start(
+            JobKind::ProjectIndex,
+            JobScope {
+                project: String::new(),
+                project_generation: 0,
+                corpus_revision: None,
+                run_id: None,
+            },
+            Duration::from_secs(30),
+            move |_| {
+                let mut projects = store.list_projects().map_err(|error| error.to_string())?;
+                projects.sort_by_key(|entry| std::cmp::Reverse(entry.1.created));
+                let trees = projects
+                    .iter()
+                    .map(|(slug, _)| {
+                        let agents = store.list_agents(slug).map_err(|error| error.to_string())?;
+                        let missions = sort_missions(
+                            store
+                                .list_missions(slug)
+                                .map_err(|error| error.to_string())?,
+                        );
+                        Ok((slug.clone(), ProjectTree { agents, missions }))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, String>>()?;
+                Ok(AppJobOutput::ProjectIndex {
+                    revision,
+                    projects,
+                    trees,
+                })
+            },
+        );
+        if matches!(outcome, StartOutcome::Started(_)) {
+            self.project_index_active_revision = Some(revision);
+        }
+        // A duplicate leaves the incremented requested revision in place as
+        // the dirty marker; completion of the active scan schedules the
+        // follow-up.
+    }
+
+    pub(super) fn apply_project_index(
+        &mut self,
+        revision: u64,
+        projects: Vec<(String, Project)>,
+        trees: BTreeMap<String, ProjectTree>,
+    ) -> bool {
+        if revision != self.project_index_revision {
+            return false;
+        }
+        self.projects = projects;
+        self.trees = trees;
+        true
     }
 
     /// Rebuild the sidebar tree: every project's agents + missions. One
@@ -136,14 +171,38 @@ impl AppState {
     pub fn effective_project(&self) -> Option<String> {
         self.selected_project
             .as_ref()
-            .filter(|slug| self.projects.iter().any(|(s, _)| s == *slug))
+            .filter(|slug| {
+                self.projects
+                    .iter()
+                    .any(|(s, project)| s == *slug && project.delete_requested.is_none())
+            })
             .cloned()
-            .or_else(|| self.projects.first().map(|(slug, _)| slug.clone()))
+            .or_else(|| {
+                self.projects
+                    .iter()
+                    .find(|(_, project)| project.delete_requested.is_none())
+                    .map(|(slug, _)| slug.clone())
+            })
     }
 
     /// Select a project in the sidebar and (re)load its scoped caches —
     /// agents, missions, and the corpus summary all move to `slug`.
     pub fn select_project(&mut self, slug: &str) {
+        let cached_and_selectable = self
+            .projects
+            .iter()
+            .any(|(candidate, project)| candidate == slug && project.delete_requested.is_none());
+        // This stat happens only for an explicit navigation action. It closes
+        // the final ghost-row window without adding filesystem work to render
+        // frames or ordinary selection maintenance.
+        let exists = self.store.project_dir(slug).is_dir();
+        if !cached_and_selectable || !exists {
+            if !exists {
+                self.prune_project_cache(slug);
+                self.refresh();
+            }
+            return;
+        }
         self.selected_project = Some(slug.to_string());
         if self.jobs.is_some() {
             let tree = self.trees.get(slug).cloned().unwrap_or_default();
@@ -254,7 +313,12 @@ impl AppState {
     /// stale checks are project-name equality, so this only hits disk on
     /// change.
     pub fn ensure_selection(&mut self) {
-        let Some(first) = self.projects.first().map(|(slug, _)| slug.clone()) else {
+        let Some(first) = self
+            .projects
+            .iter()
+            .find(|(_, project)| project.delete_requested.is_none())
+            .map(|(slug, _)| slug.clone())
+        else {
             self.selected_project = None;
             self.agents.clear();
             self.missions.clear();
@@ -276,10 +340,10 @@ impl AppState {
             self.env_project = None;
             return;
         };
-        let stale = !self
-            .projects
-            .iter()
-            .any(|(slug, _)| Some(slug.as_str()) == self.selected_project.as_deref());
+        let stale = !self.projects.iter().any(|(slug, project)| {
+            project.delete_requested.is_none()
+                && Some(slug.as_str()) == self.selected_project.as_deref()
+        });
         if stale {
             self.selected_project = Some(first.clone());
         }
@@ -370,16 +434,74 @@ impl AppState {
             .map(|p| (slug, p))
     }
 
-    pub fn delete_project(&self, slug: &str) -> Result<(), Error> {
+    pub fn delete_project(&mut self, slug: &str) -> Result<DeleteProjectResult, Error> {
         let missions = self.store.list_missions(slug)?;
         if self.project_has_inflight_run(slug)
             || missions
                 .iter()
                 .any(|(mission, _)| self.store.ensure_mission_deletable(slug, mission).is_err())
         {
-            self.store.request_project_delete(slug)
+            self.store.request_project_delete(slug)?;
+            let deleting = Project::load(&self.store, slug)?;
+            if let Some((_, cached)) = self
+                .projects
+                .iter_mut()
+                .find(|(project, _)| project == slug)
+            {
+                *cached = deleting;
+            }
+            if self.selected_project.as_deref() == Some(slug) {
+                self.selected_project = None;
+            }
+            Ok(DeleteProjectResult::Scheduled)
         } else {
-            self.store.delete_project(slug)
+            self.store.delete_project(slug)?;
+            self.prune_project_cache(slug);
+            self.refresh();
+            Ok(DeleteProjectResult::Completed)
+        }
+    }
+
+    /// Remove one project from every render-facing cache in the same UI
+    /// frame as durable deletion. Background reconciliation remains a safety
+    /// net and cannot be the source of deletion responsiveness.
+    pub(super) fn prune_project_cache(&mut self, slug: &str) {
+        self.projects.retain(|(project, _)| project != slug);
+        self.trees.remove(slug);
+        self.corpus_revisions.remove(slug);
+        if self.selected_project.as_deref() == Some(slug) {
+            self.selected_project = None;
+        }
+        if self.agents_project.as_deref() == Some(slug) {
+            self.agents.clear();
+            self.agents_project = None;
+            self.selected_agent = None;
+        }
+        if self.missions_project.as_deref() == Some(slug) {
+            self.missions.clear();
+            self.missions_project = None;
+            self.selected_mission = None;
+        }
+        if self.corpus_stats_project.as_deref() == Some(slug) {
+            self.corpus_stats = None;
+            self.corpus_cost = None;
+            self.corpus_cost_cache = corpus_core::CorpusCostCache::default();
+            self.finding_index_cache = FindingIndexCache::default();
+            self.findings = FindingDiscovery::Loading;
+            self.findings_project = None;
+            self.mission_logs.clear();
+            self.corpus_stats_project = None;
+            self.corpus_polled_at = None;
+        }
+        if self.source_revs_project.as_deref() == Some(slug) {
+            self.source_pins.clear();
+            self.source_revs.clear();
+            self.source_revs_project = None;
+            self.source_revs_loading = false;
+            self.source_revs_error = None;
+        }
+        if self.env_project.as_deref() == Some(slug) {
+            self.env_project = None;
         }
     }
 

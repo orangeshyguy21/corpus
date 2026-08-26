@@ -14,7 +14,7 @@ use egui::{Align2, RichText, Ui};
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 
 use crate::fmt::fmt_bytes;
-use crate::state::{AppState, MissionDisplayState};
+use crate::state::{AppState, DeleteProjectResult, MissionDisplayState};
 use crate::theme;
 use crate::views::components;
 use crate::views::finding_summary::FindingSummary;
@@ -619,10 +619,11 @@ impl ProjectsView {
     /// bubbles up as a toast.
     fn delete_project(&mut self, state: &mut AppState, toasts: &mut Toasts, slug: &str) {
         match state.delete_project(slug) {
-            Ok(()) => {
+            Ok(DeleteProjectResult::Completed) => {
+                toast(toasts, ToastKind::Success, "project deleted");
+            }
+            Ok(DeleteProjectResult::Scheduled) => {
                 toast(toasts, ToastKind::Success, "project deletion started");
-                state.refresh();
-                // ensure_selection re-picks a project next frame.
                 state.selected_project = None;
             }
             Err(error) => toast(toasts, ToastKind::Error, error.to_string()),
