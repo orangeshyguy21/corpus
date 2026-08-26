@@ -169,5 +169,23 @@ Before upgrading Corpus or a plugin:
 4. Run plugin `doctor` before selecting it for future work.
 5. Run the appropriate verification tier from [`testing.md`](testing.md).
 
+### Probe namespace migration
+
+Corpus stores executable regression artifacts under
+`corpus/probes/<slug>/{probe.md,run.sh}`. Projects created before this change
+may still contain `corpus/attacks/<slug>/{attack.md,run.sh}`. Preview and apply
+the per-project migration explicitly:
+
+```sh
+corpus project migrate-probes <project>
+corpus project migrate-probes <project> --apply
+```
+
+The first form is read-only. Migration refuses symlinks, malformed legacy
+artifacts, and projects with non-empty entries in both namespaces. During the
+compatibility window, legacy entries remain readable and deletable and the
+deprecated `attack_save` MCP alias writes through to the new `probes/`
+namespace. New generic writes under `attacks/` are refused.
+
 Plugin selection affects future sessions only. Existing evidence retains its
 plugin, bundle, environment, image, source, model, and agent identities.

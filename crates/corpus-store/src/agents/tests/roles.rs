@@ -26,6 +26,13 @@ fn every_corpus_tool_is_classified_by_every_role() {
     }
     assert!(AgentRole::Researcher.tools().len() < CORPUS_TOOLS.len());
     assert_eq!(AgentRole::Super.tools().len(), CORPUS_TOOLS.len());
+    for role in AgentRole::ALL {
+        assert_eq!(
+            role.allows("corpus_probe_save"),
+            role.allows("corpus_attack_save"),
+            "legacy alias must not define separate authority for {role:?}"
+        );
+    }
     // Every role is current-project scoped; a host shell could forge a
     // different project even when the role already holds every local tool.
     for role in AgentRole::ALL {
@@ -64,6 +71,14 @@ fn infer_role_matches_the_seed_permissions() {
     // No block at all: opencode allows everything.
     let bare = serde_json::json!({ "mode": "primary" });
     assert_eq!(infer_role(bare.as_object().unwrap()), AgentRole::Super);
+
+    let mut conflicting_aliases = researcher.clone();
+    conflicting_aliases["permission"]["corpus_probe_save"] = "allow".into();
+    assert_eq!(
+        infer_role(conflicting_aliases.as_object().unwrap()),
+        AgentRole::Researcher,
+        "the tighter alias decision must win during legacy inference"
+    );
 }
 
 /// A subagent can be narrower than its parent but never wider — the

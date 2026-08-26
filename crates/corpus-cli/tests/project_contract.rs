@@ -89,3 +89,31 @@ fn project_required_options_fail_before_store_creation() {
     assert!(stderr.contains("--to <TO>"), "{stderr}");
     assert!(!root.exists(), "parser failure created {}", root.display());
 }
+
+#[test]
+fn probe_migration_is_dry_run_first_through_the_binary() {
+    let root =
+        std::env::temp_dir().join(format!("corpus-cli-probe-migration-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    success(&root, &["project", "new", "alpha", "--plugin", "fixture"]);
+    let corpus = root.join("store/projects/alpha/corpus");
+    fs::remove_dir(corpus.join("probes")).unwrap();
+    fs::create_dir_all(corpus.join("attacks/replay")).unwrap();
+    fs::write(corpus.join("attacks/replay/attack.md"), "legacy\n").unwrap();
+    fs::write(corpus.join("attacks/replay/run.sh"), "#!/bin/sh\n").unwrap();
+
+    let preview = success(&root, &["project", "migrate-probes", "alpha"]);
+    assert!(preview.contains("dry run"), "{preview}");
+    assert!(preview.contains("re-run with --apply"), "{preview}");
+    assert!(corpus.join("attacks/replay/attack.md").is_file());
+
+    let applied = success(&root, &["project", "migrate-probes", "alpha", "--apply"]);
+    assert!(applied.contains("applied"), "{applied}");
+    assert!(corpus.join("probes/replay/probe.md").is_file());
+    assert!(!corpus.join("attacks").exists());
+    assert_eq!(
+        success(&root, &["project", "migrate-probes", "alpha", "--apply"]),
+        "project alpha: probe namespace already current\n"
+    );
+    let _ = fs::remove_dir_all(root);
+}

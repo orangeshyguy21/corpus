@@ -28,7 +28,7 @@ pub(crate) static STATS: ToolDefinition = ToolDefinition {
 
 pub(crate) static LIST: ToolDefinition = ToolDefinition {
     name: "corpus_list",
-    description: "List entries in a corpus category (hypotheses | techniques | findings | attacks | retro | runs).",
+    description: "List entries in a corpus category (hypotheses | techniques | findings | probes | retro | runs).",
     input_schema: input_schema::<CorpusListArgs>,
     handler: corpus_list,
     policy: READ_POLICY,
@@ -36,7 +36,7 @@ pub(crate) static LIST: ToolDefinition = ToolDefinition {
 
 pub(crate) static READ: ToolDefinition = ToolDefinition {
     name: "corpus_read",
-    description: "Read a store entry's markdown body by relative path under the project's corpus (findings/..., attacks/<slug>/attack.md, ...).",
+    description: "Read a store entry's markdown body by relative path under the project's corpus (findings/..., probes/<slug>/probe.md, ...).",
     input_schema: input_schema::<CorpusReadArgs>,
     handler: corpus_read,
     policy: READ_POLICY,

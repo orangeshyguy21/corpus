@@ -8,7 +8,7 @@
 //!     project.yaml                # name, plugin binding, created/cloned-from,
 //!                                 #   corpus_generation
 //!     corpus/                     # THE corpus (hypotheses/ techniques/
-//!                                 #   findings/ attacks/ retro/ runs/) — the
+//!                                 #   findings/ probes/ retro/ runs/) — the
 //!                                 #   ONLY corpus scope
 //!     agents/<agent-slug>/        # agent configs: agent.yaml, opencode.json,
 //!                                 #   prompts/
@@ -72,10 +72,16 @@ pub const CATEGORIES: [&str; 6] = [
     "hypotheses",
     "techniques",
     "findings",
-    "attacks",
+    PROBES,
     "retro",
     "runs",
 ];
+
+/// Durable executable regression artifacts.
+pub const PROBES: &str = "probes";
+
+/// Pre-probe namespace retained for migration and read/delete compatibility.
+pub const LEGACY_ATTACKS: &str = "attacks";
 
 /// Resolve the store root: `CORPUS_STORE`, else `~/.corpus/store`.
 pub fn store_root_env() -> PathBuf {

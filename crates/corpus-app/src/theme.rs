@@ -77,14 +77,14 @@ pub const EDITOR_BG: Color32 = Color32::from_rgb(0x0d, 0x0f, 0x10);
 /// The corpus stack graphic's front-plate fill (`#191a1f`).
 pub const PLATE_FRONT: Color32 = Color32::from_rgb(0x1b, 0x1b, 0x19);
 /// Category segment colors for the corpus visual (hypotheses, techniques,
-/// findings, attacks, then any extra bucket) — muted, distinct on the dark
+/// findings, probes, then any extra bucket) — muted, distinct on the dark
 /// panels. Mission logs are not a segment here; they carry `MISSION_LOG`
 /// in their own section.
 pub const CORPUS_PALETTE: [Color32; 5] = [
     Color32::from_rgb(0x4a, 0x6e, 0x8f), // slate blue
     Color32::from_rgb(0x6f, 0x8f, 0x5a), // moss
     SIGNAL_RED,                          // findings / signal
-    INTERACTION,                         // attacks / amber
+    INTERACTION,                         // probes / amber
     Color32::from_rgb(0x3a, 0x3b, 0x44), // plate grey (other)
 ];
 /// The mission-log accent (`#5c5d66`) — deliberately the quietest tone in

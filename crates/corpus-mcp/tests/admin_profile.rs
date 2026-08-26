@@ -302,13 +302,13 @@ fn entry_delete_is_dry_run_first_and_bound_to_current_state() {
 #[test]
 fn entry_delete_directory_requires_recursive_before_minting() {
     let (mut ctx, store, root, project) = rig("entry-delete-recursive");
-    let attack = proj_corpus(&store).join("attacks/replay");
-    std::fs::create_dir_all(&attack).unwrap();
-    std::fs::write(attack.join("attack.md"), "attack\n").unwrap();
+    let probe = proj_corpus(&store).join("probes/replay");
+    std::fs::create_dir_all(&probe).unwrap();
+    std::fs::write(probe.join("probe.md"), "probe\n").unwrap();
     let error = admin::dispatch(
         &mut ctx,
         "entry_delete",
-        &json!({"project": project, "path": "attacks/replay"}),
+        &json!({"project": project, "path": "probes/replay"}),
     )
     .expect_err("directory needs recursive")
     .to_string();
@@ -317,7 +317,7 @@ fn entry_delete_directory_requires_recursive_before_minting() {
         !error.contains("confirm_token"),
         "must not mint unusable token: {error}"
     );
-    assert!(attack.is_dir());
+    assert!(probe.is_dir());
     let _ = std::fs::remove_dir_all(&root);
 }
 

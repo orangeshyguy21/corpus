@@ -456,7 +456,7 @@ impl ProjectsView {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::destructive_button(ui, "Wipe corpus…")
-                        .on_hover_text("findings, techniques, attacks, hypotheses and logs")
+                        .on_hover_text("findings, techniques, probes, hypotheses and logs")
                         .clicked()
                     {
                         self.confirm_wipe = true;
@@ -470,7 +470,7 @@ impl ProjectsView {
                 } else {
                     empty_hint(
                         ui,
-                        "empty — missions write findings, techniques, hypotheses and attacks here",
+                        "empty — missions write findings, techniques, hypotheses and probes here",
                     );
                 }
             }
@@ -694,7 +694,7 @@ impl ProjectsView {
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -60.0))
             .show(ui.ctx(), |ui| {
                 ui.label("This wipes the project corpus and bumps the generation.");
-                ui.weak("Findings, techniques, hypotheses, attacks and run logs are removed; the project and its agents survive. There is no undo.");
+                ui.weak("Findings, techniques, hypotheses, probes and run logs are removed; the project and its agents survive. There is no undo.");
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if theme::destructive_button(ui, "Wipe corpus").clicked() {

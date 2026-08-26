@@ -105,7 +105,7 @@ fn writes_never_bring_a_project_into_being() {
             json!({ "title": "t", "severity": "high", "detail": "d" }),
         ),
         (
-            "attack_save",
+            "probe_save",
             json!({ "name": "a", "description": "d", "script": "#!/bin/sh\n" }),
         ),
         (

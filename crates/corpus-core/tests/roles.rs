@@ -167,7 +167,7 @@ fn roles_bind_their_trust_domains() {
         "corpus_faucet",
         "corpus_wallet_fund",
         "corpus_finding_write",
-        "corpus_attack_save",
+        "corpus_probe_save",
     ] {
         assert_eq!(action(&res, denied).as_deref(), Some("deny"), "{denied}");
     }

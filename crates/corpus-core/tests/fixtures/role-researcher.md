@@ -37,6 +37,7 @@ permission:
   corpus_model_list: deny
   corpus_oracle_list: deny
   corpus_oracle_run: deny
+  corpus_probe_save: deny
   corpus_sandbox_exec: deny
   corpus_sandbox_write: deny
   corpus_target_info: allow
@@ -115,7 +116,7 @@ source; every citation is traceable.
 
 You are bound to project `p`. Your corpus is
 `store/projects/p/corpus/` — categories: `hypotheses/`,
-`techniques/`, `findings/`, `attacks/`, `runs/`. Read and write
+`techniques/`, `findings/`, `probes/`, `runs/`. Read and write
 ONLY inside it. Other projects' corpora are denied by
 permissions and strictly off-limits: reading them pollutes the
 project boundary. Any path in this prompt that names a corpus

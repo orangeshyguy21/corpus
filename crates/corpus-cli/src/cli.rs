@@ -141,6 +141,13 @@ pub(crate) enum ProjectCommand {
         #[arg(long)]
         plugin: String,
     },
+    /// Migrate legacy attacks/ artifacts to the probes/ namespace.
+    MigrateProbes {
+        project: String,
+        /// Apply the migration; omission is a dry run.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -493,6 +500,15 @@ mod tests {
             CliCommand::Project(ProjectArgs {
                 command: ProjectCommand::Delete {
                     slug: "alpha".into()
+                }
+            })
+        );
+        assert_eq!(
+            parse(strings(&["project", "migrate-probes", "alpha", "--apply"])).unwrap(),
+            CliCommand::Project(ProjectArgs {
+                command: ProjectCommand::MigrateProbes {
+                    project: "alpha".into(),
+                    apply: true,
                 }
             })
         );

@@ -413,7 +413,7 @@ fn corpus_scope_section(project: &str) -> String {
         "\n---\n\n## Corpus scope (bound at launch)\n\n\
          You are bound to project `{project}`. Your corpus is\n\
          `store/projects/{project}/corpus/` — categories: `hypotheses/`,\n\
-         `techniques/`, `findings/`, `attacks/`, `runs/`. Read and write\n\
+         `techniques/`, `findings/`, `probes/`, `runs/`. Read and write\n\
          ONLY inside it. Other projects' corpora are denied by\n\
          permissions and strictly off-limits: reading them pollutes the\n\
          project boundary. Any path in this prompt that names a corpus\n\

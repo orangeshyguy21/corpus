@@ -45,7 +45,7 @@ mod test_support;
 
 pub use agents::{
     infer_role, primary_handles, AddSubagentRequest, AgentRole, CreateAgentRequest, RoleMigration,
-    CORPUS_TOOLS, CURATOR_TOOLS, SUPER_ADMIN_TOOLS,
+    CORPUS_TOOLS, CURATOR_TOOLS, LEGACY_CORPUS_TOOLS, SUPER_ADMIN_TOOLS,
 };
 pub use agents::{AgentConfig, AgentSidecar, SourcePin, DEFAULT_AGENT_NAME, OPENCODE_SCHEMA};
 pub use corpus_observe::{
@@ -106,6 +106,6 @@ pub use store::{
     CostReport, CostRow, EntryAccess, Mission, MissionCompletion, MissionControl,
     MissionDeleteRequest, MissionDispatch, MissionDispatchIdentity, MissionLaunchRequest,
     MissionLog, MissionRunRef, Project, Scope, Store, UsageSnapshot, AGENT_ENV, CATEGORIES,
-    ENVIRONMENT_SESSION_ENV, MISSION_ENV, PROJECT_ENV, RUNS, RUN_ID_ENV, RUN_LOG_ENV,
-    SOURCE_PINS_ENV, STORE_ENV, USAGE_SNAPSHOT_VERSION,
+    ENVIRONMENT_SESSION_ENV, LEGACY_ATTACKS, MISSION_ENV, PROBES, PROJECT_ENV, RUNS, RUN_ID_ENV,
+    RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV, USAGE_SNAPSHOT_VERSION,
 };

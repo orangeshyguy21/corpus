@@ -14,7 +14,7 @@ Recorded 2026-08-25 at the start of Phase 5.
 The host tools are grouped as projects (5), agents (12), missions (9), corpus
 and findings (8), and model discovery (1). The research tools are
 `target_info`, `sandbox_exec`, `sandbox_write`, `oracle_list`, `oracle_run`,
-`faucet`, `wallet_fund`, `finding_write`, `attack_save`, and
+`faucet`, `wallet_fund`, `finding_write`, `probe_save`, and
 `technique_save`.
 
 ## Metadata currently maintained separately

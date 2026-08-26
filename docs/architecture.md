@@ -179,7 +179,7 @@ must never be inferred from one another.
     project.yaml
     agents/<agent>/
     missions/<mission>.md
-    corpus/{hypotheses,techniques,findings,attacks,retro,runs}/
+    corpus/{hypotheses,techniques,findings,probes,retro,runs}/
     usage/<session>.json
   cache/sources/<source>/<sha>/
   plugins/<plugin>/<version>/
@@ -196,6 +196,11 @@ must never be inferred from one another.
   var/diagnostics/
   app.yaml
 ```
+
+Executable regression artifacts use
+`corpus/probes/<slug>/{probe.md,run.sh}`. The store temporarily recognizes the
+legacy `attacks/` namespace for explicit migration and read/delete
+compatibility only; it is not an active write category.
 
 The resource root contains shipped assets such as `benchmarks/models.yaml` and
 optional OpenCode skills. It is read-only and replaceable during an upgrade.

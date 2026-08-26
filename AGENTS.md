@@ -130,7 +130,7 @@ Keep these ownership rules explicit:
 ## Store and agent contracts
 
 The project-global corpus has conventional `hypotheses`, `techniques`,
-`findings`, `attacks`, and `runs` categories. Agents may create other corpus
+`findings`, `probes`, and `runs` categories. Agents may create other corpus
 subpaths when policy allows it. `runs/` is harness-owned provenance and cannot
 be edited by agents.
 
@@ -139,7 +139,7 @@ be edited by agents.
 - Findings, techniques, and hypotheses use validated YAML frontmatter.
 - Techniques cite an existing project run log.
 - Entries carry `open`, `internal`, or `embargoed` sensitivity.
-- Attacks are directories containing `attack.md` and `run.sh`.
+- Probes are directories containing `probe.md` and `run.sh`.
 - Corpus wipe increments `corpus_generation`; old provenance stays attributable.
 - Persisted YAML compatibility follows
   [`docs/yaml-compatibility.md`](docs/yaml-compatibility.md).
