@@ -1,4 +1,6 @@
 /target
+# macOS Finder metadata.
+.DS_Store
 # The corpus store lives OUTSIDE this repo now — `~/.corpus` (CORPUS_HOME),
 # with run dirs and chat scopes as siblings of the store. That is what puts
 # an opencode run's cwd outside any git repo, so it cannot discover this
