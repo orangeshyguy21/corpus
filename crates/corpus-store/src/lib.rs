@@ -18,6 +18,7 @@ pub mod frontmatter;
 pub mod missions;
 pub mod paths;
 pub mod preferences;
+pub mod probe_migration;
 pub mod projects;
 pub mod refusal;
 pub mod run_records;
@@ -29,7 +30,7 @@ pub mod yaml;
 pub use agents::{
     infer_role, primary_handles, AddSubagentRequest, AgentConfig, AgentRole, AgentSidecar,
     CreateAgentRequest, RoleMigration, SourcePin, CORPUS_TOOLS, CURATOR_TOOLS, DEFAULT_AGENT_NAME,
-    OPENCODE_SCHEMA, SUPER_ADMIN_TOOLS,
+    LEGACY_CORPUS_TOOLS, OPENCODE_SCHEMA, SUPER_ADMIN_TOOLS,
 };
 pub use environment::{EnvironmentSessionId, EnvironmentSessionRecord, EnvironmentSessionState};
 pub use error::{Error, Result};
@@ -39,6 +40,7 @@ pub use findings::{
     FindingSeverity, FindingSort, FindingTimeSource, FindingTitleSource, FindingWarning,
     FindingWriteResult, NewFinding, FINDING_PREFIX_LIMIT, FINDING_RESERVED_KEYS,
 };
+pub use probe_migration::ProbeMigration;
 pub use run_records::{mission_logs, MissionLog, MISSION_ENV, RUNS, RUN_ID_ENV, RUN_LOG_ENV};
 pub use sensitivity::Sensitivity;
 pub use store::{
@@ -47,5 +49,6 @@ pub use store::{
     CostReport, CostRow, EntryAccess, Mission, MissionCompletion, MissionControl,
     MissionDeleteRequest, MissionDispatch, MissionDispatchIdentity, MissionLaunchRequest,
     MissionRunRef, Project, Scope, Store, UsageSnapshot, AGENT_ENV, CATEGORIES,
-    ENVIRONMENT_SESSION_ENV, PROJECT_ENV, SOURCE_PINS_ENV, STORE_ENV, USAGE_SNAPSHOT_VERSION,
+    ENVIRONMENT_SESSION_ENV, LEGACY_ATTACKS, PROBES, PROJECT_ENV, SOURCE_PINS_ENV, STORE_ENV,
+    USAGE_SNAPSHOT_VERSION,
 };

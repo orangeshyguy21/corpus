@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::filesystem::atomic_write;
-use crate::store::{Store, CATEGORIES, RUNS};
+use crate::store::{Store, CATEGORIES, LEGACY_ATTACKS, RUNS};
 
 /// What a caller intends to do with a corpus entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +62,9 @@ impl Store {
             .first()
             .and_then(|component| component.to_str())
             .ok_or_else(|| Error::Store(format!("path names no category: {rel}")))?;
-        if !CATEGORIES.contains(&category) {
+        let legacy_read_or_delete =
+            category == LEGACY_ATTACKS && access != EntryAccess::Destination;
+        if !CATEGORIES.contains(&category) && !legacy_read_or_delete {
             return Err(Error::Store(format!(
                 "{category:?} is not a corpus category (one of {})",
                 CATEGORIES.join(", ")

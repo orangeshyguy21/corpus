@@ -43,7 +43,9 @@ pub use model::{
     AddSubagentRequest, AgentConfig, AgentSidecar, CreateAgentRequest, RoleMigration, SourcePin,
 };
 pub use rendering::primary_handles;
-pub use roles::{infer_role, AgentRole, CORPUS_TOOLS, CURATOR_TOOLS, SUPER_ADMIN_TOOLS};
+pub use roles::{
+    infer_role, AgentRole, CORPUS_TOOLS, CURATOR_TOOLS, LEGACY_CORPUS_TOOLS, SUPER_ADMIN_TOOLS,
+};
 
 /// The OpenCode config schema reference written into generated agent documents.
 pub const OPENCODE_SCHEMA: &str = "https://opencode.ai/config.json";

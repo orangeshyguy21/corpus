@@ -280,8 +280,8 @@ fn finding_write_validates_before_persistence_and_preserves_project_agency() {
 }
 
 #[test]
-fn attack_save_project_scope() {
-    let rig = rig("attack");
+fn probe_save_project_scope_and_legacy_alias() {
+    let rig = rig("probe");
     let TestRig {
         mut ctx,
         store,
@@ -290,19 +290,31 @@ fn attack_save_project_scope() {
 
     let out = tools::dispatch(
         &mut ctx,
-        "attack_save",
+        "probe_save",
         &json!({"name": "quote-id-front-run", "description": "d", "script": "#!/bin/sh\necho pwn\n"}),
     )
-    .expect("attack_save");
-    assert!(out.contains("attack saved"), "{out}");
+    .expect("probe_save");
+    assert!(out.contains("probe saved"), "{out}");
 
     let dest = proj_corpus(&store)
-        .join("attacks")
+        .join("probes")
         .join("quote-id-front-run");
-    assert!(dest.join("attack.md").is_file());
+    assert!(dest.join("probe.md").is_file());
     assert!(dest.join("run.sh").is_file());
-    let attack_text = std::fs::read_to_string(dest.join("attack.md")).unwrap();
-    assert!(attack_text.contains("sensitivity: internal"));
+    let probe_text = std::fs::read_to_string(dest.join("probe.md")).unwrap();
+    assert!(probe_text.contains("sensitivity: internal"));
+
+    let alias = tools::dispatch(
+        &mut ctx,
+        "attack_save",
+        &json!({"name": "legacy-client", "description": "d", "script": "#!/bin/sh\n"}),
+    )
+    .expect("deprecated attack_save alias");
+    assert!(alias.contains("probe saved"), "{alias}");
+    assert!(proj_corpus(&store)
+        .join("probes/legacy-client/probe.md")
+        .is_file());
+    assert!(!proj_corpus(&store).join("attacks").exists());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -418,6 +430,10 @@ fn researcher_role_is_refused_execution_and_publication_tools() {
             json!({"work_dir": "/tmp/w", "amount_sat": 10, "idempotency_key": "fund-1"}),
         ),
         (
+            "probe_save",
+            json!({"name": "a", "description": "d", "script": "s"}),
+        ),
+        (
             "attack_save",
             json!({"name": "a", "description": "d", "script": "s"}),
         ),
@@ -464,7 +480,7 @@ fn unresolved_role_denies_every_tool() {
 }
 
 /// The advertised catalog matches what the role can actually call, so a
-/// low-trust agent never sees attack-relevant tool descriptions.
+/// low-trust agent never sees execution-relevant tool descriptions.
 #[test]
 fn advertised_catalog_matches_the_role() {
     let names = |role| -> Vec<String> {
@@ -491,7 +507,7 @@ fn advertised_catalog_matches_the_role() {
         "oracle_run",
         "faucet",
         "finding_write",
-        "attack_save",
+        "probe_save",
     ] {
         assert!(
             !researcher.contains(&hidden.to_string()),
@@ -499,6 +515,10 @@ fn advertised_catalog_matches_the_role() {
         );
     }
     let sup = names(corpus_core::AgentRole::Super);
+    assert!(
+        !sup.contains(&"attack_save".to_string()),
+        "deprecated aliases must be accepted but not advertised: {sup:?}"
+    );
     assert_eq!(
         sup.len(),
         corpus_core::CORPUS_TOOLS.len() + corpus_core::SUPER_ADMIN_TOOLS.len(),

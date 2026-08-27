@@ -21,9 +21,9 @@ fn rig(tag: &str) -> (Store, PathBuf) {
     let corpus = store.project_corpus_dir("p");
     fs::write(corpus.join("findings/f1.md"), "finding\n").unwrap();
     fs::write(corpus.join("hypotheses/h1.md"), "hypothesis\n").unwrap();
-    fs::create_dir_all(corpus.join("attacks/replay")).unwrap();
-    fs::write(corpus.join("attacks/replay/attack.md"), "attack\n").unwrap();
-    fs::write(corpus.join("attacks/replay/run.sh"), "#!/bin/sh\n").unwrap();
+    fs::create_dir_all(corpus.join("probes/replay")).unwrap();
+    fs::write(corpus.join("probes/replay/probe.md"), "probe\n").unwrap();
+    fs::write(corpus.join("probes/replay/run.sh"), "#!/bin/sh\n").unwrap();
     fs::write(corpus.join("runs/1786-op.raw"), "transcript\n").unwrap();
     (store, world)
 }
@@ -36,6 +36,26 @@ fn a_relative_entry_inside_the_corpus_resolves() {
         .unwrap();
     assert!(path.starts_with(store.project_corpus_dir("p").canonicalize().unwrap()));
     assert!(path.ends_with("findings/f1.md"));
+    let _ = fs::remove_dir_all(&world);
+}
+
+#[test]
+fn legacy_attacks_are_readable_and_deletable_but_not_writable() {
+    let (store, world) = rig("legacy-category");
+    let corpus = store.project_corpus_dir("p");
+    fs::create_dir_all(corpus.join("attacks/legacy")).unwrap();
+    fs::write(corpus.join("attacks/legacy/attack.md"), "legacy\n").unwrap();
+
+    store
+        .resolve_corpus_entry("p", "attacks/legacy/attack.md", EntryAccess::Read)
+        .expect("legacy artifacts remain readable during migration");
+    assert!(store
+        .resolve_corpus_entry("p", "attacks/new/attack.md", EntryAccess::Destination)
+        .is_err());
+    store
+        .delete_corpus_entry("p", "attacks/legacy", true)
+        .expect("legacy artifacts remain deletable for cleanup");
+    assert!(!corpus.join("attacks/legacy").exists());
     let _ = fs::remove_dir_all(&world);
 }
 
@@ -145,7 +165,7 @@ fn run_transcripts_are_not_curatable() {
 #[test]
 fn a_bare_category_is_not_an_entry() {
     let (store, world) = rig("category");
-    for path in ["findings", "attacks", "hypotheses"] {
+    for path in ["findings", "probes", "hypotheses"] {
         let error = store
             .resolve_corpus_entry("p", path, EntryAccess::Mutate)
             .unwrap_err()
@@ -159,29 +179,23 @@ fn a_bare_category_is_not_an_entry() {
     let _ = fs::remove_dir_all(&world);
 }
 
-/// Attacks are directories, so a delete that silently recursed would take a
+/// Probes are directories, so a delete that silently recursed would take a
 /// whole artifact on a one-word slip.
 #[test]
 fn deleting_a_directory_needs_saying_so() {
     let (store, world) = rig("recursive");
     let error = store
-        .delete_corpus_entry("p", "attacks/replay", false)
+        .delete_corpus_entry("p", "probes/replay", false)
         .unwrap_err()
         .to_string();
     assert!(error.contains("recursive"), "{error}");
-    assert!(store
-        .project_corpus_dir("p")
-        .join("attacks/replay")
-        .is_dir());
+    assert!(store.project_corpus_dir("p").join("probes/replay").is_dir());
 
     let freed = store
-        .delete_corpus_entry("p", "attacks/replay", true)
+        .delete_corpus_entry("p", "probes/replay", true)
         .unwrap();
     assert!(freed > 0, "reports the bytes it freed");
-    assert!(!store
-        .project_corpus_dir("p")
-        .join("attacks/replay")
-        .exists());
+    assert!(!store.project_corpus_dir("p").join("probes/replay").exists());
 
     // A file needs no flag.
     store

@@ -497,7 +497,7 @@ fn resolve_role(store: &Store, scope: &Scope) -> std::result::Result<AgentRole, 
 /// The catalog as advertised to THIS run: the full sandbox catalog minus
 /// anything the resolved role cannot call. One server serves one identity,
 /// so filtering here is safe — and it stops a researcher burning turns on
-/// tools it will be refused, and keeps attack-relevant tool descriptions
+/// tools it will be refused, and keeps execution-relevant tool descriptions
 /// out of a low-trust agent's context. An unresolved role advertises
 /// nothing, matching the deny-all `dispatch` applies.
 pub fn catalog_for(role: &std::result::Result<AgentRole, String>) -> Value {
@@ -540,7 +540,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "sandbox_write",
-            "description": "Write a UTF-8 file into the sandbox's session-scoped writable workspace without shell-quoting the content yourself. Paths must be beneath /work or /tmp. Use /work for PoCs and attack_save for the final durable replay script.",
+            "description": "Write a UTF-8 file into the sandbox's session-scoped writable workspace without shell-quoting the content yourself. Paths must be beneath /work or /tmp. Use /work for PoCs and probe_save for the final durable regression script.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -610,8 +610,8 @@ pub fn catalog() -> Value {
             }
         },
         {
-            "name": "attack_save",
-            "description": "Save a reusable attack artifact into the project corpus (attack.md + executable run.sh). Attacks are regression probes and benchmark cases.",
+            "name": "probe_save",
+            "description": "Save a reusable regression probe into the project corpus (probe.md + executable run.sh). Probes are reproducible security checks and benchmark cases.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -959,6 +959,7 @@ fn dispatch_inner(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
     // explained as a permissions problem.
     let known = corpus_core::CORPUS_TOOLS
         .iter()
+        .chain(corpus_core::LEGACY_CORPUS_TOOLS.iter())
         .any(|t| t.trim_start_matches("corpus_") == name);
     if known {
         match &ctx.role {
@@ -1045,7 +1046,7 @@ fn dispatch_inner(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
         "faucet" => faucet(ctx, args),
         "wallet_fund" => wallet_fund(ctx, args),
         "finding_write" => finding_write(ctx, args),
-        "attack_save" => attack_save(ctx, args),
+        "probe_save" | "attack_save" => probe_save(ctx, args),
         "technique_save" => technique_save(ctx, args),
         // The one refusal that means the corpus server had no opinion. It
         // is gated as `Unknown` rather than `Args` so a reader can tell
@@ -1621,7 +1622,7 @@ fn finding_write(ctx: &mut Ctx, args: &Value) -> Result<String> {
     ))
 }
 
-fn attack_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
+fn probe_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
     let name = require_str(args, "name")?;
     let description = require_str(args, "description")?;
     let script = require_str(args, "script")?;
@@ -1630,10 +1631,10 @@ fn attack_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
     if slug.is_empty() {
         return Err(Error::Args("name must contain alphanumerics".to_string()));
     }
-    let dir = category_dir(ctx, &scope, "attacks")?.join(&slug);
+    let dir = category_dir(ctx, &scope, corpus_core::PROBES)?.join(&slug);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
-        dir.join("attack.md"),
+        dir.join("probe.md"),
         format!("---\nsensitivity: internal\n---\n# {name}\n\n{description}\n"),
     )?;
     let run_path = dir.join("run.sh");
@@ -1644,7 +1645,7 @@ fn attack_save(ctx: &mut Ctx, args: &Value) -> Result<String> {
         std::fs::set_permissions(&run_path, std::fs::Permissions::from_mode(0o755))?;
     }
     Ok(format!(
-        "attack saved in {}: {}",
+        "probe saved in {}: {}",
         scope.project,
         dir.display()
     ))

@@ -27,7 +27,7 @@ pub fn plugin_picker(
 ) {
     if plugins.is_empty() {
         ui.horizontal(|ui| {
-            ui.weak("no plugins discovered — check CORPUS_PLUGINS_DIR");
+            ui.weak("no environment plugins installed");
             if theme::house_button(ui, "Re-probe").clicked() {
                 *needs_probe = true;
             }

@@ -11,7 +11,8 @@ pub(crate) fn run(command: PluginCommand) -> Result<(), String> {
     let plugins = corpus_core::plugin_catalog().map_err(|error| error.to_string())?;
     match command {
         PluginCommand::List => list(&plugins),
-        PluginCommand::Install { bundle_dir } => install(&bundle_dir),
+        PluginCommand::Install { id } => install(&id),
+        PluginCommand::InstallLocal { bundle_dir } => install_local(&bundle_dir),
         PluginCommand::Select { id, version } => select(&id, &version),
         PluginCommand::Setup { id } => lifecycle(&plugins, "setup", &id),
         PluginCommand::Doctor { id } => lifecycle(&plugins, "doctor", &id),
@@ -27,7 +28,25 @@ pub(crate) fn run(command: PluginCommand) -> Result<(), String> {
 }
 
 fn list(plugins: &[PluginDir]) -> Result<(), String> {
-    for plugin in plugins {
+    let curated = corpus_core::curated_plugins().map_err(|error| error.to_string())?;
+    for candidate in &curated {
+        let selected = plugins
+            .iter()
+            .find(|plugin| plugin.manifest.name == candidate.id);
+        let state = match selected.and_then(|plugin| plugin.manifest.version.as_deref()) {
+            Some(version) if version == candidate.version => "installed",
+            Some(_) => "update",
+            None => "available",
+        };
+        println!(
+            "{:<20} {:<8} {:<9} {}",
+            candidate.id, candidate.version, state, candidate.description
+        );
+    }
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| !curated.iter().any(|item| item.id == plugin.manifest.name))
+    {
         let origin = match plugin.origin {
             PluginOrigin::Direct => "override",
             PluginOrigin::Installed => "installed",
@@ -41,18 +60,28 @@ fn list(plugins: &[PluginDir]) -> Result<(), String> {
             plugin.manifest.description.as_deref().unwrap_or("")
         );
     }
-    if plugins.is_empty() {
-        println!(
-            "no plugins found (install root: {})",
-            corpus_core::plugin_install_root().display()
-        );
-    }
     Ok(())
 }
 
-fn install(bundle_dir: &std::path::Path) -> Result<(), String> {
+fn install(id: &str) -> Result<(), String> {
+    let receipt = corpus_core::install_curated_plugin_with(
+        id,
+        || false,
+        |phase| eprintln!("[install] {}", phase.label()),
+    )
+    .map_err(|error| error.to_string())?;
+    print_receipt(&receipt);
+    Ok(())
+}
+
+fn install_local(bundle_dir: &std::path::Path) -> Result<(), String> {
     let receipt =
         corpus_core::install_plugin_bundle(bundle_dir).map_err(|error| error.to_string())?;
+    print_receipt(&receipt);
+    Ok(())
+}
+
+fn print_receipt(receipt: &corpus_core::InstallReceipt) {
     println!(
         "installed {}@{}\ndigest: {}\npath: {}\nprevious: {}",
         receipt.id,
@@ -61,7 +90,6 @@ fn install(bundle_dir: &std::path::Path) -> Result<(), String> {
         receipt.path.display(),
         receipt.previous.as_deref().unwrap_or("none")
     );
-    Ok(())
 }
 
 fn select(id: &str, version: &str) -> Result<(), String> {

@@ -28,6 +28,7 @@ pub mod paths {
 }
 mod environment_session;
 mod plugin;
+mod plugin_distribution;
 mod plugin_install;
 pub mod refusal {
     pub use corpus_store::refusal::*;
@@ -45,7 +46,7 @@ mod test_support;
 
 pub use agents::{
     infer_role, primary_handles, AddSubagentRequest, AgentRole, CreateAgentRequest, RoleMigration,
-    CORPUS_TOOLS, CURATOR_TOOLS, SUPER_ADMIN_TOOLS,
+    CORPUS_TOOLS, CURATOR_TOOLS, LEGACY_CORPUS_TOOLS, SUPER_ADMIN_TOOLS,
 };
 pub use agents::{AgentConfig, AgentSidecar, SourcePin, DEFAULT_AGENT_NAME, OPENCODE_SCHEMA};
 pub use corpus_observe::{
@@ -85,6 +86,10 @@ pub use plugin::{
     PluginManifest, ProbeResult, ProtocolError, ProtocolV1Reply, SandboxExecResult, SourceInfo,
     TargetRecord, ToolRecord,
 };
+pub use plugin_distribution::{
+    curated_plugin, curated_plugins, install_curated_plugin, install_curated_plugin_with,
+    CuratedInstallPhase, CuratedPlugin, CuratedPluginRequirement,
+};
 pub use plugin_install::{
     call_plugin_lifecycle_cancellable, install_plugin_bundle, installed_record,
     plugin_bundle_digest, plugin_lifecycle_params, select_plugin_version, selected_version,
@@ -106,6 +111,6 @@ pub use store::{
     CostReport, CostRow, EntryAccess, Mission, MissionCompletion, MissionControl,
     MissionDeleteRequest, MissionDispatch, MissionDispatchIdentity, MissionLaunchRequest,
     MissionLog, MissionRunRef, Project, Scope, Store, UsageSnapshot, AGENT_ENV, CATEGORIES,
-    ENVIRONMENT_SESSION_ENV, MISSION_ENV, PROJECT_ENV, RUNS, RUN_ID_ENV, RUN_LOG_ENV,
-    SOURCE_PINS_ENV, STORE_ENV, USAGE_SNAPSHOT_VERSION,
+    ENVIRONMENT_SESSION_ENV, LEGACY_ATTACKS, MISSION_ENV, PROBES, PROJECT_ENV, RUNS, RUN_ID_ENV,
+    RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV, USAGE_SNAPSHOT_VERSION,
 };

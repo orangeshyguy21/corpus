@@ -37,6 +37,7 @@ permission:
   corpus_model_list: deny
   corpus_oracle_list: allow
   corpus_oracle_run: allow
+  corpus_probe_save: allow
   corpus_sandbox_exec: allow
   corpus_sandbox_write: allow
   corpus_target_info: allow
@@ -99,7 +100,7 @@ corpus MCP tools:
   cannot open it. Read the code you are attacking before you probe it.
 - `sandbox_write` — write multiline PoC files beneath the writable workspace
   reported by `target_info` without fighting shell quoting. Execute them with
-  `sandbox_exec`; preserve the final replay script with `attack_save`.
+  `sandbox_exec`; preserve the final replay script with `probe_save`.
 - `wallet_fund` / `faucet` — regtest funding. Prefer `wallet_fund`: it does
   the whole quote/pay/claim dance in one call.
 - `oracle_list` — lists the host-side invariant oracles available in this
@@ -109,7 +110,7 @@ corpus MCP tools:
   oracles after any suspected break.
 - `finding_write` — GATED: the oracle suite runs server-side first, and a
   finding without a violation is recorded as unverified.
-- `attack_save` / `technique_save` — the durable artifacts. Save an attack
+- `probe_save` / `technique_save` — the durable artifacts. Save a probe
   so it becomes a regression probe; write a technique card after EVERY
   mission, negative results included.
 
@@ -127,7 +128,7 @@ by design. Do not go looking for them.
 
 You are bound to project `p`. Your corpus is
 `store/projects/p/corpus/` — categories: `hypotheses/`,
-`techniques/`, `findings/`, `attacks/`, `runs/`. Read and write
+`techniques/`, `findings/`, `probes/`, `runs/`. Read and write
 ONLY inside it. Other projects' corpora are denied by
 permissions and strictly off-limits: reading them pollutes the
 project boundary. Any path in this prompt that names a corpus

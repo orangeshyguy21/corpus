@@ -85,10 +85,11 @@ mission record by hand; it is needed to close the resource safely.
 
 ## A plugin is missing or unhealthy
 
-If `corpus plugin list` is empty, verify the bundle was installed rather than
-merely checked out, inspect `$CORPUS_HOME/plugins`, and unset an accidental
-`CORPUS_PLUGINS_DIR` catalog override. Verify checksum and manifest before
-reinstalling.
+`corpus plugin list` marks built-in entries as `available`, `installed`, or
+`update`. Install a supported entry in the app or run `corpus plugin install
+<plugin>`. If an installed entry is still missing, inspect
+`$CORPUS_HOME/plugins` and unset an accidental `CORPUS_PLUGINS_DIR` development
+override; that variable replaces normal installed-plugin discovery.
 
 ```sh
 corpus plugin status <plugin>
@@ -148,4 +149,3 @@ mission, run, plugin, and model identities; plugin status/doctor output; audit
 and refusal tails; first-attempt transcript/raw capture; chat transcript/log;
 and the earliest error. Redact secrets and honor sensitivity classifications,
 but retain identity fields needed for correlation.
-

@@ -12,7 +12,7 @@ use crate::Ctx;
 
 pub(crate) static WRITE: ToolDefinition = ToolDefinition {
     name: "entry_write",
-    description: "Write (create or replace in place) ONE entry in the project's corpus by relative path (techniques/plan.md, findings/x.md, ...). The path is relative and stays inside the corpus — pass 'techniques/plan.md', never an absolute or cwd path. Missing parent directories are created. The first path segment must be a real corpus category (hypotheses, techniques, findings, attacks, retro). runs/ is not writable — those are mission transcripts. Prefer this over raw file tools: it needs no knowledge of where the corpus lives on disk, and every write is recorded in the audit log.",
+    description: "Write (create or replace in place) ONE entry in the project's corpus by relative path (techniques/plan.md, findings/x.md, ...). The path is relative and stays inside the corpus — pass 'techniques/plan.md', never an absolute or cwd path. Missing parent directories are created. The first path segment must be a real corpus category (hypotheses, techniques, findings, probes, retro). runs/ is not writable — those are mission transcripts. Prefer this over raw file tools: it needs no knowledge of where the corpus lives on disk, and every write is recorded in the audit log.",
     input_schema: input_schema::<EntryWriteArgs>,
     handler: entry_write,
     policy: ToolPolicy {

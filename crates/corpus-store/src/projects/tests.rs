@@ -35,6 +35,15 @@ fn validate_slug_rejects_bad_names() {
 }
 
 #[test]
+fn project_records_reject_absolute_and_traversal_paths_before_filesystem_access() {
+    let store = tmp_store("project-path-boundary");
+    for invalid in ["/tmp/escape", "../escape", "a/../escape", "a\\..\\escape"] {
+        let error = Project::load(&store, invalid).unwrap_err().to_string();
+        assert!(error.contains("invalid slug"), "{invalid:?}: {error}");
+    }
+}
+
+#[test]
 fn projects_start_empty_and_clones_mirror_only_declared_agents() {
     let store = tmp_store("project-agents");
     store
@@ -54,6 +63,34 @@ fn projects_start_empty_and_clones_mirror_only_declared_agents() {
         .map(|(slug, _)| slug)
         .collect();
     assert_eq!(agents, ["analyst"]);
+    let _ = fs::remove_dir_all(store.root());
+}
+
+#[cfg(unix)]
+#[test]
+fn project_clone_refuses_symlinks_without_publishing_a_destination() {
+    let store = tmp_store("project-clone-symlink");
+    store
+        .create_project("source", "Source", "cdk-regtest")
+        .unwrap();
+    let outside = store.root().join("outside-secret");
+    fs::write(&outside, "secret\n").unwrap();
+    std::os::unix::fs::symlink(
+        &outside,
+        store.project_corpus_dir("source").join("findings/leak.md"),
+    )
+    .unwrap();
+
+    let error = store
+        .clone_project("source", "copy", None, true)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("refuses symlink"), "{error}");
+    assert!(
+        !store.project_dir("copy").exists(),
+        "a refused clone must not leave a partial destination"
+    );
+    assert_eq!(fs::read_to_string(outside).unwrap(), "secret\n");
     let _ = fs::remove_dir_all(store.root());
 }
 

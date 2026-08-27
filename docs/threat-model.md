@@ -188,22 +188,25 @@ Evidence: `corpus-admin::confirmation` tests and the destructive contracts in
 Operator data lives below `CORPUS_HOME`/`CORPUS_STORE`; shipped resources are
 read-only and independently resolved. Project run directories live outside the
 repository, expose exactly one project, and reject symlinked boundary
-components or an unexpected second project.
+components or an unexpected second project. Each pin-keyed launch view exposes
+only the exact source IDs and commit SHAs in that launch plan; the shared cache
+is never linked wholesale into an agent cwd.
 
-Evidence: store path tests, CLI resource-root binary test, and all four
-`run_workspace.rs` tests.
+Evidence: store path tests, CLI resource-root binary test, and
+`run_workspace.rs`, including
+`a_run_source_view_exposes_only_exact_pins_and_refuses_nested_symlinks`.
 
 ### SEC-FS-2: model-chosen paths cannot escape their resource root
 
 All entry paths are validated relative paths under allowed corpus categories.
 Absolute paths, traversal, bare categories, immutable `runs`, symlinks, and
-cross-device/target collisions fail before publication. Agent clone/copy and
-plugin installation preflight entire source trees and publish no partial
-destination on refusal.
+cross-device/target collisions fail before publication. Agent and project
+clone/copy, source-view provisioning, and plugin installation preflight entire
+source trees and publish no partial destination on refusal.
 
 Evidence: `corpus-store/tests/curation.rs`, finding transactional/symlink
-coverage, agent repository symlink/cancellation tests, and plugin installation
-entrypoint/symlink tests.
+coverage, agent and project clone symlink/cancellation tests, pinned-source
+view tests, and plugin installation entrypoint/symlink tests.
 
 ### SEC-FS-3: durable replacement is complete or preserves prior state
 
@@ -213,6 +216,19 @@ cleans staging and leaves the old target intact.
 
 Evidence: all tests in `corpus-store/src/filesystem.rs` and collision-safe
 finding writer tests.
+
+### SEC-FS-4: curated plugin archives fail closed before installation
+
+Normal plugin installation resolves only Corpus's compiled catalog, requires
+HTTPS and a pinned SHA-256 digest, bounds compressed size, expanded size, and
+entry count, and accepts only normal relative paths, directories, and regular
+files. The extracted manifest id and version must match the catalog before the
+immutable local installer runs. Local unpacked bundles remain an explicitly
+named development path and still pass the existing manifest/tree checks.
+
+Evidence: `corpus-core::plugin_distribution::tests`, including checksum,
+catalog metadata, manifest identity, archive path, and extraction tests; plus
+`corpus-core/tests/plugin_installation.rs` for immutable publication checks.
 
 ### SEC-DUR-1: cleanup identity survives failure and restart
 
@@ -254,13 +270,15 @@ tmux argv/session tests.
 
 An installed immutable manifest declares protocol and capabilities. V1 hello
 must agree before lifecycle or tool calls proceed. Reply IDs, terminal result
-shape, output size, oracle catalog/log size, and call duration are bounded.
+shape, raw frame and queued-stream size, lifecycle progress count, oracle
+catalog/log size, and call duration are bounded before JSON deserialization.
 Timeout or protocol loss retains reconciliation identity so work is not
 silently repeated.
 
-Evidence: `corpus-core/tests/protocol.rs`, including capability drift,
-mismatched reply, deadline, and cancellation tests; MCP V1 session tests prove
-durable session and project matching.
+Evidence: `corpus-core::plugin::framing_tests`, plus
+`corpus-core/tests/protocol.rs`, including capability drift, mismatched reply,
+deadline, and cancellation tests; MCP V1 session tests prove durable session
+and project matching.
 
 ### SEC-PROC-3: local session control is loopback and identity-bound
 

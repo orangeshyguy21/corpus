@@ -166,5 +166,35 @@ pub fn dispatch_with_origin(
 ) -> Result<String> {
     let definition = tools::registry::definition(name)
         .ok_or_else(|| Error::Args(format!("unknown admin tool: {name}")))?;
+    validate_project_arguments(name, args)?;
     definition.invoke(ctx, args, origin)
+}
+
+/// Reject project identities before any handler can turn them into paths.
+///
+/// JSON Schema is a client contract, not an authorization boundary. The host
+/// admin server receives model-authored values, so all project-bearing fields
+/// are checked again at the single dispatch door. Scoped research calls are
+/// covered too, after their launcher-proven project has been injected.
+fn validate_project_arguments(name: &str, args: &Value) -> Result<()> {
+    let project_keys: &[&str] = match name {
+        "project_new" | "project_delete" | "project_rebind" => &["slug"],
+        "project_clone" => &["from", "to"],
+        "agent_copy" => &["from_project", "to_project"],
+        _ => &["project"],
+    };
+    let Some(arguments) = args.as_object() else {
+        return Ok(()); // the typed handler reports the malformed object
+    };
+    for key in project_keys {
+        let Some(value) = arguments.get(*key) else {
+            continue; // the typed handler reports a missing required field
+        };
+        let Some(project) = value.as_str() else {
+            continue; // the typed handler reports the field's type error
+        };
+        corpus_store::validate_slug(project)
+            .map_err(|error| Error::Args(format!("{name} argument {key}: {error}")))?;
+    }
+    Ok(())
 }

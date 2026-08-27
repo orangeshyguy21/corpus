@@ -806,6 +806,41 @@ impl Sidebar {
                     state.plugins(),
                     &mut self.needs_probe,
                 );
+                if state.plugins().is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Install an environment to create your first project.")
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                    ui.add_space(4.0);
+                    if let Some(result) =
+                        crate::views::plugin_install::curated_plugin_list(ui, state)
+                    {
+                        match result {
+                            Ok(true) => {
+                                toast(toasts, ToastKind::Info, "plugin installation started")
+                            }
+                            Ok(false) => toast(
+                                toasts,
+                                ToastKind::Warning,
+                                "another plugin operation is already running",
+                            ),
+                            Err(error) => toast(toasts, ToastKind::Error, error),
+                        }
+                    }
+                    if let Some(operation) = state.plugin_operation() {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}: {}",
+                                operation.plugin,
+                                operation.phase.as_deref().unwrap_or("working")
+                            ))
+                            .size(12.0)
+                            .color(theme::TEXT_FAINT),
+                        );
+                    }
+                }
                 ui.add_space(8.0);
                 let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if theme::house_button(ui, "Create").clicked() || submit {

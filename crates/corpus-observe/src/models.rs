@@ -287,13 +287,14 @@ fn provider_label(id: &str) -> &str {
 // --- ollama_models(): the local Ollama server's installed models (GDK chat) ---
 //
 // The GDK management chat drives `goose acp` -> Ollama DIRECTLY, so its model
-// picker must enumerate `ollama list` (the actual serving set), NOT opencode's
-// models.dev catalog. Missions/agents keep opencode's catalog (`model_list`);
-// this is the chat arm's own source.
+// picker must enumerate Ollama's `/api/tags` response (the actual serving
+// set), NOT opencode's models.dev catalog. Missions/agents keep opencode's
+// catalog (`model_list`); this is the chat arm's own source. HTTP is
+// deliberate: a packaged GUI must not depend on Ollama's optional CLI link or
+// on a shell PATH that differs from the user's terminal.
 
-/// `ollama list`, parsed into a single Ollama group. Only models the local
-/// server has pulled are selectable for the chat. Errors when `ollama` is
-/// missing or returns nothing — callers degrade to free text.
+/// `/api/tags`, parsed into a single Ollama group. Only models the configured
+/// Ollama service exposes are selectable for chat.
 pub fn ollama_models() -> Result<ModelList, Error> {
     ollama_models_refresh(false)
 }
@@ -324,17 +325,30 @@ pub fn ollama_models_refresh(refresh: bool) -> Result<ModelList, Error> {
 }
 
 fn pull_ollama_models() -> Result<ModelList, Error> {
-    let ollama = std::env::var("OLLAMA").unwrap_or_else(|_| "ollama".to_string());
-    let output = Command::new(&ollama)
-        .arg("list")
-        .output()
-        .map_err(|e| Error::Store(format!("ollama list failed to run: {e}")))?;
-    if !output.status.success() {
-        return Err(Error::Store("ollama list reported an error".into()));
-    }
-    let names = parse_ollama_list(&String::from_utf8_lossy(&output.stdout));
+    let endpoint = ollama_endpoint();
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| Error::Store(format!("could not create Ollama client: {error}")))?;
+    let response = client
+        .get(format!("{endpoint}/api/tags"))
+        .send()
+        .map_err(|error| Error::Store(format!("Ollama is not reachable at {endpoint}: {error}")))?
+        .error_for_status()
+        .map_err(|error| {
+            Error::Store(format!("Ollama at {endpoint} returned an error: {error}"))
+        })?;
+    let tags: OllamaTags = response.json().map_err(|error| {
+        Error::Store(format!(
+            "Ollama at {endpoint} returned an invalid model list: {error}"
+        ))
+    })?;
+    let names = ollama_model_names(tags);
     if names.is_empty() {
-        return Err(Error::Store("ollama returned no models".into()));
+        return Err(Error::Store(format!(
+            "Ollama is running at {endpoint}, but no models are installed"
+        )));
     }
     let mut models: Vec<ModelOption> = names
         .into_iter()
@@ -354,22 +368,51 @@ fn pull_ollama_models() -> Result<ModelList, Error> {
     })
 }
 
-/// Parse `ollama list`'s tabular output: the first whitespace token of each
-/// non-header row is the model name (`NAME ID SIZE MODIFIED` header skipped).
-fn parse_ollama_list(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if line.trim_start().starts_with("NAME") {
-            continue;
-        }
-        if let Some(name) = line.split_whitespace().next() {
-            out.push(name.to_string());
-        }
+pub fn ollama_endpoint() -> String {
+    normalize_ollama_endpoint(
+        &std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".into()),
+    )
+}
+
+fn normalize_ollama_endpoint(raw: &str) -> String {
+    let raw = raw.trim().trim_end_matches('/');
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
     }
-    out
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTags {
+    #[serde(default)]
+    models: Vec<OllamaTag>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTag {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    model: String,
+}
+
+fn ollama_model_names(tags: OllamaTags) -> Vec<String> {
+    let mut names = tags
+        .models
+        .into_iter()
+        .filter_map(|tag| {
+            let name = if tag.model.trim().is_empty() {
+                tag.name
+            } else {
+                tag.model
+            };
+            (!name.trim().is_empty()).then(|| name.trim().to_string())
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
 }
 
 #[cfg(test)]
@@ -511,21 +554,34 @@ openrouter/~anthropic/claude-fable-latest
     }
 
     #[test]
-    fn ollama_list_parse_takes_name_column_only() {
-        let sample = concat!(
-            "NAME                                    ID              SIZE      MODIFIED      \n",
-            "qwen3.8:27b                             0b1bb9add2f8    29 GB      2 minutes ago\n",
-            "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0    0b1bb9add2f8    29 GB      6 minutes ago \n",
-            "qwen3.6:35b                             07d35212591f    23 GB      3 months ago  \n",
-        );
-        let names = parse_ollama_list(sample);
+    fn ollama_tags_use_model_then_name_and_deduplicate() {
+        let tags: OllamaTags = serde_json::from_str(
+            r#"{"models":[
+                {"name":"legacy:latest","model":"qwen3.8:27b"},
+                {"name":"hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0"},
+                {"name":"duplicate-name","model":"qwen3.8:27b"}
+            ]}"#,
+        )
+        .unwrap();
+        let names = ollama_model_names(tags);
         assert_eq!(
             names,
             vec![
-                "qwen3.8:27b".to_string(),
                 "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0".to_string(),
-                "qwen3.6:35b".to_string(),
+                "qwen3.8:27b".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn ollama_endpoint_accepts_bare_hosts_and_trims_slashes() {
+        assert_eq!(
+            normalize_ollama_endpoint("127.0.0.1:11434/"),
+            "http://127.0.0.1:11434"
+        );
+        assert_eq!(
+            normalize_ollama_endpoint("https://ollama.example.test/"),
+            "https://ollama.example.test"
         );
     }
 

@@ -12,22 +12,29 @@ development and tests.
 
 ## Install and operate
 
-Download a tagged archive and its checksum, verify it, unpack it, then install
-the unpacked directory:
+For the normal path, choose a supported environment in the desktop app or use
+its catalog id from the CLI:
 
 ```bash
-shasum -a 256 -c corpus-plugin-nutshell-0.3.0.tar.gz.sha256
-tar -xzf corpus-plugin-nutshell-0.3.0.tar.gz
-corpus plugin install corpus-plugin-nutshell-0.3.0
+corpus plugin install nutshell-regtest
 corpus plugin setup nutshell-regtest
 corpus plugin doctor nutshell-regtest
 corpus plugin status nutshell-regtest
 ```
 
-`install` copies the bundle into a read-only version directory and selects it.
+The built-in [`plugin-catalog.toml`](plugin-catalog.toml) pins each public
+release URL and SHA-256 digest. `install` downloads only a catalog entry,
+enforces archive size/path/type limits, verifies the digest and manifest
+identity, copies the bundle into a read-only version directory, and selects it.
 Setup is idempotent and may fetch pinned sources and build images. Doctor is a
 read-only verification; status is the fast readiness view. Stop refuses while
 the plugin has live mission leases.
+
+Plugin development keeps an explicit local path:
+
+```bash
+corpus plugin install-local /path/to/unpacked-plugin-bundle
+```
 
 Session close is a verified postcondition: a plugin must report failure when
 session containers or networks cannot be removed, leave the session retryable,
@@ -47,12 +54,12 @@ exact plugin version, bundle digest, environment lock, image digest, and source
 SHAs with which it was produced. Offline relaunch works when the selected
 bundle, its prepared environment, and the required source SHAs remain cached.
 
-The current private release locks are:
+The current built-in release locks are:
 
 | Plugin | Tag | Release archive SHA-256 |
 |---|---|---|
-| `cdk-regtest` | `corpus-plugin-cdk@v0.4.5` | `8bb5fb68cdad18d6688e195b4d02d291e553f2dfd470c0fec68edcd52c25d2ee` |
-| `nutshell-regtest` | `corpus-plugin-nutshell@v0.4.1` | `fb8fa891634f9c40c8b3bbeb1a1b631a5433705a1e7c78822ed4a8479e27f9aa` |
+| `cdk-regtest` | `corpus-plugin-cdk@v0.4.6` | `8c88e63b88721cd63d0cf957c920ba6288dfa83ffc2d01f25801f8dbf001e7ad` |
+| `nutshell-regtest` | `corpus-plugin-nutshell@v0.4.3` | `f45670cdb0d09d0f11125f5e228554fdcd9de47885c510cd131a4e7e0179bcf0` |
 
 Corpus CI downloads both assets, verifies both the attached checksum and this
 independent lock, installs them through the operator path, negotiates v1, and

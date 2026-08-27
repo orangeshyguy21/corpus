@@ -36,7 +36,7 @@ fn render_denies_corpus_tools_outside_the_role() {
         "corpus_oracle_run",
         "corpus_faucet",
         "corpus_wallet_fund",
-        "corpus_attack_save",
+        "corpus_probe_save",
         "corpus_finding_write",
     ] {
         assert_eq!(
@@ -75,6 +75,32 @@ fn render_keeps_tightening_and_never_relies_on_omission() {
             "{tool} must be written explicitly even with no stored block\n{text}"
         );
     }
+}
+
+#[test]
+fn legacy_attack_permission_tightens_both_probe_names() {
+    let store = tmp_store("legacy-probe-permission");
+    store.create_project("alpha", "A", "cdk-regtest").unwrap();
+    store
+        .create_agent_with_role("alpha", "a", AgentRole::Tester)
+        .unwrap();
+    store
+        .save_agent(
+            "alpha",
+            "a",
+            &doc(serde_json::json!({
+                "a": {
+                    "mode": "primary",
+                    "permission": {"corpus_attack_save": "deny"}
+                },
+            })),
+        )
+        .unwrap();
+
+    let text = fs::read_to_string(&store.render_project_agents("alpha").unwrap()[0]).unwrap();
+    let permission = rendered_permission(&text);
+    assert_eq!(permission["corpus_probe_save"].as_str(), Some("deny"));
+    assert_eq!(permission["corpus_attack_save"].as_str(), Some("deny"));
 }
 
 /// A scalar `read`/`edit`/`write` used to skip red-line injection

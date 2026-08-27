@@ -1,0 +1,19 @@
+catalog_version = 1
+
+[[plugins]]
+id = "cdk-regtest"
+name = "CDK Regtest"
+description = "Local CDK research environment backed by regtest services."
+version = "0.4.6"
+url = "https://github.com/orangeshyguy21/corpus-plugin-cdk/releases/download/v0.4.6/corpus-plugin-cdk-0.4.6.tar.gz"
+sha256 = "8c88e63b88721cd63d0cf957c920ba6288dfa83ffc2d01f25801f8dbf001e7ad"
+requirements = ["docker"]
+
+[[plugins]]
+id = "nutshell-regtest"
+name = "Nutshell Regtest"
+description = "Local Nutshell mint research environment backed by regtest services."
+version = "0.4.3"
+url = "https://github.com/orangeshyguy21/corpus-plugin-nutshell/releases/download/v0.4.3/corpus-plugin-nutshell-0.4.3.tar.gz"
+sha256 = "f45670cdb0d09d0f11125f5e228554fdcd9de47885c510cd131a4e7e0179bcf0"
+requirements = ["docker"]

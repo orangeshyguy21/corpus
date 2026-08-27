@@ -30,9 +30,13 @@ pub const CORPUS_TOOLS: [&str; 10] = [
     "corpus_oracle_run",
     "corpus_faucet",
     "corpus_wallet_fund",
-    "corpus_attack_save",
+    "corpus_probe_save",
     "corpus_finding_write",
 ];
+
+/// Deprecated tool spellings rendered and accepted during the probe
+/// namespace compatibility window. They never define separate authority.
+pub const LEGACY_CORPUS_TOOLS: [&str; 1] = ["corpus_attack_save"];
 
 const RESEARCHER_TOOLS: [&str; 2] = ["corpus_target_info", "corpus_technique_save"];
 
@@ -199,7 +203,7 @@ impl AgentRole {
                  No execution — enforced by the corpus server, not just by config."
             }
             Self::Tester => {
-                "acts in the regtest arena: sandbox, oracles, faucet, findings, attacks. \
+                "acts in the regtest arena: sandbox, oracles, faucet, findings, probes. \
                  No open internet, so an execution turn cannot pull in untrusted text."
             }
             Self::Super => {
@@ -230,11 +234,14 @@ impl AgentRole {
     }
 
     pub fn allows(self, tool: &str) -> bool {
-        let key = if tool.starts_with("corpus_") {
+        let mut key = if tool.starts_with("corpus_") {
             tool.to_string()
         } else {
             format!("corpus_{tool}")
         };
+        if key == "corpus_attack_save" {
+            key = "corpus_probe_save".to_string();
+        }
         self.tools().contains(&key.as_str())
     }
 
@@ -272,13 +279,28 @@ pub fn infer_role(config: &serde_json::Map<String, serde_json::Value>) -> AgentR
             Some("deny") | Some("ask")
         )
     };
+    let probe_granted = match (
+        permission.contains_key("corpus_probe_save"),
+        permission.contains_key("corpus_attack_save"),
+    ) {
+        (true, true) => granted("corpus_probe_save") && granted("corpus_attack_save"),
+        (true, false) => granted("corpus_probe_save"),
+        (false, true) => granted("corpus_attack_save"),
+        (false, false) => true,
+    };
     let wants_web = ["webfetch", "websearch"].iter().any(|tool| granted(tool));
     let needed: Vec<&str> = CORPUS_TOOLS
         .into_iter()
         // `sandbox_write` did not exist for older documents, so absence is
         // not interpreted as an intentional implicit grant during migration.
         .filter(|tool| *tool != "corpus_sandbox_write" || permission.contains_key(*tool))
-        .filter(|tool| granted(tool))
+        .filter(|tool| {
+            if *tool == "corpus_probe_save" {
+                probe_granted
+            } else {
+                granted(tool)
+            }
+        })
         .collect();
     AgentRole::LEGACY_INFERENCE_ORDER
         .into_iter()

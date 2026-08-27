@@ -362,10 +362,19 @@ fn external_read_only_bundle_recovers_setup_and_populates_sources() {
         corpus_core::EnvironmentSessionState::Closed
     );
 
-    let run = store.provision_run_dir("p").unwrap();
+    let resolved_json =
+        serde_json::to_string(&BTreeMap::from([("target".to_string(), sha.clone())])).unwrap();
+    let run = store
+        .provision_run_dir_with_sources("p", Some(&resolved_json))
+        .unwrap();
     assert_eq!(
-        fs::read_link(run.join("sources")).unwrap(),
-        store.source_cache_dir()
+        fs::read_link(run.join("sources/target").join(&sha)).unwrap(),
+        store
+            .source_cache_dir()
+            .join("target")
+            .join(&sha)
+            .canonicalize()
+            .unwrap()
     );
     let _ = fs::remove_dir_all(&root);
 }

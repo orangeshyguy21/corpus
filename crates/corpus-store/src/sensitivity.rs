@@ -84,7 +84,7 @@ mod tests {
             Sensitivity::Internal
         );
         assert_eq!(
-            Sensitivity::default_for_category("attacks"),
+            Sensitivity::default_for_category("probes"),
             Sensitivity::Internal
         );
         assert_eq!(

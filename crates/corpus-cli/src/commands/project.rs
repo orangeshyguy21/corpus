@@ -18,6 +18,7 @@ pub(crate) fn run(command: ProjectCommand) -> Result<(), String> {
         ProjectCommand::Delete { slug } => delete(&store, &slug),
         ProjectCommand::Wipe { slug } => wipe(&store, &slug),
         ProjectCommand::Rebind { slug, plugin } => rebind(&store, &slug, &plugin),
+        ProjectCommand::MigrateProbes { project, apply } => migrate_probes(&store, &project, apply),
     }
 }
 
@@ -98,5 +99,26 @@ fn rebind(store: &Store, slug: &str, plugin: &str) -> Result<(), String> {
         .rebind_project(slug, plugin)
         .map_err(|error| error.to_string())?;
     println!("rebound project {slug} -> plugin {plugin}");
+    Ok(())
+}
+
+fn migrate_probes(store: &Store, project: &str, apply: bool) -> Result<(), String> {
+    let migration = store
+        .migrate_project_probes(project, apply)
+        .map_err(|error| error.to_string())?;
+    if !migration.changed() {
+        println!("project {project}: probe namespace already current");
+        return Ok(());
+    }
+    println!(
+        "project {project}: {}",
+        if apply { "applied" } else { "dry run" }
+    );
+    for action in migration.actions {
+        println!("  {action}");
+    }
+    if !apply {
+        println!("re-run with --apply to perform this migration");
+    }
     Ok(())
 }

@@ -9,3 +9,4 @@ corpus-store = { path = "../corpus-store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+reqwest = { workspace = true }

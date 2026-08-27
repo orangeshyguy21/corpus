@@ -5,7 +5,7 @@ use std::fs;
 
 use crate::error::{Error, Result};
 use crate::run_records::RUNS;
-use crate::store::{Store, CATEGORIES};
+use crate::store::{Store, CATEGORIES, LEGACY_ATTACKS, PROBES};
 
 /// File and byte totals for one project's corpus.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -83,6 +83,14 @@ pub fn corpus_stats(store: &Store, project: &str) -> Result<CorpusStats> {
                             .and_then(|relative| relative.components().next())
                             .and_then(|component| component.as_os_str().to_str())
                             .unwrap_or("other");
+                        // Legacy artifacts remain visible as probes during the
+                        // compatibility window instead of becoming an
+                        // uncategorized or duplicate UI bucket.
+                        let category = if category == LEGACY_ATTACKS {
+                            PROBES
+                        } else {
+                            category
+                        };
                         let slot =
                             by_name
                                 .entry(category.to_string())
@@ -157,8 +165,8 @@ mod tests {
         let corpus = store.project_corpus_dir("p");
         write(&corpus.join("findings/1.md"), "hello world\n");
         write(&corpus.join("techniques/quote.md"), "abcd");
-        write(&corpus.join("attacks/attack-a/attack.md"), "body bytes\n");
-        write(&corpus.join("attacks/attack-a/run.sh"), "#!/bin/sh\n");
+        write(&corpus.join("probes/probe-a/probe.md"), "body bytes\n");
+        write(&corpus.join("probes/probe-a/run.sh"), "#!/bin/sh\n");
 
         let stats = corpus_stats(&store, "p").unwrap();
         assert_eq!(stats.files, 4);
@@ -168,11 +176,25 @@ mod tests {
             .iter()
             .map(|category| category.name.as_str())
             .collect();
-        assert_eq!(names, ["techniques", "findings", "attacks"]);
+        assert_eq!(names, ["techniques", "findings", "probes"]);
         assert_eq!(stats.categories[0].files, 1);
         assert_eq!(stats.categories[1].bytes, 12);
         assert_eq!(stats.categories[2].files, 2);
         assert_eq!(corpus_stats(&store, "ghost").unwrap(), empty_stats());
+    }
+
+    #[test]
+    fn legacy_attacks_are_projected_as_probes() {
+        let store = tmp_store("legacy-probes");
+        store.create_project("p", "P", "cdk-regtest").unwrap();
+        let corpus = store.project_corpus_dir("p");
+        write(&corpus.join("attacks/replay/attack.md"), "legacy\n");
+        write(&corpus.join("attacks/replay/run.sh"), "run\n");
+
+        let stats = corpus_stats(&store, "p").unwrap();
+        assert_eq!(stats.categories.len(), 1);
+        assert_eq!(stats.categories[0].name, PROBES);
+        assert_eq!(stats.categories[0].files, 2);
     }
 
     #[test]

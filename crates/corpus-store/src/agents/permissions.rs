@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::roles::PROJECT_MANAGEMENT_TOOLS;
-use super::{AgentRole, CORPUS_TOOLS};
+use super::{AgentRole, CORPUS_TOOLS, LEGACY_CORPUS_TOOLS};
 use crate::store::Store;
 
 /// What a render binds an entry to, beyond the entry's own config.
@@ -105,7 +105,8 @@ struct Policy {
     /// one project by construction; this is the switch deciding whether
     /// that construction can be stepped around.
     external_directory: Action,
-    /// The `corpus_*` switches: 10 sandbox/corpus tools and 29 management ones,
+    /// The `corpus_*` switches: 10 active sandbox/corpus tools, one legacy
+    /// alias, and 29 management ones,
     /// every one written explicitly so the artifact never leans on
     /// omission-means-allow. Three come out `corpus_corpus_*` because the
     /// run config names the MCP server `corpus`.
@@ -172,9 +173,25 @@ impl Policy {
         }
 
         let mut tools = BTreeMap::new();
+        let stored_probe = take_action(&mut stored, "corpus_probe_save");
+        let stored_attack = take_action(&mut stored, "corpus_attack_save");
+        let stored_probe_capability = match (stored_probe, stored_attack) {
+            (Some(current), Some(legacy)) => Some(current.max(legacy)),
+            (current, legacy) => current.or(legacy),
+        };
         for tool in CORPUS_TOOLS {
-            let stored = take_action(&mut stored, tool);
+            let stored = if tool == "corpus_probe_save" {
+                stored_probe_capability
+            } else {
+                take_action(&mut stored, tool)
+            };
             tools.insert(tool.to_string(), ceiling(role.allows(tool), stored));
+        }
+        for tool in LEGACY_CORPUS_TOOLS {
+            tools.insert(
+                tool.to_string(),
+                ceiling(role.allows(tool), stored_probe_capability),
+            );
         }
         let granted = role.admin_tools();
         for tool in PROJECT_MANAGEMENT_TOOLS {

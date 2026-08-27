@@ -16,7 +16,7 @@ use crate::Ctx;
 
 pub(crate) static DELETE: ToolDefinition = ToolDefinition {
     name: "entry_delete",
-    description: "CONFIRM-GATED. Delete ONE entry from the project's corpus by relative path (findings/x.md, attacks/<slug>/, ...). Dry-run first; returns a one-shot token bound to the entry's current state. A directory needs recursive: true. runs/ is not deletable — technique cards cite those transcripts by name and the operator audits them.",
+    description: "CONFIRM-GATED. Delete ONE entry from the project's corpus by relative path (findings/x.md, probes/<slug>/, ...). Dry-run first; returns a one-shot token bound to the entry's current state. A directory needs recursive: true. runs/ is not deletable — technique cards cite those transcripts by name and the operator audits them.",
     input_schema: input_schema::<EntryDeleteArgs>,
     handler: entry_delete,
     policy: ToolPolicy {
@@ -110,7 +110,7 @@ fn entry_delete(
 
 /// A stable state fingerprint for the short confirmation window. It includes
 /// every relative name, type, size, and modification timestamp without reading
-/// potentially large attack artifacts into memory.
+/// potentially large probe artifacts into memory.
 fn entry_preview(root: &Path) -> std::io::Result<EntryPreview> {
     fn visit(
         path: &Path,
@@ -207,8 +207,8 @@ mod tests {
         assert_eq!(first.dirs, 2);
         assert_eq!(first.bytes, 5);
         assert_eq!(
-            dry_run_summary("p", "attacks/x", &first),
-            "DRY RUN — would delete directory tree p/corpus/attacks/x (2 file(s), 2 directory/directories, 5 bytes)"
+            dry_run_summary("p", "probes/x", &first),
+            "DRY RUN — would delete directory tree p/corpus/probes/x (2 file(s), 2 directory/directories, 5 bytes)"
         );
 
         fs::write(root.join("z.md"), "changed-size").unwrap();

@@ -204,6 +204,51 @@ impl AppState {
         ))
     }
 
+    /// Download a Corpus-curated release, verify its pinned checksum and
+    /// catalog identity, then hand it to the same immutable installer used by
+    /// local bundles.
+    pub(crate) fn start_curated_plugin_install(&mut self, id: &str) -> Result<bool, String> {
+        let plugin = corpus_core::curated_plugin(id).map_err(|error| error.to_string())?;
+        let Some(jobs) = self.jobs.as_mut() else {
+            return Err("plugin installation requires the app background-job runtime".into());
+        };
+        if plugin_work_active(jobs) {
+            return Ok(false);
+        }
+
+        let operation_state = self.plugin_operation.clone();
+        *operation_state.lock().unwrap() = Some(PluginOperationView {
+            plugin: plugin.id.clone(),
+            operation: "install".into(),
+            state: PluginOperationState::Running,
+            phase: Some("downloading release".into()),
+            detail: format!("{}@{}", plugin.id, plugin.version),
+            recovery: None,
+        });
+        let plugin_id = plugin.id;
+        Ok(matches!(
+            jobs.start(
+                JobKind::PluginInstall,
+                global_job_scope(),
+                Duration::from_secs(180),
+                move |cancellation| {
+                    corpus_core::install_curated_plugin_with(
+                        &plugin_id,
+                        || cancellation.is_cancelled(),
+                        |phase| {
+                            if let Some(current) = operation_state.lock().unwrap().as_mut() {
+                                current.phase = Some(phase.label().into());
+                            }
+                        },
+                    )
+                    .map(AppJobOutput::PluginInstalled)
+                    .map_err(|error| error.to_string())
+                },
+            ),
+            StartOutcome::Started(_)
+        ))
+    }
+
     /// Start an installation-scoped plugin lifecycle operation. The worker
     /// resolves the selected bundle and spawns the executable off the render
     /// thread; cancellation is observed by the protocol client every 100ms.
