@@ -58,7 +58,7 @@ The current built-in release locks are:
 
 | Plugin | Tag | Release archive SHA-256 |
 |---|---|---|
-| `cdk-regtest` | `corpus-plugin-cdk@v0.4.6` | `8c88e63b88721cd63d0cf957c920ba6288dfa83ffc2d01f25801f8dbf001e7ad` |
+| `cdk-regtest` | `corpus-plugin-cdk@v0.4.8` | `c16f0c7f36787fb2f3d73e769c42a851e0dfa817398e9718dd51b3919c86ffd2` |
 | `nutshell-regtest` | `corpus-plugin-nutshell@v0.4.3` | `f45670cdb0d09d0f11125f5e228554fdcd9de47885c510cd131a4e7e0179bcf0` |
 
 Corpus CI downloads both assets, verifies both the attached checksum and this
