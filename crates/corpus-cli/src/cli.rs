@@ -64,8 +64,13 @@ pub(crate) struct PluginArgs {
 pub(crate) enum PluginCommand {
     /// List discovered environment plugins.
     List,
-    /// Atomically install and select a local v1 plugin bundle.
+    /// Download, verify, install, and select a supported plugin.
     Install {
+        /// Plugin id from Corpus's built-in catalog.
+        id: String,
+    },
+    /// Install an unpacked local bundle for plugin development.
+    InstallLocal {
         /// Unpacked plugin bundle directory.
         bundle_dir: PathBuf,
     },
@@ -453,6 +458,27 @@ mod tests {
         assert_eq!(
             parse(strings(&["plugin", "install"])).unwrap_err().kind(),
             ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            parse(strings(&["plugin", "install", "cdk-regtest"])).unwrap(),
+            CliCommand::Plugin(PluginArgs {
+                command: PluginCommand::Install {
+                    id: "cdk-regtest".into()
+                }
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "plugin",
+                "install-local",
+                "/tmp/corpus-plugin-fixture"
+            ]))
+            .unwrap(),
+            CliCommand::Plugin(PluginArgs {
+                command: PluginCommand::InstallLocal {
+                    bundle_dir: "/tmp/corpus-plugin-fixture".into()
+                }
+            })
         );
         assert_eq!(
             parse(strings(&["models", "list", "extra"]))

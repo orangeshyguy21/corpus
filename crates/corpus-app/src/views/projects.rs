@@ -300,7 +300,7 @@ impl ProjectsView {
                         ui.close_menu();
                     }
                     if ui
-                        .add_enabled(!plugin_busy, egui::Button::new("Install bundle…"))
+                        .add_enabled(!plugin_busy, egui::Button::new("Install plugin…"))
                         .clicked()
                     {
                         self.show_install = true;
@@ -825,29 +825,18 @@ impl ProjectsView {
             .default_width(520.0)
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
             .show(ui.ctx(), |ui| {
-                ui.label("Unpacked plugin bundle directory");
-                let entry = ui.add(
-                    egui::TextEdit::singleline(&mut self.install_path)
-                        .desired_width(500.0)
-                        .hint_text("/path/to/corpus-plugin-nutshell"),
-                );
                 ui.label(
                     RichText::new(
-                        "Corpus validates manifest v1, executable shape and immutable bundle identity, then selects the installed version.",
+                        "Choose a supported environment. Corpus downloads and verifies the release before installing it.",
                     )
                     .size(12.0)
-                    .color(theme::TEXT_FAINT),
+                    .color(theme::TEXT_MUTED),
                 );
                 ui.add_space(8.0);
-                let submit = entry.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                let enabled = !self.install_path.trim().is_empty();
-                let clicked = ui
-                    .add_enabled_ui(enabled, |ui| theme::house_button(ui, "Install"))
-                    .inner
-                    .clicked();
-                if clicked || (submit && enabled) {
-                    match state.start_plugin_install(&self.install_path) {
+                if let Some(result) =
+                    crate::views::plugin_install::curated_plugin_list(ui, state)
+                {
+                    match result {
                         Ok(true) => {
                             toast(toasts, ToastKind::Info, "plugin installation started");
                             started = true;
@@ -860,6 +849,52 @@ impl ProjectsView {
                         Err(error) => toast(toasts, ToastKind::Error, error),
                     }
                 }
+
+                egui::CollapsingHeader::new("Advanced: install a local bundle")
+                    .id_salt("project_local_plugin_install")
+                    .show(ui, |ui| {
+                        ui.label("Unpacked plugin bundle directory");
+                        let entry = ui.add(
+                            egui::TextEdit::singleline(&mut self.install_path)
+                                .desired_width(500.0)
+                                .hint_text("/path/to/corpus-plugin-nutshell"),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "For plugin development. Corpus still validates and installs an immutable bundle.",
+                            )
+                            .size(12.0)
+                            .color(theme::TEXT_FAINT),
+                        );
+                        ui.add_space(8.0);
+                        let submit = entry.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        let enabled = !self.install_path.trim().is_empty();
+                        let clicked = ui
+                            .add_enabled_ui(enabled, |ui| {
+                                theme::house_button(ui, "Install local bundle")
+                            })
+                            .inner
+                            .clicked();
+                        if clicked || (submit && enabled) {
+                            match state.start_plugin_install(&self.install_path) {
+                                Ok(true) => {
+                                    toast(
+                                        toasts,
+                                        ToastKind::Info,
+                                        "plugin installation started",
+                                    );
+                                    started = true;
+                                }
+                                Ok(false) => toast(
+                                    toasts,
+                                    ToastKind::Warning,
+                                    "another plugin operation is already running",
+                                ),
+                                Err(error) => toast(toasts, ToastKind::Error, error),
+                            }
+                        }
+                    });
             });
         self.show_install = open && !started;
     }

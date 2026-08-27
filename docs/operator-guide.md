@@ -18,19 +18,24 @@ Goose dependency tree with `cargo build --locked -p corpus-app
 --no-default-features`.
 
 Corpus does not ship a production environment adapter in this repository.
-Install a reviewed, checksummed plugin bundle and prepare it before creating a
-project. [`../PLUGINS.md`](../PLUGINS.md) owns installation, upgrade, rollback,
-and authoring details.
+The desktop app's **New project** dialog lists the supported environments and
+installs one without leaving Corpus. Corpus downloads the public release,
+checks it against the built-in catalog, installs an immutable copy, and selects
+that version. [`../PLUGINS.md`](../PLUGINS.md) owns installation,
+upgrade/rollback, and authoring details.
 
 ```sh
-corpus plugin install /path/to/unpacked-plugin-bundle
+corpus plugin install cdk-regtest
 corpus plugin setup <plugin>
 corpus plugin doctor <plugin>
 corpus plugin status <plugin>
 ```
 
-`setup` may fetch manifest-pinned sources and build local images. `doctor` is
-the full read-only readiness check; `status` is the faster lifecycle view.
+`setup` may fetch manifest-pinned sources and build local images. Plugins that
+declare Docker support surface Docker readiness through their environment
+status. `doctor` is the full read-only readiness check; `status` is the faster
+lifecycle view. Plugin authors can install an unpacked development bundle with
+`corpus plugin install-local /path/to/bundle`.
 
 ## Data and configuration
 

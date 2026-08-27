@@ -8,6 +8,7 @@ mod finding_summary;
 pub mod mission_actions;
 pub mod missions;
 pub mod model_picker;
+pub mod plugin_install;
 pub mod plugin_picker;
 pub mod policy;
 pub mod projects;

@@ -21,7 +21,10 @@ egui-toast = "0.17"
 egui_term = "0.1"
 egui-phosphor = "0.9"
 notify = "8.2"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
 goose = { git = "https://github.com/aaif-goose/goose", rev = "4bb968fadbb1d8fc0216adad627a1ab7837803c5" }
 
 [patch.crates-io]

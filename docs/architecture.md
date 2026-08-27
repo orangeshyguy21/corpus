@@ -154,6 +154,10 @@ Plugin discovery and read projections live in `corpus-observe`; protocol
 negotiation, spawning, lifecycle, sandbox, oracle, source preparation, and
 installation verification live in `corpus-core`. The app requests these
 operations through state jobs and never spawns a plugin while painting.
+Corpus also compiles `plugin-catalog.toml` into `corpus-core`. Normal app and
+CLI installation accepts a catalog id; only the explicit developer path
+accepts a local unpacked directory. Download verification and bounded archive
+extraction complete before the existing immutable installer is invoked.
 
 ### Administration and research tools
 

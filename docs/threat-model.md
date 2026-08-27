@@ -217,6 +217,19 @@ cleans staging and leaves the old target intact.
 Evidence: all tests in `corpus-store/src/filesystem.rs` and collision-safe
 finding writer tests.
 
+### SEC-FS-4: curated plugin archives fail closed before installation
+
+Normal plugin installation resolves only Corpus's compiled catalog, requires
+HTTPS and a pinned SHA-256 digest, bounds compressed size, expanded size, and
+entry count, and accepts only normal relative paths, directories, and regular
+files. The extracted manifest id and version must match the catalog before the
+immutable local installer runs. Local unpacked bundles remain an explicitly
+named development path and still pass the existing manifest/tree checks.
+
+Evidence: `corpus-core::plugin_distribution::tests`, including checksum,
+catalog metadata, manifest identity, archive path, and extraction tests; plus
+`corpus-core/tests/plugin_installation.rs` for immutable publication checks.
+
 ### SEC-DUR-1: cleanup identity survives failure and restart
 
 Environment session identity is durable outside project subtrees. Active or

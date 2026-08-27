@@ -19,13 +19,13 @@ jobs:
           - id: cdk-regtest
             repo: orangeshyguy21/corpus-plugin-cdk
             archive: corpus-plugin-cdk
-            version: 0.4.5
-            sha256: 8bb5fb68cdad18d6688e195b4d02d291e553f2dfd470c0fec68edcd52c25d2ee
+            version: 0.4.6
+            sha256: 8c88e63b88721cd63d0cf957c920ba6288dfa83ffc2d01f25801f8dbf001e7ad
           - id: nutshell-regtest
             repo: orangeshyguy21/corpus-plugin-nutshell
             archive: corpus-plugin-nutshell
-            version: 0.4.1
-            sha256: fb8fa891634f9c40c8b3bbeb1a1b631a5433705a1e7c78822ed4a8479e27f9aa
+            version: 0.4.3
+            sha256: f45670cdb0d09d0f11125f5e228554fdcd9de47885c510cd131a4e7e0179bcf0
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install pinned Rust toolchain
@@ -33,13 +33,9 @@ jobs:
       - name: Download and verify pinned plugin release
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.CORPUS_PLUGIN_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test -n "${GH_TOKEN:-}" || {
-            echo 'CORPUS_PLUGIN_TOKEN is required while plugin repositories are private' >&2
-            exit 1
-          }
           gh release download "v${{ matrix.version }}" \
             --repo "${{ matrix.repo }}" \
             --pattern "${{ matrix.archive }}-${{ matrix.version }}.tar.gz" \
@@ -49,15 +45,24 @@ jobs:
           (cd "$RUNNER_TEMP" && sha256sum --check --strict "${{ matrix.archive }}-${{ matrix.version }}.tar.gz.sha256")
           printf '%s  %s\n' "${{ matrix.sha256 }}" "$archive" | sha256sum --check --strict
           tar -xzf "$archive" -C "$RUNNER_TEMP"
-      - name: Install immutable bundle and negotiate protocol v1
+      - name: Install downloaded immutable bundle and negotiate protocol v1
         shell: bash
         run: |
           set -euo pipefail
-          export CORPUS_HOME="$RUNNER_TEMP/corpus-home"
+          export CORPUS_HOME="$RUNNER_TEMP/local-bundle-home"
           plugin="$RUNNER_TEMP/${{ matrix.archive }}-${{ matrix.version }}"
-          cargo run --locked --quiet -p corpus-cli -- plugin install "$plugin"
+          cargo run --locked --quiet -p corpus-cli -- plugin install-local "$plugin"
           cargo run --locked --quiet -p corpus-cli -- plugin list | tee "$RUNNER_TEMP/plugin-list.txt"
           grep -F "${{ matrix.id }}" "$RUNNER_TEMP/plugin-list.txt"
+          hello="$(cargo run --locked --quiet -p corpus-cli -- plugin call "${{ matrix.id }}" hello)"
+          jq -e '.protocol == "corpus.environment/1"' <<<"$hello"
+      - name: Exercise the public catalog installation path
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CORPUS_HOME="$RUNNER_TEMP/catalog-home"
+          receipt="$(cargo run --locked --quiet -p corpus-cli -- plugin install "${{ matrix.id }}")"
+          grep -F "installed ${{ matrix.id }}@${{ matrix.version }}" <<<"$receipt"
           hello="$(cargo run --locked --quiet -p corpus-cli -- plugin call "${{ matrix.id }}" hello)"
           jq -e '.protocol == "corpus.environment/1"' <<<"$hello"
       - name: Run language-neutral protocol conformance

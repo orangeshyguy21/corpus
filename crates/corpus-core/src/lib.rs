@@ -28,6 +28,7 @@ pub mod paths {
 }
 mod environment_session;
 mod plugin;
+mod plugin_distribution;
 mod plugin_install;
 pub mod refusal {
     pub use corpus_store::refusal::*;
@@ -84,6 +85,10 @@ pub use plugin::{
     LifecycleProgress, OperationState, OperationStatus, OracleInfo, OracleResult, Plugin,
     PluginManifest, ProbeResult, ProtocolError, ProtocolV1Reply, SandboxExecResult, SourceInfo,
     TargetRecord, ToolRecord,
+};
+pub use plugin_distribution::{
+    curated_plugin, curated_plugins, install_curated_plugin, install_curated_plugin_with,
+    CuratedInstallPhase, CuratedPlugin, CuratedPluginRequirement,
 };
 pub use plugin_install::{
     call_plugin_lifecycle_cancellable, install_plugin_bundle, installed_record,
