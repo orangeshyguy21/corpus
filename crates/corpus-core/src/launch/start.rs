@@ -326,7 +326,9 @@ impl RunSession {
             .map(|_| opencode_control_password(store, &session))
             .transpose()?;
 
-        let repo = store.provision_run_dir_with_sources(project, plan.source_pins_json())?;
+        let workspace =
+            store.provision_run_workspace_with_sources(project, plan.source_pins_json())?;
+        let repo = workspace.path;
         let prompt = if mission.trim().is_empty() {
             None
         } else {
@@ -368,6 +370,7 @@ impl RunSession {
             transcript: export_json.clone(),
             backend: Backend::Tui {
                 session,
+                workspace_id: workspace.id,
                 control_port,
                 // A resume already knows its session; a fresh spawn
                 // discovers one once opencode has created it.

@@ -443,6 +443,7 @@ impl eframe::App for App {
         // Keep the sidebar's agent status dots honest: poll tmux on a
         // throttle when a live session can exist (never per frame).
         self.state.poll_live_sessions();
+        self.state.poll_session_statuses();
         // Keep the selected project's agent list, mission list and corpus
         // summary current as the curator mutates them from the MCP process
         // (throttled re-list — replaces the old manual refresh button).
@@ -638,6 +639,14 @@ impl App {
                     });
                 });
             });
+        // Hiding the macOS title bar also hides AppKit's built-in title-bar
+        // double-click gesture. Treat the custom bar's background as the
+        // native title bar, while leaving its buttons and dropdowns in front.
+        #[cfg(target_os = "macos")]
+        if bar.response.interact(egui::Sense::click()).double_clicked() {
+            let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        }
         paint_header_caution_border(ctx, bar.response.rect);
     }
 

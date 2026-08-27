@@ -27,8 +27,8 @@ pub struct MissionLog {
     /// File name as it sits in `runs/` (e.g. `1786891368-verify.raw`) —
     /// the value [`RUN_LOG_ENV`] carries and findings cite.
     pub name: String,
-    /// The agent slug parsed out of `<epoch>-<agent>.<ext>` or resolved from
-    /// a mission whose OpenCode session owns a session-keyed JSON export.
+    /// The agent slug parsed out of a timestamped run artifact or resolved
+    /// from a mission whose OpenCode session owns a session-keyed JSON export.
     /// `None` for legacy/unlinked filenames that carry no agent identity.
     pub agent: Option<String>,
     /// Run-start epoch seconds from the name prefix (0 when absent).
@@ -57,6 +57,15 @@ pub fn mission_logs(store: &Store, project: &str) -> Result<Vec<MissionLog>> {
                 .map(|session| (session, mission.agent))
         })
         .collect();
+    let mut known_agents = store
+        .list_agents(project)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(slug, _)| slug)
+        .collect::<Vec<_>>();
+    // An agent slug can prefix another agent slug. Prefer the longest exact
+    // storage prefix so `recon-deep-...` does not resolve to `recon`.
+    known_agents.sort_by_key(|slug| std::cmp::Reverse(slug.len()));
     for entry in fs::read_dir(&runs)? {
         let entry = entry?;
         let path = entry.path();
@@ -79,11 +88,14 @@ pub fn mission_logs(store: &Store, project: &str) -> Result<Vec<MissionLog>> {
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or(name);
-        // `<epoch>-<mission>`: split once, and only when the prefix really is
-        // a number (a mission named `2fa-probe` must not lose its head).
+        // Timestamped artifacts historically used `<epoch>-<agent>` and now
+        // use `<epoch>-<agent>-<mission>-gN`. Resolve against known project
+        // agents instead of presenting the entire storage stem as an agent.
+        // Split only when the prefix really is a number (an unlinked file
+        // named `2fa-probe` must not lose its head).
         let (started, agent) = match stem.split_once('-') {
             Some((head, rest)) if !rest.is_empty() => match head.parse::<u64>() {
-                Ok(epoch) => (epoch, Some(rest.to_string())),
+                Ok(epoch) => (epoch, filename_agent(rest, &known_agents)),
                 Err(_) => (0, session_agents.get(stem).cloned()),
             },
             _ => (0, session_agents.get(stem).cloned()),
@@ -103,6 +115,47 @@ pub fn mission_logs(store: &Store, project: &str) -> Result<Vec<MissionLog>> {
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(logs)
+}
+
+fn filename_agent(stem: &str, known_agents: &[String]) -> Option<String> {
+    if let Some(agent) = known_agents.iter().find(|agent| {
+        stem == agent.as_str()
+            || stem
+                .strip_prefix(agent.as_str())
+                .is_some_and(|tail| tail.starts_with('-'))
+    }) {
+        return Some(agent.clone());
+    }
+
+    // Preserve a deleted app-created agent's exact UUID so presentation can
+    // replace it with a lifecycle label. Never leak the compound run stem.
+    let uuid = stem.get(..36).filter(|candidate| {
+        candidate.len() == 36
+            && candidate.as_bytes().get(8) == Some(&b'-')
+            && candidate.as_bytes().get(13) == Some(&b'-')
+            && candidate.as_bytes().get(18) == Some(&b'-')
+            && candidate.as_bytes().get(23) == Some(&b'-')
+            && candidate
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_hexdigit())
+            && stem.as_bytes().get(36).is_none_or(|byte| *byte == b'-')
+    });
+    if let Some(uuid) = uuid {
+        return Some(uuid.to_string());
+    }
+
+    // Human handles from the legacy `<epoch>-<agent>` format remain useful
+    // after deletion. A generation token identifies the newer compound form,
+    // whose agent/mission boundary cannot be recovered once the agent is gone.
+    if stem.split('-').any(|part| {
+        part.strip_prefix('g')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    }) {
+        None
+    } else {
+        Some(stem.to_string())
+    }
 }
 
 #[cfg(test)]

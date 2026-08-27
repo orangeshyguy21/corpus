@@ -224,8 +224,8 @@ aborts launch.
 1. An operator or curator persists a mission with an agent, optional budget,
    source pins, and immutable request origin.
 2. The app or CLI resolves the explicit model, validates plugin/environment
-   state, provisions the project-only workspace, and constructs one launch
-   plan.
+   state, provisions a pin-addressed project-only workspace, persists its
+   relocatable identity with the mission, and constructs one launch plan.
 3. OpenCode runs in a detached tmux TUI when available or a supervised piped
    process otherwise. Raw output is durable from first output; structured
    export is best-effort during teardown.
@@ -236,6 +236,12 @@ aborts launch.
    message to that curator session.
 6. Acknowledgement advances durable delivery state only when message and run
    identities still match. Failure or restart retains bounded retry state.
+
+Session discovery, completion checks, prompt delivery, transcript export, and
+live usage checkpoints all resolve the same persisted workspace identity.
+Legacy live missions without that field are recovered only by matching an
+unclaimed post-launch conversation inside validated project source views; the
+recovered identity is then persisted before normal accounting resumes.
 
 The real Qwen3.8 MLX integration campaign runs these steps serially because the
 prepared local runner can host only one model inference at a time. Production

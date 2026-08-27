@@ -153,9 +153,12 @@ the lifecycle failures observed in the original harness.
 **Decision.** Curator and Super may launch several child missions and finish
 their turn. Corpus observes children without inference and delivers completed,
 failed, or unexpectedly exited results once to the exact persisted parent
-project, mission, run, control endpoint, and OpenCode conversation. Ready
-results for one parent are grouped. Delivery is queued behind an active parent
-turn and survives restart.
+project, mission, run, control endpoint, OpenCode conversation, and
+pin-addressed working directory. Ready results for one parent are grouped.
+Delivery is queued behind an active parent turn and survives restart. The
+working-directory identity is stored as a validated relocatable id, never an
+absolute path; legacy live records recover it from project-confined views and
+then persist it.
 
 **Why.** Polling or keeping a model turn open wastes inference and still cannot
 prove the recipient. Agent name, role, newest session, terminal quiet, and
@@ -197,4 +200,3 @@ the properties that affect review and maintenance.
 **Where.** `Cargo.toml`, `deny.toml`, `scripts/check-dependency-policy`,
 `scripts/check-supply-chain`, [`architecture.md`](architecture.md), and
 [`supply-chain-policy.md`](supply-chain-policy.md).
-

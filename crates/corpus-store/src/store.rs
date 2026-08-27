@@ -41,6 +41,7 @@ pub use crate::projects::Project;
 pub use crate::run_records::{
     mission_logs, MissionLog, MISSION_ENV, RUNS, RUN_ID_ENV, RUN_LOG_ENV,
 };
+pub use crate::run_workspace::RunWorkspace;
 
 /// Environment variables overriding the default scope. The store root is
 /// resolved in [`crate::paths`], which owns every root the app has.

@@ -222,6 +222,27 @@ fn generated_ids_differ_across_calls() {
 }
 
 #[test]
+fn created_agent_is_cached_and_can_be_opened_immediately() {
+    let (root, mut state) = project_state("create-agent-navigation", &["p"]);
+    state.select_project("p");
+
+    let id = state
+        .create_agent_with_role("p", corpus_core::AgentRole::Researcher)
+        .unwrap();
+    state.select_agent("p", &id);
+
+    assert_eq!(state.current_screen, Screen::Agents);
+    assert_eq!(state.selected_agent.as_deref(), Some(id.as_str()));
+    assert!(state.agents.iter().any(|(slug, _)| slug == &id));
+    assert!(state
+        .trees
+        .get("p")
+        .is_some_and(|tree| tree.agents.iter().any(|(slug, _)| slug == &id)));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn selected_plugin_probe_preserves_other_cached_health() {
     let status = |name: &str, probed: bool, ready: bool| PluginStatus {
         name: name.into(),
@@ -274,6 +295,7 @@ fn prepared_lease_projection_exposes_identity_drift_and_hides_closed_leases() {
         session: None,
         control: None,
         opencode_session: None,
+        opencode_workspace: None,
         environment_session: Some(id.storage_key()),
         launch_requested: None,
         delete_requested: None,

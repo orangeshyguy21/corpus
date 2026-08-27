@@ -603,7 +603,7 @@ pub fn catalog() -> Value {
                     "title": {"type": "string"},
                     "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
                     "detail": {"type": "string"},
-                    "path": {"type": "string", "description": "Optional path beneath findings/. A .md path names the file; a path with no extension or a trailing slash names a containing folder. Existing files are never overwritten."},
+                    "path": {"type": "string", "description": "Optional path beneath findings/. Either x.md or findings/x.md is accepted. A .md path names the file; a path with no extension or a trailing slash names a containing folder. Existing files are never overwritten."},
                     "metadata": {"type": "object", "description": "Optional project-defined frontmatter. Corpus-owned keys such as title, severity, timestamp, sensitivity, verification, and provenance are refused."}
                 },
                 "required": ["title", "severity", "detail"]

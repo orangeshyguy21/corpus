@@ -75,6 +75,7 @@ struct QueueCall {
     run_id: String,
     password: String,
     session_id: String,
+    directory: PathBuf,
     message_id: String,
     prompt: String,
 }
@@ -85,6 +86,65 @@ struct RecordingQueueService {
     active: AtomicBool,
     prompt_state: Mutex<PromptDeliveryState>,
     status_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+struct WorkspaceListingService {
+    sessions: Vec<crate::session_service::SessionSummary>,
+}
+
+impl SessionService for WorkspaceListingService {
+    fn health(&self) -> Result<crate::session_service::ServiceHealth, String> {
+        Ok(crate::session_service::ServiceHealth {
+            backend: crate::session_service::SessionBackend::Http,
+            version: crate::session_service::MINIMUM_OPENCODE_VERSION.into(),
+            compatible: true,
+        })
+    }
+
+    fn list(
+        &self,
+        _directory: &std::path::Path,
+    ) -> Result<Vec<crate::session_service::SessionSummary>, String> {
+        Ok(self.sessions.clone())
+    }
+
+    fn messages(
+        &self,
+        _session: &SessionRef,
+    ) -> Result<Vec<crate::session_service::SessionMessage>, String> {
+        Ok(Vec::new())
+    }
+
+    fn session_turn_state(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+        _launched_at_ms: u64,
+    ) -> Result<SessionTurnState, String> {
+        Ok(SessionTurnState::Completed)
+    }
+
+    fn prompt_delivery_state(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+        _message_id: &str,
+    ) -> Result<PromptDeliveryState, String> {
+        Ok(PromptDeliveryState::Acknowledged)
+    }
+
+    fn queue_prompt(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+        _message_id: &str,
+        _prompt: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl Default for RecordingQueueService {
@@ -137,6 +197,7 @@ impl SessionService for RecordingQueueService {
             run_id: control.run_id.clone(),
             password: password.to_string(),
             session_id: session.id.clone(),
+            directory: session.directory.clone(),
             message_id: message_id.to_string(),
             prompt: prompt.to_string(),
         });
@@ -174,6 +235,7 @@ impl SessionService for RecordingQueueService {
 struct BlockingExportService {
     block: AtomicBool,
     in_progress: AtomicBool,
+    directory: Mutex<Option<PathBuf>>,
 }
 
 impl SessionService for BlockingExportService {
@@ -205,6 +267,7 @@ impl SessionService for BlockingExportService {
         _password: &str,
         session: &SessionRef,
     ) -> Result<corpus_core::UsageSnapshot, String> {
+        *self.directory.lock().unwrap() = Some(session.directory.clone());
         self.in_progress.store(true, Ordering::Release);
         while self.block.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(1));
@@ -215,7 +278,15 @@ impl SessionService for BlockingExportService {
             session_id: session.id.clone(),
             captured_at: 1,
             source: "test".into(),
-            rows: Vec::new(),
+            rows: vec![corpus_core::CostRow {
+                provider: "test".into(),
+                model: "fixture".into(),
+                messages: 1,
+                tokens_input: 10,
+                tokens_output: 5,
+                cost: 0.5,
+                ..Default::default()
+            }],
         })
     }
 
@@ -303,6 +374,14 @@ impl ActiveRun for FakeRun {
     fn control_port(&self) -> Option<u16> {
         Some(43_111)
     }
+
+    fn workspace_id(&self) -> Option<String> {
+        Some(fake_workspace_id())
+    }
+}
+
+fn fake_workspace_id() -> String {
+    format!("sources-{}", "a".repeat(64))
 }
 
 #[derive(Default)]
@@ -396,7 +475,12 @@ impl RunBackend for FakeRunBackend {
         Ok(pins.clone())
     }
 
-    fn export_session(&self, _project: &str, _opencode_session_id: &str) -> Result<PathBuf, Error> {
+    fn export_session(
+        &self,
+        _project: &str,
+        _workspace: &str,
+        _opencode_session_id: &str,
+    ) -> Result<PathBuf, Error> {
         self.exports.fetch_add(1, Ordering::Relaxed);
         self.export_in_progress.store(true, Ordering::Release);
         while self.block_export.load(Ordering::Acquire) {
@@ -457,6 +541,7 @@ fn mission(created: u64) -> Mission {
         session: None,
         control: None,
         opencode_session: None,
+        opencode_workspace: None,
         environment_session: None,
         launch_requested: None,
         delete_requested: None,

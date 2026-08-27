@@ -48,7 +48,7 @@ pub use store::{
     store_root_env, validate_slug, AppPrefs, CategoryStat, CorpusCostCache, CorpusStats,
     CostReport, CostRow, EntryAccess, Mission, MissionCompletion, MissionControl,
     MissionDeleteRequest, MissionDispatch, MissionDispatchIdentity, MissionLaunchRequest,
-    MissionRunRef, Project, Scope, Store, UsageSnapshot, AGENT_ENV, CATEGORIES,
+    MissionRunRef, Project, RunWorkspace, Scope, Store, UsageSnapshot, AGENT_ENV, CATEGORIES,
     ENVIRONMENT_SESSION_ENV, LEGACY_ATTACKS, PROBES, PROJECT_ENV, SOURCE_PINS_ENV, STORE_ENV,
     USAGE_SNAPSHOT_VERSION,
 };

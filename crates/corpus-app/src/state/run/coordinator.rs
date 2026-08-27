@@ -7,8 +7,9 @@ use corpus_core::{Error, Mission, Project};
 
 use super::super::session::should_reexport;
 use super::super::{
-    launch_stamp_ms, mission_label, AppJobOutput, AppState, LaunchNotice, MissionActivity, RunId,
-    RunPhase, RunPhaseKind, SessionRef, StopMissionResult,
+    launch_stamp_ms, mission_label, mission_workspace_candidates, mission_workspace_dir,
+    AppJobOutput, AppState, LaunchNotice, MissionActivity, RunId, RunPhase, RunPhaseKind,
+    SessionRef, StopMissionResult,
 };
 use super::{load_launchable_mission, LaunchMode, LaunchReady, RunCancellation, TeardownReady};
 use crate::jobs::JobKind;
@@ -42,8 +43,15 @@ impl AppState {
         let session = self.live_run_session();
         let control_port = self.run.as_ref().and_then(|run| run.control_port());
         let child_run_id = self.run.as_ref().and_then(|run| run.launch_identity());
-        if let Err(error) = self.bind_fresh_run(project, slug, session, child_run_id, control_port)
-        {
+        let workspace = self.run.as_ref().and_then(|run| run.workspace_id());
+        if let Err(error) = self.bind_fresh_run(
+            project,
+            slug,
+            session,
+            child_run_id,
+            control_port,
+            workspace,
+        ) {
             return Err(self.cleanup_failed_adoption(&run_id, error));
         }
         self.refresh_missions(project);
@@ -133,6 +141,7 @@ impl AppState {
         self.run_cancellations.remove(&run_id);
         let control_port = session.control_port();
         let child_run_id = session.launch_identity();
+        let workspace = session.workspace_id();
         let tmux = session
             .pty_attach_command()
             .and_then(|argv| AppState::pty_attach_session(&argv));
@@ -146,6 +155,7 @@ impl AppState {
                     Some(name),
                     child_run_id.clone(),
                     control_port,
+                    workspace.clone(),
                 ) {
                     self.run_phases.insert(run_id.clone(), RunPhase::Stopping);
                     let transcript = session.stop();
@@ -176,7 +186,7 @@ impl AppState {
                 }
                 self.adopt_run(session, run_id.clone());
                 if let Err(error) =
-                    self.bind_fresh_run(project, slug, None, child_run_id, control_port)
+                    self.bind_fresh_run(project, slug, None, child_run_id, control_port, workspace)
                 {
                     return Err(self.cleanup_failed_adoption(&run_id, error));
                 }
@@ -265,11 +275,17 @@ impl AppState {
         self.run_cancellations.remove(&run_id);
         let resumed_run_id = run.launch_identity();
         let control_port = run.control_port();
+        let workspace = run.workspace_id();
         self.adopt_run(run, run_id.clone());
         if let Some(session) = self.live_run_session() {
-            if let Err(error) =
-                self.bind_resumed_run(project, slug, Some(session), resumed_run_id, control_port)
-            {
+            if let Err(error) = self.bind_resumed_run(
+                project,
+                slug,
+                Some(session),
+                resumed_run_id,
+                control_port,
+                workspace,
+            ) {
                 return Err(self.cleanup_failed_adoption(&run_id, error));
             }
         }
@@ -516,6 +532,7 @@ impl AppState {
         let notice = ready.notice.take();
         let control_port = ready.session.control_port();
         let child_run_id = ready.session.launch_identity();
+        let workspace = ready.session.workspace_id();
         self.run_phases.insert(run_id.clone(), RunPhase::Starting);
         match ready.mode {
             LaunchMode::DetachedFresh => {
@@ -530,6 +547,7 @@ impl AppState {
                         Some(session),
                         child_run_id.clone(),
                         control_port,
+                        workspace.clone(),
                     ) {
                         let cleanup = ready.session.stop();
                         let combined = Error::Store(format!(
@@ -550,6 +568,7 @@ impl AppState {
                         None,
                         child_run_id.clone(),
                         control_port,
+                        workspace.clone(),
                     ) {
                         return Err(self.cleanup_failed_adoption(run_id, error));
                     }
@@ -574,6 +593,7 @@ impl AppState {
                         self.live_run_session(),
                         child_run_id,
                         control_port,
+                        workspace,
                     ),
                     LaunchMode::Resume => self.bind_resumed_run(
                         &run_id.project,
@@ -581,6 +601,7 @@ impl AppState {
                         self.live_run_session(),
                         child_run_id,
                         control_port,
+                        workspace,
                     ),
                     LaunchMode::DetachedFresh => unreachable!(),
                 };
@@ -770,27 +791,51 @@ impl AppState {
     /// launch, or re-attached after a restart. Without this they stay
     /// orphans, attachable but neither exportable nor resumable.
     pub fn sweep_conversations(&mut self, project: &str) {
-        let pending: Vec<(String, String)> = self
+        let pending: Vec<(
+            String,
+            String,
+            Option<String>,
+            Vec<corpus_core::RunWorkspace>,
+        )> = self
             .missions
             .iter()
-            .filter(|(_, m)| m.opencode_session.is_none())
-            .filter_map(|(slug, m)| Some((slug.clone(), m.session.clone()?)))
-            .filter(|(_, session)| self.live_sessions.iter().any(|l| l == session))
+            .filter(|(_, mission)| {
+                mission.opencode_session.is_none() || mission.opencode_workspace.is_none()
+            })
+            .filter_map(|(slug, mission)| {
+                Some((
+                    slug.clone(),
+                    mission.session.clone()?,
+                    mission.opencode_session.clone(),
+                    mission_workspace_candidates(&self.store, project, mission).ok()?,
+                ))
+            })
+            .filter(|(_, session, _, _)| self.live_sessions.iter().any(|l| l == session))
             .collect();
         let mut changed = false;
-        for (slug, session) in pending {
+        for (slug, session, known_session, workspaces) in pending {
             let claimed = self.claimed_conversations(project, &slug);
             let Some(launched_at_ms) = launch_stamp_ms(&session) else {
                 continue;
             };
-            let Ok(id) = self.session_service.find_for_launch(
-                &self.store.project_run_dir(project),
-                launched_at_ms,
-                &claimed,
-            ) else {
+            let identity = match known_session {
+                Some(conversation) => self
+                    .session_service
+                    .find_session_workspace(&workspaces, &conversation)
+                    .map(|workspace| (conversation, workspace)),
+                None => self.session_service.find_for_launch_in_workspaces(
+                    &workspaces,
+                    launched_at_ms,
+                    &claimed,
+                ),
+            };
+            let Ok((id, workspace)) = identity else {
                 continue;
             };
-            if self.set_opencode_session(project, &slug, Some(id)).is_ok() {
+            if self
+                .set_opencode_identity(project, &slug, Some(id), Some(workspace))
+                .is_ok()
+            {
                 changed = true;
             }
         }
@@ -813,7 +858,13 @@ impl AppState {
     /// has nothing new to record and is skipped; a failed export leaves the
     /// stamp untouched, so the next beat simply retries.
     pub(in crate::state) fn sweep_usage_exports(&mut self, project: &str) {
-        let pending: Vec<(String, String, String, corpus_core::MissionControl)> = self
+        let pending: Vec<(
+            String,
+            String,
+            String,
+            corpus_core::MissionControl,
+            std::path::PathBuf,
+        )> = self
             .missions
             .iter()
             .filter_map(|(slug, m)| {
@@ -822,15 +873,16 @@ impl AppState {
                     m.opencode_session.clone()?,
                     m.session.clone()?,
                     m.control.clone()?,
+                    mission_workspace_dir(&self.store, project, m).ok()?,
                 ))
             })
-            .filter(|(slug, _, _, _)| {
+            .filter(|(slug, _, _, _, _)| {
                 matches!(
                     self.mission_activity(project, slug),
                     MissionActivity::Waiting
                 )
             })
-            .filter(|(_, _, tmux, control)| {
+            .filter(|(_, _, tmux, control, _)| {
                 if control.run_id != *tmux {
                     return false;
                 }
@@ -846,10 +898,10 @@ impl AppState {
             return;
         }
         let mut changed = false;
-        for (_slug, opencode, tmux, control) in pending {
+        for (_slug, opencode, tmux, control, workspace) in pending {
             let session = SessionRef {
                 id: opencode,
-                directory: self.store.project_run_dir(project),
+                directory: workspace,
             };
             let captured = corpus_core::opencode_control_password(&self.store, &control.run_id)
                 .map_err(|error| error.to_string())
@@ -899,12 +951,14 @@ impl AppState {
         session: Option<String>,
         run_id: Option<String>,
         control_port: Option<u16>,
+        workspace: Option<String>,
     ) -> Result<(), Error> {
         let mut mission = self.store.load_mission(project, slug)?;
         mission.session = session;
         mission.control = run_id
             .zip(control_port)
             .map(|(run_id, port)| corpus_core::MissionControl { run_id, port });
+        mission.opencode_workspace = workspace;
         self.store.update_mission(project, slug, &mission)
     }
 
@@ -918,6 +972,7 @@ impl AppState {
         session: Option<String>,
         child_run_id: Option<String>,
         control_port: Option<u16>,
+        workspace: Option<String>,
     ) -> Result<(), Error> {
         let mut mission = self.store.load_mission(project, slug)?;
         let piped_child = session.is_none() && child_run_id.is_some();
@@ -927,6 +982,7 @@ impl AppState {
             .zip(control_port)
             .map(|(run_id, port)| corpus_core::MissionControl { run_id, port });
         mission.opencode_session = None;
+        mission.opencode_workspace = workspace;
         if let Some(dispatch) = mission
             .dispatch
             .as_mut()
@@ -981,8 +1037,20 @@ impl AppState {
         slug: &str,
         id: Option<String>,
     ) -> Result<(), Error> {
+        let workspace = self.store.load_mission(project, slug)?.opencode_workspace;
+        self.set_opencode_identity(project, slug, id, workspace)
+    }
+
+    pub(in crate::state) fn set_opencode_identity(
+        &mut self,
+        project: &str,
+        slug: &str,
+        id: Option<String>,
+        workspace: Option<String>,
+    ) -> Result<(), Error> {
         let mut mission = self.store.load_mission(project, slug)?;
         mission.opencode_session = id;
+        mission.opencode_workspace = workspace;
         self.store.update_mission(project, slug, &mission)
     }
 
@@ -1138,9 +1206,22 @@ impl AppState {
                 .err()
                 .map(|error| format!("session cleanup failed: {error}"));
             let (exported, export_error) = match mission.opencode_session.as_deref() {
-                Some(id) => match self.run_backend.export_session(project, id) {
-                    Ok(path) => (Some(path.display().to_string()), None),
-                    Err(error) => (None, Some(format!("transcript export failed: {error}"))),
+                Some(id) => match mission.opencode_workspace.as_deref() {
+                    Some(workspace) => {
+                        match self.run_backend.export_session(project, workspace, id) {
+                            Ok(path) => (Some(path.display().to_string()), None),
+                            Err(error) => {
+                                (None, Some(format!("transcript export failed: {error}")))
+                            }
+                        }
+                    }
+                    None => (
+                        None,
+                        Some(
+                            "transcript export failed: mission has no OpenCode workspace identity"
+                                .into(),
+                        ),
+                    ),
                 },
                 None => (None, None),
             };
@@ -1217,6 +1298,7 @@ impl AppState {
         let store = self.store.clone();
         let project_owned = project.to_string();
         let conversation = mission.opencode_session.clone();
+        let workspace = mission.opencode_workspace.clone();
         let environment_session = mission.environment_session.clone();
         let plugin_id = corpus_core::Project::load(&self.store, project)
             .ok()
@@ -1270,14 +1352,20 @@ impl AppState {
                         .map(|error| format!("session cleanup failed: {error}"))
                 });
                 let (transcript, export_error) = match conversation.as_deref() {
-                    Some(conversation) => {
-                        match backend.export_session(&project_owned, conversation) {
+                    Some(conversation) => match workspace.as_deref() {
+                        Some(workspace) => {
+                            match backend.export_session(&project_owned, workspace, conversation) {
                             Ok(path) => (Some(path.display().to_string()), None),
                             Err(error) => {
                                 (None, Some(format!("transcript export failed: {error}")))
                             }
                         }
-                    }
+                        }
+                        None => (
+                            None,
+                            Some("transcript export failed: mission has no OpenCode workspace identity".into()),
+                        ),
+                    },
                     None => (None, None),
                 };
                 let environment_error = match (plugin_id.as_deref(), environment_session.as_deref())

@@ -130,6 +130,10 @@ pub struct Mission {
     pub control: Option<MissionControl>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_session: Option<String>,
+    /// Relocatable id of the exact pin-specific working directory that owns
+    /// `opencode_session`. It is deliberately not an absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

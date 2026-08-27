@@ -120,6 +120,7 @@ fn consuming_a_launch_request_preserves_its_exact_parent_origin() {
             Some("corpus-worker-1700000125".into()),
             Some("corpus-worker-1700000125".into()),
             Some(43_111),
+            Some(format!("sources-{}", "a".repeat(64))),
         )
         .unwrap();
     assert_eq!(
@@ -182,6 +183,7 @@ fn child_completion_uses_exact_process_activity_not_terminal_quiet() {
         port: 41_001,
     });
     child.opencode_session = Some("ses_child".into());
+    child.opencode_workspace = Some(fake_workspace_id());
     child.dispatch = Some(corpus_core::MissionDispatch {
         parent: corpus_core::MissionRunRef {
             project: "p".into(),

@@ -10,6 +10,17 @@ use crate::filesystem::atomic_write;
 use crate::projects::Project;
 use crate::store::{Store, PROJECT_ENV, STORE_ENV};
 
+const SOURCE_VIEW_PREFIX: &str = "sources-";
+
+/// Durable, relocatable identity of one exact OpenCode working directory.
+/// The id is persisted with a mission; the absolute path is always rebuilt
+/// beneath that mission's project run root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunWorkspace {
+    pub id: String,
+    pub path: PathBuf,
+}
+
 impl Store {
     /// Corpus-owned source cache paired with this store instance. Tests and
     /// alternate stores stay in their own world instead of touching the
@@ -29,7 +40,8 @@ impl Store {
         sibling_dir(self.root(), "var")
     }
 
-    /// The project's OpenCode working directory.
+    /// The project's run root. OpenCode launches work in an exact child of
+    /// `views/`; this root itself is only a staging and namespace boundary.
     pub fn project_run_dir(&self, slug: &str) -> PathBuf {
         self.var_dir().join("run").join(slug)
     }
@@ -44,6 +56,53 @@ impl Store {
         self.provision_run_dir_with_sources(slug, None)
     }
 
+    /// Resolve a persisted workspace id beneath one project's run root.
+    /// Stored values are never accepted as paths.
+    pub fn run_workspace_dir(&self, project: &str, workspace: &str) -> Result<PathBuf> {
+        crate::store::validate_slug(project)?;
+        validate_workspace_id(workspace)?;
+        let project_run = self.project_run_dir(project);
+        existing_real_dir(&project_run)?;
+        let views = project_run.join("views");
+        existing_real_dir(&views)?;
+        let workspace = views.join(workspace);
+        existing_real_dir(&workspace)?;
+        Ok(workspace)
+    }
+
+    /// Enumerate only Corpus-shaped, real workspace directories for legacy
+    /// session recovery. Invalid names and symlinks are never candidates.
+    pub fn run_workspaces(&self, project: &str) -> Result<Vec<RunWorkspace>> {
+        crate::store::validate_slug(project)?;
+        let project_run = self.project_run_dir(project);
+        if !existing_real_dir(&project_run)? {
+            return Ok(Vec::new());
+        }
+        let views = project_run.join("views");
+        if !existing_real_dir(&views)? {
+            return Ok(Vec::new());
+        }
+        let mut workspaces = Vec::new();
+        for entry in fs::read_dir(views)? {
+            let entry = entry?;
+            let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if validate_workspace_id(&id).is_err() {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                workspaces.push(RunWorkspace {
+                    id,
+                    path: entry.path(),
+                });
+            }
+        }
+        workspaces.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(workspaces)
+    }
+
     /// Materialize the directory boundary for one project's exact source
     /// pins. Views are immutable-by-identity and separate concurrent launches
     /// whose pins differ, while the fetched cache remains host-only.
@@ -56,6 +115,17 @@ impl Store {
         slug: &str,
         source_pins_json: Option<&str>,
     ) -> Result<PathBuf> {
+        self.provision_run_workspace_with_sources(slug, source_pins_json)
+            .map(|workspace| workspace.path)
+    }
+
+    /// Materialize and identify the exact launch workspace. Callers that
+    /// create durable run/session state must retain the returned id.
+    pub fn provision_run_workspace_with_sources(
+        &self,
+        slug: &str,
+        source_pins_json: Option<&str>,
+    ) -> Result<RunWorkspace> {
         Project::load(self, slug)?;
         let pins = parse_source_pins(source_pins_json)?;
         let var_dir = self.var_dir();
@@ -68,7 +138,8 @@ impl Store {
         // pin-specific view receives a snapshot below.
         let views = project_run.join("views");
         ensure_real_dir(&views)?;
-        let run_dir = views.join(source_view_key(&pins));
+        let workspace_id = source_view_key(&pins);
+        let run_dir = views.join(&workspace_id);
         ensure_real_dir(&run_dir)?;
         let opencode = run_dir.join(".opencode");
         ensure_real_dir(&opencode)?;
@@ -98,7 +169,36 @@ impl Store {
         }
 
         write_run_opencode_config(self, slug, &opencode)?;
-        Ok(run_dir)
+        Ok(RunWorkspace {
+            id: workspace_id,
+            path: run_dir,
+        })
+    }
+}
+
+fn validate_workspace_id(workspace: &str) -> Result<()> {
+    let digest = workspace
+        .strip_prefix(SOURCE_VIEW_PREFIX)
+        .filter(|digest| digest.len() == 64)
+        .filter(|digest| {
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| Error::Store(format!("invalid run workspace id: {workspace:?}")))?;
+    debug_assert_eq!(digest.len(), 64);
+    Ok(())
+}
+
+fn existing_real_dir(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => Err(Error::Store(format!(
+            "run workspace boundary is not a real directory: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -381,6 +481,39 @@ fn relink(_target: &Path, _link: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::run_records::RUN_LOG_ENV;
+
+    #[test]
+    fn persisted_workspace_ids_resolve_only_beneath_the_project_views_root() {
+        let store = tmp_store("workspace-id");
+        store.create_project("p", "P", "fixture").unwrap();
+        let workspace = store
+            .provision_run_workspace_with_sources("p", None)
+            .unwrap();
+
+        assert_eq!(
+            store.run_workspace_dir("p", &workspace.id).unwrap(),
+            workspace.path
+        );
+        assert!(workspace.id.starts_with(SOURCE_VIEW_PREFIX));
+        for invalid in [
+            "sources-short",
+            "../sources-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "/tmp/sources-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sources-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(store.run_workspace_dir("p", invalid).is_err(), "{invalid}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            fs::remove_dir_all(&workspace.path).unwrap();
+            symlink(std::env::temp_dir(), &workspace.path).unwrap();
+            assert!(store.run_workspace_dir("p", &workspace.id).is_err());
+            assert!(store.run_workspaces("p").unwrap().is_empty());
+        }
+        let _ = fs::remove_dir_all(store.root());
+    }
     use crate::store::AGENT_ENV;
 
     fn tmp_store(tag: &str) -> Store {

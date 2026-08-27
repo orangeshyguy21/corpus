@@ -228,6 +228,28 @@ fn finding_write_validates_before_persistence_and_preserves_project_agency() {
         corpus_core::frontmatter::get_str(&frontmatter, "title").as_deref(),
         Some("Header\nseverity: low")
     );
+
+    let out = tools::dispatch(
+        &mut ctx,
+        "finding_write",
+        &json!({
+            "title": "Corpus-relative path",
+            "severity": "low",
+            "detail": "demonstrated PoC",
+            "path": "findings/campaigns/august/corpus-relative.md"
+        }),
+    )
+    .expect("finding_write corpus-relative path");
+    assert!(
+        out.contains("findings/campaigns/august/corpus-relative.md"),
+        "{out}"
+    );
+    assert!(proj_corpus(&store)
+        .join("findings/campaigns/august/corpus-relative.md")
+        .is_file());
+    assert!(!proj_corpus(&store)
+        .join("findings/findings/campaigns/august/corpus-relative.md")
+        .exists());
     assert_eq!(
         corpus_core::frontmatter::get_str(&frontmatter, "severity").as_deref(),
         Some("critical")

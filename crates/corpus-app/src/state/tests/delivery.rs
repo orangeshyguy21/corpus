@@ -30,6 +30,7 @@ fn completion_delivery_groups_children_for_each_exact_curator() {
             port,
         });
         parent.opencode_session = Some(conversation.into());
+        parent.opencode_workspace = Some(fake_workspace_id());
         store.write_mission("p", slug, &parent, "curate").unwrap();
     }
 
@@ -87,6 +88,13 @@ fn completion_delivery_groups_children_for_each_exact_curator() {
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].run_id, "run-a");
     assert_eq!(calls[0].session_id, "ses_a");
+    assert_eq!(
+        calls[0].directory,
+        store
+            .project_run_dir("p")
+            .join("views")
+            .join(fake_workspace_id())
+    );
     assert!(calls[0].message_id.starts_with("msg_corpus"));
     assert!(calls[0].prompt.contains("p/child-a1"));
     assert!(calls[0].prompt.contains("p/child-a2"));
@@ -168,6 +176,7 @@ fn failed_queue_admission_remains_retryable_with_the_same_message_id() {
         port: 41_001,
     });
     parent.opencode_session = Some("ses_a".into());
+    parent.opencode_workspace = Some(fake_workspace_id());
     store
         .write_mission("p", "curator", &parent, "curate")
         .unwrap();
@@ -243,6 +252,7 @@ fn acknowledged_delivery_with_stale_persistence_is_reported_retryable() {
         port: 41_001,
     });
     parent.opencode_session = Some("ses_a".into());
+    parent.opencode_workspace = Some(fake_workspace_id());
     store
         .write_mission("p", "curator", &parent, "curate")
         .unwrap();
@@ -319,6 +329,7 @@ fn admitted_prompt_is_not_delivered_when_the_curator_model_fails() {
         port: 41_001,
     });
     parent.opencode_session = Some("ses_a".into());
+    parent.opencode_workspace = Some(fake_workspace_id());
     store
         .write_mission("p", "curator", &parent, "curate")
         .unwrap();

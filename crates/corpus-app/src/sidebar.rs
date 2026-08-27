@@ -422,6 +422,9 @@ impl Sidebar {
                 click,
                 hovered,
             } = row_ui(ui, is_sel, true, ("mission", project, slug));
+            click
+                .clone()
+                .on_hover_text(state.mission_status_text(project, slug));
             let menu_key = format!("mission:{project}:{slug}");
             let show_menu = row_menu_visible(
                 is_sel,
@@ -913,8 +916,9 @@ impl Sidebar {
                         return;
                     }
                     match state.create_agent_with_role(&project, self.agent_role) {
-                        Ok(_) => {
+                        Ok(id) => {
                             toast(toasts, ToastKind::Success, "agent created");
+                            state.select_agent(&project, &id);
                             state.refresh_agents(&project);
                             done = true;
                         }
@@ -1105,9 +1109,19 @@ fn status_dot(ui: &Ui, rect: egui::Rect, state: MissionDisplayState) {
                 .circle_filled(center, 5.0, theme::HEALTHY.gamma_multiply(0.20));
             ui.painter().circle_filled(center, 2.2, theme::HEALTHY);
         }
+        MissionDisplayState::Retrying => {
+            ui.painter().circle_filled(center, 2.2, theme::INTERACTION);
+        }
         MissionDisplayState::Waiting => {
             ui.painter()
                 .circle_filled(center, 2.2, theme::HEALTHY.gamma_multiply(0.55));
+        }
+        MissionDisplayState::Unavailable => {
+            ui.painter().circle_stroke(
+                center,
+                2.5,
+                egui::Stroke::new(1.0_f32, theme::INTERACTION.gamma_multiply(0.65)),
+            );
         }
         MissionDisplayState::Queued
         | MissionDisplayState::Preparing

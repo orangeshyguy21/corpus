@@ -34,6 +34,7 @@ pub struct StopOutcome {
 pub(super) enum Backend {
     Tui {
         session: String,
+        workspace_id: String,
         control_port: Option<u16>,
         tui_session_id: Option<String>,
         launched_at_ms: u64,
@@ -75,6 +76,15 @@ impl RunSession {
     pub fn control_port(&self) -> Option<u16> {
         match &self.backend {
             Backend::Tui { control_port, .. } => *control_port,
+            Backend::Piped { .. } => None,
+        }
+    }
+
+    /// Relocatable identity of the exact source-view workspace that owns the
+    /// OpenCode conversation. Piped runs have no resumable TUI conversation.
+    pub fn workspace_id(&self) -> Option<String> {
+        match &self.backend {
+            Backend::Tui { workspace_id, .. } => Some(workspace_id.clone()),
             Backend::Piped { .. } => None,
         }
     }

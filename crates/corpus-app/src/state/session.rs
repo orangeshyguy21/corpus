@@ -7,9 +7,12 @@ use std::time::{Duration, Instant};
 use corpus_core::Store;
 
 use super::{
-    launch_stamp_ms, load_launchable_mission, AppJobOutput, AppState, MissionActivity,
-    MissionDisplayState, RunPhase, SessionRef, ACTIVITY_BACKSTOP, ACTIVITY_EVENT_MIN,
-    LIVE_SESSION_BACKSTOP, OWNED_RUN_REPAINT_BACKSTOP, SESSION_RECONCILE_BACKSTOP,
+    launch_stamp_ms, load_launchable_mission, mission_session_ref, mission_workspace_candidates,
+    mission_workspace_dir, AppJobOutput, AppState, MissionActivity, MissionDisplayState,
+    MissionStatusObservation, OpenCodeSessionStatus, RunPhase, SessionRef, SessionStatusUpdate,
+    ACTIVITY_BACKSTOP, ACTIVITY_EVENT_MIN, LIVE_SESSION_BACKSTOP, OWNED_RUN_REPAINT_BACKSTOP,
+    SESSION_RECONCILE_BACKSTOP, SESSION_STATUS_BUSY_POLL, SESSION_STATUS_GRACE,
+    SESSION_STATUS_IDLE_POLL,
 };
 use crate::jobs::{JobKind, JobScope};
 
@@ -37,11 +40,9 @@ pub(super) fn mission_display_state_from(
     }
 }
 
-/// The status dot's decision from the app's aged in-memory reading: turns a
-/// `last_paint` Instant into idle-seconds and defers to the shared core
-/// rule (`corpus_core::activity_from_idle`). The app keeps its own polled
-/// cache (statting per frame would be far too much I/O) — only the rule and
-/// the window are shared.
+/// Legacy/headless activity from the app's aged capture reading: turns a
+/// `last_paint` Instant into idle-seconds and defers to the shared core rule.
+/// Controlled UI missions use the owning OpenCode status endpoint instead.
 pub(super) fn activity_for(
     now: Instant,
     live: bool,
@@ -106,7 +107,8 @@ impl SessionCatalog for CoreSessionCatalog {
 
 pub(super) struct SessionMaintenance {
     /// Mission slug, exact tmux launch identity, OpenCode conversation id.
-    pub(super) conversations: Vec<(String, String, String)>,
+    pub(super) conversations: Vec<(String, String, String, String)>,
+    pub(super) discovery_failure: Option<(String, String)>,
     pub(super) exported_tmux: Vec<String>,
     pub(super) export_failure: Option<(String, String)>,
     pub(super) warning: Option<String>,
@@ -177,14 +179,28 @@ impl AppState {
             .map(|tree| tree.missions.clone())
             .unwrap_or_default();
         let live = self.live_sessions.clone();
+        let now = self.clock.monotonic_now();
         let pending_conversations = missions
             .iter()
             .filter(|(_, mission)| mission.delete_requested.is_none())
-            .filter(|(_, mission)| mission.opencode_session.is_none())
-            .filter_map(|(slug, mission)| Some((slug.clone(), mission.session.clone()?)))
-            .filter(|(_, tmux)| live.iter().any(|session| session == tmux))
+            .filter(|(_, mission)| {
+                mission.opencode_session.is_none() || mission.opencode_workspace.is_none()
+            })
+            .filter_map(|(slug, mission)| {
+                Some((
+                    slug.clone(),
+                    mission.session.clone()?,
+                    mission.opencode_session.clone(),
+                    mission_workspace_candidates(&self.store, project, mission).ok()?,
+                ))
+            })
+            .filter(|(_, tmux, _, _)| live.iter().any(|session| session == tmux))
+            .filter(|(_, tmux, _, _)| {
+                self.export_retry_after
+                    .get(tmux)
+                    .is_none_or(|deadline| now >= *deadline)
+            })
             .collect::<Vec<_>>();
-        let now = self.clock.monotonic_now();
         let pending_exports = missions
             .iter()
             .filter_map(|(slug, mission)| {
@@ -194,12 +210,13 @@ impl AppState {
                     mission.opencode_session.clone()?,
                     mission.session.clone()?,
                     mission.control.clone()?,
+                    mission_workspace_dir(&self.store, project, mission).ok()?,
                 ))
             })
-            .filter(|(_, _, _, tmux, control)| {
+            .filter(|(_, _, _, tmux, control, _)| {
                 control.run_id == *tmux && live.iter().any(|session| session == tmux)
             })
-            .filter(|(slug, deleting, _, tmux, _)| {
+            .filter(|(slug, deleting, _, tmux, _, _)| {
                 checkpoint_export_due(
                     *deleting,
                     self.mission_activity(project, slug),
@@ -213,9 +230,9 @@ impl AppState {
             // conversation waits for the next maintenance beat instead of
             // turning one job into an unbounded batch of CLI subprocesses.
             .take(1)
-            .map(|(slug, _, conversation, tmux, control)| {
+            .map(|(slug, _, conversation, tmux, control, workspace)| {
                 let lease = self.session_operation_leases.claim(project, &slug);
-                (slug, conversation, tmux, control, lease)
+                (slug, conversation, tmux, control, workspace, lease)
             })
             .collect::<Vec<_>>();
         if pending_conversations.is_empty() && pending_exports.is_empty() {
@@ -234,26 +251,46 @@ impl AppState {
             Duration::from_secs(30),
             move |_| {
                 let mut conversations = Vec::new();
+                let mut discovery_failure = None;
                 let mut claimed = missions
                     .iter()
                     .filter_map(|(_, mission)| mission.opencode_session.clone())
                     .collect::<BTreeSet<_>>();
-                for (slug, tmux) in pending_conversations {
+                for (slug, tmux, known_session, workspaces) in pending_conversations {
                     let Some(launched_at_ms) = launch_stamp_ms(&tmux) else {
                         continue;
                     };
-                    if let Ok(conversation) = service.find_for_launch(
-                        &store.project_run_dir(&project_owned),
-                        launched_at_ms,
-                        &claimed,
-                    ) {
-                        claimed.insert(conversation.clone());
-                        conversations.push((slug, tmux, conversation));
+                    let identity = match known_session {
+                        Some(conversation) => service
+                            .find_session_workspace(&workspaces, &conversation)
+                            .map(|workspace| (conversation, workspace)),
+                        None => service.find_for_launch_in_workspaces(
+                            &workspaces,
+                            launched_at_ms,
+                            &claimed,
+                        ),
+                    };
+                    match identity {
+                        Ok((conversation, workspace)) => {
+                            claimed.insert(conversation.clone());
+                            conversations.push((slug, tmux, conversation, workspace));
+                        }
+                        Err(error) => {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            if error != "no OpenCode session found for this launch"
+                                || now_ms.saturating_sub(launched_at_ms) >= 30_000
+                            {
+                                discovery_failure = Some((tmux, error));
+                            }
+                        }
                     }
                 }
                 let mut exported_tmux = Vec::new();
                 let mut export_failure = None;
-                for (slug, conversation, tmux, control, lease) in pending_exports {
+                for (slug, conversation, tmux, control, workspace, lease) in pending_exports {
                     let _ownership = lease
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -271,7 +308,7 @@ impl AppState {
                     }
                     let session = SessionRef {
                         id: conversation.clone(),
-                        directory: store.project_run_dir(&project_owned),
+                        directory: workspace,
                     };
                     let exported = corpus_core::opencode_control_password(&store, &control.run_id)
                         .map_err(|error| error.to_string())
@@ -289,6 +326,7 @@ impl AppState {
                 }
                 Ok(AppJobOutput::SessionMaintenance(SessionMaintenance {
                     conversations,
+                    discovery_failure,
                     exported_tmux,
                     export_failure,
                     warning: service.take_warning(),
@@ -393,6 +431,207 @@ impl AppState {
         }
     }
 
+    /// Poll each live controlled mission's own OpenCode server. The request
+    /// runs off the UI thread; the exact mission/session/control identities
+    /// are revalidated when results are applied.
+    pub fn poll_session_statuses(&mut self) {
+        let Some(project) = self.effective_project() else {
+            return;
+        };
+        let now = self.clock.monotonic_now();
+        let interval = if self.session_statuses.iter().any(|((p, _), observation)| {
+            p == &project
+                && observation
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| !matches!(status, OpenCodeSessionStatus::Idle))
+        }) {
+            SESSION_STATUS_BUSY_POLL
+        } else {
+            SESSION_STATUS_IDLE_POLL
+        };
+        if self
+            .session_status_polled_at
+            .is_some_and(|at| now.saturating_duration_since(at) < interval)
+        {
+            return;
+        }
+
+        let targets = self
+            .trees
+            .get(&project)
+            .into_iter()
+            .flat_map(|tree| tree.missions.iter())
+            .filter_map(|(slug, mission)| {
+                let tmux = mission.session.clone()?;
+                if !self.live_sessions.iter().any(|live| live == &tmux) {
+                    return None;
+                }
+                let control = mission.control.clone()?;
+                if control.run_id != tmux {
+                    return None;
+                }
+                let session = mission_session_ref(&self.store, &project, mission).ok()?;
+                Some((slug.clone(), tmux, control, session))
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return;
+        }
+        self.session_status_polled_at = Some(now);
+        let scope = self.job_scope(&project, None);
+        let store = self.store.clone();
+        let service = self.session_service.clone();
+        let Some(jobs) = self.jobs.as_mut() else {
+            return;
+        };
+        jobs.start(
+            JobKind::SessionStatus,
+            scope,
+            Duration::from_secs(10),
+            move |cancel| {
+                let updates = std::thread::scope(|scope| {
+                    let handles = targets
+                        .into_iter()
+                        .map(|(mission, run_id, control, session)| {
+                            let store = store.clone();
+                            let service = service.clone();
+                            let cancel = cancel.clone();
+                            scope.spawn(move || {
+                                let result = if cancel.is_cancelled() {
+                                    Err("session status poll cancelled".into())
+                                } else {
+                                    corpus_core::opencode_control_password(&store, &control.run_id)
+                                        .map_err(|error| error.to_string())
+                                        .and_then(|password| {
+                                            service.session_status(&control, &password, &session)
+                                        })
+                                };
+                                SessionStatusUpdate {
+                                    mission,
+                                    run_id,
+                                    result,
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    handles
+                        .into_iter()
+                        .filter_map(|handle| handle.join().ok())
+                        .collect()
+                });
+                Ok(AppJobOutput::SessionStatuses(updates))
+            },
+        );
+    }
+
+    pub(super) fn apply_session_status_updates(
+        &mut self,
+        project: &str,
+        updates: Vec<SessionStatusUpdate>,
+    ) {
+        let now = self.clock.monotonic_now();
+        let mut activity_changed = false;
+        for update in updates {
+            let still_current = self
+                .trees
+                .get(project)
+                .into_iter()
+                .flat_map(|tree| tree.missions.iter())
+                .find(|(slug, _)| slug == &update.mission)
+                .is_some_and(|(_, mission)| {
+                    mission.session.as_deref() == Some(update.run_id.as_str())
+                        && mission
+                            .control
+                            .as_ref()
+                            .is_some_and(|control| control.run_id == update.run_id)
+                });
+            if !still_current {
+                continue;
+            }
+            let key = (project.to_string(), update.mission);
+            match update.result {
+                Ok(status) => {
+                    activity_changed |= self.session_statuses.get(&key).is_none_or(|previous| {
+                        previous.run_id != update.run_id
+                            || previous.status.as_ref() != Some(&status)
+                            || previous.failed_at.is_some()
+                    });
+                    self.session_statuses.insert(
+                        key,
+                        MissionStatusObservation {
+                            run_id: update.run_id,
+                            status: Some(status),
+                            observed_at: now,
+                            failed_at: None,
+                        },
+                    );
+                }
+                Err(_) => {
+                    let observation =
+                        self.session_statuses
+                            .entry(key)
+                            .or_insert(MissionStatusObservation {
+                                run_id: update.run_id.clone(),
+                                status: None,
+                                observed_at: now,
+                                failed_at: Some(now),
+                            });
+                    if observation.run_id == update.run_id && observation.failed_at.is_none() {
+                        observation.failed_at = Some(now);
+                    }
+                }
+            }
+        }
+        if activity_changed {
+            self.schedule_session_reconciliation(false);
+        }
+    }
+
+    /// `None` means this is not a live controlled OpenCode mission and the
+    /// legacy capture-age signal may be used. `Some(None)` means it is
+    /// controlled but its authoritative status is currently unavailable.
+    fn controlled_mission_status(
+        &self,
+        project: &str,
+        slug: &str,
+    ) -> Option<Option<&OpenCodeSessionStatus>> {
+        let mission = self
+            .trees
+            .get(project)?
+            .missions
+            .iter()
+            .find(|(candidate, _)| candidate == slug)?
+            .1
+            .clone();
+        let tmux = mission.session?;
+        let control = mission.control?;
+        if control.run_id != tmux
+            || mission.opencode_session.is_none()
+            || mission.opencode_workspace.is_none()
+            || !self.live_sessions.iter().any(|live| live == &tmux)
+        {
+            return None;
+        }
+        let observation = self.session_statuses.get(&(project.into(), slug.into()));
+        if observation.is_none() {
+            // During identity adoption and in headless coordinators there is
+            // no authoritative reading yet. Preserve the legacy signal only
+            // for this short bootstrap window; the first poll replaces it.
+            return None;
+        }
+        Some(observation.and_then(|observation| {
+            let now = self.clock.monotonic_now();
+            let fresh = observation.failed_at.map_or_else(
+                || now.saturating_duration_since(observation.observed_at) <= SESSION_STATUS_GRACE,
+                |failed_at| now.saturating_duration_since(failed_at) <= SESSION_STATUS_GRACE,
+            );
+            (observation.run_id == tmux && observation.status.is_some() && fresh)
+                .then(|| observation.status.as_ref())
+                .flatten()
+        }))
+    }
+
     /// What the mission's status dot should say: `Idle` (nothing up),
     /// `Waiting` (session live, agent quiet), or `Working` (producing
     /// right now).
@@ -402,13 +641,22 @@ impl AppState {
     /// mission's recorded tmux session is alive on the server — which
     /// covers a relaunched app and sessions the app never owned.
     ///
-    /// The busy signal is the run's raw capture: everything the TUI
-    /// paints flows through `tmux pipe-pane` into it, and a TUI waiting
-    /// at its prompt paints nothing — so a capture that grew within
-    /// `WORKING_WINDOW` means the agent is mid-turn. A piped headless run
-    /// has no TUI to watch and is one-shot by nature: while it is up, it
-    /// IS working.
+    /// Controlled TUI missions use OpenCode's process-local status, which
+    /// remains busy through quiet inference and tool calls. Raw capture age
+    /// is retained only for legacy sessions without control identity. A
+    /// piped headless run is one-shot by nature: while it is up, it is busy.
     pub fn mission_activity(&self, project: &str, slug: &str) -> MissionActivity {
+        if let Some(status) = self.controlled_mission_status(project, slug) {
+            return match status {
+                Some(OpenCodeSessionStatus::Idle) => MissionActivity::Waiting,
+                Some(OpenCodeSessionStatus::Busy | OpenCodeSessionStatus::Retrying { .. }) => {
+                    MissionActivity::Working
+                }
+                // Unknown is conservatively non-idle so checkpoint/export
+                // logic cannot mistake an observation failure for turn end.
+                None => MissionActivity::Working,
+            };
+        }
         let owned = self.run_active() && self.run_belongs_to(project, slug);
         let session = self
             .trees
@@ -446,12 +694,39 @@ impl AppState {
                     .find(|(candidate, _)| candidate == slug)
             })
             .is_some_and(|(_, mission)| mission.launch_requested.is_some());
-        mission_display_state_from(
+        let phase = self.latest_run_phase(project, slug);
+        let projected = mission_display_state_from(
             self.mission_activity(project, slug),
-            &self.latest_run_phase(project, slug),
+            &phase,
             queued,
             self.mission_delete_pending(project, slug),
-        )
+        );
+        if matches!(phase, RunPhase::Idle | RunPhase::Running) {
+            match self.controlled_mission_status(project, slug) {
+                Some(Some(OpenCodeSessionStatus::Retrying { .. })) => MissionDisplayState::Retrying,
+                Some(None) => MissionDisplayState::Unavailable,
+                _ => projected,
+            }
+        } else {
+            projected
+        }
+    }
+
+    pub fn mission_status_text(&self, project: &str, slug: &str) -> String {
+        match self.controlled_mission_status(project, slug) {
+            Some(Some(OpenCodeSessionStatus::Retrying {
+                attempt, message, ..
+            })) if !message.is_empty() => {
+                format!("retrying (attempt {attempt}) · {message}")
+            }
+            Some(Some(OpenCodeSessionStatus::Retrying { attempt, .. })) => {
+                format!("retrying (attempt {attempt})")
+            }
+            _ => self
+                .mission_display_state(project, slug)
+                .label()
+                .to_string(),
+        }
     }
 
     /// The only app-owned repaint clock. Background jobs, terminal output
@@ -475,7 +750,7 @@ impl AppState {
             })
             .unwrap_or(MissionActivity::Idle);
 
-        match busiest {
+        let activity_after = match busiest {
             // PTY/file/job producers wake egui when new data arrives. The
             // clock is only a bounded liveness fallback for an app-owned
             // process, not an animation timer.
@@ -487,6 +762,38 @@ impl AppState {
             // names it. Keep the slow ownership beat until the cache lands.
             MissionActivity::Idle if !self.live_sessions.is_empty() => Some(Duration::from_secs(2)),
             MissionActivity::Idle => None,
+        };
+        let status_after = self.effective_project().and_then(|project| {
+            self.trees.get(&project).and_then(|tree| {
+                tree.missions
+                    .iter()
+                    .any(|(slug, _)| self.controlled_mission_status(&project, slug).is_some())
+                    .then(|| {
+                        let interval = if tree.missions.iter().any(|(slug, _)| {
+                            matches!(
+                                self.controlled_mission_status(&project, slug),
+                                Some(Some(
+                                    OpenCodeSessionStatus::Busy
+                                        | OpenCodeSessionStatus::Retrying { .. }
+                                ))
+                            )
+                        }) {
+                            SESSION_STATUS_BUSY_POLL
+                        } else {
+                            SESSION_STATUS_IDLE_POLL
+                        };
+                        self.session_status_polled_at.map_or(Duration::ZERO, |at| {
+                            interval.saturating_sub(
+                                self.clock.monotonic_now().saturating_duration_since(at),
+                            )
+                        })
+                    })
+            })
+        });
+        match (activity_after, status_after) {
+            (Some(activity), Some(status)) => Some(activity.min(status)),
+            (Some(after), None) | (None, Some(after)) => Some(after),
+            (None, None) => None,
         }
     }
 

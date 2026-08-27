@@ -402,7 +402,9 @@ impl ProjectsView {
                 });
                 let activity_tone = match display_state {
                     MissionDisplayState::Working => components::StatusTone::Healthy,
+                    MissionDisplayState::Retrying => components::StatusTone::Interaction,
                     MissionDisplayState::Waiting => components::StatusTone::HealthyMuted,
+                    MissionDisplayState::Unavailable => components::StatusTone::Neutral,
                     MissionDisplayState::Queued
                     | MissionDisplayState::Preparing
                     | MissionDisplayState::Starting
@@ -413,11 +415,11 @@ impl ProjectsView {
                     }
                     MissionDisplayState::Idle => components::StatusTone::Neutral,
                 };
-                let activity_status = display_state.label();
+                let activity_status = state.mission_status_text(project, &slug);
                 let status = if old_repo_revision {
                     format!("{activity_status} · old repo revision")
                 } else {
-                    activity_status.to_string()
+                    activity_status
                 };
                 if command_row(
                     ui,
@@ -1347,7 +1349,7 @@ fn mission_log_list(ui: &mut Ui, state: &AppState, total: u64) {
                             .agent
                             .as_deref()
                             .map(|slug| state.mission_log_agent_label(slug))
-                            .unwrap_or_else(|| "—".to_string());
+                            .unwrap_or_else(|| "unknown agent".to_string());
                         ui.label(cell(agent));
                     });
                     row.col(|ui| {

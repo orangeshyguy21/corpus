@@ -20,12 +20,25 @@ use crate::jobs::{JobKind, JobScope, JobSet, JobTerminal};
 pub(super) fn successful_job_resolves_notice(terminal: &JobTerminal<AppJobOutput>) -> bool {
     match terminal {
         JobTerminal::Success(AppJobOutput::SessionMaintenance(maintenance)) => {
-            maintenance.export_failure.is_none()
+            maintenance.export_failure.is_none() && maintenance.discovery_failure.is_none()
         }
         JobTerminal::Success(AppJobOutput::TeardownReady(teardown)) => teardown.error.is_none(),
         JobTerminal::Success(_) => true,
         _ => false,
     }
+}
+
+pub(super) fn discovered_identity_is_current(
+    mission: &corpus_core::Mission,
+    tmux: &str,
+    conversation: &str,
+) -> bool {
+    mission.session.as_deref() == Some(tmux)
+        && (mission.opencode_session.is_none() || mission.opencode_workspace.is_none())
+        && mission
+            .opencode_session
+            .as_deref()
+            .is_none_or(|known| known == conversation)
 }
 
 impl AppState {
@@ -244,13 +257,18 @@ impl AppState {
                 JobTerminal::Success(AppJobOutput::LiveSessions(sessions)) => {
                     self.apply_live_sessions(sessions);
                 }
+                JobTerminal::Success(AppJobOutput::SessionStatuses(updates)) => {
+                    let project = result.scope.project;
+                    self.apply_session_status_updates(&project, updates);
+                }
                 JobTerminal::Success(AppJobOutput::SessionMaintenance(maintenance)) => {
                     let project = result.scope.project;
                     if let Some(warning) = maintenance.warning {
                         notices.push(BackgroundNotice::info(result.kind, warning));
                     }
                     let mut missions_changed = false;
-                    for (slug, tmux, conversation) in maintenance.conversations {
+                    for (slug, tmux, conversation, workspace) in maintenance.conversations {
+                        self.export_retry_after.remove(&tmux);
                         let lease = self.session_operation_leases.claim(&project, &slug);
                         let Ok(_ownership) = lease.try_lock() else {
                             // Teardown owns this mission. Discovery is
@@ -265,8 +283,7 @@ impl AppState {
                         let durable_launch_is_current =
                             load_launchable_mission(&self.store, &project, &slug).is_ok_and(
                                 |mission| {
-                                    mission.session.as_deref() == Some(tmux.as_str())
-                                        && mission.opencode_session.is_none()
+                                    discovered_identity_is_current(&mission, &tmux, &conversation)
                                 },
                             );
                         let launch_is_current = durable_launch_is_current
@@ -277,19 +294,33 @@ impl AppState {
                                 .flat_map(|tree| tree.missions.iter())
                                 .find(|(candidate, _)| candidate == &slug)
                                 .is_some_and(|(_, mission)| {
-                                    mission.session.as_deref() == Some(tmux.as_str())
-                                        && mission.opencode_session.is_none()
+                                    discovered_identity_is_current(mission, &tmux, &conversation)
                                         && mission.delete_requested.is_none()
                                 });
                         if !launch_is_current {
                             continue;
                         }
                         if self
-                            .set_opencode_session(&project, &slug, Some(conversation))
+                            .set_opencode_identity(
+                                &project,
+                                &slug,
+                                Some(conversation),
+                                Some(workspace),
+                            )
                             .is_ok()
                         {
                             missions_changed = true;
                         }
+                    }
+                    if let Some((tmux, error)) = maintenance.discovery_failure {
+                        self.export_retry_after
+                            .insert(tmux, self.clock.monotonic_now() + Duration::from_secs(30));
+                        notices.push(BackgroundNotice::error(
+                            result.kind,
+                            format!(
+                                "OpenCode session identity unavailable; accounting and completion tracking are paused: {error}"
+                            ),
+                        ));
                     }
                     let exported = !maintenance.exported_tmux.is_empty();
                     for tmux in maintenance.exported_tmux {

@@ -190,11 +190,15 @@ read-only and independently resolved. Project run directories live outside the
 repository, expose exactly one project, and reject symlinked boundary
 components or an unexpected second project. Each pin-keyed launch view exposes
 only the exact source IDs and commit SHAs in that launch plan; the shared cache
-is never linked wholesale into an agent cwd.
+is never linked wholesale into an agent cwd. Durable mission records retain a
+validated, relocatable source-view id; session control and accounting rebuild
+the path beneath that mission's project root rather than trusting a stored
+absolute path or falling back to the project staging root.
 
 Evidence: store path tests, CLI resource-root binary test, and
 `run_workspace.rs`, including
-`a_run_source_view_exposes_only_exact_pins_and_refuses_nested_symlinks`.
+`a_run_source_view_exposes_only_exact_pins_and_refuses_nested_symlinks` and
+`persisted_workspace_ids_resolve_only_beneath_the_project_views_root`.
 
 ### SEC-FS-2: model-chosen paths cannot escape their resource root
 
@@ -283,12 +287,13 @@ and project matching.
 ### SEC-PROC-3: local session control is loopback and identity-bound
 
 OpenCode HTTP control accepts only explicit loopback URLs with ports. Delivery
-and acknowledgement require the exact bound session and message/turn evidence;
-Corpus does not infer success from quiet output.
+and acknowledgement require the exact bound session, pin-specific workspace,
+and message/turn evidence; Corpus does not infer success from quiet output.
 
 Evidence: `http_adapter_refuses_non_loopback_and_implicit_ports`,
 `turn_start_evidence_is_durable_and_scoped_after_the_exact_launch`, and
-`delivery_terminal_is_scoped_to_the_exact_legacy_user_message`.
+`delivery_terminal_is_scoped_to_the_exact_legacy_user_message`, plus app
+workspace-isolation, legacy-recovery, dispatch, and live-cost tests.
 
 ## Audit, diagnostics, and test isolation
 
