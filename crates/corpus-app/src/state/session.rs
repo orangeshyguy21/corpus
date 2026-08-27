@@ -613,23 +613,20 @@ impl AppState {
         {
             return None;
         }
-        let observation = self.session_statuses.get(&(project.into(), slug.into()));
-        if observation.is_none() {
-            // During identity adoption and in headless coordinators there is
-            // no authoritative reading yet. Preserve the legacy signal only
-            // for this short bootstrap window; the first poll replaces it.
-            return None;
-        }
-        Some(observation.and_then(|observation| {
+        // During identity adoption and in headless coordinators there is no
+        // authoritative reading yet. Preserve the legacy signal only for
+        // this short bootstrap window; the first poll replaces it.
+        let observation = self.session_statuses.get(&(project.into(), slug.into()))?;
+        Some({
             let now = self.clock.monotonic_now();
             let fresh = observation.failed_at.map_or_else(
                 || now.saturating_duration_since(observation.observed_at) <= SESSION_STATUS_GRACE,
                 |failed_at| now.saturating_duration_since(failed_at) <= SESSION_STATUS_GRACE,
             );
             (observation.run_id == tmux && observation.status.is_some() && fresh)
-                .then(|| observation.status.as_ref())
+                .then_some(observation.status.as_ref())
                 .flatten()
-        }))
+        })
     }
 
     /// What the mission's status dot should say: `Idle` (nothing up),

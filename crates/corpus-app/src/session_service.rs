@@ -128,7 +128,11 @@ pub(crate) enum PromptDeliveryState {
     Pending,
     Active,
     Acknowledged,
-    Failed { error: String, retry_ready: bool },
+    Failed {
+        error: String,
+        retry_ready: bool,
+        interrupted: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,6 +529,7 @@ impl HttpSessionService {
         Ok(match legacy_prompt_terminal(&messages, message_id) {
             Some(Ok(())) => PromptDeliveryState::Acknowledged,
             Some(Err(error)) => PromptDeliveryState::Failed {
+                interrupted: legacy_prompt_was_interrupted(&messages, message_id),
                 error,
                 retry_ready: false,
             },
@@ -534,6 +539,7 @@ impl HttpSessionService {
                     "OpenCode parked without producing a response to the admitted completion prompt"
                         .into(),
                 retry_ready: false,
+                interrupted: false,
             },
             // prompt_async persists the user message before its spawned loop
             // necessarily becomes visible in /session/status. Treat that
@@ -715,6 +721,29 @@ fn legacy_prompt_terminal(messages: &Value, message_id: &str) -> Option<Result<(
         .is_some()
         && latest.pointer("/info/finish").and_then(Value::as_str) != Some("tool-calls"))
     .then_some(Ok(()))
+}
+
+fn legacy_prompt_was_interrupted(messages: &Value, message_id: &str) -> bool {
+    messages
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .filter(|message| {
+                    message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+                        && message.pointer("/info/parentID").and_then(Value::as_str)
+                            == Some(message_id)
+                })
+                .max_by_key(|message| {
+                    message
+                        .pointer("/info/time/created")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                })
+        })
+        .and_then(|message| message.pointer("/info/error/name"))
+        .and_then(Value::as_str)
+        == Some("MessageAbortedError")
 }
 
 fn legacy_prompt_body(message_id: &str, prompt: &str) -> Value {
@@ -1541,5 +1570,17 @@ mod tests {
             legacy_prompt_terminal(&failed, "ours"),
             Some(Err("Model unavailable".into()))
         );
+        assert!(!legacy_prompt_was_interrupted(&failed, "ours"));
+
+        let interrupted = json!([{
+            "info":{"id":"ours", "role":"user"}
+        }, {
+            "info":{"id":"step", "role":"assistant", "parentID":"ours", "error":{"name":"MessageAbortedError", "data":{"message":"Aborted"}}, "time":{"created":1, "completed":2}}
+        }]);
+        assert_eq!(
+            legacy_prompt_terminal(&interrupted, "ours"),
+            Some(Err("Aborted".into()))
+        );
+        assert!(legacy_prompt_was_interrupted(&interrupted, "ours"));
     }
 }

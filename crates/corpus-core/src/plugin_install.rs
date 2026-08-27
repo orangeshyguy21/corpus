@@ -567,6 +567,40 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn explicit_store_keeps_setup_sources_and_session_runtime_in_one_world() {
+        let _lock = env_lock();
+        let root = unique_temp_path("corpus-plugin-root-alignment");
+        let _ = fs::remove_dir_all(&root);
+        let store_root = root.join("isolated/store");
+        let _home = EnvVarGuard::set("CORPUS_HOME", root.join("ignored-home"));
+        let _store = EnvVarGuard::set("CORPUS_STORE", &store_root);
+        let _override = EnvVarGuard::set("CORPUS_PLUGINS_DIR", "");
+        let _sources = EnvVarGuard::set("CORPUS_SOURCES_DIR", "");
+
+        let source = bundle(&root, "1.0.0", "#!/bin/sh\nexit 0\n");
+        let receipt = install_plugin_bundle(&source).unwrap();
+        let selected = crate::find_plugin("fixture-regtest").unwrap().unwrap();
+        let params = plugin_lifecycle_params(&selected).unwrap();
+        let store = crate::Store::from_env();
+
+        assert_eq!(store.root(), store_root);
+        assert_eq!(store.mutable_root(), root.join("isolated"));
+        assert!(receipt
+            .path
+            .starts_with(store.mutable_root().join("plugins")));
+        assert_eq!(
+            params["state_dir"].as_str().map(PathBuf::from),
+            Some(store.plugin_runtime_dir("fixture-regtest").unwrap())
+        );
+        assert_eq!(
+            params["source_cache"].as_str().map(PathBuf::from),
+            Some(store.source_cache_dir())
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn refuses_symlinks_and_non_executable_entrypoints() {

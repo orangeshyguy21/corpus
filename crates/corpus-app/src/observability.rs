@@ -73,6 +73,7 @@ impl<'a> LifecycleEvent<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeliveryTerminal {
     Acknowledged,
+    Abandoned,
     Failed,
     RetryReady,
     PersistenceFailed,
@@ -83,6 +84,7 @@ impl DeliveryTerminal {
     fn as_str(self) -> &'static str {
         match self {
             Self::Acknowledged => "acknowledged",
+            Self::Abandoned => "abandoned",
             Self::Failed => "failed",
             Self::RetryReady => "retry_ready",
             Self::PersistenceFailed => "persistence_failed",
@@ -93,6 +95,7 @@ impl DeliveryTerminal {
     fn outcome(self) -> &'static str {
         match self {
             Self::Acknowledged => "succeeded",
+            Self::Abandoned => "abandoned",
             Self::Failed | Self::RetryReady | Self::PersistenceFailed | Self::StatusError => {
                 "failed"
             }

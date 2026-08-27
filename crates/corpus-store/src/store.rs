@@ -34,7 +34,7 @@ pub use crate::corpus_stats::{corpus_stats, CategoryStat, CorpusStats};
 use crate::error::{Error, Result};
 pub use crate::missions::{
     Mission, MissionCompletion, MissionControl, MissionDeleteRequest, MissionDispatch,
-    MissionDispatchIdentity, MissionLaunchRequest, MissionRunRef,
+    MissionDispatchAbandonment, MissionDispatchIdentity, MissionLaunchRequest, MissionRunRef,
 };
 pub use crate::preferences::AppPrefs;
 pub use crate::projects::Project;
@@ -106,6 +106,7 @@ pub fn project_slug_env() -> std::result::Result<String, String> {
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    mutable_root: PathBuf,
     /// Who this process acts AS, stamped onto everything it changes.
     /// `None` reads as `operator`. Ambient rather than a parameter on six
     /// mutating methods: the answer is a property of the process, and
@@ -116,11 +117,20 @@ pub struct Store {
 
 impl Store {
     pub fn new(root: PathBuf) -> Self {
-        Self { root, actor: None }
+        let mutable_root = crate::paths::mutable_root_for_store(&root);
+        Self {
+            root,
+            mutable_root,
+            actor: None,
+        }
     }
 
     pub fn from_env() -> Self {
-        Self::new(store_root_env())
+        Self {
+            root: store_root_env(),
+            mutable_root: crate::paths::data_root(),
+            actor: None,
+        }
     }
 
     /// Act as someone in particular — the MCP server sets this from the
@@ -139,6 +149,11 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Canonical mutable-world root paired with this store instance.
+    pub fn mutable_root(&self) -> &Path {
+        &self.mutable_root
     }
 
     pub fn projects_dir(&self) -> PathBuf {

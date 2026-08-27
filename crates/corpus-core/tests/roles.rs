@@ -100,14 +100,11 @@ fn every_role_renders_to_its_fixture() {
         let store = tmp_store(&format!("fixture-{}", role.as_str()));
         store.create_project("p", "P", "cdk-regtest").unwrap();
         let rendered = render_role(&store, "p", role);
-        // The absolute-boundary rules name the store and its parent, so
+        // The absolute-boundary rules name the store and mutable root, so
         // normalize both out — the fixture must not depend on where the
         // test ran. Longest first: the store path contains the data path.
         let rendered = rendered.replace(&store.root().display().to_string(), "<STORE>");
-        let rendered = rendered.replace(
-            &store.root().parent().unwrap().display().to_string(),
-            "<DATA>",
-        );
+        let rendered = rendered.replace(&store.mutable_root().display().to_string(), "<DATA>");
         let path = fixture_dir().join(format!("role-{}.md", role.as_str()));
 
         if std::env::var("CORPUS_BLESS").as_deref() == Ok("1") {
@@ -157,7 +154,7 @@ fn roles_bind_their_trust_domains() {
         fs::read_to_string(store.opencode_agent_dir("p").join(format!("{slug}.md"))).unwrap()
     };
 
-    // Researcher: reads and curates, executes nothing, keeps the internet.
+    // Researcher: reads and persists knowledge, executes nothing, keeps the internet.
     let res = perm(&read_render("researcher"));
     for denied in [
         "corpus_sandbox_exec",
@@ -166,12 +163,16 @@ fn roles_bind_their_trust_domains() {
         "corpus_oracle_run",
         "corpus_faucet",
         "corpus_wallet_fund",
-        "corpus_finding_write",
         "corpus_probe_save",
     ] {
         assert_eq!(action(&res, denied).as_deref(), Some("deny"), "{denied}");
     }
     assert_eq!(action(&res, "corpus_target_info").as_deref(), Some("allow"));
+    assert_eq!(
+        action(&res, "corpus_finding_write").as_deref(),
+        Some("allow")
+    );
+    assert_eq!(action(&res, "corpus_entry_write").as_deref(), Some("allow"));
     assert_eq!(
         action(&res, "corpus_technique_save").as_deref(),
         Some("allow")
@@ -245,7 +246,7 @@ fn a_stored_block_cannot_widen_what_the_role_denies() {
                 //    corpus-mcp with a forged identity. This was only ever
                 //    DEFAULTED to deny, so a stored allow survived.
                 "bash": "allow",
-                // 3. A tool beyond the role's grant.
+                // 3. One tool beyond the role's grant and one it owns.
                 "corpus_sandbox_exec": "allow",
                 "corpus_finding_write": "allow",
                 // 4. Stepping outside the run dir.
@@ -269,7 +270,8 @@ fn a_stored_block_cannot_widen_what_the_role_denies() {
     );
     assert_eq!(
         action(&perms, "corpus_finding_write").as_deref(),
-        Some("deny")
+        Some("allow"),
+        "researchers may publish structured findings"
     );
     assert_eq!(
         action(&perms, "external_directory").as_deref(),
@@ -411,8 +413,8 @@ fn the_boundary_holds_by_evaluation() {
     for (path, expected, why) in [
         (
             "store/projects/p/corpus/findings/x.md",
-            "allow",
-            "own corpus",
+            "deny",
+            "own corpus via a raw file tool",
         ),
         (
             "store/projects/p/agents/researcher/agent.yaml",

@@ -62,6 +62,7 @@ fn completion_delivery_groups_children_for_each_exact_curator() {
             delivery_attempt: 0,
             delivery_message_id: None,
             delivered: slug == "child-a1",
+            delivery_abandoned: None,
         });
         store.write_mission("p", slug, &child, "work").unwrap();
     }
@@ -194,6 +195,7 @@ fn failed_queue_admission_remains_retryable_with_the_same_message_id() {
         delivery_attempt: 0,
         delivery_message_id: None,
         delivered: false,
+        delivery_abandoned: None,
     });
     store.write_mission("p", "child", &child, "work").unwrap();
 
@@ -273,6 +275,7 @@ fn acknowledged_delivery_with_stale_persistence_is_reported_retryable() {
         delivery_attempt: 0,
         delivery_message_id: None,
         delivered: false,
+        delivery_abandoned: None,
     });
     store.write_mission("p", "child", &child, "work").unwrap();
 
@@ -350,6 +353,7 @@ fn admitted_prompt_is_not_delivered_when_the_curator_model_fails() {
         delivery_attempt: 0,
         delivery_message_id: None,
         delivered: false,
+        delivery_abandoned: None,
     });
     store.write_mission("p", "child", &child, "work").unwrap();
 
@@ -357,6 +361,7 @@ fn admitted_prompt_is_not_delivered_when_the_curator_model_fails() {
     *service.prompt_state.lock().unwrap() = PromptDeliveryState::Failed {
         error: "Model unavailable".into(),
         retry_ready: false,
+        interrupted: false,
     };
     deliver_completed_dispatches(&store, &service, &["run-a".into()]).unwrap();
     let admitted = store.load_mission("p", "child").unwrap().dispatch.unwrap();
@@ -400,6 +405,7 @@ fn admitted_prompt_is_not_delivered_when_the_curator_model_fails() {
     *service.prompt_state.lock().unwrap() = PromptDeliveryState::Failed {
         error: "Model unavailable".into(),
         retry_ready: true,
+        interrupted: false,
     };
     let (result, retry_events) = crate::observability::testing::capture_events(|| {
         deliver_completed_dispatches(&store, &service, &["run-a".into()])
@@ -430,6 +436,91 @@ fn admitted_prompt_is_not_delivered_when_the_curator_model_fails() {
     let retried = store.load_mission("p", "child").unwrap().dispatch.unwrap();
     assert_eq!(retried.delivery_attempt, 2);
     assert_ne!(retried.delivery_message_id, admitted.delivery_message_id);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn interrupted_completion_delivery_is_durably_abandoned_across_restart() {
+    let root = std::env::temp_dir().join(format!(
+        "corpus-app-delivery-interrupted-{}-{}",
+        std::process::id(),
+        new_uuid_id()
+    ));
+    let store = Store::new(root.join("store"));
+    store.create_project("p", "P", "cdk-regtest").unwrap();
+    store
+        .create_agent_with_role("p", "operator", corpus_core::AgentRole::Tester)
+        .unwrap();
+    let mut parent = mission(1);
+    parent.session = Some("run-a".into());
+    parent.control = Some(corpus_core::MissionControl {
+        run_id: "run-a".into(),
+        port: 41_001,
+    });
+    parent.opencode_session = Some("ses_a".into());
+    parent.opencode_workspace = Some(fake_workspace_id());
+    store
+        .write_mission("p", "curator", &parent, "curate")
+        .unwrap();
+    let mut child = mission(2);
+    child.dispatch = Some(corpus_core::MissionDispatch {
+        parent: corpus_core::MissionRunRef {
+            project: "p".into(),
+            mission: "curator".into(),
+            run_id: "run-a".into(),
+        },
+        child_run_id: Some("child-run".into()),
+        live_seen: true,
+        running_seen: true,
+        completion: Some(corpus_core::MissionCompletion::Completed {
+            at: 3,
+            artifacts: Vec::new(),
+        }),
+        delivery_attempt: 0,
+        delivery_message_id: None,
+        delivered: false,
+        delivery_abandoned: None,
+    });
+    store.write_mission("p", "child", &child, "work").unwrap();
+
+    let service = RecordingQueueService::default();
+    deliver_completed_dispatches(&store, &service, &["run-a".into()]).unwrap();
+    *service.prompt_state.lock().unwrap() = PromptDeliveryState::Failed {
+        error: "Aborted".into(),
+        retry_ready: false,
+        interrupted: true,
+    };
+    let (result, events) = crate::observability::testing::capture_events(|| {
+        deliver_completed_dispatches(&store, &service, &["run-a".into()])
+    });
+    result.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].fields.get("terminal_state").map(String::as_str),
+        Some("abandoned")
+    );
+    assert_eq!(
+        events[0].fields.get("outcome").map(String::as_str),
+        Some("abandoned")
+    );
+    let persisted = store.load_mission("p", "child").unwrap().dispatch.unwrap();
+    let abandonment = persisted.delivery_abandoned.unwrap();
+    assert_eq!(
+        abandonment.message_id,
+        persisted.delivery_message_id.unwrap()
+    );
+    assert_eq!(abandonment.reason, "interrupted");
+    assert!(!persisted.delivered);
+
+    // A fresh reconciler sees the durable terminal disposition and neither
+    // polls nor reports the interrupted delivery again.
+    let restarted_service = RecordingQueueService::default();
+    let (result, restart_events) = crate::observability::testing::capture_events(|| {
+        deliver_completed_dispatches(&store, &restarted_service, &["run-a".into()])
+    });
+    result.unwrap();
+    assert!(restart_events.is_empty());
+    assert!(restarted_service.calls.lock().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(root);
 }
 

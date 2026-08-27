@@ -16,6 +16,9 @@ finding with no oracle violation is recorded as unverified. Save what you
 built with `probe_save`, and write a technique card with `technique_save`
 after every mission, negative results included.
 
+Use `entry_write` for any durable project document when another corpus path
+or shape fits better. Categories describe the data; they are not role gates.
+
 Use `sandbox_write` for multiline PoC files in the writable workspace that
 `target_info` reports, then run them with `sandbox_exec`. The workspace lasts
 for the environment session; `probe_save` is the durable regression artifact.

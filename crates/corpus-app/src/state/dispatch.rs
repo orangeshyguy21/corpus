@@ -742,6 +742,9 @@ pub(super) fn deliver_completed_dispatches(
             let Some(completion) = dispatch.completion else {
                 continue;
             };
+            if dispatch.delivery_abandoned.is_some() {
+                continue;
+            }
             // Records written by the old admission-is-delivery implementation
             // have `delivered=true` but no message id. They were never
             // acknowledged and must be repaired rather than silently skipped.
@@ -833,7 +836,38 @@ pub(super) fn deliver_completed_dispatches(
                         failures.push(format!("{}/{}: {error}", parent.project, parent.mission));
                     }
                 }
-                Ok(PromptDeliveryState::Failed { error, retry_ready }) => {
+                Ok(PromptDeliveryState::Failed {
+                    error,
+                    retry_ready,
+                    interrupted,
+                }) => {
+                    if interrupted {
+                        let mut persisted = true;
+                        for child in &attempted {
+                            persisted = mark_dispatch_abandoned(store, &parent, child, &message_id)
+                                && persisted;
+                        }
+                        let terminal = if persisted {
+                            DeliveryTerminal::Abandoned
+                        } else {
+                            DeliveryTerminal::PersistenceFailed
+                        };
+                        DeliveryEvent::new(
+                            &parent,
+                            &message_id,
+                            attempt,
+                            attempted.len(),
+                            started.elapsed(),
+                        )
+                        .emit(terminal, !persisted, &error);
+                        if !persisted {
+                            failures.push(format!(
+                                "{}/{}: interrupted completion delivery could not be durably abandoned",
+                                parent.project, parent.mission
+                            ));
+                        }
+                        continue;
+                    }
                     // Keep the failed admission durable. Re-posting the same
                     // id cannot restart it, while immediately minting ids in a
                     // loop can burn credits. A deliberate model switch is the
@@ -971,6 +1005,22 @@ fn mark_dispatch_admitted(
             &child.slug,
             &child.identity(parent),
             attempt,
+            message_id,
+        )
+        .unwrap_or(false)
+}
+
+fn mark_dispatch_abandoned(
+    store: &Store,
+    parent: &corpus_core::MissionRunRef,
+    child: &DispatchDeliveryItem,
+    message_id: &str,
+) -> bool {
+    store
+        .abandon_mission_dispatch_delivery(
+            &child.project,
+            &child.slug,
+            &child.identity(parent),
             message_id,
         )
         .unwrap_or(false)

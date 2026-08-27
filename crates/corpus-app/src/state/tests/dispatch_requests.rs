@@ -197,6 +197,7 @@ fn child_completion_uses_exact_process_activity_not_terminal_quiet() {
         delivery_attempt: 0,
         delivery_message_id: None,
         delivered: false,
+        delivery_abandoned: None,
     });
     store.write_mission("p", "child", &child, "work").unwrap();
     let clock = Arc::new(ManualClock::new(1_700_000_100));
@@ -316,6 +317,7 @@ fn disappeared_child_and_launch_failure_each_record_once() {
             delivery_attempt: 0,
             delivery_message_id: None,
             delivered: false,
+            delivery_abandoned: None,
         });
         store.write_mission("p", slug, &child, "work").unwrap();
     }

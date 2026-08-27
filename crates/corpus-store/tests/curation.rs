@@ -1,12 +1,11 @@
 //! Corpus curation: the guard that decides which paths a caller may
 //! delete, move or read inside a project's corpus.
 //!
-//! The entries are markdown on disk, and the one place an agent is allowed
-//! to write with its own file tools — so "it is a relative path with no
-//! `..` in it" is not sufficient. A link planted inside the corpus is a
-//! legal relative path that resolves anywhere; only canonicalization
-//! catches it, which is why the guard ends there rather than starting
-//! there.
+//! Agents persist through the audited entry tools, which route every
+//! model-chosen path through this guard. "It is a relative path with no
+//! `..` in it" is not sufficient: a link planted inside the corpus is a
+//! legal relative path that resolves anywhere. Only canonicalization catches
+//! it, which is why the guard ends there rather than starting there.
 
 use std::fs;
 use std::path::PathBuf;
@@ -165,17 +164,22 @@ fn run_transcripts_are_not_curatable() {
 #[test]
 fn a_bare_category_is_not_an_entry() {
     let (store, world) = rig("category");
-    for path in ["findings", "probes", "hypotheses"] {
+    for path in ["findings", "probes", "hypotheses", "notes"] {
         let error = store
             .resolve_corpus_entry("p", path, EntryAccess::Mutate)
             .unwrap_err()
             .to_string();
         assert!(error.contains("whole category"), "{path}: {error}");
     }
-    // And a path naming no category at all.
-    assert!(store
-        .resolve_corpus_entry("p", "notes/x.md", EntryAccess::Mutate)
-        .is_err());
+    // Categories are organizational choices, not role gates. A nested custom
+    // path is a normal entry and its parent is created on write.
+    store
+        .write_corpus_entry("p", "notes/recon/x.md", "evidence\n")
+        .expect("custom corpus categories are writable");
+    assert_eq!(
+        fs::read_to_string(store.project_corpus_dir("p").join("notes/recon/x.md")).unwrap(),
+        "evidence\n"
+    );
     let _ = fs::remove_dir_all(&world);
 }
 

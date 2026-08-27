@@ -77,8 +77,8 @@ resistance for arbitrarily large operator-owned data.
 | Host admin MCP | Full operator administration | Model tool arguments | Typed registry, audit classification, exact target, confirmation where destructive; never gains plugin/launch powers |
 | Project-scoped research MCP | One proven project/run and server-derived role | All agent arguments and plugin replies | Inject scope/origin, advertise a role-filtered catalog, and refuse uniformly when identity is partial |
 | Curator domain | Manage agents, missions, and corpus inside one project | Child requests, completion state, attempted cross-project arguments | No sandbox or open research authority; every mutation audited; cannot become host-global operator |
-| Tester domain | Execute and publish verified work in the selected sandbox | Target and sandbox output | No internet research or project administration; server role gate remains authoritative |
-| Researcher domain | Internet research without execution | External content | No sandbox, finding publication, or project management |
+| Tester domain | Execute and persist work in the selected sandbox/project | Target and sandbox output | No internet research or project administration; corpus writes remain scoped and audited |
+| Researcher domain | Internet/source research and durable project knowledge without execution | External content and model-chosen corpus paths | No sandbox or project administration; corpus writes remain scoped and audited |
 | Super domain | Union of project-scoped curator/tester/researcher powers | Same inputs as all project roles | Still confined to one proven project; no host-global lifecycle or unrestricted shell |
 | OpenCode/tmux process | Run one explicit launch plan | Mission/prompt, rendered agent, terminal/session output | Project-only cwd, explicit environment, bounded supervision, exact session identity |
 | Plugin process and sandbox | Host-trusted environment orchestration and target-specific tools | Manifest and streamed protocol data; research code inside sandbox | Version/capability negotiation, deadlines, output caps, kill/reap; plugin owns sandbox isolation |
@@ -160,9 +160,11 @@ plus store tests `red_lines_survive_scalar_permissions`,
 ### SEC-AUTH-3: host administration and scoped management stay distinct
 
 Project creation/deletion, cross-project copying, and other-project access are
-operator-only. Curator and Super receive only the scoped subset; Super may wipe
-its own corpus with confirmation but is not a host-global operator. The admin
-artifact cannot depend on core, plugin, launch, research MCP, app, or Goose.
+operator-only. Every role receives the non-destructive, scoped `entry_write`
+capability; Curator and Super additionally receive the scoped management
+subset. Super may wipe its own corpus with confirmation but is not a
+host-global operator. The admin artifact cannot depend on core, plugin, launch,
+research MCP, app, or Goose.
 
 Enforcement: typed registry grant sets, scoped schemas, separate MCP binaries,
 and `scripts/check-dependency-policy`.
@@ -202,9 +204,13 @@ Evidence: store path tests, CLI resource-root binary test, and
 
 ### SEC-FS-2: model-chosen paths cannot escape their resource root
 
-All entry paths are validated relative paths under allowed corpus categories.
-Absolute paths, traversal, bare categories, immutable `runs`, symlinks, and
-cross-device/target collisions fail before publication. Agent and project
+All entry paths are validated relative paths beneath the proven project's
+corpus. Agents may create categories and nested paths that fit their data;
+category names are organization, not authority. Absolute paths, traversal,
+bare categories, retired `attacks`, immutable `runs`, symlinks, and
+cross-device/target collisions fail before publication. Raw OpenCode file
+mutation is denied: durable model writes cross the scoped, audited entry-tool
+boundary. Agent and project
 clone/copy, source-view provisioning, and plugin installation preflight entire
 source trees and publish no partial destination on refusal.
 
@@ -251,11 +257,15 @@ Evidence: mission deletion/environment tests,
 Background results carry project generation, corpus revision, and optional run
 identity. Navigation, deletion, or a newer generation makes stale results
 inapplicable. Acknowledgement whose durable identity changed remains visible
-and retryable rather than reporting success.
+and retryable rather than reporting success. An exact completion prompt
+interrupted by the operator is durably abandoned against its message identity;
+restart reconciliation does not redeliver it or repeatedly report the same
+terminal interruption.
 
 Evidence: `job_scope_guard_rejects_navigation_and_generation_staleness`,
 corpus revision tests, and
-`acknowledged_delivery_with_stale_persistence_is_reported_retryable`.
+`acknowledged_delivery_with_stale_persistence_is_reported_retryable` plus
+`interrupted_completion_delivery_is_durably_abandoned_across_restart`.
 
 ## Process and protocol invariants
 
@@ -328,11 +338,13 @@ model smoke, and the full curator system campaign.
    parent and child run identities, never slug or UI selection alone.
 3. A stale completion acknowledges a newer run. The compare-and-advance fails,
    remains retryable, and emits a persistence-failure delivery event.
-4. A model proposes traversal, a symlink, or a destructive call without fresh
+4. An operator interrupts an admitted completion prompt. Its exact message is
+   durably abandoned and later restart reconciliation skips it.
+5. A model proposes traversal, a symlink, or a destructive call without fresh
    confirmation. Validation below the schema refuses before publication.
-5. A plugin stalls, floods output, changes capability claims, or returns the
+6. A plugin stalls, floods output, changes capability claims, or returns the
    wrong ID. The call fails within bounds and the owned process is cleaned up.
-6. Two Cargo invocations start live model tests concurrently. Only one can hold
+7. Two Cargo invocations start live model tests concurrently. Only one can hold
    the global lease; the other fails before entering the model boundary.
 
 ## Security review gate

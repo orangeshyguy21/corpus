@@ -32,12 +32,12 @@ impl Store {
         {
             return PathBuf::from(explicit);
         }
-        sibling_dir(self.root(), "cache/sources")
+        self.mutable_root().join("cache/sources")
     }
 
     /// This store's mutable side-tree (`<store parent>/var`).
     pub fn var_dir(&self) -> PathBuf {
-        sibling_dir(self.root(), "var")
+        self.mutable_root().join("var")
     }
 
     /// The project's run root. OpenCode launches work in an exact child of
@@ -353,13 +353,6 @@ fn sync_rendered_agents(source: &Path, destination: &Path) -> Result<()> {
         atomic_write(&destination.join(entry.file_name()), contents)?;
     }
     Ok(())
-}
-
-fn sibling_dir(root: &Path, child: &str) -> PathBuf {
-    root.parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| root.to_path_buf())
-        .join(child)
 }
 
 /// Create one corpus-managed directory component without following an

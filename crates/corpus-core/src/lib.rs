@@ -109,8 +109,9 @@ pub use store::{
     corpus_cost, corpus_cost_cached, corpus_stats, fnv1a_hex, mission_logs, project_slug_env,
     slugify, store_root_env, validate_slug, AppPrefs, CategoryStat, CorpusCostCache, CorpusStats,
     CostReport, CostRow, EntryAccess, Mission, MissionCompletion, MissionControl,
-    MissionDeleteRequest, MissionDispatch, MissionDispatchIdentity, MissionLaunchRequest,
-    MissionLog, MissionRunRef, Project, RunWorkspace, Scope, Store, UsageSnapshot, AGENT_ENV,
-    CATEGORIES, ENVIRONMENT_SESSION_ENV, LEGACY_ATTACKS, MISSION_ENV, PROBES, PROJECT_ENV, RUNS,
-    RUN_ID_ENV, RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV, USAGE_SNAPSHOT_VERSION,
+    MissionDeleteRequest, MissionDispatch, MissionDispatchAbandonment, MissionDispatchIdentity,
+    MissionLaunchRequest, MissionLog, MissionRunRef, Project, RunWorkspace, Scope, Store,
+    UsageSnapshot, AGENT_ENV, CATEGORIES, ENVIRONMENT_SESSION_ENV, LEGACY_ATTACKS, MISSION_ENV,
+    PROBES, PROJECT_ENV, RUNS, RUN_ID_ENV, RUN_LOG_ENV, SOURCE_PINS_ENV, STORE_ENV,
+    USAGE_SNAPSHOT_VERSION,
 };

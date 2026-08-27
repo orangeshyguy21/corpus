@@ -434,11 +434,13 @@ mod tests {
 
     #[test]
     fn detach_resets_all_per_attachment_interaction_state() {
-        let mut pane = TerminalPane::default();
-        pane.attached = Some("mission-a".into());
-        pane.focused = true;
-        pane.shift_selecting = true;
-        pane.scroll_points = 7.5;
+        let mut pane = TerminalPane {
+            attached: Some("mission-a".into()),
+            focused: true,
+            shift_selecting: true,
+            scroll_points: 7.5,
+            ..TerminalPane::default()
+        };
 
         pane.detach();
 

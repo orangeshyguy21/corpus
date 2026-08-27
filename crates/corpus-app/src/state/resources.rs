@@ -399,7 +399,7 @@ impl AppState {
     /// gives the id — an auto-generated UUIDv4, which is a valid
     /// kebab-case slug, so it slots straight into the store layout
     /// (`store/projects/<id>/`), CLI scopes, and `CORPUS_PROJECT`.
-    pub fn create_project(&self, name: &str, plugin: &str) -> Result<(String, Project), Error> {
+    pub fn create_project(&mut self, name: &str, plugin: &str) -> Result<(String, Project), Error> {
         // Human names mint human slugs ("Dep Scans" → "dep-scans"); only a
         // name with no alphanumerics falls back to the opaque id. (UUID
         // slugs made every chat/tool reference unreadable — 2026-08-14.)
@@ -411,9 +411,22 @@ impl AppState {
                 s
             }
         };
-        self.store
-            .create_project(&slug, name, plugin)
-            .map(|p| (slug, p))
+        let project = self.store.create_project(&slug, name, plugin)?;
+
+        // Make the just-created project selectable before the asynchronous
+        // project-index refresh completes. Otherwise `select_project` rejects
+        // it as absent from the current cache and leaves the previous project
+        // selected until a later interaction.
+        self.projects.retain(|(candidate, _)| candidate != &slug);
+        self.projects.push((slug.clone(), project.clone()));
+        self.projects
+            .sort_by_key(|entry| std::cmp::Reverse(entry.1.created));
+        self.trees.entry(slug.clone()).or_default();
+        self.select_project(&slug);
+        self.current_screen = Screen::Projects;
+        self.refresh();
+
+        Ok((slug, project))
     }
 
     /// Clone a project; the copied name falls back to the source's when

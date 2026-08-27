@@ -63,11 +63,7 @@ pub struct EnvironmentSessionRecord {
 impl Store {
     pub fn plugin_runtime_dir(&self, plugin_id: &str) -> Result<std::path::PathBuf> {
         validate_component("plugin id", plugin_id)?;
-        let data = self
-            .root()
-            .parent()
-            .ok_or_else(|| Error::Store("store root has no data-root parent".into()))?;
-        Ok(data.join("var/plugins").join(plugin_id))
+        Ok(self.mutable_root().join("var/plugins").join(plugin_id))
     }
 
     pub fn environment_session_path(
@@ -142,11 +138,7 @@ impl Store {
     /// reconciliation uses this to find historical owners even when neither
     /// their project nor their plugin is currently selected in the UI.
     pub fn list_all_environment_sessions(&self) -> Result<Vec<EnvironmentSessionRecord>> {
-        let data = self
-            .root()
-            .parent()
-            .ok_or_else(|| Error::Store("store root has no data-root parent".into()))?;
-        let plugins = data.join("var/plugins");
+        let plugins = self.mutable_root().join("var/plugins");
         let entries = match std::fs::read_dir(plugins) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

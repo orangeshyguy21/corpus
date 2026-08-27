@@ -16,6 +16,21 @@ fn project_state(name: &str, projects: &[&str]) -> (PathBuf, AppState) {
 }
 
 #[test]
+fn creating_a_project_selects_it_before_the_async_index_refresh() {
+    let (root, mut state) = project_state("project-create-navigation", &["existing"]);
+    state.install_job_runtime(eframe::egui::Context::default());
+    state.current_screen = Screen::Missions;
+
+    let (slug, _) = state.create_project("New Project", "cdk-regtest").unwrap();
+
+    assert_eq!(slug, "new-project");
+    assert_eq!(state.effective_project().as_deref(), Some("new-project"));
+    assert_eq!(state.current_screen, Screen::Projects);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn completed_project_delete_prunes_render_state_immediately() {
     let (root, mut state) = project_state("project-delete-prune", &["keep", "remove"]);
     state.select_project("remove");

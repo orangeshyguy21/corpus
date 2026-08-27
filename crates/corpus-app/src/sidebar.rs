@@ -448,9 +448,7 @@ impl Sidebar {
                                     ui,
                                     state,
                                     toasts,
-                                    project,
-                                    slug,
-                                    &label_text,
+                                    (project, slug, &label_text),
                                     show_menu,
                                 )
                             })
@@ -539,11 +537,10 @@ impl Sidebar {
         ui: &mut Ui,
         state: &mut AppState,
         toasts: &mut Toasts,
-        project: &str,
-        slug: &str,
-        name: &str,
+        mission: (&str, &str, &str),
         show_button: bool,
     ) -> bool {
+        let (project, slug, name) = mission;
         menu_was_open_or_clicked(egui::menu::menu_custom_button(
             ui,
             overflow_button(show_button),
@@ -800,7 +797,7 @@ impl Sidebar {
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
             .show(ui.ctx(), |ui| {
-                ui.label("Display name (the id is generated)");
+                ui.label("Display name");
                 let entry = ui.text_edit_singleline(&mut self.create_name);
                 ui.label("Environment plugin");
                 plugin_picker(
@@ -852,13 +849,8 @@ impl Sidebar {
                         toast(toasts, ToastKind::Warning, "display name is required");
                     } else {
                         match state.create_project(name, self.create_plugin.trim()) {
-                            Ok((id, _)) => {
+                            Ok(_) => {
                                 toast(toasts, ToastKind::Success, "project created");
-                                state.refresh();
-                                state.select_project(&id);
-                                // Land on the new project's page, not
-                                // wherever the operator happened to be.
-                                state.current_screen = Screen::Projects;
                                 self.create_name.clear();
                                 done = true;
                             }

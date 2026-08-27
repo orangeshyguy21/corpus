@@ -185,12 +185,7 @@ fn tui_raw_capture_is_durable_in_project_corpus() {
     )
     .expect("tui spawn");
     let (raw, script, tmux_session) = match &session.backend {
-        Backend::Tui {
-            raw,
-            script,
-            session,
-            ..
-        } => (raw.clone(), script.clone(), session.clone()),
+        Backend::Tui(tui) => (tui.raw.clone(), tui.script.clone(), tui.session.clone()),
         _ => panic!("expected the TUI backend (tmux is available)"),
     };
     let launch_script = fs::read_to_string(script).unwrap();

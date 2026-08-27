@@ -19,8 +19,8 @@ jobs:
           - id: cdk-regtest
             repo: orangeshyguy21/corpus-plugin-cdk
             archive: corpus-plugin-cdk
-            version: 0.4.6
-            sha256: 8c88e63b88721cd63d0cf957c920ba6288dfa83ffc2d01f25801f8dbf001e7ad
+            version: 0.4.8
+            sha256: c16f0c7f36787fb2f3d73e769c42a851e0dfa817398e9718dd51b3919c86ffd2
           - id: nutshell-regtest
             repo: orangeshyguy21/corpus-plugin-nutshell
             archive: corpus-plugin-nutshell

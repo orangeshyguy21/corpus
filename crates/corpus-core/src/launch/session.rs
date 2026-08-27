@@ -31,28 +31,32 @@ pub struct StopOutcome {
 }
 
 /// The concrete backend state is visible only to the parent launch facade.
+pub(super) struct TuiBackend {
+    pub(super) session: String,
+    pub(super) workspace_id: String,
+    pub(super) control_port: Option<u16>,
+    pub(super) tui_session_id: Option<String>,
+    pub(super) launched_at_ms: u64,
+    pub(super) stopped: bool,
+    pub(super) exported: bool,
+    pub(super) export_json: PathBuf,
+    pub(super) raw: PathBuf,
+    pub(super) script: PathBuf,
+    pub(super) file_pos: u64,
+    pub(super) pending: String,
+    pub(super) liveness: (Instant, bool),
+    pub(super) discovery: Instant,
+    pub(super) repo: PathBuf,
+}
+
+pub(super) struct PipedBackend {
+    pub(super) child: Child,
+    pub(super) rx: mpsc::Receiver<RunLine>,
+}
+
 pub(super) enum Backend {
-    Tui {
-        session: String,
-        workspace_id: String,
-        control_port: Option<u16>,
-        tui_session_id: Option<String>,
-        launched_at_ms: u64,
-        stopped: bool,
-        exported: bool,
-        export_json: PathBuf,
-        raw: PathBuf,
-        script: PathBuf,
-        file_pos: u64,
-        pending: String,
-        liveness: (Instant, bool),
-        discovery: Instant,
-        repo: PathBuf,
-    },
-    Piped {
-        child: Child,
-        rx: mpsc::Receiver<RunLine>,
-    },
+    Tui(Box<TuiBackend>),
+    Piped(PipedBackend),
 }
 
 /// A running OpenCode mission on one project scope.
@@ -65,8 +69,8 @@ pub struct RunSession {
 impl RunSession {
     pub fn launch_identity(&self) -> Option<String> {
         match &self.backend {
-            Backend::Tui { session, .. } => Some(session.clone()),
-            Backend::Piped { .. } => self
+            Backend::Tui(tui) => Some(tui.session.clone()),
+            Backend::Piped(_) => self
                 .transcript
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned()),
@@ -75,8 +79,8 @@ impl RunSession {
 
     pub fn control_port(&self) -> Option<u16> {
         match &self.backend {
-            Backend::Tui { control_port, .. } => *control_port,
-            Backend::Piped { .. } => None,
+            Backend::Tui(tui) => tui.control_port,
+            Backend::Piped(_) => None,
         }
     }
 
@@ -84,47 +88,35 @@ impl RunSession {
     /// OpenCode conversation. Piped runs have no resumable TUI conversation.
     pub fn workspace_id(&self) -> Option<String> {
         match &self.backend {
-            Backend::Tui { workspace_id, .. } => Some(workspace_id.clone()),
-            Backend::Piped { .. } => None,
+            Backend::Tui(tui) => Some(tui.workspace_id.clone()),
+            Backend::Piped(_) => None,
         }
     }
 
     /// Discover and cache the OpenCode conversation backing a TUI run.
     pub fn opencode_session_id(&mut self, claimed: &BTreeSet<String>) -> Option<String> {
-        let Backend::Tui {
-            tui_session_id,
-            launched_at_ms,
-            repo,
-            discovery,
-            ..
-        } = &mut self.backend
-        else {
+        let Backend::Tui(tui) = &mut self.backend else {
             return None;
         };
-        if let Some(id) = tui_session_id {
+        if let Some(id) = &tui.tui_session_id {
             return Some(id.clone());
         }
-        if discovery.elapsed() < Duration::from_secs(1) {
+        if tui.discovery.elapsed() < Duration::from_secs(1) {
             return None;
         }
-        *discovery = Instant::now();
-        let found = find_opencode_session(repo, *launched_at_ms, claimed)
+        tui.discovery = Instant::now();
+        let found = find_opencode_session(&tui.repo, tui.launched_at_ms, claimed)
             .ok()
             .flatten()?;
-        *tui_session_id = Some(found.clone());
+        tui.tui_session_id = Some(found.clone());
         Some(found)
     }
 
     /// Return one buffered output line without blocking.
     pub fn poll_line(&mut self) -> Option<RunLine> {
         match &mut self.backend {
-            Backend::Piped { rx, .. } => rx.try_recv().ok(),
-            Backend::Tui {
-                raw,
-                file_pos,
-                pending,
-                ..
-            } => tail_line(raw, file_pos, pending),
+            Backend::Piped(piped) => piped.rx.try_recv().ok(),
+            Backend::Tui(tui) => tail_line(&tui.raw, &mut tui.file_pos, &mut tui.pending),
         }
     }
 
@@ -143,16 +135,11 @@ impl RunSession {
 
     pub fn try_exit(&mut self) -> Option<ExitStatus> {
         match &mut self.backend {
-            Backend::Piped { child, .. } => child.try_wait().ok().flatten(),
-            Backend::Tui {
-                stopped,
-                session,
-                liveness,
-                ..
-            } => {
-                if *stopped {
+            Backend::Piped(piped) => piped.child.try_wait().ok().flatten(),
+            Backend::Tui(tui) => {
+                if tui.stopped {
                     Some(stopped_exit_status())
-                } else if !session_live(session, liveness) {
+                } else if !session_live(&tui.session, &mut tui.liveness) {
                     Some(successful_exit_status())
                 } else {
                     None
@@ -164,32 +151,29 @@ impl RunSession {
     /// External terminal attachment retained for CLI callers.
     pub fn attach_command(&self) -> Option<Vec<String>> {
         match &self.backend {
-            Backend::Piped { .. } => None,
-            Backend::Tui { session, .. } => external_attach_argv(session),
+            Backend::Piped(_) => None,
+            Backend::Tui(tui) => external_attach_argv(&tui.session),
         }
     }
 
     /// Plain tmux attachment for the application's embedded PTY.
     pub fn pty_attach_command(&self) -> Option<Vec<String>> {
         match &self.backend {
-            Backend::Piped { .. } => None,
-            Backend::Tui { session, .. } => tui_attach_command(session),
+            Backend::Piped(_) => None,
+            Backend::Tui(tui) => tui_attach_command(&tui.session),
         }
     }
 
     /// Stop the owned backend, then export or retain its durable fallback.
     pub fn stop_detailed(&mut self) -> StopOutcome {
         match &mut self.backend {
-            Backend::Piped { child, .. } => StopOutcome {
+            Backend::Piped(piped) => StopOutcome {
                 transcript: self.transcript.clone(),
                 export_error: None,
-                cleanup_errors: kill_tree_checked(child),
+                cleanup_errors: kill_tree_checked(&mut piped.child),
             },
-            Backend::Tui { .. } => {
-                let fallback = match &self.backend {
-                    Backend::Tui { raw, .. } => raw.clone(),
-                    Backend::Piped { .. } => self.transcript.clone(),
-                };
+            Backend::Tui(tui) => {
+                let fallback = tui.raw.clone();
                 // Stop the writer before export so a successful command cannot
                 // publish a truncated document while OpenCode is still writing.
                 let cleanup_errors = self.close_tui_checked();
@@ -197,8 +181,8 @@ impl RunSession {
                     Ok(path) => (path, None),
                     Err(error) => (fallback, Some(format!("transcript export failed: {error}"))),
                 };
-                if let Backend::Tui { stopped, .. } = &mut self.backend {
-                    *stopped = true;
+                if let Backend::Tui(tui) = &mut self.backend {
+                    tui.stopped = true;
                 }
                 StopOutcome {
                     transcript,
@@ -221,55 +205,48 @@ impl RunSession {
     }
 
     fn export_transcript(&mut self) -> Result<PathBuf> {
-        let Backend::Tui {
-            export_json,
-            exported,
-            tui_session_id,
-            launched_at_ms,
-            repo,
-            raw,
-            ..
-        } = &mut self.backend
-        else {
+        let Backend::Tui(tui) = &mut self.backend else {
             return Ok(self.transcript.clone());
         };
-        if *exported {
-            return Ok(export_json.clone());
+        if tui.exported {
+            return Ok(tui.export_json.clone());
         }
-        let id = match tui_session_id.clone() {
+        let id = match tui.tui_session_id.clone() {
             Some(id) => id,
             None => {
-                let Some(found) = find_opencode_session(repo, *launched_at_ms, &BTreeSet::new())?
+                let Some(found) =
+                    find_opencode_session(&tui.repo, tui.launched_at_ms, &BTreeSet::new())?
                 else {
-                    return Ok(raw.clone());
+                    return Ok(tui.raw.clone());
                 };
-                *tui_session_id = Some(found.clone());
+                tui.tui_session_id = Some(found.clone());
                 found
             }
         };
-        let runs = export_json
+        let runs = tui
+            .export_json
             .parent()
             .ok_or_else(|| Error::Store("export path has no runs dir".into()))?;
-        let output = export_record(repo, runs, &id)?;
-        *export_json = output.clone();
-        *exported = true;
+        let output = export_record(&tui.repo, runs, &id)?;
+        tui.export_json = output.clone();
+        tui.exported = true;
         Ok(output)
     }
 
     fn close_tui_checked(&self) -> Vec<String> {
         let mut errors = Vec::new();
-        let Backend::Tui {
-            session, script, ..
-        } = &self.backend
-        else {
+        let Backend::Tui(tui) = &self.backend else {
             return errors;
         };
-        if let Err(error) = kill_tmux_session_checked(session) {
+        if let Err(error) = kill_tmux_session_checked(&tui.session) {
             errors.push(error.to_string());
         }
-        if let Err(error) = fs::remove_file(script) {
+        if let Err(error) = fs::remove_file(&tui.script) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                errors.push(format!("remove run script {}: {error}", script.display()));
+                errors.push(format!(
+                    "remove run script {}: {error}",
+                    tui.script.display()
+                ));
             }
         }
         errors
