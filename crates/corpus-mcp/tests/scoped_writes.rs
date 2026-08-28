@@ -228,6 +228,28 @@ fn finding_write_validates_before_persistence_and_preserves_project_agency() {
         corpus_core::frontmatter::get_str(&frontmatter, "title").as_deref(),
         Some("Header\nseverity: low")
     );
+
+    let out = tools::dispatch(
+        &mut ctx,
+        "finding_write",
+        &json!({
+            "title": "Corpus-relative path",
+            "severity": "low",
+            "detail": "demonstrated PoC",
+            "path": "findings/campaigns/august/corpus-relative.md"
+        }),
+    )
+    .expect("finding_write corpus-relative path");
+    assert!(
+        out.contains("findings/campaigns/august/corpus-relative.md"),
+        "{out}"
+    );
+    assert!(proj_corpus(&store)
+        .join("findings/campaigns/august/corpus-relative.md")
+        .is_file());
+    assert!(!proj_corpus(&store)
+        .join("findings/findings/campaigns/august/corpus-relative.md")
+        .exists());
     assert_eq!(
         corpus_core::frontmatter::get_str(&frontmatter, "severity").as_deref(),
         Some("critical")
@@ -360,7 +382,7 @@ fn target_info_reports_mission_pins_not_defaults() {
 /// inside the container — and each is reachable only by its own tool.
 /// `target_info` used to report the SANDBOX path to every role and assert
 /// "you have no host filesystem", which is false for all of them and
-/// useless to a researcher, whose two tools do not include `sandbox_exec`.
+/// useless to a researcher, whose grant set does not include `sandbox_exec`.
 /// One agent believed it, spent a run being denied by opencode for reading
 /// a path absent from the machine, and concluded the harness was lying to
 /// it rather than that it held the wrong path. It was right.
@@ -407,12 +429,12 @@ fn source_paths_are_reported_per_role_not_per_sandbox() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// THE role gate: a researcher is refused the execution and publication
-/// tools by the SERVER, whatever any permission block says — the server
+/// THE role gate: a researcher is refused execution tools by the SERVER,
+/// whatever any permission block says — the server
 /// never reads that block. This is the property the whole role system
 /// exists to provide.
 #[test]
-fn researcher_role_is_refused_execution_and_publication_tools() {
+fn researcher_role_is_refused_execution_tools() {
     let TestRig { mut ctx, root, .. } = rig("role-researcher");
     ctx.role = Ok(corpus_core::AgentRole::Researcher);
 
@@ -437,10 +459,6 @@ fn researcher_role_is_refused_execution_and_publication_tools() {
             "attack_save",
             json!({"name": "a", "description": "d", "script": "s"}),
         ),
-        (
-            "finding_write",
-            json!({"title": "t", "severity": "high", "detail": "d"}),
-        ),
     ] {
         let err = tools::dispatch(&mut ctx, tool, &args)
             .expect_err("a researcher must be refused {tool}");
@@ -449,8 +467,15 @@ fn researcher_role_is_refused_execution_and_publication_tools() {
         assert!(msg.contains(tool), "{tool}: {msg}");
     }
 
-    // ...and still gets the two tools its role does grant.
+    // ...and still gets the research and persistence tools its role grants.
     tools::dispatch(&mut ctx, "target_info", &json!({})).expect("a researcher reads its target");
+    assert!(ctx.role.as_ref().unwrap().allows("finding_write"));
+    assert!(ctx
+        .role
+        .as_ref()
+        .unwrap()
+        .admin_tools()
+        .contains(&"entry_write"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -500,13 +525,20 @@ fn advertised_catalog_matches_the_role() {
         researcher.contains(&"technique_save".to_string()),
         "{researcher:?}"
     );
+    assert!(
+        researcher.contains(&"finding_write".to_string()),
+        "{researcher:?}"
+    );
+    assert!(
+        researcher.contains(&"entry_write".to_string()),
+        "{researcher:?}"
+    );
     for hidden in [
         "sandbox_exec",
         "sandbox_write",
         "oracle_list",
         "oracle_run",
         "faucet",
-        "finding_write",
         "probe_save",
     ] {
         assert!(

@@ -697,6 +697,26 @@ fn writer_is_collision_safe_and_confines_agent_chosen_paths() {
         before
     );
 
+    let prefixed = store
+        .write_finding(
+            "project",
+            &draft("Prefixed finding", Some("findings/custom/prefixed.md")),
+        )
+        .unwrap();
+    assert_eq!(
+        prefixed.path,
+        Path::new("findings/custom/prefixed.md"),
+        "a corpus-relative input must not duplicate the findings category"
+    );
+    assert!(store
+        .project_corpus_dir("project")
+        .join("findings/custom/prefixed.md")
+        .is_file());
+    assert!(!store
+        .project_corpus_dir("project")
+        .join("findings/findings/custom/prefixed.md")
+        .exists());
+
     for bad in [
         "../runs/stolen.md",
         "/tmp/out.md",

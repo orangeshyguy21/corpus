@@ -1,5 +1,5 @@
-//! The curator route: project-management tools served to an in-project
-//! agent, scoped to the project the server already proved.
+//! The scoped-project route: common corpus persistence plus management tools
+//! served according to an in-project agent's role and proven project.
 //!
 //! The property under test throughout is that the project is NOT the
 //! caller's to choose. The host-admin artifact resolves it from a tool
@@ -144,9 +144,11 @@ fn super_merges_the_two_scoped_catalogs() {
     for role in [AgentRole::Researcher, AgentRole::Tester] {
         let got = names(&tools::catalog_for(&Ok(role)));
         for admin in corpus_core::CURATOR_TOOLS {
-            assert!(
-                !got.contains(&admin.to_string()),
-                "{} must not advertise {admin}",
+            let expected = role.admin_tools().contains(&admin);
+            assert_eq!(
+                got.contains(&admin.to_string()),
+                expected,
+                "{} grant for {admin}",
                 role.as_str()
             );
         }
@@ -185,7 +187,7 @@ fn super_merges_the_two_scoped_catalogs() {
 /// it silently replaced — worse than never asking.
 #[test]
 fn scoped_management_schemas_never_advertise_a_project() {
-    for role in [AgentRole::Curator, AgentRole::Super] {
+    for role in AgentRole::ALL {
         let catalog = tools::catalog_for(&Ok(role));
         for tool in catalog.as_array().unwrap() {
             let name = tool["name"].as_str().unwrap();
@@ -430,6 +432,59 @@ fn a_curator_writes_corpus_entries_by_relative_path() {
     );
 }
 
+/// Persistence is a common role capability, not curator authority. Both
+/// narrow roles can choose a useful custom namespace, while the scoped
+/// adapter injects the project and the store retains its hard boundaries.
+#[test]
+fn narrow_roles_write_audited_entries_where_the_data_fits() {
+    for role in [AgentRole::Researcher, AgentRole::Tester] {
+        let mut rig = rig(&format!("contributor-write-{}", role.as_str()), role);
+        tools::dispatch(
+            &mut rig.ctx,
+            "entry_write",
+            &json!({
+                "project": "beta",
+                "path": "notes/recon/session.md",
+                "content": format!("recorded by {}\n", role.as_str()),
+            }),
+        )
+        .expect("a narrow role may persist project knowledge");
+
+        let alpha = rig
+            .store
+            .project_corpus_dir("alpha")
+            .join("notes/recon/session.md");
+        assert!(alpha.is_file(), "{} write lands in scope", role.as_str());
+        assert!(
+            !rig.store
+                .project_corpus_dir("beta")
+                .join("notes/recon/session.md")
+                .exists(),
+            "{} cannot select another project",
+            role.as_str()
+        );
+        assert!(
+            tools::dispatch(
+                &mut rig.ctx,
+                "entry_write",
+                &json!({"path": "runs/forged.raw", "content": "x"}),
+            )
+            .is_err(),
+            "{} cannot forge an immutable transcript",
+            role.as_str()
+        );
+
+        let audit = corpus_core::audit::tail(&rig.store, "alpha", 20).unwrap();
+        assert!(
+            audit.iter().any(|record| {
+                record.op == "entry_write" && record.outcome == corpus_core::audit::Outcome::Ok
+            }),
+            "{} write is audited: {audit:?}",
+            role.as_str()
+        );
+    }
+}
+
 /// `mission_launch` flags the mission record for the app to spawn — the
 /// MCP process cannot start a run itself. The flag lands on the scoped
 /// project's mission, the brief is untouched, and a second call is a no-op
@@ -616,7 +671,7 @@ fn a_curator_refused_a_sandbox_tool_is_told_what_it_holds() {
         .expect_err("must refuse")
         .to_string();
     assert!(error.contains("curator"), "{error}");
-    assert!(error.contains("project-management"), "{error}");
+    assert!(error.contains("scoped project"), "{error}");
     assert!(!error.contains("(allowed: )"), "{error}");
 }
 

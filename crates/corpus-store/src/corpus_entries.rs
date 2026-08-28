@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::filesystem::atomic_write;
-use crate::store::{Store, CATEGORIES, LEGACY_ATTACKS, RUNS};
+use crate::store::{Store, LEGACY_ATTACKS, RUNS};
 
 /// What a caller intends to do with a corpus entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,12 +62,11 @@ impl Store {
             .first()
             .and_then(|component| component.to_str())
             .ok_or_else(|| Error::Store(format!("path names no category: {rel}")))?;
-        let legacy_read_or_delete =
-            category == LEGACY_ATTACKS && access != EntryAccess::Destination;
-        if !CATEGORIES.contains(&category) && !legacy_read_or_delete {
+        // `attacks/` is a retired compatibility namespace: existing entries
+        // remain readable/removable, but new data must not recreate it.
+        if category == LEGACY_ATTACKS && access == EntryAccess::Destination {
             return Err(Error::Store(format!(
-                "{category:?} is not a corpus category (one of {})",
-                CATEGORIES.join(", ")
+                "{LEGACY_ATTACKS}/ is a retired corpus category and cannot receive new entries"
             )));
         }
         if category == RUNS && access.is_mutation() {

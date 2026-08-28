@@ -141,25 +141,18 @@ impl Policy {
             _ => serde_json::Map::new(),
         };
 
-        let corpus = format!("store/projects/{}/corpus/**", ctx.project);
-        let runs = format!("store/projects/{}/corpus/runs/**", ctx.project);
-        // `runs/` sits inside the corpus but is not an agent's to change:
-        // those transcripts are what technique cards cite by name, what the
-        // cost report counts, and the only provenance a mission leaves.
-        let mutable_default = || {
-            rules([
-                ("*", Action::Deny),
-                (corpus.as_str(), Action::Allow),
-                (runs.as_str(), Action::Deny),
-            ])
-        };
         let mut read =
             take_rules(&mut stored, "read").unwrap_or_else(|| rules([("*", Action::Allow)]));
-        let mut edit = take_rules(&mut stored, "edit").unwrap_or_else(mutable_default);
-        let mut write = take_rules(&mut stored, "write").unwrap_or_else(mutable_default);
+        // Durable writes cross the audited, project-scoped `entry_write`
+        // boundary. OpenCode file tools normalize paths differently across
+        // symlinked workspaces, and a direct write would bypass both audit
+        // and the immutable-runs guard. Stored permissions may tighten a
+        // role, never restore this alternate mutation route.
+        let _ = take_rules(&mut stored, "edit");
+        let _ = take_rules(&mut stored, "write");
+        let edit = rules([("*", Action::Deny)]);
+        let write = rules([("*", Action::Deny)]);
         seal_readable(&mut read, ctx);
-        seal_mutable(&mut edit, ctx);
-        seal_mutable(&mut write, ctx);
 
         let mut task = take_rules(&mut stored, "task").unwrap_or_default();
         // Omission would inherit opencode's default and let a dangling name
@@ -382,14 +375,7 @@ fn seal_readable(rules: &mut Rules, ctx: &RenderCtx<'_>) {
             );
         }
     }
-    seal_data_roots(rules, ctx, false);
-}
-
-/// The red lines on WRITING. The agent tree holds the role sidecars this
-/// gate trusts, and the run cwd links the project — no agent writes there.
-fn seal_mutable(rules: &mut Rules, ctx: &RenderCtx<'_>) {
-    rules.insert("store/projects/*/agents/**".to_string(), Action::Deny);
-    seal_data_roots(rules, ctx, true);
+    seal_data_roots(rules, ctx);
 }
 
 /// Deny the data roots by ABSOLUTE path, then re-allow exactly one
@@ -404,7 +390,7 @@ fn seal_mutable(rules: &mut Rules, ctx: &RenderCtx<'_>) {
 /// sort AFTER the broad deny. `<data>/**` < `<data>/store/projects/<p>/…`
 /// holds because the allow extends the deny's prefix — every allow emitted
 /// here must keep that property.
-fn seal_data_roots(rules: &mut Rules, ctx: &RenderCtx<'_>, mutating: bool) {
+fn seal_data_roots(rules: &mut Rules, ctx: &RenderCtx<'_>) {
     let roots = &ctx.roots;
     if !roots.data.is_empty() {
         let data = roots.data.trim_end_matches('/');
@@ -433,14 +419,6 @@ fn seal_data_roots(rules: &mut Rules, ctx: &RenderCtx<'_>, mutating: bool) {
         format!("{store}/projects/{}/corpus/**", ctx.project),
         Action::Allow,
     );
-    // The absolute half of the `runs/` rule. Reading a transcript is fine —
-    // an agent may want its own — but changing one is not.
-    if mutating {
-        rules.insert(
-            format!("{store}/projects/{}/corpus/runs/**", ctx.project),
-            Action::Deny,
-        );
-    }
 }
 
 /// The absolute roots a render denies by path. Held as strings because
@@ -455,18 +433,14 @@ pub(super) struct DataRoots {
 }
 
 impl DataRoots {
-    /// Derived from the STORE, never from the environment: a render must
-    /// produce the same bytes for the same store regardless of what
-    /// `CORPUS_STORE` happens to say in this process. The store's parent
-    /// is denied too — that is where `var/run` and `var/chat` live, so the
-    /// deny covers run dirs and management-chat transcripts as well.
+    /// Derived from the Store's canonical mutable world, never from the
+    /// process environment: a render must produce the same bytes for the
+    /// same store regardless of ambient overrides. The mutable root is denied
+    /// too — that is where `var/run` and `var/chat` live, so the deny covers
+    /// run dirs and management-chat transcripts as well.
     pub(super) fn for_store(store: &Store) -> Self {
         Self {
-            data: store
-                .root()
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            data: store.mutable_root().to_string_lossy().into_owned(),
             store: store.root().to_string_lossy().into_owned(),
         }
     }

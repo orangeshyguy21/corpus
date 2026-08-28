@@ -26,8 +26,9 @@ use crate::jobs::{JobKind, JobTerminal};
 use crate::jobs::{JobScope, JobSet};
 use crate::nav::Screen;
 use crate::session_service::{
-    launch_stamp_ms, ConfiguredSessionService, PromptDeliveryState, SessionRef, SessionService,
-    SessionTurnState,
+    launch_stamp_ms, mission_session_ref, mission_workspace_candidates, mission_workspace_dir,
+    ConfiguredSessionService, OpenCodeSessionStatus, PromptDeliveryState, SessionRef,
+    SessionService, SessionTurnState,
 };
 
 mod models;
@@ -40,7 +41,9 @@ mod resources;
 mod run;
 mod session;
 #[cfg(test)]
-use background::{merge_plugin_statuses, successful_job_resolves_notice};
+use background::{
+    discovered_identity_is_current, merge_plugin_statuses, successful_job_resolves_notice,
+};
 #[cfg(test)]
 use dispatch::{deliver_completed_dispatches, reconcile_dispatch_activity};
 use dispatch::{AgentDeletionRequest, DeletionRequest, LaunchRequest};
@@ -69,6 +72,9 @@ const ACTIVITY_EVENT_MIN: Duration = Duration::from_millis(100);
 /// events, watcher failure, and changes made on filesystems without native
 /// notification support.
 const ACTIVITY_BACKSTOP: Duration = Duration::from_secs(10);
+const SESSION_STATUS_BUSY_POLL: Duration = Duration::from_millis(500);
+const SESSION_STATUS_IDLE_POLL: Duration = Duration::from_secs(2);
+const SESSION_STATUS_GRACE: Duration = Duration::from_secs(5);
 /// Native mission/run events make liveness refresh immediately. This slow
 /// subprocess backstop covers startup, watcher failure, and external tmux
 /// exits that do not touch the project tree.
@@ -270,6 +276,10 @@ pub struct AppState {
     /// session — cheap, so polled faster than the tmux listing).
     session_activity_polled_at: Option<std::time::Instant>,
     session_activity_dirty: bool,
+    /// Authoritative process-local OpenCode execution state for controlled
+    /// missions. Raw capture age remains only as a legacy fallback.
+    session_statuses: BTreeMap<(String, String), MissionStatusObservation>,
+    session_status_polled_at: Option<std::time::Instant>,
     /// Per tmux session, the moment we last re-exported its usage transcript.
     /// The turn-completion sweep exports only when the session last painted
     /// (its `session_activity` instant) is NEWER than this — so a finished
@@ -305,6 +315,7 @@ enum AppJobOutput {
     LaunchReady(LaunchReady),
     CorpusSnapshot(CorpusSnapshot),
     LiveSessions(Vec<String>),
+    SessionStatuses(Vec<SessionStatusUpdate>),
     SessionMaintenance(SessionMaintenance),
     DispatchDeliveries,
     TeardownReady(TeardownReady),
@@ -326,6 +337,21 @@ enum AppJobOutput {
     },
     Agents(Vec<(String, AgentConfig)>),
     Missions(Vec<(String, Mission)>),
+}
+
+#[derive(Debug)]
+struct SessionStatusUpdate {
+    mission: String,
+    run_id: String,
+    result: Result<OpenCodeSessionStatus, String>,
+}
+
+#[derive(Debug, Clone)]
+struct MissionStatusObservation {
+    run_id: String,
+    status: Option<OpenCodeSessionStatus>,
+    observed_at: std::time::Instant,
+    failed_at: Option<std::time::Instant>,
 }
 
 struct PluginLifecycleResult {
@@ -355,10 +381,9 @@ struct ProjectScopeSnapshot {
     findings: FindingSnapshot,
 }
 
-/// The activity signal (Idle / Waiting / Working) is owned by corpus-core
-/// now, so the app's dots and the curator's `mission_status` tool read the
-/// SAME rule and window. Re-exported here so `crate::state::MissionActivity`
-/// callers (the sidebar dot, the repaint budget) are unchanged.
+/// Shared activity vocabulary. Controlled app missions refine it with their
+/// owning OpenCode server's status; corpus-core's capture-age rule remains
+/// the fallback for headless/legacy observers without that control endpoint.
 pub use corpus_core::MissionActivity;
 
 /// Reload the complete durable launch ancestry. Parent deletion requests do
@@ -523,6 +548,8 @@ impl AppState {
             session_activity: BTreeMap::new(),
             session_activity_polled_at: None,
             session_activity_dirty: false,
+            session_statuses: BTreeMap::new(),
+            session_status_polled_at: None,
             last_exported_at: BTreeMap::new(),
             export_retry_after: BTreeMap::new(),
             launch_requests_polled_at: None,

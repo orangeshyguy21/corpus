@@ -380,6 +380,8 @@ mod tests {
             assert!(status.success(), "git {args:?} failed");
         };
         git(&["init", "--quiet", "-b", "main"]);
+        git(&["config", "user.email", "fixture@corpus.invalid"]);
+        git(&["config", "user.name", "Corpus test fixture"]);
         git(&[
             "-c",
             "user.email=t@t",

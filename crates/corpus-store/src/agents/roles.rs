@@ -38,7 +38,14 @@ pub const CORPUS_TOOLS: [&str; 10] = [
 /// namespace compatibility window. They never define separate authority.
 pub const LEGACY_CORPUS_TOOLS: [&str; 1] = ["corpus_attack_save"];
 
-const RESEARCHER_TOOLS: [&str; 2] = ["corpus_target_info", "corpus_technique_save"];
+const RESEARCHER_TOOLS: [&str; 3] = [
+    "corpus_target_info",
+    "corpus_technique_save",
+    "corpus_finding_write",
+];
+
+/// Non-destructive, project-confined corpus tools available to every role.
+const CONTRIBUTOR_TOOLS: [&str; 1] = ["entry_write"];
 
 /// Curator's project-scoped management catalog.
 pub const CURATOR_TOOLS: [&str; 27] = [
@@ -179,7 +186,7 @@ impl AgentRole {
         match self {
             Self::Researcher => {
                 "Reads the corpus, the pinned source and the open internet; never executes. \
-                 Produces cited hypotheses and technique cards."
+                 Persists cited project knowledge wherever it fits best."
             }
             Self::Tester => {
                 "Runs adversarial missions against sandboxed targets through the corpus tools \
@@ -199,8 +206,8 @@ impl AgentRole {
     pub fn hint(self) -> &'static str {
         match self {
             Self::Researcher => {
-                "reads and curates: target_info + technique_save, plus the open internet. \
-                 No execution — enforced by the corpus server, not just by config."
+                "reads and records project knowledge: target_info, entry_write, finding_write, \
+                 technique_save, and the open internet. No execution."
             }
             Self::Tester => {
                 "acts in the regtest arena: sandbox, oracles, faucet, findings, probes. \
@@ -229,7 +236,7 @@ impl AgentRole {
         match self {
             Self::Super => &SUPER_ADMIN_TOOLS,
             Self::Curator => &CURATOR_TOOLS,
-            Self::Researcher | Self::Tester => &[],
+            Self::Researcher | Self::Tester => &CONTRIBUTOR_TOOLS,
         }
     }
 

@@ -56,6 +56,12 @@ pub enum MissionCompletion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionDispatchAbandonment {
+    pub message_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionDispatch {
     pub parent: MissionRunRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,6 +78,8 @@ pub struct MissionDispatch {
     pub delivery_message_id: Option<String>,
     #[serde(default)]
     pub delivered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_abandoned: Option<MissionDispatchAbandonment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +138,10 @@ pub struct Mission {
     pub control: Option<MissionControl>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_session: Option<String>,
+    /// Relocatable id of the exact pin-specific working directory that owns
+    /// `opencode_session`. It is deliberately not an absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,6 +324,7 @@ impl Store {
                     delivery_attempt: 0,
                     delivery_message_id: None,
                     delivered: false,
+                    delivery_abandoned: None,
                 });
         }
         self.update_mission(project, slug, &mission)?;
@@ -351,6 +364,7 @@ impl Store {
             dispatch.delivery_attempt = attempt;
             dispatch.delivery_message_id = Some(message_id.to_string());
             dispatch.delivered = false;
+            dispatch.delivery_abandoned = None;
             true
         })
     }
@@ -363,10 +377,35 @@ impl Store {
         message_id: &str,
     ) -> Result<bool> {
         self.update_dispatch_if(project, slug, identity, |dispatch| {
-            if dispatch.delivery_message_id.as_deref() != Some(message_id) || dispatch.delivered {
+            if dispatch.delivery_message_id.as_deref() != Some(message_id)
+                || dispatch.delivered
+                || dispatch.delivery_abandoned.is_some()
+            {
                 return false;
             }
             dispatch.delivered = true;
+            true
+        })
+    }
+
+    pub fn abandon_mission_dispatch_delivery(
+        &self,
+        project: &str,
+        slug: &str,
+        identity: &MissionDispatchIdentity,
+        message_id: &str,
+    ) -> Result<bool> {
+        self.update_dispatch_if(project, slug, identity, |dispatch| {
+            if dispatch.delivery_message_id.as_deref() != Some(message_id)
+                || dispatch.delivered
+                || dispatch.delivery_abandoned.is_some()
+            {
+                return false;
+            }
+            dispatch.delivery_abandoned = Some(MissionDispatchAbandonment {
+                message_id: message_id.to_string(),
+                reason: "interrupted".to_string(),
+            });
             true
         })
     }
@@ -379,7 +418,10 @@ impl Store {
         message_id: &str,
     ) -> Result<bool> {
         self.update_dispatch_if(project, slug, identity, |dispatch| {
-            if dispatch.delivery_message_id.as_deref() != Some(message_id) || dispatch.delivered {
+            if dispatch.delivery_message_id.as_deref() != Some(message_id)
+                || dispatch.delivered
+                || dispatch.delivery_abandoned.is_some()
+            {
                 return false;
             }
             dispatch.delivery_message_id = None;

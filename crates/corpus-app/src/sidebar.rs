@@ -422,6 +422,9 @@ impl Sidebar {
                 click,
                 hovered,
             } = row_ui(ui, is_sel, true, ("mission", project, slug));
+            click
+                .clone()
+                .on_hover_text(state.mission_status_text(project, slug));
             let menu_key = format!("mission:{project}:{slug}");
             let show_menu = row_menu_visible(
                 is_sel,
@@ -445,9 +448,7 @@ impl Sidebar {
                                     ui,
                                     state,
                                     toasts,
-                                    project,
-                                    slug,
-                                    &label_text,
+                                    (project, slug, &label_text),
                                     show_menu,
                                 )
                             })
@@ -536,11 +537,10 @@ impl Sidebar {
         ui: &mut Ui,
         state: &mut AppState,
         toasts: &mut Toasts,
-        project: &str,
-        slug: &str,
-        name: &str,
+        mission: (&str, &str, &str),
         show_button: bool,
     ) -> bool {
+        let (project, slug, name) = mission;
         menu_was_open_or_clicked(egui::menu::menu_custom_button(
             ui,
             overflow_button(show_button),
@@ -797,7 +797,7 @@ impl Sidebar {
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
             .show(ui.ctx(), |ui| {
-                ui.label("Display name (the id is generated)");
+                ui.label("Display name");
                 let entry = ui.text_edit_singleline(&mut self.create_name);
                 ui.label("Environment plugin");
                 plugin_picker(
@@ -849,13 +849,8 @@ impl Sidebar {
                         toast(toasts, ToastKind::Warning, "display name is required");
                     } else {
                         match state.create_project(name, self.create_plugin.trim()) {
-                            Ok((id, _)) => {
+                            Ok(_) => {
                                 toast(toasts, ToastKind::Success, "project created");
-                                state.refresh();
-                                state.select_project(&id);
-                                // Land on the new project's page, not
-                                // wherever the operator happened to be.
-                                state.current_screen = Screen::Projects;
                                 self.create_name.clear();
                                 done = true;
                             }
@@ -913,8 +908,9 @@ impl Sidebar {
                         return;
                     }
                     match state.create_agent_with_role(&project, self.agent_role) {
-                        Ok(_) => {
+                        Ok(id) => {
                             toast(toasts, ToastKind::Success, "agent created");
+                            state.select_agent(&project, &id);
                             state.refresh_agents(&project);
                             done = true;
                         }
@@ -1105,9 +1101,19 @@ fn status_dot(ui: &Ui, rect: egui::Rect, state: MissionDisplayState) {
                 .circle_filled(center, 5.0, theme::HEALTHY.gamma_multiply(0.20));
             ui.painter().circle_filled(center, 2.2, theme::HEALTHY);
         }
+        MissionDisplayState::Retrying => {
+            ui.painter().circle_filled(center, 2.2, theme::INTERACTION);
+        }
         MissionDisplayState::Waiting => {
             ui.painter()
                 .circle_filled(center, 2.2, theme::HEALTHY.gamma_multiply(0.55));
+        }
+        MissionDisplayState::Unavailable => {
+            ui.painter().circle_stroke(
+                center,
+                2.5,
+                egui::Stroke::new(1.0_f32, theme::INTERACTION.gamma_multiply(0.65)),
+            );
         }
         MissionDisplayState::Queued
         | MissionDisplayState::Preparing

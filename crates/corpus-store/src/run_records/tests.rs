@@ -34,6 +34,7 @@ fn session_keyed_logs_resolve_through_their_mission() {
         session: None,
         control: None,
         opencode_session: Some("ses_abc".into()),
+        opencode_workspace: None,
         environment_session: None,
         launch_requested: None,
         delete_requested: None,
@@ -56,5 +57,37 @@ fn session_keyed_logs_resolve_through_their_mission() {
     assert_eq!(linked.agent.as_deref(), Some("runner"));
     let legacy = logs.iter().find(|log| log.name == "legacy.json").unwrap();
     assert_eq!(legacy.agent, None);
+    let _ = fs::remove_dir_all(store.root());
+}
+
+#[test]
+fn compound_run_names_resolve_only_the_agent_prefix() {
+    let store = tmp_store("compound-log-agent");
+    store.create_project("p", "P", "cdk-regtest").unwrap();
+    store
+        .create_agent_with_role("p", "cdk-recon", crate::agents::AgentRole::Tester)
+        .unwrap();
+    let uuid = "af2cf850-a33f-46a7-a9ec-0346292a11bb";
+    store
+        .create_agent_with_role("p", uuid, crate::agents::AgentRole::Tester)
+        .unwrap();
+    let runs = store.project_corpus_dir("p").join("runs");
+    write(
+        &runs.join("1786891368-cdk-recon-m01-hypothesis-scan-g1.raw"),
+        "capture",
+    );
+    write(
+        &runs.join(format!("1786891369-{uuid}-m02-bea-g1.raw")),
+        "capture",
+    );
+    write(
+        &runs.join("1786891370-removed-agent-m03-probe-g2.raw"),
+        "capture",
+    );
+
+    let logs = mission_logs(&store, "p").unwrap();
+    assert_eq!(logs[2].agent.as_deref(), Some("cdk-recon"));
+    assert_eq!(logs[1].agent.as_deref(), Some(uuid));
+    assert_eq!(logs[0].agent, None);
     let _ = fs::remove_dir_all(store.root());
 }

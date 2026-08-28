@@ -10,7 +10,7 @@ use super::policy::{
     allocate_control_port, opencode_agent_handle, opencode_control_password, resolve_launch_model,
 };
 use super::process::spawn_piped;
-use super::session::{Backend, RunSession};
+use super::session::{Backend, PipedBackend, RunSession, TuiBackend};
 use super::tmux::{start_session, SessionSetup};
 use super::transcript::{artifact_stem, create_piped};
 use crate::error::{Error, Result};
@@ -326,7 +326,9 @@ impl RunSession {
             .map(|_| opencode_control_password(store, &session))
             .transpose()?;
 
-        let repo = store.provision_run_dir_with_sources(project, plan.source_pins_json())?;
+        let workspace =
+            store.provision_run_workspace_with_sources(project, plan.source_pins_json())?;
+        let repo = workspace.path;
         let prompt = if mission.trim().is_empty() {
             None
         } else {
@@ -366,8 +368,9 @@ impl RunSession {
         }
         Ok(Self {
             transcript: export_json.clone(),
-            backend: Backend::Tui {
+            backend: Backend::Tui(Box::new(TuiBackend {
                 session,
+                workspace_id: workspace.id,
                 control_port,
                 // A resume already knows its session; a fresh spawn
                 // discovers one once opencode has created it.
@@ -383,7 +386,7 @@ impl RunSession {
                 liveness: (std::time::Instant::now(), true),
                 discovery: std::time::Instant::now(),
                 repo,
-            },
+            })),
         })
     }
 
@@ -426,7 +429,7 @@ impl RunSession {
         let (child, rx) = spawn_piped(command, &transcript)?;
         Ok(Self {
             transcript,
-            backend: Backend::Piped { child, rx },
+            backend: Backend::Piped(PipedBackend { child, rx }),
         })
     }
 

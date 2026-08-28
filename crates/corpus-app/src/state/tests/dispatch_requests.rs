@@ -120,6 +120,7 @@ fn consuming_a_launch_request_preserves_its_exact_parent_origin() {
             Some("corpus-worker-1700000125".into()),
             Some("corpus-worker-1700000125".into()),
             Some(43_111),
+            Some(format!("sources-{}", "a".repeat(64))),
         )
         .unwrap();
     assert_eq!(
@@ -182,6 +183,7 @@ fn child_completion_uses_exact_process_activity_not_terminal_quiet() {
         port: 41_001,
     });
     child.opencode_session = Some("ses_child".into());
+    child.opencode_workspace = Some(fake_workspace_id());
     child.dispatch = Some(corpus_core::MissionDispatch {
         parent: corpus_core::MissionRunRef {
             project: "p".into(),
@@ -195,6 +197,7 @@ fn child_completion_uses_exact_process_activity_not_terminal_quiet() {
         delivery_attempt: 0,
         delivery_message_id: None,
         delivered: false,
+        delivery_abandoned: None,
     });
     store.write_mission("p", "child", &child, "work").unwrap();
     let clock = Arc::new(ManualClock::new(1_700_000_100));
@@ -314,6 +317,7 @@ fn disappeared_child_and_launch_failure_each_record_once() {
             delivery_attempt: 0,
             delivery_message_id: None,
             delivered: false,
+            delivery_abandoned: None,
         });
         store.write_mission("p", slug, &child, "work").unwrap();
     }

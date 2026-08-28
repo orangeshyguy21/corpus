@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use corpus_core::{Error, Store};
 
 use super::{
-    launch_stamp_ms, mission_label, orphan_environment_sessions, AppJobOutput, AppState,
-    DeleteMissionResult, LaunchNotice, PromptDeliveryState, SessionRef, SessionService,
-    SessionTurnState,
+    launch_stamp_ms, mission_label, mission_session_ref, mission_workspace_candidates,
+    orphan_environment_sessions, AppJobOutput, AppState, DeleteMissionResult, LaunchNotice,
+    PromptDeliveryState, SessionService, SessionTurnState,
 };
 use crate::jobs::{JobKind, JobScope};
 use crate::observability::{DeliveryEvent, DeliveryTerminal};
@@ -67,7 +67,7 @@ impl AppState {
             .filter_map(|(_, mission)| mission.opencode_session.clone())
             .collect::<BTreeSet<_>>();
         for (slug, mut mission) in missions {
-            if mission.opencode_session.is_some() {
+            if mission.opencode_session.is_some() && mission.opencode_workspace.is_some() {
                 continue;
             }
             let Some(run_id) = mission.session.as_deref() else {
@@ -78,17 +78,26 @@ impl AppState {
             }
             let launched_at_ms = launch_stamp_ms(run_id)
                 .ok_or_else(|| format!("invalid Corpus run identity: {run_id}"))?;
-            let conversation = match self.session_service.find_for_launch(
-                &self.store.project_run_dir(project),
-                launched_at_ms,
-                &claimed,
-            ) {
-                Ok(conversation) => conversation,
+            let workspaces = mission_workspace_candidates(&self.store, project, &mission)?;
+            let identity = match mission.opencode_session.clone() {
+                Some(conversation) => self
+                    .session_service
+                    .find_session_workspace(&workspaces, &conversation)
+                    .map(|workspace| (conversation, workspace)),
+                None => self.session_service.find_for_launch_in_workspaces(
+                    &workspaces,
+                    launched_at_ms,
+                    &claimed,
+                ),
+            };
+            let (conversation, workspace) = match identity {
+                Ok(identity) => identity,
                 Err(error) if error == "no OpenCode session found for this launch" => continue,
                 Err(error) => return Err(error),
             };
             claimed.insert(conversation.clone());
             mission.opencode_session = Some(conversation);
+            mission.opencode_workspace = Some(workspace);
             self.store
                 .update_mission(project, &slug, &mission)
                 .map_err(|error| error.to_string())?;
@@ -121,16 +130,13 @@ impl AppState {
             .as_ref()
             .filter(|control| control.run_id == run_id)
             .ok_or_else(|| format!("{project}/{slug} has no matching control endpoint"))?;
-        let conversation = mission
+        mission
             .opencode_session
             .as_ref()
             .ok_or_else(|| format!("{project}/{slug} has no OpenCode session yet"))?;
         let password = corpus_core::opencode_control_password(&self.store, run_id)
             .map_err(|error| error.to_string())?;
-        let session = SessionRef {
-            id: conversation.clone(),
-            directory: self.store.project_run_dir(project),
-        };
+        let session = mission_session_ref(&self.store, project, &mission)?;
         let launched_at_ms = launch_stamp_ms(run_id).unwrap_or(0);
         self.session_service
             .session_turn_state(control, &password, &session, launched_at_ms)
@@ -653,7 +659,7 @@ pub(super) fn reconcile_dispatch_activity(
             else {
                 continue;
             };
-            let Some(conversation) = mission.opencode_session.as_ref() else {
+            let Some(_conversation) = mission.opencode_session.as_ref() else {
                 continue;
             };
             let password = match corpus_core::opencode_control_password(store, child_run_id) {
@@ -663,9 +669,12 @@ pub(super) fn reconcile_dispatch_activity(
                     continue;
                 }
             };
-            let session = SessionRef {
-                id: conversation.clone(),
-                directory: store.project_run_dir(&project),
+            let session = match mission_session_ref(store, &project, &mission) {
+                Ok(session) => session,
+                Err(error) => {
+                    failures.push(format!("{project}/{slug}: {error}"));
+                    continue;
+                }
             };
             let launched_at_ms = launch_stamp_ms(child_run_id).unwrap_or(0);
             let turn_state =
@@ -733,6 +742,9 @@ pub(super) fn deliver_completed_dispatches(
             let Some(completion) = dispatch.completion else {
                 continue;
             };
+            if dispatch.delivery_abandoned.is_some() {
+                continue;
+            }
             // Records written by the old admission-is-delivery implementation
             // have `delivered=true` but no message id. They were never
             // acknowledged and must be repaired rather than silently skipped.
@@ -771,16 +783,19 @@ pub(super) fn deliver_completed_dispatches(
         {
             continue;
         }
-        let Some(conversation) = parent_mission.opencode_session.as_ref() else {
+        let Some(_conversation) = parent_mission.opencode_session.as_ref() else {
             continue;
         };
         let Ok(password) = corpus_core::opencode_control_password(store, &control.run_id) else {
             continue;
         };
 
-        let session = SessionRef {
-            id: conversation.clone(),
-            directory: store.project_run_dir(&parent.project),
+        let session = match mission_session_ref(store, &parent.project, &parent_mission) {
+            Ok(session) => session,
+            Err(error) => {
+                failures.push(format!("{}/{}: {error}", parent.project, parent.mission));
+                continue;
+            }
         };
 
         let mut admitted: BTreeMap<String, Vec<DispatchDeliveryItem>> = BTreeMap::new();
@@ -821,7 +836,38 @@ pub(super) fn deliver_completed_dispatches(
                         failures.push(format!("{}/{}: {error}", parent.project, parent.mission));
                     }
                 }
-                Ok(PromptDeliveryState::Failed { error, retry_ready }) => {
+                Ok(PromptDeliveryState::Failed {
+                    error,
+                    retry_ready,
+                    interrupted,
+                }) => {
+                    if interrupted {
+                        let mut persisted = true;
+                        for child in &attempted {
+                            persisted = mark_dispatch_abandoned(store, &parent, child, &message_id)
+                                && persisted;
+                        }
+                        let terminal = if persisted {
+                            DeliveryTerminal::Abandoned
+                        } else {
+                            DeliveryTerminal::PersistenceFailed
+                        };
+                        DeliveryEvent::new(
+                            &parent,
+                            &message_id,
+                            attempt,
+                            attempted.len(),
+                            started.elapsed(),
+                        )
+                        .emit(terminal, !persisted, &error);
+                        if !persisted {
+                            failures.push(format!(
+                                "{}/{}: interrupted completion delivery could not be durably abandoned",
+                                parent.project, parent.mission
+                            ));
+                        }
+                        continue;
+                    }
                     // Keep the failed admission durable. Re-posting the same
                     // id cannot restart it, while immediately minting ids in a
                     // loop can burn credits. A deliberate model switch is the
@@ -959,6 +1005,22 @@ fn mark_dispatch_admitted(
             &child.slug,
             &child.identity(parent),
             attempt,
+            message_id,
+        )
+        .unwrap_or(false)
+}
+
+fn mark_dispatch_abandoned(
+    store: &Store,
+    parent: &corpus_core::MissionRunRef,
+    child: &DispatchDeliveryItem,
+    message_id: &str,
+) -> bool {
+    store
+        .abandon_mission_dispatch_delivery(
+            &child.project,
+            &child.slug,
+            &child.identity(parent),
             message_id,
         )
         .unwrap_or(false)

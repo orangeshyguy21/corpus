@@ -11,6 +11,23 @@ fn tmp_store(tag: &str) -> Store {
 }
 
 #[test]
+fn legacy_mission_without_workspace_identity_remains_compatible() {
+    let store = tmp_store("legacy-workspace");
+    store.create_project("p", "P", "fixture").unwrap();
+    fs::create_dir_all(store.project_missions_dir("p")).unwrap();
+    fs::write(
+        store.project_missions_dir("p").join("legacy.md"),
+        "---\nagent: runner\npins: {}\ncreated: 1\nopencode_session: ses_old\n---\n\nbrief\n",
+    )
+    .unwrap();
+
+    let loaded = store.load_mission("p", "legacy").unwrap();
+    assert_eq!(loaded.opencode_session.as_deref(), Some("ses_old"));
+    assert_eq!(loaded.opencode_workspace, None);
+    let _ = fs::remove_dir_all(store.root());
+}
+
+#[test]
 fn an_historical_orphan_mission_can_be_updated_for_teardown_and_deleted() {
     let store = tmp_store("orphan-mission-delete");
     store.create_project("p", "P", "cdk-regtest").unwrap();
@@ -26,6 +43,7 @@ fn an_historical_orphan_mission_can_be_updated_for_teardown_and_deleted() {
         session: Some("corpus-old-run".into()),
         control: None,
         opencode_session: Some("ses_old".into()),
+        opencode_workspace: None,
         environment_session: None,
         launch_requested: None,
         delete_requested: None,
@@ -86,6 +104,7 @@ fn active_environment_identity_blocks_every_delete_cascade() {
         session: None,
         control: None,
         opencode_session: None,
+        opencode_workspace: None,
         environment_session: Some(key.clone()),
         launch_requested: None,
         delete_requested: None,

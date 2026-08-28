@@ -87,6 +87,10 @@ impl TerminalPane {
         target: Option<(String, Vec<String>)>,
         focus_new: bool,
     ) -> Result<(), String> {
+        // Reconcile the current client before comparing targets. An exit that
+        // was already queued must retire the backend that produced it, not a
+        // replacement installed later in this method.
+        self.drain_events();
         match target {
             Some((session, _)) if self.attached.as_deref() == Some(session.as_str()) => Ok(()),
             Some((session, argv)) => self.attach(ctx, &session, &argv, focus_new),
@@ -324,20 +328,26 @@ impl TerminalPane {
         }
     }
 
-    /// Drain PTY events (keeps the backend's subscription channel
-    /// empty); a client exit (session killed, TUI quit) detaches the
-    /// pane — it must never be re-attached implicitly.
+    /// Drain PTY events (keeps the backend's subscription channel empty).
+    /// Backend ids are attachment generations: replacing a client can enqueue
+    /// its Exit after the new client is installed, so only the active
+    /// generation is allowed to detach the pane.
     fn drain_events(&mut self) {
-        let mut exited = false;
-        while let Ok((_, event)) = self.pty_rx.try_recv() {
-            if matches!(event, PtyEvent::Exit) {
-                exited = true;
-            }
-        }
-        if exited {
+        let active_id = self.backend.as_ref().map(|backend| backend.id);
+        if drain_reports_active_exit(&self.pty_rx, active_id) {
             self.detach();
         }
     }
+}
+
+fn drain_reports_active_exit(receiver: &Receiver<(u64, PtyEvent)>, active_id: Option<u64>) -> bool {
+    let mut active_exited = false;
+    while let Ok((id, event)) = receiver.try_recv() {
+        if Some(id) == active_id && matches!(event, PtyEvent::Exit) {
+            active_exited = true;
+        }
+    }
+    active_exited
 }
 
 fn wheel_lines(
@@ -390,7 +400,55 @@ fn pane_font(ctx: &egui::Context) -> TerminalFont {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_sgr_scroll, wheel_lines};
+    use std::sync::mpsc::channel;
+
+    use super::{drain_reports_active_exit, encode_sgr_scroll, wheel_lines, TerminalPane};
+    use egui_term::PtyEvent;
+
+    #[test]
+    fn stale_backend_exit_cannot_detach_the_active_generation() {
+        let (sender, receiver) = channel();
+        sender.send((1, PtyEvent::Exit)).unwrap();
+
+        assert!(!drain_reports_active_exit(&receiver, Some(2)));
+    }
+
+    #[test]
+    fn active_backend_exit_is_detected_among_stale_events() {
+        let (sender, receiver) = channel();
+        sender.send((1, PtyEvent::Exit)).unwrap();
+        sender.send((2, PtyEvent::Wakeup)).unwrap();
+        sender.send((2, PtyEvent::Exit)).unwrap();
+
+        assert!(drain_reports_active_exit(&receiver, Some(2)));
+        assert!(receiver.try_recv().is_err(), "the event queue is drained");
+    }
+
+    #[test]
+    fn exits_are_inert_without_an_active_backend() {
+        let (sender, receiver) = channel();
+        sender.send((1, PtyEvent::Exit)).unwrap();
+
+        assert!(!drain_reports_active_exit(&receiver, None));
+    }
+
+    #[test]
+    fn detach_resets_all_per_attachment_interaction_state() {
+        let mut pane = TerminalPane {
+            attached: Some("mission-a".into()),
+            focused: true,
+            shift_selecting: true,
+            scroll_points: 7.5,
+            ..TerminalPane::default()
+        };
+
+        pane.detach();
+
+        assert!(pane.attached.is_none());
+        assert!(!pane.focused);
+        assert!(!pane.shift_selecting);
+        assert_eq!(pane.scroll_points, 0.0);
+    }
 
     #[test]
     fn line_and_page_wheels_preserve_direction() {

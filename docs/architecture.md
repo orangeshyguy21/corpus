@@ -116,7 +116,7 @@ filesystem directly. `AppState` is the coordination boundary:
 | `state/plugin.rs` | Plugin discovery, operations, and durable environment leases |
 | `state/run.rs` and `state/run/coordinator.rs` | Owned run state, asynchronous launch, maintenance, and teardown |
 | `state/session.rs` | External session discovery, activity, and repaint policy |
-| `state/dispatch.rs` | Durable curator requests, child completion, delivery, acknowledgement, and recovery |
+| `state/dispatch.rs` | Durable curator requests, child completion, delivery, acknowledgement/abandonment, and recovery |
 | `state/background.rs` | Job runtime, stale-scope rejection, invalidation, and result routing |
 | `jobs.rs` | Bounded background execution, cancellation, deadlines, and terminal delivery |
 | `session_service.rs` | OpenCode session HTTP/CLI adapter and exact turn/message identity |
@@ -168,9 +168,12 @@ confirmation, refresh, and destructive authority.
 
 `corpus-admin-mcp` advertises the host-global catalog. `corpus-mcp` uses the
 same definitions through a scoped adapter, injects the launcher-proven project
-and mission origin, and exposes only the role's allowed catalog. Research-only
-sandbox, target, oracle, faucet, and finding behavior remains in
-`corpus-mcp::tools`.
+and mission origin, and exposes only the role's allowed catalog. `entry_write`
+is the common persistence boundary for every role: it accepts any suitable
+corpus-relative category/path, enforces store confinement and immutable
+namespaces, and records mutations in the audit log. Raw model file mutation is
+denied. Research-only sandbox, target, oracle, faucet, and structured finding
+behavior remains in `corpus-mcp::tools`.
 
 ## Durable data and execution namespaces
 
@@ -183,7 +186,7 @@ must never be inferred from one another.
     project.yaml
     agents/<agent>/
     missions/<mission>.md
-    corpus/{hypotheses,techniques,findings,probes,retro,runs}/
+    corpus/{hypotheses,techniques,findings,probes,retro,runs,...custom}/
     usage/<session>.json
   cache/sources/<source>/<sha>/
   plugins/<plugin>/<version>/
@@ -204,7 +207,8 @@ must never be inferred from one another.
 Executable regression artifacts use
 `corpus/probes/<slug>/{probe.md,run.sh}`. The store temporarily recognizes the
 legacy `attacks/` namespace for explicit migration and read/delete
-compatibility only; it is not an active write category.
+compatibility only; it is not an active write category. Other category names
+are agent-chosen organizational structure rather than authorization domains.
 
 The resource root contains shipped assets such as `benchmarks/models.yaml` and
 optional OpenCode skills. It is read-only and replaceable during an upgrade.
@@ -224,8 +228,8 @@ aborts launch.
 1. An operator or curator persists a mission with an agent, optional budget,
    source pins, and immutable request origin.
 2. The app or CLI resolves the explicit model, validates plugin/environment
-   state, provisions the project-only workspace, and constructs one launch
-   plan.
+   state, provisions a pin-addressed project-only workspace, persists its
+   relocatable identity with the mission, and constructs one launch plan.
 3. OpenCode runs in a detached tmux TUI when available or a supervised piped
    process otherwise. Raw output is durable from first output; structured
    export is best-effort during teardown.
@@ -236,6 +240,12 @@ aborts launch.
    message to that curator session.
 6. Acknowledgement advances durable delivery state only when message and run
    identities still match. Failure or restart retains bounded retry state.
+
+Session discovery, completion checks, prompt delivery, transcript export, and
+live usage checkpoints all resolve the same persisted workspace identity.
+Legacy live missions without that field are recovered only by matching an
+unclaimed post-launch conversation inside validated project source views; the
+recovered identity is then persisted before normal accounting resumes.
 
 The real Qwen3.8 MLX integration campaign runs these steps serially because the
 prepared local runner can host only one model inference at a time. Production

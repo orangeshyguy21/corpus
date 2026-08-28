@@ -58,6 +58,53 @@ pub(crate) struct SessionRef {
     pub directory: PathBuf,
 }
 
+pub(crate) fn mission_workspace_dir(
+    store: &corpus_core::Store,
+    project: &str,
+    mission: &corpus_core::Mission,
+) -> Result<PathBuf, String> {
+    let workspace = mission
+        .opencode_workspace
+        .as_deref()
+        .ok_or_else(|| "mission has no OpenCode workspace identity".to_string())?;
+    store
+        .run_workspace_dir(project, workspace)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn mission_workspace_candidates(
+    store: &corpus_core::Store,
+    project: &str,
+    mission: &corpus_core::Mission,
+) -> Result<Vec<corpus_core::RunWorkspace>, String> {
+    if let Some(id) = mission.opencode_workspace.as_deref() {
+        return Ok(vec![corpus_core::RunWorkspace {
+            id: id.to_string(),
+            path: store
+                .run_workspace_dir(project, id)
+                .map_err(|error| error.to_string())?,
+        }]);
+    }
+    store
+        .run_workspaces(project)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn mission_session_ref(
+    store: &corpus_core::Store,
+    project: &str,
+    mission: &corpus_core::Mission,
+) -> Result<SessionRef, String> {
+    let id = mission
+        .opencode_session
+        .clone()
+        .ok_or_else(|| "mission has no OpenCode session identity".to_string())?;
+    Ok(SessionRef {
+        id,
+        directory: mission_workspace_dir(store, project, mission)?,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionTurnState {
     Pending,
@@ -66,11 +113,26 @@ pub(crate) enum SessionTurnState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenCodeSessionStatus {
+    Idle,
+    Busy,
+    Retrying {
+        attempt: u32,
+        message: String,
+        next_at: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PromptDeliveryState {
     Pending,
     Active,
     Acknowledged,
-    Failed { error: String, retry_ready: bool },
+    Failed {
+        error: String,
+        retry_ready: bool,
+        interrupted: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +170,18 @@ pub(crate) trait SessionService: Send + Sync {
         session: &SessionRef,
         launched_at_ms: u64,
     ) -> Result<SessionTurnState, String>;
+
+    /// Process-local execution state for the exact owning OpenCode session.
+    /// Unlike terminal output, this remains `Busy` through quiet inference
+    /// and tool calls. Implementations without an owning endpoint may refuse.
+    fn session_status(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        _session: &SessionRef,
+    ) -> Result<OpenCodeSessionStatus, String> {
+        Err("live status requires the owning OpenCode TUI endpoint".into())
+    }
 
     /// Resume the exact session with one idempotent prompt when its owning
     /// TUI process is idle. Implementations must bind the id to
@@ -155,6 +229,49 @@ pub(crate) trait SessionService: Send + Sync {
         claimed: &BTreeSet<String>,
     ) -> Result<String, String> {
         select_launch_session(self.list(directory)?, directory, launched_at_ms, claimed)
+    }
+
+    fn find_for_launch_in_workspaces(
+        &self,
+        workspaces: &[corpus_core::RunWorkspace],
+        launched_at_ms: u64,
+        claimed: &BTreeSet<String>,
+    ) -> Result<(String, String), String> {
+        if let [workspace] = workspaces {
+            return self
+                .find_for_launch(&workspace.path, launched_at_ms, claimed)
+                .map(|session| (session, workspace.id.clone()));
+        }
+        let mut sessions = Vec::new();
+        for workspace in workspaces {
+            sessions.extend(self.list(&workspace.path)?);
+        }
+        select_launch_workspace_session(sessions, workspaces, launched_at_ms, claimed)
+    }
+
+    fn find_session_workspace(
+        &self,
+        workspaces: &[corpus_core::RunWorkspace],
+        session_id: &str,
+    ) -> Result<String, String> {
+        let mut matched = None;
+        for workspace in workspaces {
+            let owns_session = self
+                .list(&workspace.path)?
+                .into_iter()
+                .any(|session| session.id == session_id && session.directory == workspace.path);
+            if owns_session {
+                if matched.is_some() {
+                    return Err(format!(
+                        "OpenCode session {session_id} matched multiple project workspaces"
+                    ));
+                }
+                matched = Some(workspace.id.clone());
+            }
+        }
+        matched.ok_or_else(|| {
+            format!("OpenCode session {session_id} was not found in project workspaces")
+        })
     }
 }
 
@@ -412,6 +529,7 @@ impl HttpSessionService {
         Ok(match legacy_prompt_terminal(&messages, message_id) {
             Some(Ok(())) => PromptDeliveryState::Acknowledged,
             Some(Err(error)) => PromptDeliveryState::Failed {
+                interrupted: legacy_prompt_was_interrupted(&messages, message_id),
                 error,
                 retry_ready: false,
             },
@@ -421,6 +539,7 @@ impl HttpSessionService {
                     "OpenCode parked without producing a response to the admitted completion prompt"
                         .into(),
                 retry_ready: false,
+                interrupted: false,
             },
             // prompt_async persists the user message before its spawned loop
             // necessarily becomes visible in /session/status. Treat that
@@ -454,12 +573,53 @@ impl HttpSessionService {
         usage_snapshot_from_record(&record, &session.id)
     }
 
-    fn session_is_active(&self, session: &SessionRef) -> Result<bool, String> {
+    fn session_status(&self, session: &SessionRef) -> Result<OpenCodeSessionStatus, String> {
+        self.require_bound_session(session)?;
         let statuses = self.get("/session/status", Some(&session.directory))?;
-        let statuses = statuses
-            .as_object()
-            .ok_or_else(|| "OpenCode session status response was not an object".to_string())?;
-        Ok(statuses.contains_key(&session.id))
+        parse_session_status(&statuses, &session.id)
+    }
+
+    fn session_is_active(&self, session: &SessionRef) -> Result<bool, String> {
+        Ok(matches!(
+            self.session_status(session)?,
+            OpenCodeSessionStatus::Busy | OpenCodeSessionStatus::Retrying { .. }
+        ))
+    }
+}
+
+fn parse_session_status(
+    statuses: &Value,
+    session_id: &str,
+) -> Result<OpenCodeSessionStatus, String> {
+    let statuses = statuses
+        .as_object()
+        .ok_or_else(|| "OpenCode session status response was not an object".to_string())?;
+    let Some(status) = statuses.get(session_id) else {
+        // Older 1.18.x servers omitted parked sessions instead of returning
+        // the newer explicit `{ type: "idle" }` value.
+        return Ok(OpenCodeSessionStatus::Idle);
+    };
+    match status.get("type").and_then(Value::as_str) {
+        Some("idle") => Ok(OpenCodeSessionStatus::Idle),
+        Some("busy") => Ok(OpenCodeSessionStatus::Busy),
+        Some("retry") => Ok(OpenCodeSessionStatus::Retrying {
+            attempt: status
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| "OpenCode retry status omitted a valid attempt".to_string())?,
+            message: status
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            next_at: status
+                .get("next")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "OpenCode retry status omitted next retry time".to_string())?,
+        }),
+        Some(kind) => Err(format!("OpenCode returned unknown session status {kind:?}")),
+        None => Err("OpenCode session status omitted type".into()),
     }
 }
 
@@ -563,6 +723,29 @@ fn legacy_prompt_terminal(messages: &Value, message_id: &str) -> Option<Result<(
     .then_some(Ok(()))
 }
 
+fn legacy_prompt_was_interrupted(messages: &Value, message_id: &str) -> bool {
+    messages
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .filter(|message| {
+                    message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+                        && message.pointer("/info/parentID").and_then(Value::as_str)
+                            == Some(message_id)
+                })
+                .max_by_key(|message| {
+                    message
+                        .pointer("/info/time/created")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                })
+        })
+        .and_then(|message| message.pointer("/info/error/name"))
+        .and_then(Value::as_str)
+        == Some("MessageAbortedError")
+}
+
 fn legacy_prompt_body(message_id: &str, prompt: &str) -> Value {
     serde_json::json!({
         "messageID": message_id,
@@ -636,6 +819,15 @@ impl SessionService for HttpSessionService {
         launched_at_ms: u64,
     ) -> Result<SessionTurnState, String> {
         HttpSessionService::session_turn_state(self, session, launched_at_ms)
+    }
+
+    fn session_status(
+        &self,
+        _control: &corpus_core::MissionControl,
+        _password: &str,
+        session: &SessionRef,
+    ) -> Result<OpenCodeSessionStatus, String> {
+        HttpSessionService::session_status(self, session)
     }
 
     fn prompt_delivery_state(
@@ -766,6 +958,19 @@ impl SessionService for ConfiguredSessionService {
         http.session_turn_state(session, launched_at_ms)
     }
 
+    fn session_status(
+        &self,
+        control: &corpus_core::MissionControl,
+        password: &str,
+        session: &SessionRef,
+    ) -> Result<OpenCodeSessionStatus, String> {
+        let http = HttpSessionService::new(
+            &format!("http://127.0.0.1:{}", control.port),
+            password.to_string(),
+        )?;
+        http.session_status(session)
+    }
+
     fn prompt_delivery_state(
         &self,
         control: &corpus_core::MissionControl,
@@ -886,6 +1091,26 @@ fn select_launch_session(
         .filter(|session| !claimed.contains(&session.id))
         .min_by_key(|session| session.created_ms)
         .map(|session| session.id)
+        .ok_or_else(|| "no OpenCode session found for this launch".into())
+}
+
+fn select_launch_workspace_session(
+    sessions: Vec<SessionSummary>,
+    workspaces: &[corpus_core::RunWorkspace],
+    launched_at_ms: u64,
+    claimed: &BTreeSet<String>,
+) -> Result<(String, String), String> {
+    sessions
+        .into_iter()
+        .filter_map(|session| {
+            let workspace = workspaces
+                .iter()
+                .find(|workspace| workspace.path == session.directory)?;
+            (session.created_ms >= launched_at_ms && !claimed.contains(&session.id))
+                .then(|| (session.created_ms, session.id, workspace.id.clone()))
+        })
+        .min_by_key(|(created, _, _)| *created)
+        .map(|(_, session, workspace)| (session, workspace))
         .ok_or_else(|| "no OpenCode session found for this launch".into())
 }
 
@@ -1090,6 +1315,49 @@ mod tests {
     }
 
     #[test]
+    fn workspace_launch_selection_keeps_concurrent_source_views_isolated() {
+        let first = corpus_core::RunWorkspace {
+            id: format!("sources-{}", "a".repeat(64)),
+            path: "/run/p/views/first".into(),
+        };
+        let second = corpus_core::RunWorkspace {
+            id: format!("sources-{}", "b".repeat(64)),
+            path: "/run/p/views/second".into(),
+        };
+        let sessions = vec![
+            SessionSummary {
+                id: "later-first".into(),
+                directory: first.path.clone(),
+                created_ms: 103,
+                title: None,
+            },
+            SessionSummary {
+                id: "earlier-second".into(),
+                directory: second.path.clone(),
+                created_ms: 102,
+                title: None,
+            },
+            SessionSummary {
+                id: "other-project".into(),
+                directory: "/run/q/views/other".into(),
+                created_ms: 101,
+                title: None,
+            },
+        ];
+
+        assert_eq!(
+            select_launch_workspace_session(
+                sessions,
+                &[first, second.clone()],
+                100,
+                &BTreeSet::new()
+            )
+            .unwrap(),
+            ("earlier-second".into(), second.id)
+        );
+    }
+
+    #[test]
     fn id_read_rejects_a_record_from_another_directory() {
         let expected = SessionRef {
             id: "ses_x".into(),
@@ -1115,6 +1383,54 @@ mod tests {
         assert_eq!(parsed[0].text, ["done"]);
         assert_eq!(parsed[0].output_tokens, Some(3));
         assert_eq!(parsed[0].cost, Some(0.25));
+    }
+
+    #[test]
+    fn session_status_parses_idle_busy_and_retry_without_presence_guessing() {
+        assert_eq!(
+            parse_session_status(&json!({"ses": {"type": "idle"}}), "ses").unwrap(),
+            OpenCodeSessionStatus::Idle
+        );
+        assert_eq!(
+            parse_session_status(&json!({"ses": {"type": "busy"}}), "ses").unwrap(),
+            OpenCodeSessionStatus::Busy
+        );
+        assert_eq!(
+            parse_session_status(
+                &json!({"ses": {
+                    "type": "retry",
+                    "attempt": 2,
+                    "message": "rate limited",
+                    "next": 1234
+                }}),
+                "ses"
+            )
+            .unwrap(),
+            OpenCodeSessionStatus::Retrying {
+                attempt: 2,
+                message: "rate limited".into(),
+                next_at: 1234,
+            }
+        );
+        assert_eq!(
+            parse_session_status(&json!({}), "parked").unwrap(),
+            OpenCodeSessionStatus::Idle,
+            "older compatible servers omit idle sessions"
+        );
+    }
+
+    #[test]
+    fn malformed_session_status_is_not_misreported_as_idle() {
+        assert!(
+            parse_session_status(&json!({"ses": {"type": "surprised"}}), "ses")
+                .unwrap_err()
+                .contains("unknown")
+        );
+        assert!(
+            parse_session_status(&json!({"ses": {"type": "retry"}}), "ses")
+                .unwrap_err()
+                .contains("attempt")
+        );
     }
 
     #[test]
@@ -1254,5 +1570,17 @@ mod tests {
             legacy_prompt_terminal(&failed, "ours"),
             Some(Err("Model unavailable".into()))
         );
+        assert!(!legacy_prompt_was_interrupted(&failed, "ours"));
+
+        let interrupted = json!([{
+            "info":{"id":"ours", "role":"user"}
+        }, {
+            "info":{"id":"step", "role":"assistant", "parentID":"ours", "error":{"name":"MessageAbortedError", "data":{"message":"Aborted"}}, "time":{"created":1, "completed":2}}
+        }]);
+        assert_eq!(
+            legacy_prompt_terminal(&interrupted, "ours"),
+            Some(Err("Aborted".into()))
+        );
+        assert!(legacy_prompt_was_interrupted(&interrupted, "ours"));
     }
 }

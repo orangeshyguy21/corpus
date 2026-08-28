@@ -53,6 +53,7 @@ pub(super) trait ActiveRun: Send {
     fn opencode_session_id(&mut self, claimed: &BTreeSet<String>) -> Option<String>;
     fn launch_identity(&self) -> Option<String>;
     fn control_port(&self) -> Option<u16>;
+    fn workspace_id(&self) -> Option<String>;
 }
 
 impl ActiveRun for RunSession {
@@ -82,6 +83,10 @@ impl ActiveRun for RunSession {
 
     fn control_port(&self) -> Option<u16> {
         RunSession::control_port(self)
+    }
+
+    fn workspace_id(&self) -> Option<String> {
+        RunSession::workspace_id(self)
     }
 }
 
@@ -119,7 +124,12 @@ pub(super) trait RunBackend: Send + Sync {
         cancellation: &RunCancellation,
     ) -> Result<BTreeMap<String, String>, Error>;
 
-    fn export_session(&self, project: &str, opencode_session_id: &str) -> Result<PathBuf, Error>;
+    fn export_session(
+        &self,
+        project: &str,
+        workspace: &str,
+        opencode_session_id: &str,
+    ) -> Result<PathBuf, Error>;
     fn kill_tmux_session(&self, session: &str) -> Result<(), Error>;
 }
 
@@ -188,8 +198,13 @@ impl RunBackend for CoreRunBackend {
         corpus_core::prepare_source_pins(store, project, pins)
     }
 
-    fn export_session(&self, project: &str, opencode_session_id: &str) -> Result<PathBuf, Error> {
-        corpus_core::export_session(project, opencode_session_id)
+    fn export_session(
+        &self,
+        project: &str,
+        workspace: &str,
+        opencode_session_id: &str,
+    ) -> Result<PathBuf, Error> {
+        corpus_core::export_session(project, workspace, opencode_session_id)
     }
 
     fn kill_tmux_session(&self, session: &str) -> Result<(), Error> {

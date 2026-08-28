@@ -38,11 +38,10 @@ record. A path is always relative to the corpus (`techniques/…`,
 the cost report counts, and what the operator reads to audit a mission. They
 cannot be deleted, and nothing you do should depend on changing one.
 
-`retro/` is yours, and only yours — the sandboxed agents can neither read nor
-write it. It is durable memory that outlives any one mission: how past teams
-fared, what worked against this target and what did not, judgements worth
-carrying into the next campaign. What you keep there and whether you consult
-it is your call.
+`retro/` is durable memory that outlives any one mission: how past teams
+fared, what worked against this target and what did not, and judgements worth
+carrying into the next campaign. Agents may place useful data there or create
+other categories when those describe their work better.
 
 ## Missions
 

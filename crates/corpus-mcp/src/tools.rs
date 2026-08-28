@@ -81,6 +81,20 @@ fn bounded_oracle_log(mut log: String) -> String {
     log
 }
 
+/// Truncate a UTF-8 string to at most `limit` bytes without splitting a code
+/// point. Protocol and audit caps are byte limits, but `String::truncate`
+/// panics when the requested byte is not a character boundary.
+fn truncate_utf8_bytes(text: &mut String, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
 fn validate_oracle_result(name: &str, mut result: OracleResult) -> Result<OracleResult> {
     if !matches!(
         result.verdict.as_str(),
@@ -596,14 +610,14 @@ pub fn catalog() -> Value {
         },
         {
             "name": "finding_write",
-            "description": "Record a security finding in the project corpus. GATED: the oracle suite runs server-side first; findings without an oracle violation are marked unverified. Findings default to sensitivity: embargoed. Only call with a demonstrated PoC.",
+            "description": "Structured convenience for recording a security finding in the project corpus. The oracle suite runs server-side first; findings without an oracle violation are marked unverified. Findings default to sensitivity: embargoed. Use entry_write instead when another path or document shape better represents the work.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "title": {"type": "string"},
                     "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
                     "detail": {"type": "string"},
-                    "path": {"type": "string", "description": "Optional path beneath findings/. A .md path names the file; a path with no extension or a trailing slash names a containing folder. Existing files are never overwritten."},
+                    "path": {"type": "string", "description": "Optional path beneath findings/. Either x.md or findings/x.md is accepted. A .md path names the file; a path with no extension or a trailing slash names a containing folder. Existing files are never overwritten."},
                     "metadata": {"type": "object", "description": "Optional project-defined frontmatter. Corpus-owned keys such as title, severity, timestamp, sensitivity, verification, and provenance are refused."}
                 },
                 "required": ["title", "severity", "detail"]
@@ -652,9 +666,9 @@ fn grants_line(role: AgentRole) -> String {
     match (corpus.is_empty(), admin.is_empty()) {
         (true, true) => "nothing".to_string(),
         (false, true) => format!("sandbox tools: {}", corpus.join(", ")),
-        (true, false) => format!("project-management tools: {}", admin.join(", ")),
+        (true, false) => format!("scoped project tools: {}", admin.join(", ")),
         (false, false) => format!(
-            "sandbox tools: {}; project-management tools: {}",
+            "sandbox tools: {}; scoped project tools: {}",
             corpus.join(", "),
             admin.join(", ")
         ),
@@ -711,7 +725,7 @@ fn summarize_args(args: &Value) -> String {
     }
     let mut text = summary.to_string();
     if text.len() > 400 {
-        text.truncate(400);
+        truncate_utf8_bytes(&mut text, 400);
         text.push('…');
     }
     text
@@ -802,7 +816,7 @@ fn enforce_curator_agent_ceiling(ctx: &Ctx, name: &str, args: &Value, project: &
     Ok(())
 }
 
-/// Project-management tools served to an IN-PROJECT agent.
+/// Project-scoped persistence and management tools served to an in-project agent.
 ///
 /// Three things separate this from the `corpus-admin-mcp` operator
 /// profile, which is untouched:
@@ -828,7 +842,7 @@ fn scoped_management_dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result
         return Err(Error::refused(
             Gate::Role,
             format!(
-                "refusing {name}: {name} manages a project, and agent role {:?} does not. \
+                "refusing {name}: {name} is a scoped project tool, and agent role {:?} does not grant it. \
                  This role grants {}.",
                 role.as_str(),
                 grants_line(role)
@@ -941,7 +955,7 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
 /// The dispatch proper. Split from [`dispatch`] only so that every exit
 /// path from it is observed.
 fn dispatch_inner(ctx: &mut Ctx, name: &str, args: &Value) -> Result<String> {
-    // Project-management tools route FIRST — ahead of the corpus-tool gate
+    // Project-scoped tools route FIRST — ahead of the corpus-tool gate
     // and ahead of the probe. A curator's work is entirely store-side, so a
     // dead mint or an absent plugin must not stop it from fixing the very
     // project whose configuration is broken.
@@ -1226,7 +1240,7 @@ fn sandbox_exec(ctx: &mut Ctx, command: &str) -> Result<String> {
     let result = run_sandbox_command(ctx, command)?;
     let mut combined = result.output;
     if combined.len() > OUTPUT_CAP_BYTES {
-        combined.truncate(OUTPUT_CAP_BYTES);
+        truncate_utf8_bytes(&mut combined, OUTPUT_CAP_BYTES);
         combined.push_str("\n[truncated]");
     }
     combined.push_str(&format!("\n[exit {}]", result.exit_code));
@@ -1805,6 +1819,27 @@ mod tests {
             shell_single_quote("can't $(escape)"),
             "'can'\"'\"'t $(escape)'"
         );
+    }
+
+    #[test]
+    fn byte_caps_preserve_valid_utf8_at_multibyte_boundaries() {
+        let mut sandbox_output = "x".repeat(OUTPUT_CAP_BYTES - 1);
+        sandbox_output.push('é');
+        assert_eq!(sandbox_output.len(), OUTPUT_CAP_BYTES + 1);
+        truncate_utf8_bytes(&mut sandbox_output, OUTPUT_CAP_BYTES);
+        assert_eq!(sandbox_output.len(), OUTPUT_CAP_BYTES - 1);
+        assert!(sandbox_output.is_char_boundary(sandbox_output.len()));
+
+        let args = json!({
+            "project": "alpha",
+            // JSON's `{"content":"` prefix is 12 bytes, placing this
+            // two-byte character across byte 400.
+            "content": format!("{}é", "x".repeat(387)),
+        });
+        let summary = summarize_args(&args);
+        assert!(summary.ends_with('…'));
+        assert!(summary.is_char_boundary(summary.len()));
+        assert!(summary.len() <= 403, "ellipsis may extend the 400-byte cap");
     }
 
     #[test]

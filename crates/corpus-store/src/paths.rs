@@ -40,13 +40,47 @@ pub const SOURCES_DIR_ENV: &str = "CORPUS_SOURCES_DIR";
 /// Override for the optional benchmark/model metadata registry.
 pub const MODELS_ENV: &str = "CORPUS_MODELS";
 
-/// The data root: `CORPUS_HOME`, else `~/.corpus`.
+/// The data root for the effective store world.
+///
+/// `CORPUS_STORE` wins over `CORPUS_HOME` and relocates the complete mutable
+/// world beside the explicit store, not just project records. This keeps
+/// plugin runtime state and source custody aligned with run/chat/audit paths.
 pub fn data_root() -> PathBuf {
-    if let Some(dir) = std::env::var(HOME_ENV).ok().filter(|s| !s.is_empty()) {
+    let store = std::env::var(STORE_ENV).ok().filter(|s| !s.is_empty());
+    let corpus_home = std::env::var(HOME_ENV).ok().filter(|s| !s.is_empty());
+    let user_home = std::env::var("HOME").ok().filter(|s| !s.is_empty());
+    resolve_data_root(
+        store.as_deref(),
+        corpus_home.as_deref(),
+        user_home.as_deref(),
+    )
+}
+
+fn resolve_data_root(
+    store: Option<&str>,
+    corpus_home: Option<&str>,
+    user_home: Option<&str>,
+) -> PathBuf {
+    if let Some(store) = store {
+        let store = PathBuf::from(store);
+        return mutable_root_for_store(&store);
+    }
+    if let Some(dir) = corpus_home {
         return PathBuf::from(dir);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home = user_home.unwrap_or("/tmp");
     PathBuf::from(home).join(".corpus")
+}
+
+/// Mutable-world root paired with one explicit store path. Kept here so root
+/// ownership remains in the canonical resolver rather than being re-inferred
+/// independently by runtime/session call sites.
+pub(crate) fn mutable_root_for_store(store: &Path) -> PathBuf {
+    store
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| store.to_path_buf())
 }
 
 /// The store root: `CORPUS_STORE`, else `<data root>/store`.
@@ -296,7 +330,11 @@ mod tests {
         // under their own lock, so a mutation here reaches across threads
         // and fails an unrelated test.
         match std::env::var(STORE_ENV).ok().filter(|s| !s.is_empty()) {
-            Some(explicit) => assert_eq!(store_root(), PathBuf::from(explicit)),
+            Some(explicit) => {
+                let explicit = PathBuf::from(explicit);
+                assert_eq!(store_root(), explicit);
+                assert_eq!(data_root(), mutable_root_for_store(&explicit));
+            }
             None => {
                 assert_eq!(store_root(), data_root().join("store"));
                 if std::env::var(HOME_ENV).is_err() {
@@ -304,5 +342,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_explicit_store_relocates_every_mutable_root_together() {
+        let store = PathBuf::from("/tmp/corpus-isolated/store");
+        let data = mutable_root_for_store(&store);
+        assert_eq!(data, PathBuf::from("/tmp/corpus-isolated"));
+        assert_eq!(
+            data.join("cache/sources"),
+            store.parent().unwrap().join("cache/sources")
+        );
+        assert_eq!(
+            data.join("var/plugins"),
+            store.parent().unwrap().join("var/plugins")
+        );
+    }
+
+    #[test]
+    fn mutable_root_precedence_is_total_for_supported_overrides() {
+        assert_eq!(
+            resolve_data_root(None, None, Some("/home/operator")),
+            PathBuf::from("/home/operator/.corpus")
+        );
+        assert_eq!(
+            resolve_data_root(None, Some("/data/corpus"), Some("/home/operator")),
+            PathBuf::from("/data/corpus")
+        );
+        assert_eq!(
+            resolve_data_root(Some("/isolated/world/store"), None, Some("/home/operator")),
+            PathBuf::from("/isolated/world")
+        );
+        assert_eq!(
+            resolve_data_root(
+                Some("/isolated/world/store"),
+                Some("/ignored/corpus-home"),
+                Some("/home/operator")
+            ),
+            PathBuf::from("/isolated/world"),
+            "CORPUS_STORE moves one complete mutable world"
+        );
     }
 }

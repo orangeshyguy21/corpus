@@ -219,6 +219,16 @@ impl AppState {
         self.refresh_env(slug);
     }
 
+    /// Select an agent and navigate to its editor. Like mission selection,
+    /// this may switch project scope, but it performs no mutation itself.
+    pub fn select_agent(&mut self, project: &str, slug: &str) {
+        if self.effective_project().as_deref() != Some(project) {
+            self.select_project(project);
+        }
+        self.selected_agent = Some(slug.to_string());
+        self.current_screen = Screen::Agents;
+    }
+
     /// Mission selection is navigation only. It may switch the cached project
     /// scope, but it never prepares, resumes, or spawns a run. Launch and
     /// Resume call their explicit state actions after selecting.
@@ -389,7 +399,7 @@ impl AppState {
     /// gives the id — an auto-generated UUIDv4, which is a valid
     /// kebab-case slug, so it slots straight into the store layout
     /// (`store/projects/<id>/`), CLI scopes, and `CORPUS_PROJECT`.
-    pub fn create_project(&self, name: &str, plugin: &str) -> Result<(String, Project), Error> {
+    pub fn create_project(&mut self, name: &str, plugin: &str) -> Result<(String, Project), Error> {
         // Human names mint human slugs ("Dep Scans" → "dep-scans"); only a
         // name with no alphanumerics falls back to the opaque id. (UUID
         // slugs made every chat/tool reference unreadable — 2026-08-14.)
@@ -401,9 +411,22 @@ impl AppState {
                 s
             }
         };
-        self.store
-            .create_project(&slug, name, plugin)
-            .map(|p| (slug, p))
+        let project = self.store.create_project(&slug, name, plugin)?;
+
+        // Make the just-created project selectable before the asynchronous
+        // project-index refresh completes. Otherwise `select_project` rejects
+        // it as absent from the current cache and leaves the previous project
+        // selected until a later interaction.
+        self.projects.retain(|(candidate, _)| candidate != &slug);
+        self.projects.push((slug.clone(), project.clone()));
+        self.projects
+            .sort_by_key(|entry| std::cmp::Reverse(entry.1.created));
+        self.trees.entry(slug.clone()).or_default();
+        self.select_project(&slug);
+        self.current_screen = Screen::Projects;
+        self.refresh();
+
+        Ok((slug, project))
     }
 
     /// Clone a project; the copied name falls back to the source's when
@@ -683,7 +706,7 @@ impl AppState {
     /// document was only ever contributing a starting prompt, which now
     /// ships compiled into corpus-core.
     pub fn create_agent_with_role(
-        &self,
+        &mut self,
         project: &str,
         role: corpus_core::AgentRole,
     ) -> Result<String, Error> {
@@ -702,6 +725,21 @@ impl AppState {
         let _ = self
             .store
             .set_agent_name(project, &id, corpus_core::DEFAULT_AGENT_NAME);
+
+        // Make the newly created record renderable immediately. The normal
+        // background refresh still reconciles the full list, but navigation
+        // must not briefly treat this selection as stale and fall back to a
+        // different agent while that refresh is in flight.
+        if let Ok(agent) = self.store.load_agent(project, &id) {
+            if let Some(tree) = self.trees.get_mut(project) {
+                tree.agents.push((id.clone(), agent.clone()));
+                tree.agents.sort_by(|(left, _), (right, _)| left.cmp(right));
+            }
+            if self.agents_project.as_deref() == Some(project) {
+                self.agents.push((id.clone(), agent));
+                self.agents.sort_by(|(left, _), (right, _)| left.cmp(right));
+            }
+        }
         Ok(id)
     }
 
@@ -733,6 +771,7 @@ impl AppState {
             session: None,
             control: None,
             opencode_session: None,
+            opencode_workspace: None,
             environment_session: None,
             launch_requested: None,
             delete_requested: None,

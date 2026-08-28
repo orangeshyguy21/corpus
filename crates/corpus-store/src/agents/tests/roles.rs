@@ -49,7 +49,9 @@ fn every_corpus_tool_is_classified_by_every_role() {
 /// legacy agent changes nothing about what it can do.
 #[test]
 fn infer_role_matches_the_seed_permissions() {
-    // The researcher seed: only target_info + technique_save allowed.
+    // Historical researcher seed: only target_info + technique_save allowed.
+    // Inference remains backward-compatible even though new researchers also
+    // receive the scoped persistence tools.
     let researcher = serde_json::json!({
         "permission": {
             "corpus_sandbox_exec": "deny", "corpus_faucet": "deny",

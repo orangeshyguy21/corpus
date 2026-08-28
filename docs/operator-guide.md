@@ -73,7 +73,10 @@ corpus mission new example first-pass --agent tester \
 Roles are capability ceilings: `researcher` researches without execution;
 `tester` uses the plugin sandbox without open research authority; `curator`
 manages only its proven project; and `super` combines project-scoped roles but
-is not a host-global operator.
+is not a host-global operator. Every role can persist durable work through
+`entry_write` at any relative path beneath its own corpus. Agents may organize
+that data into categories that fit the work; `runs/` remains immutable, and
+cross-project, absolute, traversal, and symlink escapes are refused.
 
 Source revisions are resolved when a mission is created. A repeated
 `--pin source=revision` overrides the project pin, which overrides the plugin

@@ -97,6 +97,7 @@ fn new(store: &Store, request: NewMission) -> Result<(), String> {
         session: None,
         control: None,
         opencode_session: None,
+        opencode_workspace: None,
         environment_session: None,
         launch_requested: None,
         delete_requested: None,

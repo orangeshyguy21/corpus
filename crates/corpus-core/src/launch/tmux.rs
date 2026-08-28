@@ -128,20 +128,35 @@ pub fn kill_tmux_session(session: &str) {
 pub fn kill_tmux_session_checked(session: &str) -> Result<()> {
     let tmux = Tmux::resolve()
         .ok_or_else(|| Error::Store("cannot stop tmux session: tmux is unavailable".into()))?;
-    let status = tmux
+    kill_tmux_session_with(&tmux, session)
+}
+
+fn kill_tmux_session_with(tmux: &Tmux, session: &str) -> Result<()> {
+    // Capture stderr because "can't find session" is an expected race during
+    // teardown. It should not leak into the app terminal before we verify that
+    // the session is already gone.
+    let output = tmux
         .command()
         .args(["kill-session", "-t", session])
-        .status()?;
-    if status.success() {
+        .output()?;
+    if output.status.success() {
         return Ok(());
     }
     // A session may exit between listing and Stop. A failed kill is successful
     // cleanup only when the same resolved tmux proves the session is gone.
-    if !has_session(&tmux, session, false)? {
+    if !has_session(tmux, session, true)? {
         return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    let detail = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    };
     Err(Error::Store(format!(
-        "tmux kill-session failed for {session} with {status}; session is still alive"
+        "tmux kill-session failed for {session} with {}{detail}; session is still alive",
+        output.status
     )))
 }
 
@@ -170,6 +185,19 @@ fn has_session(tmux: &Tmux, session: &str, quiet: bool) -> std::io::Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn fake_tmux(script: &str) -> (tempfile::TempDir, Tmux) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("tmux");
+        std::fs::write(&executable, script).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        (dir, Tmux { executable })
+    }
 
     #[test]
     fn detached_session_command_keeps_identity_cwd_and_script_separate() {
@@ -211,5 +239,37 @@ mod tests {
             attach_argv("/opt/tmux test/bin/tmux", "corpus-agent-42"),
             ["/opt/tmux test/bin/tmux", "attach", "-t", "corpus-agent-42"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_session_is_silent_successful_cleanup() {
+        let (_dir, tmux) = fake_tmux(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"kill-session\" ]; then\n\
+               echo \"can't find session: $3\" >&2\n\
+             fi\n\
+             exit 1\n",
+        );
+
+        kill_tmux_session_with(&tmux, "already-gone").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_kill_preserves_stderr_when_session_is_still_alive() {
+        let (_dir, tmux) = fake_tmux(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"kill-session\" ]; then\n\
+               echo \"permission denied\" >&2\n\
+               exit 1\n\
+             fi\n\
+             exit 0\n",
+        );
+
+        let error = kill_tmux_session_with(&tmux, "still-live").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("session is still alive"));
+        assert!(message.contains("permission denied"));
     }
 }

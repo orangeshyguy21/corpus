@@ -920,7 +920,7 @@ impl Plugin {
         {
             let pgid = self.child.id().to_string();
             let _ = Command::new("kill")
-                .args(["-TERM", &format!("-{pgid}")])
+                .args(["-TERM", "--", &format!("-{pgid}")])
                 .status();
         }
         let _ = self.child.kill();

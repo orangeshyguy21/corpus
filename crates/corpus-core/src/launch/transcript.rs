@@ -264,17 +264,15 @@ pub(super) fn tail_line(path: &Path, file_pos: &mut u64, pending: &mut String) -
 pub fn session_conversation(
     store: &Store,
     project: &str,
+    workspace: &str,
     session: &str,
     claimed: &BTreeSet<String>,
 ) -> Option<String> {
     let timestamp = session_stamp(session)?;
-    find_opencode_session(
-        &store.project_run_dir(project),
-        timestamp.saturating_mul(1000),
-        claimed,
-    )
-    .ok()
-    .flatten()
+    let directory = store.run_workspace_dir(project, workspace).ok()?;
+    find_opencode_session(&directory, timestamp.saturating_mul(1000), claimed)
+        .ok()
+        .flatten()
 }
 
 fn session_stamp(session: &str) -> Option<u64> {
@@ -294,9 +292,13 @@ pub fn run_idle_secs(log: &Path) -> Option<u64> {
     corpus_observe::run_idle_secs(log)
 }
 
-pub fn export_session(project: &str, opencode_session_id: &str) -> Result<PathBuf> {
+pub fn export_session(
+    project: &str,
+    workspace: &str,
+    opencode_session_id: &str,
+) -> Result<PathBuf> {
     let store = Store::from_env();
-    let repo = store.provision_run_dir(project)?;
+    let repo = store.run_workspace_dir(project, workspace)?;
     let runs = store.project_corpus_dir(project).join("runs");
     export_record(&repo, &runs, opencode_session_id)
 }
@@ -395,11 +397,17 @@ mod tests {
         store
             .create_project("default", "Default", "cdk-regtest")
             .unwrap();
+        let workspace = store
+            .provision_run_workspace_with_sources("default", None)
+            .unwrap();
         let runs = store.project_corpus_dir("default").join("runs");
         fs::create_dir_all(&runs).unwrap();
         let existing = runs.join("ses_large.json");
         fs::write(&existing, r#"{"info":{"id":"ses_large"},"messages":[]}"#).unwrap();
-        assert_eq!(export_session("default", "ses_large").unwrap(), existing);
+        assert_eq!(
+            export_session("default", &workspace.id, "ses_large").unwrap(),
+            existing
+        );
         assert!(valid_existing_export(&existing));
         fs::remove_dir_all(bin).unwrap();
         fs::remove_dir_all(store_dir).unwrap();

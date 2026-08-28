@@ -11,17 +11,19 @@ use corpus_core::AgentRole;
 pub enum Capability {
     OpenInternet,
     TargetResearch,
+    CorpusPersistence,
     SandboxExecution,
-    OraclesAndFindings,
+    OracleExecution,
     ProjectAdministration,
 }
 
 impl Capability {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::OpenInternet,
         Self::TargetResearch,
+        Self::CorpusPersistence,
         Self::SandboxExecution,
-        Self::OraclesAndFindings,
+        Self::OracleExecution,
         Self::ProjectAdministration,
     ];
 
@@ -29,8 +31,9 @@ impl Capability {
         match self {
             Self::OpenInternet => "Open internet",
             Self::TargetResearch => "Target research",
+            Self::CorpusPersistence => "Corpus persistence",
             Self::SandboxExecution => "Sandbox execution",
-            Self::OraclesAndFindings => "Oracles & findings",
+            Self::OracleExecution => "Oracle execution",
             Self::ProjectAdministration => "Project administration",
         }
     }
@@ -39,8 +42,9 @@ impl Capability {
         match self {
             Self::OpenInternet => "External web research",
             Self::TargetResearch => "Read target context and save techniques",
+            Self::CorpusPersistence => "Write audited data anywhere in this project's corpus",
             Self::SandboxExecution => "Execute inside the isolated target",
-            Self::OraclesAndFindings => "Test invariants and publish gated evidence",
+            Self::OracleExecution => "Test target invariants through the environment",
             Self::ProjectAdministration => "Manage this project's team, missions and corpus",
         }
     }
@@ -68,11 +72,14 @@ impl RolePolicy {
             Capability::TargetResearch => {
                 self.role.allows("target_info") || self.role.allows("technique_save")
             }
+            Capability::CorpusPersistence => self.role.admin_tools().contains(&"entry_write"),
             Capability::SandboxExecution => self.role.allows("sandbox_exec"),
-            Capability::OraclesAndFindings => {
-                self.role.allows("oracle_run") || self.role.allows("finding_write")
-            }
-            Capability::ProjectAdministration => !self.role.admin_tools().is_empty(),
+            Capability::OracleExecution => self.role.allows("oracle_run"),
+            Capability::ProjectAdministration => self
+                .role
+                .admin_tools()
+                .iter()
+                .any(|tool| *tool != "entry_write"),
         }
     }
 }
@@ -107,21 +114,22 @@ mod tests {
     fn capability_matrix_is_derived_from_role_authority() {
         use AgentRole::{Curator, Researcher, Super, Tester};
         use Capability::{
-            OpenInternet, OraclesAndFindings, ProjectAdministration, SandboxExecution,
-            TargetResearch,
+            CorpusPersistence, OpenInternet, OracleExecution, ProjectAdministration,
+            SandboxExecution, TargetResearch,
         };
 
         let expected = [
-            (Researcher, [true, true, false, false, false]),
-            (Tester, [false, true, true, true, false]),
-            (Super, [true, true, true, true, true]),
-            (Curator, [false, false, false, false, true]),
+            (Researcher, [true, true, true, false, false, false]),
+            (Tester, [false, true, true, true, true, false]),
+            (Super, [true, true, true, true, true, true]),
+            (Curator, [false, false, true, false, false, true]),
         ];
         let capabilities = [
             OpenInternet,
             TargetResearch,
+            CorpusPersistence,
             SandboxExecution,
-            OraclesAndFindings,
+            OracleExecution,
             ProjectAdministration,
         ];
 
@@ -140,7 +148,7 @@ mod tests {
 
     #[test]
     fn capability_catalog_is_total_and_stable() {
-        assert_eq!(Capability::ALL.len(), 5);
+        assert_eq!(Capability::ALL.len(), 6);
         for role in AgentRole::ALL {
             let policy = RolePolicy::new(role);
             assert_eq!(
@@ -149,10 +157,10 @@ mod tests {
                     .filter(|capability| policy.allows(*capability))
                     .count(),
                 match role {
-                    AgentRole::Researcher => 2,
-                    AgentRole::Tester => 3,
-                    AgentRole::Super => 5,
-                    AgentRole::Curator => 1,
+                    AgentRole::Researcher => 3,
+                    AgentRole::Tester => 4,
+                    AgentRole::Super => 6,
+                    AgentRole::Curator => 2,
                 }
             );
         }

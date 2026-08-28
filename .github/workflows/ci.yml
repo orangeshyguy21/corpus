@@ -80,3 +80,11 @@ jobs:
           cargo test --locked -p corpus-core --lib
           launch::tests::tui_raw_capture_is_durable_in_project_corpus --
           --ignored --exact --test-threads=1
+      - name: Run process-group platform tests serially
+        run: |
+          cargo test --locked -p corpus-core --lib \
+            launch::process::tests::timeout_kills_and_reaps_the_owned_process_group -- \
+            --ignored --exact --test-threads=1
+          cargo test --locked -p corpus-core --lib \
+            launch::tests::construction::spawn_stop_and_piped_headless -- \
+            --ignored --exact --test-threads=1

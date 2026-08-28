@@ -1,90 +1,200 @@
-# corpus
+<p align="center">
+  <img src="crates/corpus-app/assets/logo.png" alt="Corpus" width="536">
+</p>
 
-A local-first platform for autonomous vulnerability research: a team of AI
-researchers that investigate codebases at pinned commits, hunt for novel
-vulnerabilities in a sandboxed environment, and compile everything they
-learn into a private, verifiable knowledge base — the corpus.
+<p align="center">
+  <strong>Local-first, verification-driven vulnerability research.</strong>
+</p>
 
-The core is the research system. Everything project-specific (how to boot a
-regtest network, what invariants must hold, which tools an attacker gets)
-is a plugin, so the community can point corpus at any open-source project
-with a reproducible test environment.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#command-line-quick-start">CLI</a> ·
+  <a href="#contributing">Contributing</a> ·
+  <a href="docs/operator-guide.md">Operator guide</a>
+</p>
 
-## Why this exists
+> [!WARNING]
+> Corpus is pre-alpha software. Use it only against systems you own or have
+> explicit written permission to test. The intended target is a local,
+> disposable environment—not production.
 
-Unit tests are common. Integration tests are less common. Adversarial
-testing with executable verification barely exists — and the AI tools
-emerging for it (XBOW, Strix, Buttercup, CAI) are cloud-first,
-web-app-focused, or require paid frontier APIs. Two problems with that:
+## What is Corpus?
 
-1. **Privacy.** A verified 0-day in your own infrastructure is not
-   something you want to stream through a third-party API or a hosted
-   dashboard. Even Google's oss-fuzz-gen keeps its reports private
-   precisely because they contain undisclosed vulnerabilities.
-2. **Ground truth.** Most agentic security tools produce *claims*. For
-   bitcoin/ecash infrastructure we can do better: regtest environments
-   (bitcoind + Lightning nodes + the real service under test) let every
-   claimed exploit be *executed and checked against invariants* — value
-   conservation, auth enforcement, state-machine legality. No oracle trip,
-   no finding.
+Corpus is a local-first platform for autonomous vulnerability research. It
+runs AI research agents against source code pinned to exact revisions, executes
+proofs of concept inside plugin-provided sandboxes, checks results with
+programmatic oracles, and stores attributable evidence in a private local
+corpus.
 
-corpus runs entirely on your own hardware: local open-weight models
-(via ollama or any OpenAI-compatible server), local sandboxed execution,
-a local encrypted git repo as the knowledge store. Frontier APIs are an
-opt-in escape hatch, never a requirement.
+## Quick start
 
-## Design pillars
+### Prerequisites
 
-- **Verification-first.** A finding exists only when backed by an
-  executable PoC that trips a programmatic oracle. This is what makes
-  local, weaker-than-frontier models viable: generation becomes search.
-- **Pinned heads.** Every run records the exact commit under test.
-  Findings are reproducible; replaying a PoC against a later commit is how
-  fixes get verified and regressions get caught.
-- **Meticulous, tamper-evident logging.** Every model call, tool call,
-  and environment state is recorded in an append-only, hash-chained run
-  log; the corpus lives in a signed, optionally encrypted git repository.
-- **Trust domains.** Attack code executes in an egress-denied sandbox.
-  Internet research happens in a separate zone with no code execution.
-  The model endpoint is host-side. Plugins are host-trusted by nature.
-- **Two jobs.** *Campaigns* (ad hoc, scoped by mission or diff) and
-  *watch mode* (continuous: new commits replay findings, spec changes and
-  external advisories generate new missions).
-- **A lab for open-weight models.** corpus benchmarks models against
-  *your* purpose — funded Lightning attacks, quote state-machine abuse,
-  race conditions — not generic leaderboards. Every finding and run is
-  tagged with the exact model that produced it; when a new open-weight
-  model drops, the forensic suite tells you whether it got better or
-  worse at the work you actually care about.
+| Requirement | Version / purpose | Required? |
+|---|---|---|
+| Git | Clone the repository and pinned target sources | Yes |
+| Rust via `rustup` | Toolchain `1.97.1` is pinned in `rust-toolchain.toml` | Yes |
+| OpenCode | `1.18.18` or a newer `1.18.x` patch; runs research agents | Yes |
+| Model provider | Any provider configured in OpenCode; launches use an explicit `provider/model` | Yes |
+| Docker | Runs the current `cdk-regtest` and `nutshell-regtest` environments | Yes for bundled plugins |
+| tmux | `3.2a` or newer; enables attachable desktop sessions | Recommended |
 
-## Status
+OpenCode must be available on `PATH` or installed at
+`~/.opencode/bin/opencode`. Docker must be running before plugin setup.
 
-Pre-alpha. The first-party `cdk-regtest` and `nutshell-regtest` environments
-are independently versioned in the `corpus-plugin-cdk` and
-`corpus-plugin-nutshell` repositories. Both provide a sandbox, invariant
-oracles, and a bounded regtest Lightning faucet through the same portable
-protocol. Corpus installs immutable plugin versions and owns their source and
-runtime paths; the application repository carries no production adapter.
+### Install from source
 
-In this repo: Rust workspace (`crates/corpus-core`, the separate research and
-admin MCP servers, the headless `crates/corpus-cli`, and `crates/corpus-app`
-desktop UI), the plugin
-protocol and conformance fixtures, and the model registry
-(`benchmarks/models.yaml`).
+```sh
+git clone https://github.com/orangeshyguy21/corpus.git
+cd corpus
 
-See [the architecture guide](docs/architecture.md) for the shipped crate and
-runtime boundaries, [the security invariants](docs/threat-model.md) for trust
-and failure policy, [the operator guide](docs/operator-guide.md) for routine
-workflows, [the troubleshooting guide](docs/troubleshooting.md) for recovery,
-and [the testing guide](docs/testing.md) for verification. [PLUGINS.md](PLUGINS.md)
-owns plugin installation, upgrade/rollback, release locks, and the
-environment-plugin authoring contract. Durable rationale is recorded in
-[the architectural decisions](docs/decisions.md); historical refactor evidence
-and the remaining closeout roadmap are tracked in
-[the senior-developer refactor plan](docs/senior-developer-refactor-plan.md).
+rustup show
+cargo build --locked --workspace
+```
 
-## Authorized use
+The build produces the desktop app, the `corpus` CLI, and its companion MCP
+servers in `target/debug/`.
 
-corpus is an offensive-capable defensive tool. Point it only at systems
-you own or have explicit written permission to test. The default target is
-always a local, disposable test environment — never production.
+### Start the desktop app
+
+Launch Corpus from the repository root:
+
+```sh
+./target/debug/corpus-app
+```
+
+The app guides the rest of the setup. Install a supported environment when
+prompted, then create a project and choose its environment plugin. Open the
+project's environment controls and run **Setup**, followed by **Doctor**, to
+prepare its pinned sources and Docker services and confirm that it is ready.
+
+Next, add an agent to the project and choose the role that matches its job.
+Create a mission, select an explicit model, and use **Launch** to start the
+run. Corpus opens the mission in its integrated terminal and keeps the
+transcript, findings, and other evidence attached to that project.
+
+Use the sidebar to move between projects, agents, and missions. The project
+view is where you inspect environment health and findings; the mission view is
+where you launch, resume, and follow active work.
+
+Corpus stores operator-owned data under `~/.corpus` by default. Set
+`CORPUS_HOME` before first use to place it elsewhere.
+
+## Command-line quick start
+
+Prefer a terminal? Add the freshly built binaries to the current shell, then
+confirm the model identifiers available through OpenCode:
+
+```sh
+export PATH="$PWD/target/debug:$PATH"
+opencode models
+```
+
+Install and prepare an environment, create a project and agent, then launch a
+mission:
+
+```sh
+corpus plugin install cdk-regtest
+corpus plugin setup cdk-regtest
+corpus plugin doctor cdk-regtest
+
+corpus project new example --name "Example" --plugin cdk-regtest
+corpus agent new example tester --role tester
+
+CORPUS_PROJECT=example corpus run tester \
+  --model <provider/model> \
+  "Investigate the authorized target and verify any findings"
+```
+
+The project scope is always explicit—Corpus will not silently choose one for
+a run. Replace `<provider/model>` with an identifier from `opencode models`.
+To use the Nutshell environment, replace `cdk-regtest` with
+`nutshell-regtest`.
+
+That is enough to get started. For the full command catalog, roles, mission
+lifecycle, cleanup, audit logs, and configuration overrides, continue to the
+[operator guide](docs/operator-guide.md). If a launch, plugin, or model is not
+ready, see [the troubleshooting guide](docs/troubleshooting.md).
+
+## Contributing
+
+### Development setup
+
+Fork and clone the repository, then build the complete workspace with the
+locked dependency graph:
+
+```sh
+rustup show
+cargo build --locked --workspace
+cargo test --locked --workspace --all-targets
+```
+
+The repository's pinned toolchain installs `rustfmt`, Clippy, and
+`rust-analyzer`. The default test suite is hermetic: it does not require a
+model server, network access, Docker, OpenCode, or tmux.
+
+### Before opening a pull request
+
+Run the checks relevant to your change:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
+./scripts/check-dependency-policy
+git diff --check
+```
+
+Dependency changes must also pass the supply-chain gate:
+
+```sh
+cargo install --locked cargo-deny --version 0.20.2
+./scripts/check-supply-chain
+```
+
+Keep the following contribution rules in mind:
+
+- Preserve project scope, role ceilings, confirmation gates, and filesystem
+  confinement; review [the threat model](docs/threat-model.md) for security
+  invariants.
+- Add characterization tests before changing unclear behavior.
+- Keep normal tests hermetic. Platform, plugin, and live-model tests have
+  separate, explicitly invoked suites.
+- Update architecture and dependency-policy documentation when crate ownership
+  or workspace edges change.
+- Do not edit production plugin implementations in this repository; plugins
+  are independently released and tested against Corpus's protocol fixtures.
+- Never relax a security assertion merely to make a test pass.
+
+### Workspace map
+
+| Path | Responsibility |
+|---|---|
+| `crates/corpus-app` | Desktop operator application |
+| `crates/corpus-cli` | Headless `corpus` command |
+| `crates/corpus-core` | Plugins, sources, launches, processes, and compatibility facade |
+| `crates/corpus-store` | Durable filesystem data model |
+| `crates/corpus-observe` | Read-only host projections |
+| `crates/corpus-admin*` | Host-side administration policy and MCP server |
+| `crates/corpus-mcp` | Project-scoped research MCP server |
+| `crates/corpus-integration` | Hermetic and live end-to-end scenarios |
+| `benchmarks` | Model registry and forensic fixtures |
+| `docs` | Architecture, operations, testing, and security documentation |
+
+For the complete contributor contract, read [AGENTS.md](AGENTS.md) and the
+[testing guide](docs/testing.md).
+
+## Documentation
+
+| Guide | Use it for |
+|---|---|
+| [Operator guide](docs/operator-guide.md) | Routine setup, projects, missions, cleanup, and diagnostics |
+| [Plugin guide](PLUGINS.md) | Plugin installation, rollback, lifecycle, and authoring |
+| [Architecture](docs/architecture.md) | Runtime boundaries, crate ownership, and data flow |
+| [Threat model](docs/threat-model.md) | Trust zones and enforced security invariants |
+| [Testing](docs/testing.md) | Hermetic, platform, plugin, and live-model suites |
+| [Troubleshooting](docs/troubleshooting.md) | Symptom-first recovery and evidence collection |
+
+## License
+
+See [LICENSE](LICENSE).

@@ -29,6 +29,7 @@ fn render_denies_corpus_tools_outside_the_role() {
     let perm = rendered_permission(&text);
     assert_eq!(perm["corpus_target_info"].as_str(), Some("allow"));
     assert_eq!(perm["corpus_technique_save"].as_str(), Some("allow"));
+    assert_eq!(perm["corpus_finding_write"].as_str(), Some("allow"));
     for denied in [
         "corpus_sandbox_exec",
         "corpus_sandbox_write",
@@ -37,7 +38,6 @@ fn render_denies_corpus_tools_outside_the_role() {
         "corpus_faucet",
         "corpus_wallet_fund",
         "corpus_probe_save",
-        "corpus_finding_write",
     ] {
         assert_eq!(
             perm[denied].as_str(),
@@ -105,7 +105,7 @@ fn legacy_attack_permission_tightens_both_probe_names() {
 
 /// A scalar `read`/`edit`/`write` used to skip red-line injection
 /// entirely; it must be normalized to a map so the denies always land.
-/// The agent tree itself is unwritable — it holds the role sidecars.
+/// Raw mutation is unwritable — durable writes must cross `entry_write`.
 #[test]
 fn red_lines_survive_scalar_permissions() {
     let store = tmp_store("role-scalar");
@@ -134,11 +134,8 @@ fn red_lines_survive_scalar_permissions() {
         "{text}"
     );
     assert_eq!(perm["read"]["plugins/**"].as_str(), Some("deny"), "{text}");
-    assert_eq!(
-        perm["write"]["store/projects/*/agents/**"].as_str(),
-        Some("deny"),
-        "no agent may rewrite the sidecars the role gate trusts\n{text}"
-    );
+    assert_eq!(perm["write"]["*"].as_str(), Some("deny"), "{text}");
+    assert_eq!(perm["edit"]["*"].as_str(), Some("deny"), "{text}");
 }
 
 /// The module doc has promised since the roles landed that a shell and a
@@ -190,6 +187,9 @@ fn render_derives_the_admin_namespace_for_curator_and_super() {
         .create_agent_with_role("alpha", "res", AgentRole::Researcher)
         .unwrap();
     store
+        .create_agent_with_role("alpha", "test", AgentRole::Tester)
+        .unwrap();
+    store
         .create_agent_with_role("alpha", "cur", AgentRole::Curator)
         .unwrap();
     store
@@ -202,10 +202,16 @@ fn render_derives_the_admin_namespace_for_curator_and_super() {
                 .unwrap(),
         )
     };
-    let (res, cur, sup) = (read("res"), read("cur"), read("sup"));
+    let (res, test, cur, sup) = (read("res"), read("test"), read("cur"), read("sup"));
     for tool in PROJECT_MANAGEMENT_TOOLS {
         let key = format!("corpus_{tool}");
-        assert_eq!(res[&key].as_str(), Some("deny"), "researcher: {key}");
+        let contributor = if tool == "entry_write" {
+            "allow"
+        } else {
+            "deny"
+        };
+        assert_eq!(res[&key].as_str(), Some(contributor), "researcher: {key}");
+        assert_eq!(test[&key].as_str(), Some(contributor), "tester: {key}");
         let expected = if CURATOR_TOOLS.contains(&tool) {
             "allow"
         } else {

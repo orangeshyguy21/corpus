@@ -45,15 +45,6 @@ permission:
   corpus_wallet_fund: allow
   edit:
     '*': deny
-    <STORE>/**: deny
-    <STORE>/projects/p/corpus/**: allow
-    <STORE>/projects/p/corpus/runs/**: deny
-    <DATA>/var/audit/**: deny
-    <DATA>/var/chat/**: deny
-    <DATA>/var/refusals/**: deny
-    store/projects/*/agents/**: deny
-    store/projects/p/corpus/**: allow
-    store/projects/p/corpus/runs/**: deny
   external_directory: deny
   read:
     '*': allow
@@ -73,15 +64,6 @@ permission:
   websearch: allow
   write:
     '*': deny
-    <STORE>/**: deny
-    <STORE>/projects/p/corpus/**: allow
-    <STORE>/projects/p/corpus/runs/**: deny
-    <DATA>/var/audit/**: deny
-    <DATA>/var/chat/**: deny
-    <DATA>/var/refusals/**: deny
-    store/projects/*/agents/**: deny
-    store/projects/p/corpus/**: allow
-    store/projects/p/corpus/runs/**: deny
 ---
 You are the SUPER agent for one project. You hold every capability available
 inside that project: open-internet research, sandbox penetration, corpus work,
@@ -100,6 +82,9 @@ go through `finding_write`, which runs the oracle suite server-side — a
 finding with no oracle violation is recorded as unverified. Save what you
 built with `probe_save`, and write a technique card with `technique_save`
 after every mission, negative results included.
+
+Use `entry_write` for any durable project document when another corpus path
+or shape fits better. Categories describe the data; they are not role gates.
 
 Use `sandbox_write` for multiline PoC files in the writable workspace that
 `target_info` reports, then run them with `sandbox_exec`. The workspace lasts
@@ -137,9 +122,10 @@ reading them poisons the benchmark.
 ## Corpus scope (bound at launch)
 
 You are bound to project `p`. Your corpus is
-`store/projects/p/corpus/` — categories: `hypotheses/`,
-`techniques/`, `findings/`, `probes/`, `runs/`. Read and write
-ONLY inside it. Other projects' corpora are denied by
+`store/projects/p/corpus/`. Read ONLY inside this project's
+mounted corpus. Persist durable work with `entry_write`, using any
+corpus-relative path that best represents the data. `runs/` is
+immutable. Other projects' corpora are denied by
 permissions and strictly off-limits: reading them pollutes the
 project boundary. Any path in this prompt that names a corpus
 category without the `store/projects/p/` prefix means

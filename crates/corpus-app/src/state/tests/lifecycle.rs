@@ -1,6 +1,50 @@
 use super::*;
 
 #[test]
+fn fresh_launch_persists_the_exact_opencode_workspace() {
+    let root = std::env::temp_dir().join(format!(
+        "corpus-app-workspace-binding-{}-{}",
+        std::process::id(),
+        new_uuid_id()
+    ));
+    let store = Store::new(root.clone());
+    store.create_project("p", "P", "cdk-regtest").unwrap();
+    store
+        .create_agent_with_role("p", "runner", corpus_core::AgentRole::Tester)
+        .unwrap();
+    let mut record = mission(1);
+    record.agent = "runner".into();
+    store
+        .write_mission("p", "mission", &record, "brief")
+        .unwrap();
+    let mut state = AppState::with_runtime(
+        store.clone(),
+        Arc::new(ManualClock::new(1_700_000_123)),
+        Arc::new(FakeRunBackend::default()),
+        Arc::new(FakeSessionCatalog),
+    );
+
+    state.launch_mission("p", "mission").unwrap();
+    let launched = store.load_mission("p", "mission").unwrap();
+    assert_eq!(
+        launched.opencode_workspace.as_deref(),
+        Some(fake_workspace_id().as_str())
+    );
+    state.capture_opencode_session();
+    let discovered = store.load_mission("p", "mission").unwrap();
+    let session = mission_session_ref(&store, "p", &discovered).unwrap();
+    assert_eq!(
+        session.directory,
+        store
+            .project_run_dir("p")
+            .join("views")
+            .join(fake_workspace_id())
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn selecting_a_mission_never_spawns_or_prepares_a_run() {
     let root = std::env::temp_dir().join(format!(
         "corpus-app-mission-navigation-{}-{}",
@@ -666,6 +710,7 @@ fn detached_stop_preserves_identity_when_cleanup_fails_then_allows_retry() {
     record.agent = "runner".into();
     record.session = Some("fake-run".into());
     record.opencode_session = Some("fake-conversation".into());
+    record.opencode_workspace = Some(fake_workspace_id());
     store
         .write_mission("p", "mission", &record, "brief")
         .unwrap();

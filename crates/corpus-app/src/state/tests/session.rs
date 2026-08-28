@@ -62,6 +62,121 @@ fn mission_display_state_has_stable_precedence() {
 }
 
 #[test]
+fn controlled_status_stays_working_through_quiet_tools_and_exposes_retry_failure() {
+    let root = std::env::temp_dir().join(format!(
+        "corpus-app-controlled-status-{}-{}",
+        std::process::id(),
+        new_uuid_id()
+    ));
+    let clock = Arc::new(ManualClock::new(1_700_000_123));
+    let mut state = AppState::with_runtime(
+        Store::new(root.clone()),
+        clock.clone(),
+        Arc::new(FakeRunBackend::default()),
+        Arc::new(FakeSessionCatalog),
+    );
+    let mut record = mission(1);
+    record.session = Some("controlled-run".into());
+    record.control = Some(corpus_core::MissionControl {
+        run_id: "controlled-run".into(),
+        port: 4096,
+    });
+    record.opencode_session = Some("ses_controlled".into());
+    record.opencode_workspace = Some("workspace".into());
+    state.trees.insert(
+        "p".into(),
+        ProjectTree {
+            agents: Vec::new(),
+            missions: vec![("mission".into(), record)],
+        },
+    );
+    state.live_sessions.push("controlled-run".into());
+    state.apply_session_status_updates(
+        "p",
+        vec![SessionStatusUpdate {
+            mission: "mission".into(),
+            run_id: "stale-run".into(),
+            result: Ok(OpenCodeSessionStatus::Busy),
+        }],
+    );
+    assert!(state.session_statuses.is_empty(), "late run was rejected");
+    state.apply_session_status_updates(
+        "p",
+        vec![SessionStatusUpdate {
+            mission: "mission".into(),
+            run_id: "controlled-run".into(),
+            result: Ok(OpenCodeSessionStatus::Busy),
+        }],
+    );
+
+    clock.advance(Duration::from_secs(corpus_core::WORKING_WINDOW_SECS + 1));
+    assert_eq!(
+        state.mission_activity("p", "mission"),
+        MissionActivity::Working
+    );
+    assert_eq!(
+        state.mission_display_state("p", "mission"),
+        MissionDisplayState::Working,
+        "terminal silence must not dim an OpenCode-busy mission"
+    );
+
+    state.apply_session_status_updates(
+        "p",
+        vec![SessionStatusUpdate {
+            mission: "mission".into(),
+            run_id: "controlled-run".into(),
+            result: Ok(OpenCodeSessionStatus::Retrying {
+                attempt: 2,
+                message: "rate limited".into(),
+                next_at: 1_700_000_130,
+            }),
+        }],
+    );
+    assert_eq!(
+        state.mission_display_state("p", "mission"),
+        MissionDisplayState::Retrying
+    );
+
+    state.apply_session_status_updates(
+        "p",
+        vec![SessionStatusUpdate {
+            mission: "mission".into(),
+            run_id: "controlled-run".into(),
+            result: Ok(OpenCodeSessionStatus::Idle),
+        }],
+    );
+    assert_eq!(
+        state.mission_display_state("p", "mission"),
+        MissionDisplayState::Waiting
+    );
+
+    state.apply_session_status_updates(
+        "p",
+        vec![SessionStatusUpdate {
+            mission: "mission".into(),
+            run_id: "controlled-run".into(),
+            result: Err("injected timeout".into()),
+        }],
+    );
+    assert_eq!(
+        state.mission_display_state("p", "mission"),
+        MissionDisplayState::Waiting,
+        "a transient failure retains the last observation during the grace period"
+    );
+    clock.advance(SESSION_STATUS_GRACE + Duration::from_millis(1));
+    assert_eq!(
+        state.mission_display_state("p", "mission"),
+        MissionDisplayState::Unavailable
+    );
+    assert_eq!(
+        state.mission_activity("p", "mission"),
+        MissionActivity::Working,
+        "unknown status must not trigger turn-completion work"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn idle_state_owns_no_repaint_deadline() {
     let root = std::env::temp_dir().join(format!(
         "corpus-app-idle-repaint-{}-{}",

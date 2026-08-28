@@ -236,8 +236,9 @@ pub struct NewFinding {
     pub timestamp: u64,
     pub oracle_verified: bool,
     pub oracle_output: String,
-    /// Relative beneath `findings/`. A `.md` path names the file; a path with
-    /// no extension (or a trailing slash) names a containing directory.
+    /// Relative beneath `findings/`, optionally beginning with `findings/`.
+    /// A `.md` path names the file; a path with no extension (or a trailing
+    /// slash) names a containing directory.
     pub path: Option<String>,
     pub metadata: BTreeMap<String, serde_json::Value>,
     pub run_log: Option<String>,
@@ -303,6 +304,15 @@ impl Store {
             ));
         }
         let directory_hint = requested.is_some_and(|path| path.ends_with('/'));
+        // Most corpus tools accept corpus-relative paths (`findings/x.md`),
+        // while finding_write historically described this field as relative
+        // beneath findings (`x.md`). Accept both forms, but canonicalize them
+        // before joining so the category cannot be duplicated on disk.
+        let requested = requested.map(|path| {
+            path.strip_prefix("findings/")
+                .or_else(|| (path == "findings").then_some(""))
+                .unwrap_or(path)
+        });
         let requested_path = requested.filter(|path| !path.is_empty()).map(Path::new);
         let extension = requested_path
             .and_then(Path::extension)

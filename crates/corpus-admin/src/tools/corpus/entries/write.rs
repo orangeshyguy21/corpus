@@ -12,7 +12,7 @@ use crate::Ctx;
 
 pub(crate) static WRITE: ToolDefinition = ToolDefinition {
     name: "entry_write",
-    description: "Write (create or replace in place) ONE entry in the project's corpus by relative path (techniques/plan.md, findings/x.md, ...). The path is relative and stays inside the corpus — pass 'techniques/plan.md', never an absolute or cwd path. Missing parent directories are created. The first path segment must be a real corpus category (hypotheses, techniques, findings, probes, retro). runs/ is not writable — those are mission transcripts. Prefer this over raw file tools: it needs no knowledge of where the corpus lives on disk, and every write is recorded in the audit log.",
+    description: "Write (create or replace in place) ONE entry in the proven project's corpus by relative path (findings/x.md, notes/recon.md, ...). Choose any category or nested path that best represents the data. Missing parent directories are created. Absolute paths, traversal, symlink escapes, retired attacks/, and immutable runs/ are refused. Prefer this over raw file tools: it needs no knowledge of where the corpus lives on disk, and every write is recorded in the audit log.",
     input_schema: input_schema::<EntryWriteArgs>,
     handler: entry_write,
     policy: ToolPolicy {
@@ -27,7 +27,7 @@ pub(crate) static WRITE: ToolDefinition = ToolDefinition {
 #[derive(Debug, Deserialize, JsonSchema, PartialEq, Eq)]
 struct EntryWriteArgs {
     project: String,
-    /// relative path under the project corpus, e.g. techniques/plan.md.
+    /// relative path under the project corpus, e.g. notes/recon.md.
     path: String,
     /// the full entry body to write — replaces any existing content at this path.
     content: String,
@@ -135,6 +135,26 @@ mod tests {
             "wrote p/corpus/techniques/nested/plan.md (3 bytes)"
         );
         assert_eq!(fs::read_to_string(path).unwrap(), "v2\n");
+
+        crate::dispatch(
+            &mut ctx,
+            WRITE.name,
+            &json!({
+                "project": "p",
+                "path": "notes/recon/evidence.md",
+                "content": "custom category\n"
+            }),
+        )
+        .expect("custom categories are valid organizational choices");
+        assert_eq!(
+            fs::read_to_string(
+                store
+                    .project_corpus_dir("p")
+                    .join("notes/recon/evidence.md")
+            )
+            .unwrap(),
+            "custom category\n"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }
