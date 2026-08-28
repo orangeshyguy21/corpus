@@ -21,16 +21,21 @@ use corpus_store::EnvironmentSessionId;
 #[test]
 fn spawn_stop_and_piped_headless() {
     let _guard = env_lock();
-    let _ = Command::new("pkill").args(["-f", "sleep 90127"]).status();
     let bin = unique_temp_path("corpus-fake-bin");
+    let child_pid_file = unique_temp_path("corpus-fake-child-pid");
     let _ = fs::remove_dir_all(&bin);
     fs::create_dir_all(&bin).unwrap();
     let fake = bin.join("opencode");
-    fs::write(&fake, "#!/bin/sh\nsleep 90127\n").unwrap();
+    fs::write(
+        &fake,
+        "#!/bin/sh\nsleep 90127 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$CORPUS_TEST_CHILD_PID\"\nwait \"$child\"\n",
+    )
+    .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     let mut path = std::env::var("PATH").unwrap_or_default();
     path = format!("{}:{}", bin.display(), path);
     let _path = EnvVarGuard::set("PATH", &path);
+    let _child_pid = EnvVarGuard::set("CORPUS_TEST_CHILD_PID", &child_pid_file);
 
     let (store, store_dir) = tmp_store("stop-v2");
     let _store = EnvVarGuard::set("CORPUS_STORE", &store_dir);
@@ -40,6 +45,10 @@ fn spawn_stop_and_piped_headless() {
         .expect("piped headless spawn");
     assert!(session.transcript.is_file(), "transcript starts at spawn");
     std::thread::sleep(Duration::from_millis(800));
+    let child_pid = fs::read_to_string(&child_pid_file)
+        .expect("fake child publishes its pid")
+        .trim()
+        .to_string();
 
     let started = std::time::Instant::now();
     let stopped_at = session.stop();
@@ -56,11 +65,12 @@ fn spawn_stop_and_piped_headless() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(exited, "stop reaps the run within 5s");
-    let alive = Command::new("pgrep")
-        .args(["-f", "sleep 90127"])
-        .output()
-        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-        .unwrap_or(false);
+    let alive = Command::new("kill")
+        .args(["-0", &child_pid])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
     assert!(!alive, "no orphaned grandchildren");
 
     // Transcript is in the project corpus runs/.
@@ -73,6 +83,7 @@ fn spawn_stop_and_piped_headless() {
     );
 
     let _ = fs::remove_dir_all(&bin);
+    let _ = fs::remove_file(&child_pid_file);
     let _ = fs::remove_dir_all(&store_dir);
 }
 
