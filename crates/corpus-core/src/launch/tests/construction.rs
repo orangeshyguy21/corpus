@@ -19,6 +19,7 @@ use corpus_store::EnvironmentSessionId;
 /// runs against a temp store with agents created explicitly by role,
 /// exercising the teamless paths.
 #[test]
+#[ignore = "platform: sends signals to an owned Unix process group"]
 fn spawn_stop_and_piped_headless() {
     let _guard = env_lock();
     let bin = unique_temp_path("corpus-fake-bin");

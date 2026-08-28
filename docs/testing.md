@@ -31,11 +31,20 @@ it must not silently skip after partially exercising a workflow.
 ## Platform suite
 
 Platform tests exercise real process facilities without contacting a model.
-The initial suite covers the durable tmux capture and teardown path:
+The suite covers durable tmux capture and the process-group signal paths that
+must run serially outside the parallel hermetic test binary:
 
 ```sh
 cargo test --locked -p corpus-core --lib \
   tui_raw_capture_is_durable_in_project_corpus -- \
+  --ignored --exact --test-threads=1
+
+cargo test --locked -p corpus-core --lib \
+  launch::process::tests::timeout_kills_and_reaps_the_owned_process_group -- \
+  --ignored --exact --test-threads=1
+
+cargo test --locked -p corpus-core --lib \
+  launch::tests::construction::spawn_stop_and_piped_headless -- \
   --ignored --exact --test-threads=1
 ```
 
