@@ -232,12 +232,21 @@ pub(super) fn kill_tree_checked(child: &mut Child) -> Vec<String> {
 }
 
 fn signal_group(signal: &str, pgid: &str) -> std::io::Result<()> {
-    Command::new("kill")
-        .args([signal, &format!("-{pgid}")])
+    let output = Command::new("kill")
+        .args([signal, "--", &format!("-{pgid}")])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|_| ())
+        .stderr(Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(std::io::Error::other(if detail.is_empty() {
+            format!("kill {signal} exited with {}", output.status)
+        } else {
+            detail
+        }))
+    }
 }
 
 pub(super) fn stopped_exit_status() -> ExitStatus {
