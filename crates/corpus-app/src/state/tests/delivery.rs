@@ -526,13 +526,14 @@ fn interrupted_completion_delivery_is_durably_abandoned_across_restart() {
 
 #[test]
 fn failed_environment_survives_restart_and_blocks_relaunch_and_delete() {
+    const MISSING_PLUGIN: &str = "missing-session-plugin";
     let root = std::env::temp_dir().join(format!(
         "corpus-app-environment-recovery-{}-{}",
         std::process::id(),
         new_uuid_id()
     ));
     let store = Store::new(root.join("store"));
-    store.create_project("p", "P", "cdk-regtest").unwrap();
+    store.create_project("p", "P", MISSING_PLUGIN).unwrap();
     store
         .create_agent_with_role("p", "operator", corpus_core::AgentRole::Tester)
         .unwrap();
@@ -548,7 +549,7 @@ fn failed_environment_survives_restart_and_blocks_relaunch_and_delete() {
         .unwrap();
     let mut environment = corpus_core::EnvironmentSessionRecord {
         id,
-        plugin_id: "cdk-regtest".into(),
+        plugin_id: MISSING_PLUGIN.into(),
         plugin_version: "1.0.0".into(),
         plugin_digest: "fixture".into(),
         state: corpus_core::EnvironmentSessionState::Failed,
@@ -575,7 +576,9 @@ fn failed_environment_survives_restart_and_blocks_relaunch_and_delete() {
         .contains("requiring cleanup"));
     let cleanup_error = state.delete_mission("p", "mission").unwrap_err();
     assert!(
-        cleanup_error.to_string().contains("cleanup_failed"),
+        cleanup_error
+            .to_string()
+            .contains("plugin not found: missing-session-plugin"),
         "{cleanup_error}"
     );
     assert!(store.load_mission("p", "mission").is_ok());
