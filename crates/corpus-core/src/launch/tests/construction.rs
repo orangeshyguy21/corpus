@@ -33,9 +33,13 @@ fn spawn_stop_and_piped_headless() {
     )
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_mcp = bin.join("corpus-mcp");
+    fs::write(&fake_mcp, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&fake_mcp, fs::Permissions::from_mode(0o755)).unwrap();
     let mut path = std::env::var("PATH").unwrap_or_default();
     path = format!("{}:{}", bin.display(), path);
     let _path = EnvVarGuard::set("PATH", &path);
+    let _mcp = EnvVarGuard::set("CORPUS_MCP", &fake_mcp);
     let _child_pid = EnvVarGuard::set("CORPUS_TEST_CHILD_PID", &child_pid_file);
 
     let (store, store_dir) = tmp_store("stop-v2");
