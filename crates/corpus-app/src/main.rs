@@ -780,13 +780,12 @@ impl App {
                 }
             }
         }
-        if revs.is_empty() {
-            if project
+        if revs.is_empty()
+            && project
                 .as_deref()
                 .is_some_and(|project| self.state.source_revisions_loading(project))
-            {
-                ui.weak("loading source revisions…");
-            }
+        {
+            ui.weak("loading source revisions…");
         }
     }
 
