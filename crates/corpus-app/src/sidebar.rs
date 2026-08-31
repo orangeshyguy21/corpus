@@ -37,6 +37,7 @@ pub struct Sidebar {
     create_project: bool,
     create_name: String,
     create_plugin: String,
+    show_create_plugin_catalog: bool,
     new_agent: bool,
     agent_role: corpus_core::AgentRole,
     clone_from: Option<String>,
@@ -76,6 +77,7 @@ impl Default for Sidebar {
             create_project: false,
             create_name: String::new(),
             create_plugin: "cdk-regtest".to_string(),
+            show_create_plugin_catalog: false,
             new_agent: false,
             agent_role: corpus_core::AgentRole::Researcher,
             clone_from: None,
@@ -151,6 +153,7 @@ impl Sidebar {
         }
         if plus {
             self.create_project = true;
+            self.show_create_plugin_catalog = false;
             self.needs_probe = true;
         }
         ui.add_space(2.0);
@@ -168,7 +171,7 @@ impl Sidebar {
             }
         }
         if projects.is_empty() {
-            row_hint(ui, 8.0, "no projects — press +");
+            row_hint(ui, 8.0, "no projects");
         }
     }
 
@@ -395,7 +398,7 @@ impl Sidebar {
             }
         }
         if tree.agents.is_empty() {
-            row_hint(ui, 24.0, "no agents — press +");
+            row_hint(ui, 24.0, "no agents");
         }
         // --- missions (siblings of agents, NOT nested under them) ---
         let (missions_header, missions_plus) =
@@ -481,7 +484,7 @@ impl Sidebar {
             }
         }
         if tree.missions.is_empty() {
-            row_hint(ui, 24.0, "no missions — press +");
+            row_hint(ui, 24.0, "no missions");
         }
     }
 
@@ -795,30 +798,54 @@ impl Sidebar {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
+            .default_width(600.0)
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
             .show(ui.ctx(), |ui| {
+                ui.set_min_width(560.0);
                 ui.label("Display name");
-                let entry = ui.text_edit_singleline(&mut self.create_name);
+                let entry = ui.add_sized(
+                    egui::vec2(ui.available_width(), 32.0),
+                    egui::TextEdit::singleline(&mut self.create_name),
+                );
+                ui.add_space(10.0);
                 ui.label("Environment plugin");
+                ui.add_space(4.0);
                 plugin_picker(
                     ui,
                     &mut self.create_plugin,
                     state.plugins(),
                     &mut self.needs_probe,
                 );
-                if state.plugins().is_empty() {
+                let no_plugins = state.plugins().is_empty();
+                if !no_plugins {
+                    ui.add_space(6.0);
+                    let catalog_label = if self.show_create_plugin_catalog {
+                        "Hide plugin catalog"
+                    } else {
+                        "Install another plugin…"
+                    };
+                    if theme::house_button(ui, catalog_label).clicked() {
+                        self.show_create_plugin_catalog = !self.show_create_plugin_catalog;
+                    }
+                }
+                if no_plugins || self.show_create_plugin_catalog {
                     ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("Install an environment to create your first project.")
-                            .size(12.0)
-                            .color(theme::TEXT_MUTED),
-                    );
-                    ui.add_space(4.0);
-                    if let Some(result) =
+                    if no_plugins {
+                        ui.label(
+                            RichText::new("Install an environment to create your first project.")
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        );
+                        ui.add_space(4.0);
+                    }
+                    if let Some(request) =
                         crate::views::plugin_install::curated_plugin_list(ui, state)
                     {
-                        match result {
+                        match request.result {
                             Ok(true) => {
+                                self.create_plugin = request.plugin_id;
+                                self.show_create_plugin_catalog = true;
+                                self.needs_probe = true;
                                 toast(toasts, ToastKind::Info, "plugin installation started")
                             }
                             Ok(false) => toast(
@@ -830,20 +857,36 @@ impl Sidebar {
                         }
                     }
                     if let Some(operation) = state.plugin_operation() {
-                        ui.label(
-                            RichText::new(format!(
-                                "{}: {}",
-                                operation.plugin,
+                        let progress = match operation.state {
+                            crate::state::PluginOperationState::Running => {
                                 operation.phase.as_deref().unwrap_or("working")
-                            ))
-                            .size(12.0)
-                            .color(theme::TEXT_FAINT),
+                            }
+                            crate::state::PluginOperationState::Succeeded => {
+                                "installed — finishing discovery"
+                            }
+                            crate::state::PluginOperationState::Failed => "installation failed",
+                            crate::state::PluginOperationState::Cancelled => {
+                                "installation cancelled"
+                            }
+                        };
+                        ui.label(
+                            RichText::new(format!("{}: {progress}", operation.plugin))
+                                .size(12.0)
+                                .color(theme::TEXT_FAINT),
                         );
                     }
                 }
-                ui.add_space(8.0);
+                ui.add_space(14.0);
+                let plugin_available = state
+                    .plugins()
+                    .iter()
+                    .any(|plugin| plugin.name == self.create_plugin);
                 let submit = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if theme::house_button(ui, "Create").clicked() || submit {
+                let create = ui
+                    .add_enabled_ui(plugin_available, |ui| theme::primary_button(ui, "Create"))
+                    .inner
+                    .on_disabled_hover_text("Install and select an environment plugin first.");
+                if create.clicked() || (submit && plugin_available) {
                     let name = self.create_name.trim();
                     if name.is_empty() {
                         toast(toasts, ToastKind::Warning, "display name is required");
@@ -852,6 +895,7 @@ impl Sidebar {
                             Ok(_) => {
                                 toast(toasts, ToastKind::Success, "project created");
                                 self.create_name.clear();
+                                self.show_create_plugin_catalog = false;
                                 done = true;
                             }
                             Err(error) => toast(toasts, ToastKind::Error, error.to_string()),

@@ -38,6 +38,7 @@ fn generic_tools_forward_the_durable_v1_session_and_typed_description() {
             created: 1,
             updated: 1,
             error: None,
+            cleanup_verified_at: None,
         })
         .unwrap();
     let plugin = Plugin::spawn(&fixture).unwrap();
@@ -296,6 +297,7 @@ fn startup_refuses_an_environment_session_from_another_project() {
             created: 1,
             updated: 1,
             error: None,
+            cleanup_verified_at: None,
         })
         .unwrap();
 

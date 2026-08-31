@@ -8,7 +8,7 @@ use corpus_core::{Mission, PluginStatus, Store};
 
 use super::{
     global_job_scope, mission_label, AppJobOutput, AppState, PluginLeaseView,
-    PluginLifecycleResult, PluginOperationState, PluginOperationView,
+    PluginLifecycleResult, PluginOperationState, PluginOperationView, PluginSessionBlockerView,
 };
 use crate::jobs::{JobKind, JobScope, JobSet, StartOutcome};
 
@@ -38,6 +38,7 @@ impl AppState {
         let mut operation = self.plugin_operation.lock().unwrap();
         if let Some(current) = operation.as_mut() {
             current.state = state;
+            current.phase = None;
             current.detail = detail;
             current.recovery = recovery;
         }
@@ -105,9 +106,48 @@ impl AppState {
         &self.plugin_leases
     }
 
-    /// Close a durable lease whose mission record is already gone. The
-    /// reconciliation beat invokes this automatically; the UI calls it only
-    /// as an immediate retry after automatic cleanup failed.
+    /// Active durable environments are installation-global. Surface their
+    /// owner instead of making a fresh project look responsible for an opaque
+    /// `sessions_active` lifecycle failure.
+    pub fn plugin_session_blockers(&self, plugin_id: &str) -> Vec<PluginSessionBlockerView> {
+        let mut blockers: Vec<_> = self
+            .store
+            .list_environment_sessions(plugin_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| {
+                !matches!(
+                    record.state,
+                    corpus_core::EnvironmentSessionState::Closed
+                        | corpus_core::EnvironmentSessionState::Failed
+                )
+            })
+            .filter_map(|record| {
+                let session_key = record.id.storage_key();
+                self.store
+                    .load_mission(&record.id.project, &record.id.mission)
+                    .ok()
+                    .map(|mission| PluginSessionBlockerView {
+                        project: record.id.project,
+                        mission: mission_label(mission.name.as_deref(), &record.id.mission),
+                        mission_slug: record.id.mission,
+                        session_key,
+                    })
+            })
+            .collect();
+        blockers.sort_by(|a, b| {
+            (&a.project, &a.mission, &a.mission_slug).cmp(&(
+                &b.project,
+                &b.mission,
+                &b.mission_slug,
+            ))
+        });
+        blockers
+    }
+
+    /// Converge one durable lease onto physically absent plugin resources.
+    /// Active leases require their mission to be gone; legacy terminal
+    /// records without cleanup verification receive one bounded repair close.
     pub fn cleanup_orphan_environment(
         &mut self,
         plugin_id: &str,
@@ -117,10 +157,16 @@ impl AppState {
             .store
             .load_environment_session_key(plugin_id, session_key)
             .map_err(|error| error.to_string())?;
-        if self
-            .store
-            .load_mission(&record.id.project, &record.id.mission)
-            .is_ok()
+        let legacy_terminal_needs_verification = matches!(
+            record.state,
+            corpus_core::EnvironmentSessionState::Closed
+                | corpus_core::EnvironmentSessionState::Failed
+        ) && record.cleanup_verified_at.is_none();
+        if !legacy_terminal_needs_verification
+            && self
+                .store
+                .load_mission(&record.id.project, &record.id.mission)
+                .is_ok()
         {
             return Err(
                 "environment still belongs to a mission; delete that mission instead".into(),
@@ -142,6 +188,9 @@ impl AppState {
             .claim(&project, &record.id.mission);
         let scope = self.job_scope(&project, None);
         let jobs = self.jobs.as_mut().expect("checked above");
+        if plugin_work_active(jobs) {
+            return Ok(false);
+        }
         Ok(matches!(
             jobs.start(
                 JobKind::OrphanCleanup,
@@ -273,6 +322,14 @@ impl AppState {
             Duration::from_secs(120)
         };
         let plugin_id = plugin_id.to_string();
+        let repairs: Vec<String> = if operation == "setup" {
+            orphan_environment_sessions(&self.store)
+                .into_iter()
+                .filter_map(|(plugin, key)| (plugin == plugin_id).then_some(key))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let Some(jobs) = self.jobs.as_mut() else {
             return Err("plugin lifecycle requires the app background-job runtime".into());
         };
@@ -280,20 +337,48 @@ impl AppState {
             return Ok(false);
         }
         let operation_state = self.plugin_operation.clone();
+        let initial_phase = if !repairs.is_empty() {
+            format!("cleaning {} stale environment(s)", repairs.len())
+        } else if operation == "setup" {
+            "preparing sources".into()
+        } else {
+            format!("running {operation}")
+        };
         *operation_state.lock().unwrap() = Some(PluginOperationView {
             plugin: plugin_id.clone(),
             operation: operation.into(),
             state: PluginOperationState::Running,
-            phase: Some(if operation == "setup" {
-                "preparing sources".into()
-            } else {
-                format!("running {operation}")
-            }),
+            phase: Some(initial_phase),
             detail: String::new(),
             recovery: None,
         });
+        let store = self.store.clone();
+        let session_operation_leases = self.session_operation_leases.clone();
         Ok(matches!(
             jobs.start(kind, global_job_scope(), timeout, move |cancellation| {
+                for (index, key) in repairs.iter().enumerate() {
+                    if cancellation.is_cancelled() {
+                        return Err("cancelled".into());
+                    }
+                    let record = store
+                        .load_environment_session_key(&plugin_id, key)
+                        .map_err(|error| error.to_string())?;
+                    let ownership =
+                        session_operation_leases.claim(&record.id.project, &record.id.mission);
+                    let _ownership = ownership
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(current) = operation_state.lock().unwrap().as_mut() {
+                        current.phase = Some("cleaning stale environments".into());
+                        current.detail = format!(
+                            "removing old session resources · {}/{}",
+                            index + 1,
+                            repairs.len()
+                        );
+                    }
+                    corpus_core::close_environment_session_key(&store, &plugin_id, key)
+                        .map_err(|error| error.to_string())?;
+                }
                 let selected = corpus_core::find_plugin(&plugin_id)
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| format!("plugin not found: {plugin_id}"))?;
@@ -390,6 +475,7 @@ fn plugin_work_active(jobs: &JobSet<AppJobOutput>) -> bool {
         JobKind::PluginSetup,
         JobKind::PluginDoctor,
         JobKind::PluginStop,
+        JobKind::OrphanCleanup,
     ]
     .into_iter()
     .any(|kind| jobs.is_kind_active(kind))
@@ -511,16 +597,19 @@ pub(super) fn orphan_environment_sessions(store: &Store) -> Vec<(String, String)
         .unwrap_or_default()
         .into_iter()
         .filter(|record| {
-            !matches!(
+            let legacy_terminal_needs_verification = matches!(
                 record.state,
                 corpus_core::EnvironmentSessionState::Closed
                     | corpus_core::EnvironmentSessionState::Failed
-            )
-        })
-        .filter(|record| {
-            store
+            ) && record.cleanup_verified_at.is_none();
+            let active_orphan = !matches!(
+                record.state,
+                corpus_core::EnvironmentSessionState::Closed
+                    | corpus_core::EnvironmentSessionState::Failed
+            ) && store
                 .load_mission(&record.id.project, &record.id.mission)
-                .is_err()
+                .is_err();
+            legacy_terminal_needs_verification || active_orphan
         })
         .map(|record| (record.plugin_id, record.id.storage_key()))
         .collect()
@@ -528,8 +617,11 @@ pub(super) fn orphan_environment_sessions(store: &Store) -> Vec<(String, String)
 
 pub(super) fn plugin_recovery_hint(error: &str) -> Option<&'static str> {
     let error = error.to_ascii_lowercase();
-    if error.contains("sessions_active") || error.contains("session(s) are active") {
-        Some("Delete every live mission lease, then retry environment Stop.")
+    if error.contains("sessions_active")
+        || error.contains("session(s) are active")
+        || error.contains("active session target")
+    {
+        Some("Stop the listed active mission environments, then retry Setup or Stop.")
     } else if error.contains("source_missing")
         || error.contains("source identity mismatch")
         || error.contains("target identity")

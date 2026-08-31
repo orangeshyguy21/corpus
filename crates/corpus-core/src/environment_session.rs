@@ -44,6 +44,7 @@ pub fn open_environment_session(
         created: now,
         updated: now,
         error: None,
+        cleanup_verified_at: None,
     };
     store.save_environment_session(&record)?;
 
@@ -143,6 +144,7 @@ pub fn close_environment_session(
     let plugin_dir = crate::find_plugin(&record.plugin_id)?
         .ok_or_else(|| Error::Store(format!("plugin not found: {}", record.plugin_id)))?;
     record.state = EnvironmentSessionState::Closing;
+    record.cleanup_verified_at = None;
     record.updated = epoch();
     store.save_environment_session(record)?;
     let operation_key = format!("session_close:{}", record.id.storage_key());
@@ -162,7 +164,13 @@ pub fn close_environment_session(
             params.as_object().cloned().unwrap_or_default(),
         )?;
         match status.state {
-            crate::OperationState::Succeeded => Ok(()),
+            // A receipt proves that cleanup succeeded once, not that the
+            // resources are absent now. A late session_open may have raced an
+            // older close. session_close is deliberately idempotent, so run
+            // it again to converge physical state before trusting Closed.
+            crate::OperationState::Succeeded => {
+                plugin.call_v1("session_close", Some(params)).map(|_| ())
+            }
             crate::OperationState::Running => Err(Error::Plugin {
                 plugin: record.plugin_id.clone(),
                 message: "session_close is already running".into(),
@@ -187,12 +195,15 @@ pub fn close_environment_session(
         Ok(()) => {
             record.state = EnvironmentSessionState::Closed;
             record.error = None;
-            record.updated = epoch();
+            let now = epoch();
+            record.updated = now;
+            record.cleanup_verified_at = Some(now);
             store.save_environment_session(record)
         }
         Err(error) => {
             record.state = EnvironmentSessionState::Failed;
             record.error = Some(error.to_string());
+            record.cleanup_verified_at = None;
             record.updated = epoch();
             store.save_environment_session(record)?;
             Err(error)

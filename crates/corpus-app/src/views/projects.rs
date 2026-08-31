@@ -132,8 +132,8 @@ impl ProjectsView {
                     Some(env.notes.as_str()),
                 ),
                 Some(ref env) => (
-                    "environment degraded",
-                    components::StatusTone::Danger,
+                    "environment not ready",
+                    components::StatusTone::Warning,
                     Some(env.notes.as_str()),
                 ),
                 None => ("probe unavailable", components::StatusTone::Warning, None),
@@ -229,6 +229,7 @@ impl ProjectsView {
                 .find(|plugin| plugin.name == self.edit_plugin)
                 .cloned();
             let leases = state.plugin_leases().to_vec();
+            let blockers = state.plugin_session_blockers(&self.edit_plugin);
             let plugin_busy = state.plugin_work_active();
             ui.horizontal_wrapped(|ui| {
                 if let Some(status) = selected_status.as_ref() {
@@ -250,7 +251,16 @@ impl ProjectsView {
                 };
                 for (label, operation) in [(setup_label, "setup"), ("Doctor", "doctor")] {
                     let enabled = !plugin_busy;
-                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                    let response = if operation == "setup"
+                        && selected_status.as_ref().is_some_and(|status| !status.ready)
+                    {
+                        ui.add_enabled_ui(enabled, |ui| theme::primary_button(ui, label))
+                            .inner
+                    } else {
+                        ui.add_enabled(enabled, egui::Button::new(label))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    };
+                    if response.clicked() {
                         match state.start_plugin_lifecycle(&self.edit_plugin, operation) {
                             Ok(true) => toast(
                                 toasts,
@@ -267,7 +277,7 @@ impl ProjectsView {
                     }
                 }
                 ui.menu_button("⋮", |ui| {
-                    let environments_live = !leases.is_empty();
+                    let environments_live = !blockers.is_empty();
                     let stop = ui
                         .add_enabled(
                             !environments_live && !plugin_busy,
@@ -308,6 +318,10 @@ impl ProjectsView {
                     }
                 });
             });
+            if let Some(status) = selected_status.as_ref().filter(|status| !status.ready) {
+                ui.add_space(10.0);
+                plugin_not_ready_help(ui, status, &blockers);
+            }
             if let Some(operation) = state.plugin_operation() {
                 ui.add_space(8.0);
                 plugin_operation(ui, &operation);
@@ -835,11 +849,13 @@ impl ProjectsView {
                     .color(theme::TEXT_MUTED),
                 );
                 ui.add_space(8.0);
-                if let Some(result) =
+                if let Some(request) =
                     crate::views::plugin_install::curated_plugin_list(ui, state)
                 {
-                    match result {
+                    match request.result {
                         Ok(true) => {
+                            self.edit_plugin = request.plugin_id;
+                            self.needs_probe = true;
                             toast(toasts, ToastKind::Info, "plugin installation started");
                             started = true;
                         }
@@ -924,7 +940,7 @@ fn plugin_summary(ui: &mut Ui, status: &corpus_core::PluginStatus) {
         if status.ready {
             components::StatusTone::Healthy
         } else {
-            components::StatusTone::Danger
+            components::StatusTone::Warning
         },
     )
     .on_hover_text(&status.notes);
@@ -937,6 +953,83 @@ fn plugin_summary(ui: &mut Ui, status: &corpus_core::PluginStatus) {
         .size(12.0)
         .color(theme::TEXT_MUTED),
     );
+}
+
+fn plugin_not_ready_help(
+    ui: &mut Ui,
+    status: &corpus_core::PluginStatus,
+    blockers: &[crate::state::PluginSessionBlockerView],
+) {
+    egui::Frame::new()
+        .fill(theme::WARN.gamma_multiply(0.06))
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            theme::WARN.gamma_multiply(0.45),
+        ))
+        .corner_radius(theme::CONTROL_RADIUS)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("Environment setup required")
+                    .size(12.5)
+                    .strong()
+                    .color(theme::WARN),
+            );
+            ui.add_space(3.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "This plugin is installed, but it cannot run missions yet. Run Setup, then Doctor to verify the environment.",
+                    )
+                    .size(12.0)
+                    .color(theme::TEXT_MUTED),
+                )
+                .wrap(),
+            );
+            let notes = status.notes.trim();
+            if !notes.is_empty() && notes != "not probed" {
+                ui.add_space(5.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("Diagnostic: {notes}"))
+                            .monospace()
+                            .size(10.5)
+                            .color(theme::TEXT_FAINT),
+                    )
+                    .wrap(),
+                );
+            }
+            if !blockers.is_empty() {
+                ui.add_space(7.0);
+                ui.label(
+                    RichText::new(if blockers.len() == 1 {
+                        "1 active environment can block reset:"
+                    } else {
+                        "Active environments can block reset:"
+                    })
+                    .size(11.5)
+                    .strong()
+                    .color(theme::WARN),
+                );
+                for blocker in blockers.iter().take(3) {
+                    ui.label(
+                        RichText::new(format!("{} / {}", blocker.project, blocker.mission))
+                            .monospace()
+                            .size(10.5)
+                            .color(theme::TEXT_MUTED),
+                    )
+                    .on_hover_text(format!("session: {}", blocker.session_key));
+                }
+                if blockers.len() > 3 {
+                    ui.label(
+                        RichText::new(format!("and {} more", blockers.len() - 3))
+                            .size(10.5)
+                            .color(theme::TEXT_FAINT),
+                    );
+                }
+            }
+        });
 }
 
 fn details_toggle(ui: &mut Ui, open: &mut bool) {
@@ -1070,35 +1163,111 @@ fn short_identity(value: &str) -> String {
 fn plugin_operation(ui: &mut Ui, operation: &crate::state::PluginOperationView) {
     let (label, tone) = match operation.state {
         crate::state::PluginOperationState::Running => {
-            ui.spinner();
-            ("running", components::StatusTone::Interaction)
+            ("loading", components::StatusTone::Interaction)
         }
-        crate::state::PluginOperationState::Succeeded => {
-            ("complete", components::StatusTone::Healthy)
-        }
-        crate::state::PluginOperationState::Failed => ("failed", components::StatusTone::Danger),
-        crate::state::PluginOperationState::Cancelled => {
-            ("cancelled", components::StatusTone::Warning)
+        crate::state::PluginOperationState::Succeeded => ("done", components::StatusTone::Healthy),
+        crate::state::PluginOperationState::Failed
+        | crate::state::PluginOperationState::Cancelled => {
+            ("error", components::StatusTone::Danger)
         }
     };
-    ui.horizontal_wrapped(|ui| {
-        components::status_badge(ui, label, tone);
-        ui.label(
-            RichText::new(format!("{} {}", operation.plugin, operation.operation))
-                .monospace()
-                .size(12.0)
-                .color(theme::TEXT),
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(104.0, 30.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                components::status_badge(ui, label, tone);
+            },
         );
-        if let Some(phase) = operation.phase.as_deref() {
-            ui.label(RichText::new(phase).size(12.0).color(theme::TEXT_MUTED));
-        }
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("{} {}", operation.plugin, operation.operation))
+                    .monospace()
+                    .size(12.0)
+                    .color(theme::TEXT),
+            )
+            .truncate(),
+        );
     });
-    if !operation.detail.is_empty() {
-        empty_hint(ui, &operation.detail);
+    let progress = if operation.state == crate::state::PluginOperationState::Running {
+        plugin_progress_text(operation)
+    } else {
+        None
+    };
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 18.0),
+        egui::Layout::left_to_right(egui::Align::Min),
+        |ui| {
+            ui.add_space(104.0);
+            if let Some(progress) = progress {
+                ui.add(
+                    egui::Label::new(RichText::new(progress).size(11.0).color(theme::TEXT_MUTED))
+                        .truncate(),
+                );
+            }
+        },
+    );
+    if matches!(
+        operation.state,
+        crate::state::PluginOperationState::Failed | crate::state::PluginOperationState::Cancelled
+    ) {
+        if !operation.detail.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(compact_operation_error(&operation.detail))
+                        .size(11.5)
+                        .color(theme::SIGNAL_RED),
+                )
+                .wrap(),
+            );
+        }
+        if let Some(recovery) = operation.recovery.as_deref() {
+            ui.add(egui::Label::new(RichText::new(recovery).size(11.5).color(theme::WARN)).wrap());
+        }
     }
-    if let Some(recovery) = operation.recovery.as_deref() {
-        ui.label(RichText::new(recovery).size(12.0).color(theme::WARN));
+}
+
+fn plugin_progress_text(operation: &crate::state::PluginOperationView) -> Option<String> {
+    let detail = operation.detail.lines().next().unwrap_or_default().trim();
+    if let Some((message, counter)) = detail.rsplit_once(" · ") {
+        if let Some((completed, total)) = counter.split_once('/') {
+            if completed.parse::<usize>().is_ok() && total.parse::<usize>().is_ok() {
+                return Some(format!(
+                    "Step {completed} of {total} · {}",
+                    compact_progress_message(message)
+                ));
+            }
+        }
     }
+    if !detail.is_empty() {
+        return Some(compact_progress_message(detail));
+    }
+    operation
+        .phase
+        .as_deref()
+        .map(|phase| compact_progress_message(&phase.replace('_', " ")))
+}
+
+fn compact_progress_message(message: &str) -> String {
+    const LIMIT: usize = 96;
+    let message = message.trim();
+    if message.chars().count() <= LIMIT {
+        return message.to_string();
+    }
+    let mut compact: String = message.chars().take(LIMIT - 1).collect();
+    compact.push('…');
+    compact
+}
+
+fn compact_operation_error(detail: &str) -> String {
+    const LIMIT: usize = 160;
+    let first_line = detail.lines().next().unwrap_or_default().trim();
+    if first_line.chars().count() <= LIMIT {
+        return first_line.to_string();
+    }
+    let mut compact: String = first_line.chars().take(LIMIT - 1).collect();
+    compact.push('…');
+    compact
 }
 
 fn plugin_environments(
@@ -1624,5 +1793,32 @@ mod tests {
         assert_eq!(dashboard_columns(TWO_COLUMN_AT - 1.0), 1);
         assert_eq!(dashboard_columns(TWO_COLUMN_AT), 2);
         assert_eq!(dashboard_columns(1_440.0), 2);
+    }
+
+    #[test]
+    fn plugin_errors_are_reduced_to_one_bounded_line() {
+        assert_eq!(
+            compact_operation_error("first line\nlog line"),
+            "first line"
+        );
+        let compact = compact_operation_error(&"x".repeat(200));
+        assert_eq!(compact.chars().count(), 160);
+        assert!(compact.ends_with('…'));
+    }
+
+    #[test]
+    fn plugin_progress_is_normalized_without_exposing_payloads() {
+        let operation = crate::state::PluginOperationView {
+            plugin: "nutshell-regtest".into(),
+            operation: "setup".into(),
+            state: crate::state::PluginOperationState::Running,
+            phase: Some("dependency_fetch".into()),
+            detail: "fetching pinned sources · 1/5".into(),
+            recovery: None,
+        };
+        assert_eq!(
+            plugin_progress_text(&operation).as_deref(),
+            Some("Step 1 of 5 · fetching pinned sources")
+        );
     }
 }

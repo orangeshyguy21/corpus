@@ -786,8 +786,6 @@ impl App {
                 .is_some_and(|project| self.state.source_revisions_loading(project))
             {
                 ui.weak("loading source revisions…");
-            } else {
-                ui.weak("no source pins");
             }
         }
     }

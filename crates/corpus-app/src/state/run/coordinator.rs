@@ -306,6 +306,7 @@ impl AppState {
         let store = self.store.clone();
         let backend = self.run_backend.clone();
         let environment_runtime = self.environment_runtime.clone();
+        let session_operation = self.session_operation_leases.claim(project, slug);
         let project = project.to_string();
         let slug = slug.to_string();
         let jobs = self.jobs.as_mut().expect("installed above");
@@ -314,6 +315,9 @@ impl AppState {
             scope,
             Duration::from_secs(120),
             move |job_cancellation| {
+                let _environment_ownership = session_operation
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let cancellation = RunCancellation(job_cancellation);
                 if cancellation.is_cancelled() {
                     return Err("launch preparation cancelled".into());
@@ -629,6 +633,12 @@ impl AppState {
         let cancellation = RunCancellation::default();
         self.run_cancellations
             .insert(run_id.clone(), cancellation.clone());
+        let session_operation = self
+            .session_operation_leases
+            .claim(&run_id.project, &run_id.mission);
+        let _environment_ownership = session_operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let result = (|| {
             if cancellation.is_cancelled() {
                 return Err(Error::Store("launch preparation cancelled".into()));

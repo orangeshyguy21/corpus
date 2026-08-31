@@ -189,8 +189,8 @@ impl AppState {
                     self.finish_plugin_operation(
                         PluginOperationState::Succeeded,
                         format!(
-                            "installed {}@{} · {}",
-                            receipt.id, receipt.version, receipt.digest
+                            "Version {} is installed. Run Setup to prepare the environment, then Doctor to verify it.",
+                            receipt.version
                         ),
                         None,
                     );

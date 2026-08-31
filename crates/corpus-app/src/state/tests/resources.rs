@@ -331,6 +331,7 @@ fn prepared_lease_projection_exposes_identity_drift_and_hides_closed_leases() {
         created: 1,
         updated: 1,
         error: None,
+        cleanup_verified_at: None,
     };
     store.save_environment_session(&record).unwrap();
     let statuses = vec![PluginStatus {
@@ -357,15 +358,39 @@ fn prepared_lease_projection_exposes_identity_drift_and_hides_closed_leases() {
     assert_eq!(leases[0].mission_slug, mission_slug);
     assert_eq!(leases[0].image_digest.as_deref(), Some("sha256:target"));
     assert_eq!(leases[0].drift.len(), 3, "{:?}", leases[0].drift);
+    let state = AppState::with_runtime(
+        store.clone(),
+        Arc::new(ManualClock::new(2)),
+        Arc::new(FakeRunBackend::default()),
+        Arc::new(FakeSessionCatalog),
+    );
+    assert_eq!(
+        state.plugin_session_blockers("fixture-regtest"),
+        vec![PluginSessionBlockerView {
+            project: "p".into(),
+            mission: "new".into(),
+            mission_slug: mission_slug.into(),
+            session_key: record.id.storage_key(),
+        }]
+    );
 
     record.state = corpus_core::EnvironmentSessionState::Closed;
     store.save_environment_session(&record).unwrap();
     assert!(
         prepared_plugin_leases(&store, Some("p"), Some("fixture-regtest"), &statuses,).is_empty()
     );
+    assert_eq!(
+        orphan_environment_sessions(&store),
+        vec![("fixture-regtest".to_string(), record.id.storage_key())],
+        "legacy closed leases receive one physical cleanup verification"
+    );
+    record.cleanup_verified_at = Some(2);
+    store.save_environment_session(&record).unwrap();
+    assert!(orphan_environment_sessions(&store).is_empty());
 
     record.id.mission = "deleted-mission".into();
     record.state = corpus_core::EnvironmentSessionState::Ready;
+    record.cleanup_verified_at = None;
     store.save_environment_session(&record).unwrap();
     let orphan = prepared_plugin_leases(&store, Some("p"), Some("fixture-regtest"), &statuses);
     assert_eq!(orphan.len(), 1);
@@ -386,8 +411,13 @@ fn plugin_failures_map_to_actionable_recovery() {
     assert!(
         plugin_recovery_hint("sessions_active: 2 environment session(s) are active")
             .unwrap()
-            .contains("mission lease")
+            .contains("active mission environments")
     );
+    assert!(plugin_recovery_hint(
+        "backbone is unhealthy, but 3 active session target(s) prevent automatic reset"
+    )
+    .unwrap()
+    .contains("retry Setup"));
     assert!(plugin_recovery_hint("source identity mismatch")
         .unwrap()
         .contains("source pins"));

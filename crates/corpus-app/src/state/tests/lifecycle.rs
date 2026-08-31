@@ -692,6 +692,50 @@ fn asynchronous_launch_is_stopped_when_deletion_removes_its_mission() {
 }
 
 #[test]
+fn environment_open_owns_the_same_mission_lease_as_teardown() {
+    let root = std::env::temp_dir().join(format!(
+        "corpus-app-environment-open-lease-{}-{}",
+        std::process::id(),
+        new_uuid_id()
+    ));
+    let store = Store::new(root.clone());
+    store.create_project("p", "P", "cdk-regtest").unwrap();
+    store
+        .create_agent_with_role("p", "runner", corpus_core::AgentRole::Tester)
+        .unwrap();
+    let mut record = mission(1);
+    record.agent = "runner".into();
+    store
+        .write_mission("p", "mission", &record, "brief")
+        .unwrap();
+    let mut state = AppState::with_runtime(
+        store,
+        Arc::new(ManualClock::new(0)),
+        Arc::new(FakeRunBackend::default()),
+        Arc::new(FakeSessionCatalog),
+    );
+    let lease = state.session_operation_leases.claim("p", "mission");
+    let environment = Arc::new(LeaseCheckingEnvironmentRuntime {
+        lease,
+        observed_locked: AtomicBool::new(false),
+    });
+    state.environment_runtime = environment.clone();
+    state.install_job_runtime(eframe::egui::Context::default());
+
+    state.launch_mission("p", "mission").unwrap();
+    for _ in 0..200 {
+        state.poll_background_jobs();
+        if environment.observed_locked.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    assert!(environment.observed_locked.load(Ordering::Acquire));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn detached_stop_preserves_identity_when_cleanup_fails_then_allows_retry() {
     let root = std::env::temp_dir().join(format!(
         "corpus-app-stop-retry-{}-{}",

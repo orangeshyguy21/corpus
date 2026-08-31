@@ -220,6 +220,7 @@ pub fn house_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
         ui.button(egui::RichText::new(text.into()).size(14.0).color(TEXT))
     })
     .inner
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// A house button with a Phosphor glyph and a regular text label. Keeping the
@@ -257,6 +258,7 @@ pub fn primary_button(ui: &mut Ui, text: impl Into<String>) -> egui::Response {
         )
     })
     .inner
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Primary action with a Phosphor icon pinned independently from its label.

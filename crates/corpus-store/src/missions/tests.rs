@@ -93,6 +93,7 @@ fn active_environment_identity_blocks_every_delete_cascade() {
             created: 1,
             updated: 1,
             error: None,
+            cleanup_verified_at: None,
         })
         .unwrap();
     let mission = Mission {

@@ -559,6 +559,7 @@ fn failed_environment_survives_restart_and_blocks_relaunch_and_delete() {
         created: 1,
         updated: 2,
         error: Some("cleanup failed".into()),
+        cleanup_verified_at: None,
     };
     store.save_environment_session(&environment).unwrap();
 

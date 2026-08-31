@@ -37,10 +37,13 @@ corpus.
 | OpenCode | `1.18.18` or a newer `1.18.x` patch; runs research agents | Yes |
 | Model provider | Any provider configured in OpenCode; launches use an explicit `provider/model` | Yes |
 | Docker | Runs the current `cdk-regtest` and `nutshell-regtest` environments | Yes for bundled plugins |
+| [Nix](https://nixos.org/download/) | `2.4` or newer, with `nix-command` and `flakes` enabled; builds and runs the CDK regtest backbone | Yes for `cdk-regtest` |
 | tmux | `3.2a` or newer; enables attachable desktop sessions | Recommended |
 
 OpenCode must be available on `PATH` or installed at
-`~/.opencode/bin/opencode`. Docker must be running before plugin setup.
+`~/.opencode/bin/opencode`. Docker must be running before plugin setup. The
+`cdk-regtest` plugin also requires Nix; verify that `nix build` and
+`nix develop` can use flakes before running its setup.
 
 ### Install from source
 
