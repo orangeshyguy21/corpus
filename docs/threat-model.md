@@ -245,12 +245,19 @@ catalog metadata, manifest identity, archive path, and extraction tests; plus
 Environment session identity is durable outside project subtrees. Active or
 failed cleanup state blocks deletion and relaunch until teardown succeeds.
 Stopping attempts every cleanup step and retains enough session/transcript
-identity for retry; restart can recover detached sessions.
+identity for retry; restart can recover detached sessions. Environment open
+and close share one per-project/mission writer lease, so a late open cannot
+recreate resources after teardown. A historical successful close receipt is
+not sufficient by itself: the owning plugin reruns idempotent cleanup and the
+store records when physical absence was verified. Legacy terminal records
+without that verification receive a bounded reconciliation close.
 
 Evidence: mission deletion/environment tests,
 `detached_stop_preserves_identity_when_cleanup_fails_then_allows_retry`,
 `failed_environment_survives_restart_and_blocks_relaunch_and_delete`, and
-`restarted_app_recovers_a_durable_detached_session`.
+`restarted_app_recovers_a_durable_detached_session`, plus
+`environment_open_owns_the_same_mission_lease_as_teardown` and the stale-close
+replay case in `corpus-core/tests/plugin_installation.rs`.
 
 ### SEC-DUR-2: lifecycle reconciliation rejects stale work
 

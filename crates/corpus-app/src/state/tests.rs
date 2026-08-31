@@ -518,6 +518,24 @@ impl SessionCatalog for FakeSessionCatalog {
     }
 }
 
+struct LeaseCheckingEnvironmentRuntime {
+    lease: Arc<Mutex<()>>,
+    observed_locked: AtomicBool,
+}
+
+impl EnvironmentRuntime for LeaseCheckingEnvironmentRuntime {
+    fn open(
+        &self,
+        _store: &Store,
+        _id: RunId,
+        _source_shas: BTreeMap<String, String>,
+    ) -> Result<Option<corpus_core::EnvironmentSessionRecord>, Error> {
+        self.observed_locked
+            .store(self.lease.try_lock().is_err(), Ordering::Release);
+        Ok(None)
+    }
+}
+
 struct CountingSessionCatalog(Arc<AtomicUsize>);
 
 impl SessionCatalog for CountingSessionCatalog {

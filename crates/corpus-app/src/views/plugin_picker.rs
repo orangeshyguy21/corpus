@@ -35,7 +35,18 @@ pub fn plugin_picker(
         return;
     }
 
-    let field_size = egui::vec2(360.0, 28.0);
+    if !plugins.iter().any(|plugin| plugin.name == *current) {
+        if let Some(plugin) = plugins
+            .iter()
+            .find(|plugin| plugin.ready)
+            .or(plugins.first())
+        {
+            *current = plugin.name.clone();
+            *needs_probe = true;
+        }
+    }
+
+    let field_size = egui::vec2(ui.available_width(), 34.0);
     let (rect, _) = ui.allocate_exact_size(field_size, egui::Sense::click());
     let id = ui.id().with("plugin_picker_field");
     // The popup gets its OWN id: egui registers the field's interact on the
@@ -87,13 +98,16 @@ pub fn plugin_picker(
         egui::AboveOrBelow::Below,
         egui::popup::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
-            ui.set_min_width(360.0);
+            ui.set_min_width(field_size.x);
             egui::ScrollArea::vertical()
                 .max_height(280.0)
                 .id_salt("plugin_list")
                 .show(ui, |ui| {
                     for status in plugins {
-                        row(ui, status, current);
+                        if row(ui, status, current) {
+                            *needs_probe = true;
+                            ui.memory_mut(|memory| memory.close_popup());
+                        }
                     }
                 });
         },
@@ -101,7 +115,8 @@ pub fn plugin_picker(
 }
 
 /// A popup row: probe badge + selectable plugin name + failing notes.
-fn row(ui: &mut Ui, status: &PluginStatus, current: &mut String) {
+fn row(ui: &mut Ui, status: &PluginStatus, current: &mut String) -> bool {
+    let mut changed = false;
     ui.horizontal(|ui| {
         let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
         let color = badge_color(status);
@@ -115,6 +130,7 @@ fn row(ui: &mut Ui, status: &PluginStatus, current: &mut String) {
         );
         if resp.clicked() {
             *current = status.name.clone();
+            changed = true;
         }
         if status.probed && !status.ready && !status.notes.is_empty() {
             resp.on_hover_text(&status.notes);
@@ -122,6 +138,7 @@ fn row(ui: &mut Ui, status: &PluginStatus, current: &mut String) {
             ui.weak(short.to_string());
         }
     });
+    changed
 }
 
 /// The probe badge colour for a plugin: health-green when the live probe is

@@ -58,6 +58,11 @@ pub struct EnvironmentSessionRecord {
     pub updated: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Last time the owning plugin physically confirmed that this session's
+    /// resources were absent. Legacy records omit this field and receive one
+    /// bounded reconciliation close before they are trusted as clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_verified_at: Option<u64>,
 }
 
 impl Store {
@@ -203,6 +208,7 @@ mod tests {
             created: now,
             updated: now,
             error: None,
+            cleanup_verified_at: None,
         };
         store.save_environment_session(&record).unwrap();
         assert_eq!(

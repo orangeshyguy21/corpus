@@ -40,6 +40,16 @@ pub struct PluginLeaseView {
     pub error: Option<String>,
 }
 
+/// One installation-global environment that can prevent lifecycle reset or
+/// stop even when the currently viewed project has no missions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginSessionBlockerView {
+    pub project: String,
+    pub mission: String,
+    pub mission_slug: String,
+    pub session_key: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginOperationState {
     Running,

@@ -127,12 +127,15 @@ while IFS= read -r line; do
       fi ;;
     operation_status)
       key="$(jq -r '.idempotency_key // ""' <<<"$params")"
-      if [[ "$key" == setup:* && -f "$state/ready" ]]; then state_value=succeeded; else state_value=unknown; fi
+      if [[ "$key" == setup:* && -f "$state/ready" ]]; then state_value=succeeded
+      elif [[ "$key" == session_close:* && -f "$state/close.succeeded" ]]; then state_value=succeeded
+      else state_value=unknown; fi
       jq -nc --argjson id "$id" --arg key "$key" --arg state "$state_value" \
         '{id:$id,ok:true,result:{idempotency_key:$key,state:$state}}' ;;
     session_open)
       mkdir -p "$state"
       jq -c '.sources' <<<"$params" > "$state/sources.json"
+      touch "$state/resources-live"
       printf '{"id":%s,"ok":true,"result":{"environment_lock":"fixture-lock","image_digest":"sha256:fixture"}}\n' "$id" ;;
     session_probe)
       printf '{"id":%s,"ok":true,"result":{"ready":true,"notes":"fixture session ready"}}\n' "$id" ;;
@@ -143,6 +146,9 @@ while IFS= read -r line; do
         rm -f "$state/fail-close-once"
         printf '{"id":%s,"ok":false,"error":{"code":"cleanup_failed","message":"injected close failure","retryable":true}}\n' "$id"
       else
+        rm -f "$state/resources-live"
+        touch "$state/close.succeeded"
+        printf 'closed\n' >> "$state/close.calls"
         printf '{"id":%s,"ok":true,"result":{"closed":true}}\n' "$id"
       fi ;;
     stop)
@@ -360,6 +366,23 @@ fn external_read_only_bundle_recovers_setup_and_populates_sources() {
     assert_eq!(
         environment.state,
         corpus_core::EnvironmentSessionState::Closed
+    );
+    assert!(environment.cleanup_verified_at.is_some());
+
+    // A late opener can recreate resources after an older successful close.
+    // The old close receipt is not proof of current physical state: closing
+    // again must invoke the idempotent plugin cleanup instead of replaying
+    // success and leaving the resource behind.
+    fs::write(state_dir.join("resources-live"), "late open").unwrap();
+    corpus_core::close_environment_session_key(&store, "fixture-regtest", &id.storage_key())
+        .unwrap();
+    assert!(!state_dir.join("resources-live").exists());
+    assert_eq!(
+        fs::read_to_string(state_dir.join("close.calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
     );
 
     let resolved_json =
